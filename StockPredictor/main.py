@@ -5,9 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 
-from stock_predictor.config import build_config
+from stock_predictor.config import build_config, load_environment
 from stock_predictor.model import StockPredictorAI
 
 
@@ -19,16 +20,31 @@ def configure_logging(level: str) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    load_environment()
+
+    default_mode = os.getenv("STOCK_PREDICTOR_DEFAULT_MODE", "predict")
+    default_ticker = os.getenv("STOCK_PREDICTOR_DEFAULT_TICKER", "AAPL")
+
     parser = argparse.ArgumentParser(
         description="Run the Stock Predictor AI pipeline.",
     )
     parser.add_argument(
         "--mode",
         choices=["download-data", "train", "predict"],
-        required=True,
-        help="Pipeline mode to run.",
+        default=default_mode,
+        help=(
+            "Pipeline mode to run. Defaults to the value of the "
+            "STOCK_PREDICTOR_DEFAULT_MODE environment variable or 'predict'."
+        ),
     )
-    parser.add_argument("--ticker", required=True, help="Ticker symbol to process.")
+    parser.add_argument(
+        "--ticker",
+        default=default_ticker,
+        help=(
+            "Ticker symbol to process. Defaults to the value of the "
+            "STOCK_PREDICTOR_DEFAULT_TICKER environment variable or 'AAPL'."
+        ),
+    )
     parser.add_argument(
         "--start-date",
         help="Historical start date (YYYY-MM-DD). Defaults to one year ago.",

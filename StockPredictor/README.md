@@ -88,6 +88,12 @@ and returns a JSON blob with the predicted closing price for the next trading
 day, the absolute and percentage change relative to the latest observed close
 and metadata about the run.
 
+Running `python main.py` without arguments uses defaults. Set
+`STOCK_PREDICTOR_DEFAULT_MODE` and `STOCK_PREDICTOR_DEFAULT_TICKER` in your
+environment (or `.env`) to customise the implicit `mode` and `ticker`. The
+application falls back to `predict` for the mode and `AAPL` for the ticker when
+no overrides are provided.
+
 ### Additional options
 
 - `--no-sentiment` disables sentiment processing even when news is available.
