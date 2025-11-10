@@ -1,177 +1,125 @@
-"""Convenience entry point for running the Stocksight utilities.
-
-This module helps with the first start of the project by making sure the
-configuration file exists, offering an optional download of the required NLTK
-data, and delegating to the original ``sentiment.py`` and ``stockprice.py``
-scripts.
-
-Example usage::
-
-    $ python main.py sentiment -s TSLA -k "Tesla"
-
-    $ python main.py stockprice -s TSLA
-
-    $ python main.py --download-nltk
-"""
+"""Command line interface for the stock predictor pipeline."""
 
 from __future__ import annotations
 
 import argparse
-import shutil
-import subprocess
+import json
+import logging
 import sys
-from pathlib import Path
-from typing import Iterable, List, Optional
+
+from stock_predictor.config import build_config
+from stock_predictor.model import StockPredictorAI
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-CONFIG_FILE = PROJECT_ROOT / "config.py"
-CONFIG_SAMPLE_FILE = PROJECT_ROOT / "config.py.sample"
-
-
-def ensure_config_file() -> bool:
-    """Ensure that ``config.py`` exists.
-
-    If the configuration file is missing but the sample file is available, the
-    sample is copied to ``config.py`` so that the user has a starting point.
-    A short message is displayed so users know they still need to edit the
-    configuration before running the pipelines for real data collection.
-    """
-
-    if CONFIG_FILE.exists():
-        return True
-
-    if not CONFIG_SAMPLE_FILE.exists():
-        print(
-            "Es wurde keine config.py gefunden und die Beispiel-Datei "
-            "config.py.sample existiert nicht. Bitte lege eine Konfigurationsdatei "
-            "manuell an, bevor du das Projekt startest."
-        )
-        return False
-
-    shutil.copy(CONFIG_SAMPLE_FILE, CONFIG_FILE)
-    print(
-        "Es wurde keine config.py gefunden. Die config.py.sample wurde als "
-        "Ausgangspunkt kopiert. Bitte bearbeite die neue config.py und trage "
-        "deine Zugangsdaten (z. B. Twitter API) ein, bevor du einen Dienst startest."
+def configure_logging(level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-    return False
 
 
-def download_nltk_data() -> None:
-    """Download the NLTK data required by the original scripts."""
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the Stock Predictor AI pipeline.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["download-data", "train", "predict"],
+        required=True,
+        help="Pipeline mode to run.",
+    )
+    parser.add_argument("--ticker", required=True, help="Ticker symbol to process.")
+    parser.add_argument(
+        "--start-date",
+        help="Historical start date (YYYY-MM-DD). Defaults to one year ago.",
+    )
+    parser.add_argument("--end-date", help="Historical end date (YYYY-MM-DD).")
+    parser.add_argument(
+        "--interval",
+        default="1d",
+        help="Historical data interval supported by yfinance (default: 1d).",
+    )
+    parser.add_argument(
+        "--model-type",
+        default="random_forest",
+        help="Model type to use (currently only random_forest is implemented).",
+    )
+    parser.add_argument(
+        "--data-dir",
+        help="Directory to store downloaded data (defaults to ./data).",
+    )
+    parser.add_argument(
+        "--models-dir",
+        help="Directory to store trained models (defaults to ./models).",
+    )
+    parser.add_argument(
+        "--news-api-key",
+        help="API key for the Financial Modeling Prep news endpoint.",
+    )
+    parser.add_argument(
+        "--news-limit",
+        type=int,
+        default=50,
+        help="Maximum number of news articles to download (default: 50).",
+    )
+    parser.add_argument(
+        "--no-sentiment",
+        action="store_true",
+        help="Disable sentiment analysis even if news data is available.",
+    )
+    parser.add_argument(
+        "--refresh-data",
+        action="store_true",
+        help="Force redownload of remote data before processing.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        help="Logging level (DEBUG, INFO, WARNING, ...).",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    configure_logging(args.log_level)
+
+    config = build_config(
+        ticker=args.ticker,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        interval=args.interval,
+        model_type=args.model_type,
+        data_dir=args.data_dir,
+        models_dir=args.models_dir,
+        news_api_key=args.news_api_key,
+        news_limit=args.news_limit,
+        sentiment=not args.no_sentiment,
+    )
+
+    ai = StockPredictorAI(config)
 
     try:
-        import nltk
-    except ImportError as exc:  # pragma: no cover - defensive path
-        print(
-            "Die Installation von NLTK wurde nicht gefunden."
-            " Installiere zuerst die Abhängigkeiten (siehe requirements.txt)."
-        )
-        raise SystemExit(1) from exc
-
-    for resource in ("punkt", "stopwords"):
-        print(f"Lade NLTK Ressource '{resource}' herunter ...")
-        nltk.download(resource)
-
-
-def run_legacy_script(script_name: str, args: Iterable[str]) -> int:
-    """Run one of the legacy entry-point scripts with the given arguments."""
-
-    script_path = PROJECT_ROOT / script_name
-    if not script_path.exists():
-        print(
-            f"Das Skript '{script_name}' wurde nicht gefunden."
-            " Bitte überprüfe deine Installation."
-        )
+        if args.mode == "download-data":
+            result = ai.download_data(force=args.refresh_data)
+            print(json.dumps({"status": "ok", "downloaded": {k: str(v) for k, v in result.items()}}, indent=2))
+        elif args.mode == "train":
+            if args.refresh_data:
+                ai.download_data(force=True)
+            metrics = ai.train_model()
+            print(json.dumps({"status": "ok", "metrics": metrics}, indent=2))
+        elif args.mode == "predict":
+            prediction = ai.predict(refresh_data=args.refresh_data)
+            print(json.dumps({"status": "ok", "prediction": prediction}, indent=2))
+        else:
+            raise ValueError(f"Unsupported mode: {args.mode}")
+    except Exception as exc:  # pylint: disable=broad-except
+        logging.exception("Pipeline failed")
+        print(json.dumps({"status": "error", "message": str(exc)}), file=sys.stderr)
         return 1
 
-    command: List[str] = [sys.executable, str(script_path), *args]
-    print("Starte:", " ".join(command))
-    return subprocess.call(command)
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Hilfsprogramm für den Projektstart. Stelle sicher, dass die"
-            " Konfiguration vorhanden ist und delegiere bei Bedarf an"
-            " sentiment.py oder stockprice.py."
-        )
-    )
-
-    parser.add_argument(
-        "--download-nltk",
-        action="store_true",
-        help="Lade die erforderlichen NLTK-Daten (punkt, stopwords) herunter.",
-    )
-
-    subparsers = parser.add_subparsers(dest="command")
-
-    sentiment_parser = subparsers.add_parser(
-        "sentiment",
-        help="Starte das Sammeln und Analysieren von Tweets.",
-    )
-    sentiment_parser.add_argument(
-        "extra_args",
-        nargs=argparse.REMAINDER,
-        help=(
-            "Weitere Argumente, die an sentiment.py weitergereicht werden."
-            " Beispiel: -s TSLA -k Tesla,SpaceX"
-        ),
-    )
-
-    stock_parser = subparsers.add_parser(
-        "stockprice",
-        help="Starte das Sammeln von Börsenkursen.",
-    )
-    stock_parser.add_argument(
-        "extra_args",
-        nargs=argparse.REMAINDER,
-        help="Weitere Argumente, die an stockprice.py weitergereicht werden.",
-    )
-
-    return parser
-
-
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-
-    if args.download_nltk:
-        download_nltk_data()
-
-    config_ready = ensure_config_file()
-
-    if args.command is None:
-        if not config_ready:
-            # When the configuration file was just created we terminate so the
-            # user can edit it before running a worker.
-            return 0
-
-        parser.print_help()
-        print(
-            "\nBeispiele:\n"
-            "  python main.py sentiment -s TSLA -k 'Elon Musk',Musk\n"
-            "  python main.py stockprice -s TSLA\n"
-        )
-        return 0
-
-    if not config_ready:
-        # We already displayed a message in ensure_config_file().
-        return 0
-
-    extra_args: List[str] = getattr(args, "extra_args", [])
-
-    if args.command == "sentiment":
-        return run_legacy_script("sentiment.py", extra_args)
-
-    if args.command == "stockprice":
-        return run_legacy_script("stockprice.py", extra_args)
-
-    parser.error(f"Unbekannter Befehl: {args.command}")
-    return 2
+    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+# Ignore generated datasets while keeping placeholder files
+data/*
+!data/.gitkeep
+
+# Ignore trained models while keeping placeholder files
+models/*
+!models/.gitkeep

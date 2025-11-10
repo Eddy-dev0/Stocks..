@@ -1,8 +1,8 @@
-elasticsearch>=5.0.0,<6.0.0
-requests
-nltk
-tweepy>=3.8.0
-beautifulsoup4
-textblob
-vaderSentiment
-newspaper3k
+joblib>=1.2,<2.0
+numpy>=1.24,<2.0
+pandas>=2.0,<3.0
+python-dotenv>=1.0,<2.0
+requests>=2.31,<3.0
+scikit-learn>=1.2,<2.0
+vaderSentiment>=3.3,<4.0
+yfinance>=0.2,<0.3
