@@ -19,8 +19,17 @@ import sys
 from elasticsearch import Elasticsearch
 from random import randint
 
-# import elasticsearch host
-from config import elasticsearch_host, elasticsearch_port, elasticsearch_user, elasticsearch_password
+CONFIG_LOADED = True
+CONFIG_IMPORT_ERROR = None
+try:
+    from config import elasticsearch_host, elasticsearch_port, elasticsearch_user, elasticsearch_password
+except ImportError as exc:
+    CONFIG_LOADED = False
+    CONFIG_IMPORT_ERROR = exc
+    elasticsearch_host = "localhost"
+    elasticsearch_port = 9200
+    elasticsearch_user = ""
+    elasticsearch_password = ""
 
 from sentiment import STOCKSIGHT_VERSION
 __version__ = STOCKSIGHT_VERSION
@@ -28,9 +37,7 @@ __version__ = STOCKSIGHT_VERSION
 # url to fetch stock price from, SYMBOL will be replaced with symbol from cli args
 url = "https://query1.finance.yahoo.com/v8/finance/chart/SYMBOL?region=US&lang=en-US&includePrePost=false&interval=2m&range=5d&corsDomain=finance.yahoo.com&.tsrc=finance"
 
-# create instance of elasticsearch
-es = Elasticsearch(hosts=[{'host': elasticsearch_host, 'port': elasticsearch_port}],
-                   http_auth=(elasticsearch_user, elasticsearch_password))
+es = None
 
 class GetStock:
 
@@ -180,16 +187,24 @@ if __name__ == '__main__':
             color = '35m'
 
         banner = """\033[%s
-       _                     _                 
-     _| |_ _           _   _| |_ _     _   _   
-    |   __| |_ ___ ___| |_|   __|_|___| |_| |_ 
+       _                     _
+     _| |_ _           _   _| |_ _     _   _
+    |   __| |_ ___ ___| |_|   __|_|___| |_| |_
     |__   |  _| . |  _| '_|__   | | . |   |  _|
-    |_   _|_| |___|___|_,_|_   _|_|_  |_|_|_|  
-      |_|                   |_|   |___|                
+    |_   _|_| |___|___|_,_|_   _|_|_  |_|_|_|
+      |_|                   |_|   |___|
           :) = +$   :( = -$    v%s
      https://github.com/shirosaidev/stocksight
             \033[0m""" % (color, STOCKSIGHT_VERSION)
         print(banner + '\n')
+
+    if not CONFIG_LOADED:
+        logger.error('config.py not found or failed to import: %s', CONFIG_IMPORT_ERROR)
+        logger.error('Copy config.py.sample to config.py and update it with your credentials.')
+        sys.exit(1)
+
+    es = Elasticsearch(hosts=[{'host': elasticsearch_host, 'port': elasticsearch_port}],
+                       http_auth=(elasticsearch_user, elasticsearch_password))
 
     # set up elasticsearch mappings and create index
     mappings = {
