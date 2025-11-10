@@ -1,201 +1,107 @@
-<img src="/docs/stocksight.png?raw=true" alt="stocksight" />
+# Stock Predictor
 
-[![License](https://img.shields.io/github/license/shirosaidev/stocksight.svg?label=License&maxAge=86400)](./LICENSE)
-[![Release](https://img.shields.io/github/release/shirosaidev/stocksight.svg?label=Release&maxAge=60)](https://github.com/shirosaidev/stocksight/releases/latest)
-[![Sponsor Patreon](https://img.shields.io/badge/Sponsor%20%24-Patreon-brightgreen.svg)](https://www.patreon.com/shirosaidev)
-[![Donate PayPal](https://img.shields.io/badge/Donate%20%24-PayPal-brightgreen.svg)](https://www.paypal.com/cgi-bin/webscr?cmd=_s-xclick&hosted_button_id=CLF223XAS4W72)
+The Stock Predictor project provides an end-to-end machine learning pipeline for
+downloading financial market data, engineering features, training a predictive
+model and generating forecasts. All functionality is exposed through a single
+command line interface so the system can be automated or integrated into other
+workflows easily.
 
-# stocksight
-Stock market analyzer and stock predictor using Elasticsearch, Twitter, News headlines and Python natural language processing and sentiment analysis. How much do emotions on Twitter and news headlines affect a stock's price? Let's find out...
+## Features
 
-## About
-stocksight is an open source stock market analysis software that uses Elasticsearch to store Twitter and news headlines data for stocks. stocksight analyzes the emotions of what the author writes and does sentiment analysis on the text to determine how the author "feels" about a stock. It could be used for more than finding sentiment of just stocks, it could be used to find sentiment of anything...
+- Download historical price data via [yfinance](https://github.com/ranaroussi/yfinance).
+- Optional download of recent company news headlines from Financial Modeling
+  Prep's public API (requires an API key, falls back to demo limits).
+- Automatic sentiment scoring for news articles using VADER.
+- Feature engineering with common technical indicators and aggregated
+  sentiment information.
+- Machine learning model (Random Forest Regressor) with persisted metrics and
+  trained model artefacts.
+- CLI modes for data collection, training and inference.
 
+## Project layout
 
-## Slack workspace
-Join the conversation, get support, etc on [stocksight Slack](https://join.slack.com/t/stocksightworkspace/shared_invite/enQtNzk1ODI0NjA3MTM4LTA3ZDA0YzllOGNiM2I5ZjAzYWM2MjNmMjI0OTRlY2ZjYTk1NmM5YmEwMmMwOTE2OTNiMGZlNzdjZmZkM2RjM2U).
+```
+StockPredictor/
+├── main.py                # Command line interface
+├── stock_predictor/
+│   ├── __init__.py
+│   ├── config.py          # Runtime configuration helpers
+│   ├── data_fetcher.py    # Internet data acquisition
+│   ├── model.py           # StockPredictorAI implementation
+│   ├── preprocessing.py   # Feature engineering helpers
+│   └── sentiment.py       # Sentiment scoring utilities
+├── data/                  # Cached datasets (created automatically)
+└── models/                # Trained models & metrics (created automatically)
+```
 
+## Installation
+
+1. Create and activate a virtual environment (recommended).
+2. Install dependencies:
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+3. (Optional) create a `.env` file in the project root and provide the API key
+   used for downloading news headlines:
+
+   ```
+   FINANCIALMODELINGPREP_API_KEY=demo
+   ```
+
+   If no key is provided the application continues to run but skips news and
+   sentiment integration.
+
+## Usage
+
+All commands are executed from the project root (`StockPredictor/`).
+
+### Download data
+
+```bash
+python main.py --mode download-data --ticker TSLA --start-date 2022-01-01 --refresh-data
+```
+
+This downloads price data (and news if available) and stores them inside the
+`data/` directory. The `--refresh-data` flag forces re-download even when cached
+files already exist.
+
+### Train a model
+
+```bash
+python main.py --mode train --ticker TSLA --start-date 2022-01-01 --news-limit 100
+```
+
+This prepares features, trains a Random Forest model and saves both the model
+(`models/TSLA_random_forest.joblib`) and metrics
+(`models/TSLA_random_forest_metrics.json`).
+
+### Generate a prediction
+
+```bash
+python main.py --mode predict --ticker TSLA
+```
+
+The command loads the most recent trained model, refreshes features if needed
+and returns a JSON blob with the predicted closing price for the next trading
+day, the absolute and percentage change relative to the latest observed close
+and metadata about the run.
+
+### Additional options
+
+- `--no-sentiment` disables sentiment processing even when news is available.
+- `--data-dir` and `--models-dir` allow custom storage locations.
+- `--log-level DEBUG` enables more verbose logging for troubleshooting.
+
+Run `python main.py --help` for the full set of options.
 
 ## Requirements
-- Python 3.x
-- Elasticsearch 5.x
-- Kibana 5.x
-- elasticsearch python module
-- nltk python module
-- requests python module
-- tweepy python module
-- beautifulsoup4 python module
-- textblob python module
-- vaderSentiment python module
-- newspaper3k python module
 
-### Download
+See [`requirements.txt`](requirements.txt) for the complete dependency list.
+All packages are available on PyPI and can be installed with `pip`.
 
-```shell
-$ git clone https://github.com/shirosaidev/stocksight.git
-$ cd stocksight
-```
-[Download latest version](https://github.com/shirosaidev/stocksight/releases/latest)
+## License
 
-## Screenshot
-Stocksight Kibana dashboard
-<img src="https://github.com/shirosaidev/stocksight/blob/master/docs/stocksight-dashboard-kibana.png?raw=true" alt="stocksight kibana dashboard" />
-
-
-## Install - Docker
-
-*** **See [how to use](#how-to-use) below before building the Docker containers** ***
-
-1) Download/clone stocksight repo with git.
-2) Set up stocksight, elasticsearch and kibana containers using Docker compose
-```
-cd stocksight
-cp config.py.sample config.py
-***see how to use below for config.py (stocksight config) changes***
-docker-compose build && docker-compose up
-```
-**This will volume mount config.py (stocksight settings) and twitteruserids.txt to those files in your local git cloned "stocksight" directory**
-
-3) Once all the containers have started up, shell into the container
-
-`docker exec -it stocksight_stocksight_1 bash`
-
-4) See examples below for running stocksight.
-
-## Install - local
-
-**Recommended to install Elasticsearch and Kibana in local machine or other machine/vm/docker**
-
-1) Install python requirements using pip
-
-`pip install -r requirements.txt`
-
-2) Install python nltk data
-
-`python -c "import nltk; nltk.download('punkt'); nltk.download('stopwords')"`
-
-
-## How to use
-1) Create a new twitter application and generate your consumer key and access token. https://developer.twitter.com/en/docs/basics/developer-portal/guides/apps.html
-https://developer.twitter.com/en/docs/basics/authentication/guides/access-tokens.html
-
-2) Copy config.py.sample to config.py (stocksight config file)
-
-3) Set elasticsearch settings in config.py for your env (for Docker, set `elasticsearch_host = "elasticsearch"`)
-
-4) Add twitter consumer key/access token and secrets to config.py
-
-5) Edit config.py and modify NLTK tokens required/ignored and twitter feeds you want to mine. NLTK tokens required are keywords which must be in tweet before adding it to Elasticsearch (whitelist). NLTK tokens ignored are keywords which if are found in tweet, it will not be added to Elasticsearch (blacklist).
-
-> **Note:** stocksight now detects recent Tweepy releases (v4+) automatically. When the legacy streaming API is unavailable it transparently falls back to polling Twitter's REST endpoints, so you can continue to launch the tool with `python sentiment.py ...` without additional configuration changes.
-
-### Examples
-
-Run sentiment.py to create 'stocksight' index in Elasticsearch and start mining and analyzing Tweets using keywords and the stock symbol TSLA
-
-```sh
-$ python sentiment.py -s TSLA -k 'Elon Musk',Musk,Tesla,SpaceX --debug
-```
-
-Start mining and analyzing Tweets using keywords and the stock symbol TSLA and follow any url links in tweets and performing sentiment analysis on the link web page as well as the tweet
-
-```sh
-$ python sentiment.py -s TSLA -k 'Elon Musk',Musk,Tesla,SpaceX -l --debug
-```
-
-Start mining and analyzing Tweets from feeds in config using cached user ids from file (if you change any of the twitter  feeds in the config file, you need to delete this file and recreate it without -f)
-
-```sh
-$ python sentiment.py -s TSLA -f twitteruserids.txt --debug
-```
-
-Start mining and analyzing News headlines and following headline links and scraping relevant text on landing page
-
-```sh
-$ python sentiment.py -s TSLA --followlinks --debug
-```
-
-Run stockprice.py to add stock prices to 'stocksight' index in Elasticsearch
-
-```sh
-$ python stockprice.py -s TSLA --debug
-```
-
-### Kibana
-
-Load 'stocksight' index in Kibana. For index pattern you can use 'stocksight' if you only have the single index or 'stocksight-*', etc. For time-field name you will want to use the date/time field 'date'.
-
-To import the saved exported visualizations/dashboard, go to Kibana, click on management, click on saved objects, click on the import button and import the export.json file.
-
-
-### CLI options
-
-```
-usage: sentiment.py [-h] [-i INDEX] [-d] -s SYMBOL [-k KEYWORDS] [-a] [-u URL]
-                    [-f FILE] [-l] [-n] [--frequency FREQUENCY]
-                    [--followlinks] [-w]
-                    [--overridetokensreq TOKEN [TOKEN ...]]
-                    [--overridetokensignore TOKEN [TOKEN ...]] [-v] [--debug]
-                    [-q] [-V]
-
-optional arguments:
-  -h, --help            show this help message and exit
-  -i INDEX, --index INDEX
-                        Index name for Elasticsearch (default: stocksight)
-  -d, --delindex        Delete existing Elasticsearch index first
-  -s SYMBOL, --symbol SYMBOL
-                        Stock symbol you are interesed in searching for,
-                        example: TSLA
-  -k KEYWORDS, --keywords KEYWORDS
-                        Use keywords to search for in Tweets instead of feeds.
-                        Separated by comma, case insensitive, spaces are ANDs
-                        commas are ORs. Example: TSLA,'Elon
-                        Musk',Musk,Tesla,SpaceX
-  -a, --addtokens       Add nltk tokens required from config to keywords
-  -u URL, --url URL     Use twitter users from any links in web page at url
-  -f FILE, --file FILE  Use twitter user ids from file
-  -l, --linksentiment   Follow any link url in tweets and analyze sentiment on
-                        web page
-  -n, --newsheadlines   Get news headlines instead of Twitter using stock
-                        symbol from -s
-  --frequency FREQUENCY
-                        How often in seconds to retrieve news headlines
-                        (default: 120 sec)
-  --followlinks         Follow links on news headlines and scrape relevant
-                        text from landing page
-  -w, --websentiment    Get sentiment results from text processing website
-  --overridetokensreq TOKEN [TOKEN ...]
-                        Override nltk required tokens from config, separate
-                        with space
-  --overridetokensignore TOKEN [TOKEN ...]
-                        Override nltk ignore tokens from config, separate with
-                        space
-  -v, --verbose         Increase output verbosity
-  --debug               Debug message output
-  -q, --quiet           Run quiet with no message output
-  -V, --version         Prints version and exits
-  
-  
-usage: stockprice.py [-h] [-i INDEX] [-d] [-s SYMBOL] [-f FREQUENCY] [-v]
-                     [--debug] [-q] [-V]
-
-optional arguments:
-  -h, --help            show this help message and exit
-  -i INDEX, --index INDEX
-                        Index name for Elasticsearch (default: stocksight)
-  -d, --delindex        Delete existing Elasticsearch index first
-  -s SYMBOL, --symbol SYMBOL
-                        Stock symbol to use, example: TSLA
-  -f FREQUENCY, --frequency FREQUENCY
-                        How often in seconds to retrieve stock data (default:
-                        120 sec)
-  -v, --verbose         Increase output verbosity
-  --debug               Debug message output
-  -q, --quiet           Run quiet with no message output
-  -V, --version         Prints version and exits
-  ```
-  
-  
-## Disclaimer
-
-This software is for educational purposes only. USE THE SOFTWARE AT YOUR OWN RISK. THE AUTHORS AND ALL AFFILIATES ASSUME NO RESPONSIBILITY FOR YOUR TRADING RESULTS. Do not risk money which you are afraid to lose. There might be bugs in the code - this software DOES NOT come with ANY warranty.
+This project is distributed under the terms of the MIT License. See the
+[`LICENSE`](LICENSE) file for details.
