@@ -87,6 +87,8 @@ https://developer.twitter.com/en/docs/basics/authentication/guides/access-tokens
 
 5) Edit config.py and modify NLTK tokens required/ignored and twitter feeds you want to mine. NLTK tokens required are keywords which must be in tweet before adding it to Elasticsearch (whitelist). NLTK tokens ignored are keywords which if are found in tweet, it will not be added to Elasticsearch (blacklist).
 
+> **Note:** stocksight now detects recent Tweepy releases (v4+) automatically. When the legacy streaming API is unavailable it transparently falls back to polling Twitter's REST endpoints, so you can continue to launch the tool with `python sentiment.py ...` without additional configuration changes.
+
 ### Examples
 
 Run sentiment.py to create 'stocksight' index in Elasticsearch and start mining and analyzing Tweets using keywords and the stock symbol TSLA

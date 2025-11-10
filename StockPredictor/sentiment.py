@@ -24,18 +24,80 @@ try:
     import urllib.parse as urlparse
 except ImportError:
     import urlparse
-from tweepy.streaming import StreamListener
-from tweepy import API, Stream, OAuthHandler, TweepError
+# Tweepy introduced breaking changes in v4 where StreamListener/Stream were
+# removed. Try to import the legacy streaming classes first and gracefully
+# fall back to the modern interfaces when unavailable.
+try:
+    from tweepy.streaming import StreamListener
+except ImportError:  # Tweepy >= 4
+    StreamListener = None
+
+from tweepy import API, OAuthHandler
+
+try:
+    from tweepy import Stream
+except ImportError:  # Tweepy >= 4
+    Stream = None
+
+try:
+    from tweepy import TweepError
+except ImportError:  # Tweepy >= 4
+    from tweepy import TweepyException as TweepError
+
+if StreamListener is None:
+    class StreamListener(object):
+        """Fallback StreamListener stub for Tweepy >= 4."""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+        def on_data(self, raw_data):  # pragma: no cover - stub method
+            return True
+
+        def on_error(self, status_code):  # pragma: no cover - stub method
+            return False
+
 from textblob import TextBlob
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from bs4 import BeautifulSoup
 from elasticsearch import Elasticsearch
 from random import randint, randrange
 from datetime import datetime
-from newspaper import Article, ArticleException
+try:
+    from newspaper import Article, ArticleException
+    NEWSPAPER_AVAILABLE = True
+    NEWSPAPER_IMPORT_ERROR = None
+except ImportError as exc:
+    Article = None
 
-# import elasticsearch host, twitter keys and tokens
-from config import *
+    class ArticleException(Exception):
+        pass
+
+    NEWSPAPER_AVAILABLE = False
+    NEWSPAPER_IMPORT_ERROR = exc
+
+# import elasticsearch host, twitter keys and tokens. The file is optional at
+# import time so that "python sentiment.py -h" works even when config.py hasn't
+# been created yet.
+CONFIG_LOADED = True
+CONFIG_IMPORT_ERROR = None
+try:
+    from config import *  # noqa
+except ImportError as exc:
+    CONFIG_LOADED = False
+    CONFIG_IMPORT_ERROR = exc
+    elasticsearch_host = "localhost"
+    elasticsearch_port = 9200
+    elasticsearch_user = ""
+    elasticsearch_password = ""
+    consumer_key = ""
+    consumer_secret = ""
+    access_token = ""
+    access_token_secret = ""
+    nltk_tokens_required = tuple()
+    nltk_min_tokens = 1
+    nltk_tokens_ignored = tuple()
+    twitter_feeds = []
 
 
 STOCKSIGHT_VERSION = '0.1-b.12'
@@ -58,6 +120,11 @@ twitter_users_file = './twitteruserids.txt'
 
 prev_time = time.time()
 sentiment_avg = [0.0,0.0,0.0]
+
+
+TWEEPY_HAS_STREAMING = Stream is not None and StreamListener is not None
+POLLING_DELAY_SECONDS = 30
+USER_TIMELINE_DELAY_SECONDS = 2
 
 
 class TweetStreamListener(StreamListener):
@@ -531,6 +598,10 @@ def sentiment_analysis(text):
 def tweeklink_sentiment_analysis(url):
     # get text summary of tweek link web page and run sentiment analysis on it
     try:
+        if not NEWSPAPER_AVAILABLE:
+            logger.warning('newspaper3k is not available (%s); skipping link sentiment.',
+                           NEWSPAPER_IMPORT_ERROR)
+            return None
         logger.info('Following tweet link %s to get sentiment..' % url)
         article = Article(url)
         article.download()
@@ -624,6 +695,91 @@ def get_twitter_users_from_file(file):
         logger.warning("Exception: error opening file caused by: %s" % e)
         pass
     return twitter_users
+
+
+def _prepare_tweet_payload(tweet):
+    """Return a JSON string for the tweet regardless of Tweepy version."""
+    if isinstance(tweet, str):
+        return tweet
+
+    if hasattr(tweet, "_json"):
+        payload = tweet._json.copy()
+    elif isinstance(tweet, dict):
+        payload = tweet.copy()
+    else:
+        return json.dumps(tweet)
+
+    extended = payload.get("extended_tweet", {})
+    full_text = extended.get("full_text") or payload.get("full_text")
+    if full_text:
+        payload["text"] = full_text
+
+    return json.dumps(payload)
+
+
+def _dispatch_to_listener(listener, tweet):
+    payload = _prepare_tweet_payload(tweet)
+    if payload:
+        listener.on_data(payload)
+
+
+def poll_keyword_search(api, listener, keywords):
+    """Fallback that polls the search API when streaming isn't available."""
+    query = " OR ".join(keywords)
+    since_id = None
+    tweet_mode_kwargs = {'tweet_mode': 'extended'}
+    logger.info('Polling Twitter search results every %s seconds', POLLING_DELAY_SECONDS)
+    while True:
+        try:
+            tweets = api.search_tweets(q=query, lang='en', result_type='recent',
+                                       count=100, since_id=since_id, **tweet_mode_kwargs)
+        except TypeError:
+            # Older Tweepy versions may not support tweet_mode
+            tweet_mode_kwargs = {}
+            logger.debug('Tweet mode not supported in current Tweepy version; retrying without it.')
+            continue
+        except TweepError as te:
+            logger.warning('Tweepy exception while polling search results: %s', te)
+            time.sleep(POLLING_DELAY_SECONDS)
+            continue
+
+        if tweets:
+            for tweet in reversed(tweets):
+                _dispatch_to_listener(listener, tweet)
+            since_id = max(t.id for t in tweets)
+
+        time.sleep(POLLING_DELAY_SECONDS)
+
+
+def poll_user_timelines(api, listener, user_ids):
+    """Fallback that polls user timelines when streaming isn't available."""
+    since_ids = {}
+    tweet_mode_kwargs = {'tweet_mode': 'extended'}
+    logger.info('Polling Twitter timelines every %s seconds', POLLING_DELAY_SECONDS)
+    while True:
+        for uid in user_ids:
+            try:
+                tweets = api.user_timeline(user_id=uid,
+                                           since_id=since_ids.get(uid),
+                                           count=200,
+                                           **tweet_mode_kwargs)
+            except TypeError:
+                tweet_mode_kwargs = {}
+                logger.debug('Tweet mode not supported in current Tweepy version; retrying without it.')
+                continue
+            except TweepError as te:
+                logger.warning('Tweepy exception while polling timeline for %s: %s', uid, te)
+                time.sleep(POLLING_DELAY_SECONDS)
+                continue
+
+            if tweets:
+                for tweet in reversed(tweets):
+                    _dispatch_to_listener(listener, tweet)
+                since_ids[uid] = max(t.id for t in tweets)
+
+            time.sleep(USER_TIMELINE_DELAY_SECONDS)
+
+        time.sleep(POLLING_DELAY_SECONDS)
 
 
 if __name__ == '__main__':
@@ -723,16 +879,21 @@ if __name__ == '__main__':
             color = '35m'
 
         banner = """\033[%s
-       _                     _                 
-     _| |_ _           _   _| |_ _     _   _   
-    |   __| |_ ___ ___| |_|   __|_|___| |_| |_ 
+       _                     _
+     _| |_ _           _   _| |_ _     _   _
+    |   __| |_ ___ ___| |_|   __|_|___| |_| |_
     |__   |  _| . |  _| '_|__   | | . |   |  _|
-    |_   _|_| |___|___|_,_|_   _|_|_  |_|_|_|  
-      |_|                   |_|   |___|                
+    |_   _|_| |___|___|_,_|_   _|_|_  |_|_|_|
+      |_|                   |_|   |___|
           :) = +$   :( = -$    v%s
      https://github.com/shirosaidev/stocksight
             \033[0m""" % (color, STOCKSIGHT_VERSION)
         print(banner + '\n')
+
+    if not CONFIG_LOADED:
+        logger.error('config.py not found or failed to import: %s', CONFIG_IMPORT_ERROR)
+        logger.error('Copy config.py.sample to config.py and update it with your credentials.')
+        sys.exit(1)
 
     # create instance of elasticsearch
     es = Elasticsearch(hosts=[{'host': elasticsearch_host, 'port': elasticsearch_port}],
@@ -889,10 +1050,13 @@ if __name__ == '__main__':
         # set twitter keys/tokens
         auth = OAuthHandler(consumer_key, consumer_secret)
         auth.set_access_token(access_token, access_token_secret)
-        api = API(auth)
+        api = API(auth, wait_on_rate_limit=True)
 
-        # create instance of the tweepy stream
-        stream = Stream(auth, tweetlistener)
+        # create instance of the tweepy stream when available
+        if TWEEPY_HAS_STREAMING:
+            stream = Stream(auth, tweetlistener)
+        else:
+            stream = None
 
         # grab any twitter users from links in web page at url
         if args.url:
@@ -962,7 +1126,11 @@ if __name__ == '__main__':
                 logger.info('No keywords entered, following Twitter users...')
                 logger.info('Twitter Feeds: ' + str(twitter_feeds))
                 logger.info('Twitter User Ids: ' + str(useridlist))
-                stream.filter(follow=useridlist, languages=['en'])
+                if TWEEPY_HAS_STREAMING:
+                    stream.filter(follow=useridlist, languages=['en'])
+                else:
+                    logger.info('Legacy Tweepy streaming classes not available; polling timelines instead.')
+                    poll_user_timelines(api, tweetlistener, useridlist)
             else:
                 # keywords to search on twitter
                 # add keywords to list
@@ -973,10 +1141,15 @@ if __name__ == '__main__':
                         keywords.append(f)
                 logger.info('Searching Twitter for keywords...')
                 logger.info('Twitter keywords: ' + str(keywords))
-                stream.filter(track=keywords, languages=['en'])
+                if TWEEPY_HAS_STREAMING:
+                    stream.filter(track=keywords, languages=['en'])
+                else:
+                    logger.info('Legacy Tweepy streaming classes not available; polling search results instead.')
+                    poll_keyword_search(api, tweetlistener, keywords)
         except TweepError as te:
             logger.debug("Tweepy Exception: Failed to get tweets caused by: %s" % te)
         except KeyboardInterrupt:
             print("Ctrl-c keyboard interrupt, exiting...")
-            stream.disconnect()
+            if stream is not None:
+                stream.disconnect()
             sys.exit(0)
