@@ -62,8 +62,13 @@ def build_supervised_dataset(
     merged, aggregated = merge_with_sentiment(price_features, sentiment_df)
 
     dataset = merged.copy()
-    dataset["Target"] = dataset["Close"].shift(-1)
-    dataset = dataset.dropna(subset=["Target"]).reset_index(drop=True)
+    target = dataset["Close"].shift(-1)
+    dataset = dataset.assign(Target=target)
+
+    if "Target" not in dataset.columns:
+        raise KeyError("Failed to create the 'Target' column for the supervised dataset.")
+
+    dataset = dataset.loc[target.notna()].reset_index(drop=True)
 
     feature_columns = [
         col
