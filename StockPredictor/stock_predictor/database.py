@@ -230,11 +230,16 @@ class Database:
             session.execute(stmt)
 
     def get_meta(self, key: str) -> Any | None:
+        value: str | None = None
         with self.session() as session:
-            result = session.execute(select(MetaEntry).where(MetaEntry.key == key)).scalar_one_or_none()
-        if not result:
+            result = (
+                session.execute(select(MetaEntry).where(MetaEntry.key == key))
+                .scalar_one_or_none()
+            )
+            if result is not None:
+                value = result.value
+        if value is None:
             return None
-        value = result.value
         try:
             return json.loads(value)
         except (TypeError, json.JSONDecodeError):
@@ -394,9 +399,15 @@ class Database:
         stmt = stmt.order_by(Price.date.asc())
         with self.session() as session:
             rows = session.execute(stmt).scalars().all()
-        if not rows:
+            data = [row.to_frame_dict() for row in rows]
+        if not data:
+            LOGGER.debug(
+                "No price records found for ticker=%s interval=%s in requested range.",
+                ticker,
+                interval,
+            )
             return pd.DataFrame()
-        frame = pd.DataFrame([row.to_frame_dict() for row in rows])
+        frame = pd.DataFrame(data)
         return frame
 
     def get_indicators(
@@ -411,17 +422,19 @@ class Database:
         stmt = stmt.order_by(Indicator.date.asc())
         with self.session() as session:
             rows = session.execute(stmt).scalars().all()
-        if not rows:
+            data = [row.to_frame_dict() for row in rows]
+        if not data:
             return pd.DataFrame()
-        return pd.DataFrame([row.to_frame_dict() for row in rows])
+        return pd.DataFrame(data)
 
     def get_fundamentals(self, ticker: str) -> pd.DataFrame:
         stmt = select(Fundamental).where(Fundamental.ticker == ticker)
         with self.session() as session:
             rows = session.execute(stmt).scalars().all()
-        if not rows:
+            data = [row.to_frame_dict() for row in rows]
+        if not data:
             return pd.DataFrame()
-        return pd.DataFrame([row.to_frame_dict() for row in rows])
+        return pd.DataFrame(data)
 
     def get_news(self, ticker: str) -> pd.DataFrame:
         stmt = select(NewsArticle).where(NewsArticle.ticker == ticker).order_by(
@@ -429,9 +442,10 @@ class Database:
         )
         with self.session() as session:
             rows = session.execute(stmt).scalars().all()
-        if not rows:
+            data = [row.to_frame_dict() for row in rows]
+        if not data:
             return pd.DataFrame()
-        return pd.DataFrame([row.to_frame_dict() for row in rows])
+        return pd.DataFrame(data)
 
     # ------------------------------------------------------------------
     # Convenience helpers

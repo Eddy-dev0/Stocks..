@@ -62,6 +62,11 @@ class MarketDataETL:
             start=self.config.start_date,
             end=self.config.end_date,
         )
+        if existing.empty:
+            LOGGER.info(
+                "No cached price data found for %s; attempting to download fresh data.",
+                self.config.ticker,
+            )
         if not force and self._covers_requested_range(existing):
             LOGGER.debug("Price data already present for %s", self.config.ticker)
             return RefreshResult(existing, downloaded=False)
@@ -201,6 +206,7 @@ class MarketDataETL:
             interval="1d",
             progress=False,
             group_by="ticker",
+            auto_adjust=False,
         )
         if data.empty:
             LOGGER.warning("No macro data returned from yfinance.")
@@ -333,6 +339,7 @@ class MarketDataETL:
             end=self.config.end_date.isoformat() if self.config.end_date else None,
             interval=self.config.interval,
             progress=False,
+            auto_adjust=False,
         )
         if df.empty:
             return pd.DataFrame()
