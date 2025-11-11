@@ -530,7 +530,7 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
             if isinstance(exc, ModelNotFoundError):
                 message = (
                     "Prediction failed: could not load saved model for target "
-                    f"'{exc.target}'. Please retrain the model or verify the file at {exc.path}."
+                    f"'{exc.target}' (horizon {exc.horizon}). Please retrain the model or verify the file at {exc.path}."
                 )
             else:
                 message = f"Prediction failed: {exc}"

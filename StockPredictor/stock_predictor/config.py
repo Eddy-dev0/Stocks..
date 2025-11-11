@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-import os
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
@@ -35,6 +36,8 @@ DEFAULT_PREDICTION_TARGETS: tuple[str, ...] = (
     "volatility",
 )
 
+DEFAULT_PREDICTION_HORIZONS: tuple[int, ...] = (1, 5, 21, 63)
+
 DEFAULT_TEST_SIZE = 0.2
 DEFAULT_BACKTEST_STRATEGY = "rolling"
 DEFAULT_BACKTEST_WINDOW = 252
@@ -60,6 +63,9 @@ class PredictorConfig:
     prediction_targets: tuple[str, ...] = field(
         default_factory=lambda: DEFAULT_PREDICTION_TARGETS
     )
+    prediction_horizons: tuple[int, ...] = field(
+        default_factory=lambda: DEFAULT_PREDICTION_HORIZONS
+    )
     model_params: dict[str, dict[str, Any]] = field(
         default_factory=lambda: {"global": {}}
     )
@@ -77,6 +83,7 @@ class PredictorConfig:
         self.prediction_targets = self._normalise_collection(
             self.prediction_targets, DEFAULT_PREDICTION_TARGETS
         )
+        self.prediction_horizons = self._normalise_horizons(self.prediction_horizons)
         self.model_params = self._normalise_model_params(self.model_params)
         self.shuffle_training = bool(self.shuffle_training)
         self.backtest_strategy = (
@@ -109,11 +116,11 @@ class PredictorConfig:
 
     @property
     def model_path(self) -> Path:
-        return self.models_dir / f"{self.ticker}_{self.model_type}.joblib"
+        return self.model_path_for("close")
 
     @property
     def metrics_path(self) -> Path:
-        return self.models_dir / f"{self.ticker}_{self.model_type}_metrics.json"
+        return self.metrics_path_for("close")
 
     @property
     def database_path(self) -> Path:
@@ -121,17 +128,42 @@ class PredictorConfig:
             raise ValueError("database_path is only available for SQLite URLs.")
         return Path(self.database_url.replace("sqlite:///", ""))
 
-    def model_path_for(self, target: str) -> Path:
+    def model_path_for(self, target: str, horizon: Optional[int] = None) -> Path:
         """Return the filesystem path for a persisted model of ``target``."""
 
-        return self.models_dir / self._build_filename(target, suffix=".joblib")
+        resolved_horizon = self.resolve_horizon(horizon)
+        return self.models_dir / self._build_filename(
+            target, resolved_horizon, suffix=".joblib"
+        )
 
-    def metrics_path_for(self, target: str) -> Path:
+    def metrics_path_for(self, target: str, horizon: Optional[int] = None) -> Path:
         """Return the filesystem path for metrics associated with ``target``."""
 
+        resolved_horizon = self.resolve_horizon(horizon)
         return self.models_dir / self._build_filename(
-            target, suffix="_metrics.json"
+            target, resolved_horizon, suffix="_metrics.json"
         )
+
+    def resolve_horizon(self, horizon: Optional[int]) -> int:
+        """Validate and resolve ``horizon`` against configured horizons."""
+
+        if horizon is None:
+            return self.prediction_horizons[0]
+        try:
+            value = int(horizon)
+        except (TypeError, ValueError) as exc:  # pragma: no cover - defensive
+            raise ValueError("horizon must be an integer") from exc
+        if value <= 0:
+            raise ValueError("horizon must be a positive integer")
+        if value not in self.prediction_horizons:
+            raise ValueError(
+                f"horizon {value} is not configured. Available: {self.prediction_horizons}."
+            )
+        return value
+
+    @property
+    def default_horizon(self) -> int:
+        return self.prediction_horizons[0]
 
     # ------------------------------------------------------------------
     # Normalisation helpers
@@ -163,10 +195,31 @@ class PredictorConfig:
         result.setdefault("global", {})
         return result
 
-    def _build_filename(self, target: str, suffix: str) -> str:
+    def _normalise_horizons(
+        self, horizons: Sequence[int] | Iterable[int] | None
+    ) -> tuple[int, ...]:
+        values: list[int] = []
+        if horizons is not None:
+            for raw in horizons:
+                if raw is None:
+                    continue
+                try:
+                    value = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if value <= 0:
+                    continue
+                if value not in values:
+                    values.append(value)
+        if not values:
+            values = list(DEFAULT_PREDICTION_HORIZONS)
+        values.sort()
+        return tuple(values)
+
+    def _build_filename(self, target: str, horizon: int, suffix: str) -> str:
         clean_target = str(target).strip().lower() or "default"
         clean_target = clean_target.replace(" ", "_")
-        return f"{self.ticker}_{self.model_type}_{clean_target}{suffix}"
+        return f"{self.ticker}_{self.model_type}_{clean_target}_h{int(horizon)}{suffix}"
 
 
 def load_environment() -> None:
@@ -189,6 +242,7 @@ def build_config(
     database_url: Optional[str] = None,
     feature_sets: Optional[Iterable[str] | str] = None,
     prediction_targets: Optional[Iterable[str] | str] = None,
+    prediction_horizons: Optional[Iterable[int] | str] = None,
     model_params: Optional[Mapping[str, Mapping[str, Any]]] = None,
     test_size: Optional[float] = None,
     shuffle_training: Optional[bool] = None,
@@ -236,6 +290,9 @@ def build_config(
         prediction_targets=_coerce_iterable(
             prediction_targets, DEFAULT_PREDICTION_TARGETS
         ),
+        prediction_horizons=_coerce_int_iterable(
+            prediction_horizons, DEFAULT_PREDICTION_HORIZONS
+        ),
         model_params=model_params or {"global": {}},
         test_size=test_size if test_size is not None else DEFAULT_TEST_SIZE,
         shuffle_training=_coerce_bool(shuffle_training, default=True),
@@ -271,3 +328,22 @@ def _coerce_bool(value: Optional[object], *, default: bool) -> bool:
         if normalized in {"false", "0", "no", "n", "off"}:
             return False
     return bool(value)
+
+
+def _coerce_int_iterable(
+    value: Optional[Iterable[int] | str], default: Sequence[int]
+) -> tuple[int, ...]:
+    if value is None:
+        return tuple(default)
+    if isinstance(value, str):
+        tokens = [part.strip() for part in value.split(",")]
+    else:
+        tokens = list(value)
+    result: list[int] = []
+    for token in tokens:
+        try:
+            number = int(token)
+        except (TypeError, ValueError):
+            continue
+        result.append(number)
+    return tuple(result) if result else tuple(default)

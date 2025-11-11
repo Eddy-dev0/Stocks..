@@ -16,7 +16,7 @@ class FeatureResult:
     """Container holding processed features and metadata."""
 
     features: pd.DataFrame
-    targets: Dict[str, pd.Series]
+    targets: Dict[int, Dict[str, pd.Series]]
     metadata: Dict[str, object]
 
 
@@ -37,11 +37,14 @@ class FeatureAssembler:
         "macro",
     }
 
-    def __init__(self, enabled_sets: Iterable[str]) -> None:
+    def __init__(self, enabled_sets: Iterable[str], horizons: Iterable[int] | None = None) -> None:
         self.enabled_sets = {name.lower() for name in enabled_sets if name}
         self.enabled_sets.intersection_update(self.SUPPORTED_SETS)
         if not self.enabled_sets:
             self.enabled_sets = {"technical"}
+        if horizons is None:
+            horizons = (1,)
+        self.horizons = _normalise_horizons(horizons)
 
     # ------------------------------------------------------------------
     # Public API
@@ -90,7 +93,7 @@ class FeatureAssembler:
 
         merged["Close_Current"] = merged["Close"]
 
-        targets = _generate_targets(merged)
+        targets = _generate_targets(merged, self.horizons)
 
         feature_columns = [col for col in merged.columns if col not in {"Date", "Close"}]
         metadata.update(
@@ -99,6 +102,8 @@ class FeatureAssembler:
                 "latest_features": merged.iloc[[-1]][feature_columns],
                 "latest_close": float(merged.iloc[-1]["Close"]),
                 "latest_date": pd.to_datetime(merged.iloc[-1]["Date"]),
+                "horizons": self.horizons,
+                "target_dates": _estimate_target_dates(merged["Date"], self.horizons),
             }
         )
 
@@ -281,22 +286,66 @@ def _prepare_sentiment_features(news_df: pd.DataFrame) -> pd.DataFrame:
 # Target generation
 # ----------------------------------------------------------------------
 
-def _generate_targets(merged: pd.DataFrame) -> Dict[str, pd.Series]:
-    targets: Dict[str, pd.Series] = {}
+def _generate_targets(merged: pd.DataFrame, horizons: Iterable[int]) -> Dict[int, Dict[str, pd.Series]]:
     merged = merged.copy()
-    merged["Return_1d"] = merged["Close"].pct_change()
-    merged["Target_Close"] = merged["Close"].shift(-1)
-    merged["Target_Return"] = merged["Return_1d"].shift(-1)
-    merged["Target_Direction"] = (merged["Target_Return"] > 0).astype(int)
-    merged["Target_Volatility"] = merged["Return_1d"].rolling(window=21, min_periods=1).std().shift(-1)
+    merged["Daily_Return"] = merged["Close"].pct_change()
 
-    targets["close"] = merged["Target_Close"]
-    targets["return"] = merged["Target_Return"]
-    targets["direction"] = merged["Target_Direction"].astype(float)
-    targets["volatility"] = merged["Target_Volatility"]
+    targets_by_horizon: Dict[int, Dict[str, pd.Series]] = {}
+    for horizon in horizons:
+        future_close = merged["Close"].shift(-horizon)
+        future_return = (future_close - merged["Close"]) / merged["Close"]
+        direction = (future_return > 0).astype(float)
+        direction[future_return.isna()] = np.nan
+        volatility = (
+            merged["Daily_Return"].rolling(window=horizon, min_periods=1).std().shift(-horizon)
+        )
 
-    for name in list(targets):
-        series = targets[name].dropna()
-        if series.empty:
-            targets.pop(name)
-    return targets
+        horizon_targets: Dict[str, pd.Series] = {
+            "close": future_close,
+            "return": future_return,
+            "direction": direction,
+            "volatility": volatility,
+        }
+
+        valid_targets: Dict[str, pd.Series] = {}
+        for name, series in horizon_targets.items():
+            cleaned = series.dropna()
+            if cleaned.empty:
+                continue
+            valid_targets[name] = series
+        if valid_targets:
+            targets_by_horizon[horizon] = valid_targets
+
+    return targets_by_horizon
+
+
+def _estimate_target_dates(dates: pd.Series, horizons: Iterable[int]) -> Dict[int, pd.Timestamp]:
+    timestamps = pd.to_datetime(dates).dropna().sort_values()
+    if timestamps.empty:
+        return {}
+    latest = timestamps.iloc[-1]
+    result: Dict[int, pd.Timestamp] = {}
+    for horizon in horizons:
+        try:
+            offset = pd.tseries.offsets.BDay(int(horizon))
+        except Exception:  # pragma: no cover - defensive
+            offset = pd.Timedelta(days=int(horizon))
+        result[int(horizon)] = latest + offset
+    return result
+
+
+def _normalise_horizons(horizons: Iterable[int]) -> tuple[int, ...]:
+    unique: list[int] = []
+    for raw in horizons:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if value <= 0:
+            continue
+        if value not in unique:
+            unique.append(value)
+    if not unique:
+        unique = [1]
+    unique.sort()
+    return tuple(unique)

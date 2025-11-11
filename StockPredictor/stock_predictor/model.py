@@ -6,7 +6,7 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import joblib
 import numpy as np
@@ -31,23 +31,30 @@ LOGGER = logging.getLogger(__name__)
 
 
 class ModelNotFoundError(FileNotFoundError):
-    """Raised when a persisted model for a target cannot be located on disk."""
+    """Raised when a persisted model for a target/horizon cannot be located."""
 
-    def __init__(self, target: str, path: Path) -> None:
-        super().__init__(f"Saved model for target '{target}' not found at {path}.")
+    def __init__(self, target: str, horizon: int, path: Path) -> None:
+        message = (
+            f"Saved model for target '{target}' with horizon {horizon} not found at {path}."
+        )
+        super().__init__(message)
         self.target = target
+        self.horizon = horizon
         self.path = path
 
 
 class StockPredictorAI:
     """Pipeline that assembles features, trains models, and produces forecasts."""
 
-    def __init__(self, config: PredictorConfig) -> None:
+    def __init__(self, config: PredictorConfig, *, horizon: Optional[int] = None) -> None:
         self.config = config
+        self.horizon = self.config.resolve_horizon(horizon)
         self.fetcher = DataFetcher(config)
-        self.feature_assembler = FeatureAssembler(config.feature_sets)
+        self.feature_assembler = FeatureAssembler(
+            config.feature_sets, config.prediction_horizons
+        )
         self.tracker = ExperimentTracker(config)
-        self.models: dict[str, Any] = {}
+        self.models: dict[Tuple[str, int], Any] = {}
         self.metadata: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
@@ -68,7 +75,7 @@ class StockPredictorAI:
         self,
         price_df: Optional[pd.DataFrame] = None,
         news_df: Optional[pd.DataFrame] = None,
-    ) -> tuple[pd.DataFrame, dict[str, pd.Series]]:
+    ) -> tuple[pd.DataFrame, dict[int, Dict[str, pd.Series]]]:
         if price_df is None:
             price_df = self.fetcher.fetch_price_data()
         if news_df is None and self.config.sentiment:
@@ -80,25 +87,43 @@ class StockPredictorAI:
         metadata = dict(feature_result.metadata)
         metadata.setdefault("sentiment_daily", pd.DataFrame(columns=["Date", "sentiment"]))
         metadata["data_sources"] = self.fetcher.get_data_sources()
+        metadata.setdefault("target_dates", {})
+        metadata.setdefault("horizons", tuple(self.config.prediction_horizons))
+        metadata["active_horizon"] = self.horizon
         self.metadata = metadata
         return feature_result.features, feature_result.targets
 
     # ------------------------------------------------------------------
     # Model persistence helpers
     # ------------------------------------------------------------------
-    def _get_model(self, target: str) -> Any:
-        if target not in self.models:
-            raise RuntimeError(f"Model for target '{target}' is not loaded. Train or load it first.")
-        return self.models[target]
+    def _resolve_horizon(self, horizon: Optional[int]) -> int:
+        if horizon is None:
+            return self.horizon
+        return self.config.resolve_horizon(horizon)
 
-    def load_model(self, target: str = "close") -> Any:
-        path = self.config.model_path_for(target)
+    def _get_model(self, target: str, horizon: Optional[int] = None) -> Any:
+        resolved_horizon = self._resolve_horizon(horizon)
+        key = (target, resolved_horizon)
+        if key not in self.models:
+            raise RuntimeError(
+                f"Model for target '{target}' and horizon {resolved_horizon} is not loaded. Train or load it first."
+            )
+        return self.models[key]
+
+    def load_model(self, target: str = "close", horizon: Optional[int] = None) -> Any:
+        resolved_horizon = self._resolve_horizon(horizon)
+        path = self.config.model_path_for(target, resolved_horizon)
         if not path.exists():
-            raise ModelNotFoundError(target, path)
-        LOGGER.info("Loading %s model for target '%s'", self.config.model_type, target)
+            raise ModelNotFoundError(target, resolved_horizon, path)
+        LOGGER.info(
+            "Loading %s model for target '%s' at horizon %s",
+            self.config.model_type,
+            target,
+            resolved_horizon,
+        )
         model = joblib.load(path)
-        self.models[target] = model
-        metadata_path = self.config.metrics_path_for(target)
+        self.models[(target, resolved_horizon)] = model
+        metadata_path = self.config.metrics_path_for(target, resolved_horizon)
         if metadata_path.exists():
             with open(metadata_path, "r", encoding="utf-8") as handle:
                 stored = json.load(handle)
@@ -108,34 +133,50 @@ class StockPredictorAI:
                 indicator_columns = stored.get("indicator_columns")
                 if indicator_columns:
                     self.metadata["indicator_columns"] = indicator_columns
+                target_dates = stored.get("target_dates")
+                if isinstance(target_dates, dict):
+                    self.metadata.setdefault("target_dates", {}).update(target_dates)
+        self.metadata["active_horizon"] = resolved_horizon
         return model
 
-    def save_state(self, metrics: Dict[str, Any]) -> None:
-        """Persist metrics and feature information to disk."""
-
-    def save_state(self, target: str, metrics: Dict[str, Any]) -> None:
+    def save_state(self, target: str, horizon: int, metrics: Dict[str, Any]) -> None:
         payload = {
             **metrics,
             "feature_columns": self.metadata.get("feature_columns", []),
             "indicator_columns": self.metadata.get("indicator_columns", []),
+            "horizon": horizon,
+            "target_dates": self.metadata.get("target_dates", {}),
         }
-        path = self.config.metrics_path_for(target)
+        path = self.config.metrics_path_for(target, horizon)
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, default=str)
-        LOGGER.info("Saved metrics for target '%s' to %s", target, path)
-        if target == "close":
+        LOGGER.info("Saved metrics for target '%s' (horizon %s) to %s", target, horizon, path)
+        if target == "close" and horizon == self.config.default_horizon:
             with open(self.config.metrics_path, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, indent=2, default=str)
 
     # ------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------
-    def train_model(self, targets: Optional[Iterable[str]] = None) -> Dict[str, Any]:
-        X, y_targets = self.prepare_features()
+    def train_model(
+        self,
+        targets: Optional[Iterable[str]] = None,
+        horizon: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        resolved_horizon = self._resolve_horizon(horizon)
+        self.horizon = resolved_horizon
+        X, targets_by_horizon = self.prepare_features()
         feature_columns = self.metadata.get("feature_columns", list(X.columns))
 
         requested_targets = list(targets) if targets else list(self.config.prediction_targets)
-        available_targets = {name: y for name, y in y_targets.items() if name in requested_targets}
+        horizon_targets = targets_by_horizon.get(resolved_horizon)
+        if not horizon_targets:
+            raise RuntimeError(
+                f"No targets available for horizon {resolved_horizon}."
+            )
+        available_targets = {
+            name: series for name, series in horizon_targets.items() if name in requested_targets
+        }
         if not available_targets:
             raise RuntimeError("No matching targets available for training.")
 
@@ -173,29 +214,42 @@ class StockPredictorAI:
 
             metrics["training_rows"] = int(len(X_train))
             metrics["test_rows"] = int(len(X_test))
+            metrics["horizon"] = resolved_horizon
             metrics_by_target[target] = metrics
 
-            self.models[target] = model
-            joblib.dump(model, self.config.model_path_for(target))
-            self.save_state(target, metrics)
+            self.models[(target, resolved_horizon)] = model
+            joblib.dump(model, self.config.model_path_for(target, resolved_horizon))
+            self.save_state(target, resolved_horizon, metrics)
             self.tracker.log_run(
                 target=target,
                 run_type="training",
                 parameters={"model_type": self.config.model_type, **model_params},
                 metrics=metrics,
-                context={"feature_columns": feature_columns},
+                context={"feature_columns": feature_columns, "horizon": resolved_horizon},
             )
 
             if target == "close":
                 summary_metrics.update({k: v for k, v in metrics.items() if isinstance(v, (int, float))})
 
-        LOGGER.info("Training complete for targets: %s", ", ".join(metrics_by_target))
-        return {"targets": metrics_by_target, **summary_metrics}
+        LOGGER.info(
+            "Training complete for targets %s at horizon %s",
+            ", ".join(metrics_by_target),
+            resolved_horizon,
+        )
+        self.metadata["active_horizon"] = resolved_horizon
+        return {"horizon": resolved_horizon, "targets": metrics_by_target, **summary_metrics}
 
     # ------------------------------------------------------------------
     # Inference
     # ------------------------------------------------------------------
-    def predict(self, refresh_data: bool = False, targets: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+    def predict(
+        self,
+        refresh_data: bool = False,
+        targets: Optional[Iterable[str]] = None,
+        horizon: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        resolved_horizon = self._resolve_horizon(horizon)
+        self.horizon = resolved_horizon
         if refresh_data:
             LOGGER.info("Refreshing data prior to prediction.")
             self.download_data(force=True)
@@ -208,6 +262,7 @@ class StockPredictorAI:
         latest_features = self.metadata.get("latest_features")
         if feature_columns is None or latest_features is None:
             raise RuntimeError("No feature metadata available. Train the model first.")
+        self.metadata["active_horizon"] = resolved_horizon
 
         requested_targets = list(targets) if targets else list(self.config.prediction_targets)
         predictions: dict[str, Any] = {}
@@ -216,12 +271,17 @@ class StockPredictorAI:
 
         for target in requested_targets:
             try:
-                model = self.models.get(target) or self.load_model(target)
+                model = self.models.get((target, resolved_horizon)) or self.load_model(
+                    target, resolved_horizon
+                )
             except ModelNotFoundError:
                 LOGGER.warning("Model for target '%s' missing. Triggering training.", target)
-                report = self.train_model(targets=[target])
-                training_report[target] = report.get("targets", {}).get(target, {})
-                model = self._get_model(target)
+                report = self.train_model(targets=[target], horizon=resolved_horizon)
+                training_report[target] = {
+                    "horizon": resolved_horizon,
+                    **report.get("targets", {}).get(target, {}),
+                }
+                model = self._get_model(target, resolved_horizon)
 
             current_features = latest_features[feature_columns]
             pred_value = model.predict(current_features)[0]
@@ -244,6 +304,11 @@ class StockPredictorAI:
         latest_date = self.metadata.get("latest_date")
         if isinstance(latest_date, pd.Timestamp):
             latest_date = latest_date.to_pydatetime()
+
+        target_dates = self.metadata.get("target_dates", {})
+        target_date = None
+        if isinstance(target_dates, dict):
+            target_date = target_dates.get(resolved_horizon)
 
         def _to_iso(value: Any) -> Optional[str]:
             if value is None:
@@ -270,6 +335,8 @@ class StockPredictorAI:
             "expected_change": expected_change,
             "expected_change_pct": pct_change,
             "predictions": predictions,
+            "horizon": resolved_horizon,
+            "target_date": _to_iso(target_date) or "",
         }
         if confidences:
             result["confidence"] = confidences
@@ -520,38 +587,51 @@ class StockPredictorAI:
             return None
         return result
 
-    def feature_importance(self, target: str = "close") -> Dict[str, float]:
-        model = self.models.get(target) or self.load_model(target)
+    def feature_importance(
+        self, target: str = "close", horizon: Optional[int] = None
+    ) -> Dict[str, float]:
+        resolved_horizon = self._resolve_horizon(horizon)
+        model = self.models.get((target, resolved_horizon)) or self.load_model(
+            target, resolved_horizon
+        )
         feature_columns = self.metadata.get("feature_columns")
         if not feature_columns:
             raise RuntimeError("Feature columns unknown; train the model first.")
         return extract_feature_importance(model, list(feature_columns))
 
     def list_available_models(self) -> Dict[str, str]:
-        entries = {}
-        for target in self.config.prediction_targets:
-            path = self.config.model_path_for(target)
-            if path.exists():
-                entries[target] = str(path)
+        entries: Dict[str, str] = {}
+        for horizon in self.config.prediction_horizons:
+            for target in self.config.prediction_targets:
+                path = self.config.model_path_for(target, horizon)
+                if path.exists():
+                    entries[f"{target}_h{horizon}"] = str(path)
         return entries
 
     # ------------------------------------------------------------------
     # Backtesting
     # ------------------------------------------------------------------
-    def run_backtest(self, targets: Optional[Iterable[str]] = None) -> Dict[str, Any]:
-        X, y_targets = self.prepare_features()
+    def run_backtest(
+        self, targets: Optional[Iterable[str]] = None, horizon: Optional[int] = None
+    ) -> Dict[str, Any]:
+        resolved_horizon = self._resolve_horizon(horizon)
+        self.horizon = resolved_horizon
+        X, targets_by_horizon = self.prepare_features()
+        horizon_targets = targets_by_horizon.get(resolved_horizon)
+        if not horizon_targets:
+            raise RuntimeError(f"No targets available for horizon {resolved_horizon}.")
         requested_targets = list(targets) if targets else list(self.config.prediction_targets)
         results: dict[str, Any] = {}
 
         for target in requested_targets:
-            if target not in y_targets:
+            if target not in horizon_targets:
                 LOGGER.warning("Skipping backtest for target '%s' (no data available).", target)
                 continue
             factory = ModelFactory(
                 self.config.model_type,
                 {**self.config.model_params.get("global", {}), **self.config.model_params.get(target, {})},
             )
-            y_clean = y_targets[target].dropna()
+            y_clean = horizon_targets[target].dropna()
             aligned_X = X.loc[y_clean.index]
 
             backtester = Backtester(
@@ -575,7 +655,8 @@ class StockPredictorAI:
                     "step": self.config.backtest_step,
                 },
                 metrics=result.aggregate,
-                context={"splits": result.splits},
+                context={"splits": result.splits, "horizon": resolved_horizon},
             )
+        self.metadata["active_horizon"] = resolved_horizon
         return results
 
