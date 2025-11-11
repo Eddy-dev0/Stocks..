@@ -622,7 +622,13 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
 
     def _fetch_latest_fx_rate(self) -> Optional[float]:
         try:
-            data = yf.download("EURUSD=X", period="5d", interval="1d", progress=False)
+            data = yf.download(
+                "EURUSD=X",
+                period="5d",
+                interval="1d",
+                progress=False,
+                auto_adjust=False,
+            )
         except Exception as exc:  # pylint: disable=broad-except
             LOGGER.warning("Failed to download EUR/USD rate: %s", exc)
             return None
