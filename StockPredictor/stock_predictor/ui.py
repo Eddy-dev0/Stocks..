@@ -25,7 +25,7 @@ from matplotlib.patches import Rectangle
 
 from .config import PredictorConfig, build_config
 from .elliott import WaveSegment, apply_wave_features
-from .model import StockPredictorAI
+from .model import ModelNotFoundError, StockPredictorAI
 from .preprocessing import compute_price_features
 
 LOGGER = logging.getLogger(__name__)
@@ -133,7 +133,9 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         self.last_close_var = tk.StringVar(value="-")
         self.absolute_change_var = tk.StringVar(value="-")
         self.percent_change_var = tk.StringVar(value="-")
-        self.as_of_var = tk.StringVar(value="-")
+        self.prediction_header_var = tk.StringVar(value="Prediction details will appear here.")
+        self.market_data_time_var = tk.StringVar(value="Market data as of: -")
+        self.prediction_time_var = tk.StringVar(value="Prediction generated at: -")
         self.currency_var = tk.StringVar(value="USD")
         self.currency_button_text = tk.StringVar(value="Display in EUR (€)")
         self.metric_vars: dict[str, tk.StringVar] = {
@@ -256,70 +258,82 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
 
         header = ttk.Label(
             prediction_tab,
-            textvariable=self.as_of_var,
-            font=("Helvetica", 12),
+            textvariable=self.prediction_header_var,
+            font=("Helvetica", 16, "bold"),
         )
         header.grid(column=0, row=0, columnspan=2, sticky="w")
 
         ttk.Label(
             prediction_tab,
-            text="Predicted Close",
-            font=("Helvetica", 16, "bold"),
-        ).grid(column=0, row=1, sticky="w", pady=(10, 5))
+            textvariable=self.market_data_time_var,
+            font=("Helvetica", 11),
+        ).grid(column=0, row=1, columnspan=2, sticky="w", pady=(6, 0))
+
+        ttk.Label(
+            prediction_tab,
+            textvariable=self.prediction_time_var,
+            font=("Helvetica", 11),
+        ).grid(column=0, row=2, columnspan=2, sticky="w", pady=(0, 12))
+
+        ttk.Label(
+            prediction_tab,
+            text="Predicted close (forecast for next close):",
+            font=("Helvetica", 13, "bold"),
+        ).grid(column=0, row=3, sticky="w")
         self.predicted_close_label = ttk.Label(
             prediction_tab,
             textvariable=self.predicted_close_var,
             font=("Helvetica", 24, "bold"),
         )
-        self.predicted_close_label.grid(column=0, row=2, sticky="w")
+        self.predicted_close_label.grid(column=0, row=4, sticky="w")
 
         ttk.Label(
             prediction_tab,
-            text="Last Close",
+            text="Last close (actual, previous trading day):",
             font=("Helvetica", 12, "bold"),
-        ).grid(column=0, row=3, sticky="w", pady=(20, 5))
+        ).grid(column=0, row=5, sticky="w", pady=(18, 4))
         ttk.Label(
             prediction_tab,
             textvariable=self.last_close_var,
             font=("Helvetica", 14),
-        ).grid(column=0, row=4, sticky="w")
+        ).grid(column=0, row=6, sticky="w")
 
         ttk.Label(
             prediction_tab,
-            text="Expected Change",
+            text="Expected change (predicted − last close):",
             font=("Helvetica", 12, "bold"),
-        ).grid(column=1, row=1, sticky="w", padx=(40, 0), pady=(10, 5))
+        ).grid(column=1, row=3, sticky="w", padx=(40, 0))
         self.absolute_change_label = ttk.Label(
             prediction_tab,
             textvariable=self.absolute_change_var,
             font=("Helvetica", 16, "bold"),
         )
-        self.absolute_change_label.grid(column=1, row=2, sticky="w", padx=(40, 0))
+        self.absolute_change_label.grid(column=1, row=4, sticky="w", padx=(40, 0))
 
         ttk.Label(
             prediction_tab,
-            text="% Change",
+            text="% change (relative to last close):",
             font=("Helvetica", 12, "bold"),
-        ).grid(column=1, row=3, sticky="w", padx=(40, 0), pady=(20, 5))
+        ).grid(column=1, row=5, sticky="w", padx=(40, 0), pady=(18, 4))
         self.percent_change_label = ttk.Label(
             prediction_tab,
             textvariable=self.percent_change_var,
             font=("Helvetica", 16, "bold"),
         )
-        self.percent_change_label.grid(column=1, row=4, sticky="w", padx=(40, 0))
+        self.percent_change_label.grid(column=1, row=6, sticky="w", padx=(40, 0))
 
         ttk.Separator(prediction_tab, orient="horizontal").grid(
-            column=0, row=5, columnspan=2, sticky="ew", pady=(25, 15)
+            column=0, row=7, columnspan=2, sticky="ew", pady=(25, 15)
         )
 
         ttk.Label(
             prediction_tab,
             text="Training Metrics",
             font=("Helvetica", 13, "bold"),
-        ).grid(column=0, row=6, columnspan=2, sticky="w", pady=(0, 10))
+        ).grid(column=0, row=8, columnspan=2, sticky="w", pady=(0, 10))
 
         metrics_grid = ttk.Frame(prediction_tab)
-        metrics_grid.grid(column=0, row=7, columnspan=2, sticky="w")
+        metrics_grid.grid(column=0, row=9, columnspan=2, sticky="w")
 
         metric_labels = [
             ("MAE", "mae"),
@@ -435,7 +449,13 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
             )
         except Exception as exc:  # pylint: disable=broad-except
             LOGGER.exception("Prediction failed for %s", ticker)
-            message = str(exc)
+            if isinstance(exc, ModelNotFoundError):
+                message = (
+                    "Prediction failed: could not load saved model for target "
+                    f"'{exc.target}'. Please retrain the model or verify the file at {exc.path}."
+                )
+            else:
+                message = f"Prediction failed: {exc}"
             self.after(0, lambda msg=message: self._on_prediction_error(msg))
 
     def _prepare_prices(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -731,9 +751,17 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         self.absolute_change_label.configure(foreground=color)
         self.percent_change_label.configure(foreground=color)
 
-        as_of = prediction.get("as_of") or "-"
         ticker = prediction.get("ticker") or (self.current_ticker or "-")
-        self.as_of_var.set(f"{ticker} – as of {as_of}")
+        self.prediction_header_var.set(f"Prediction for {ticker}")
+
+        market_timestamp = prediction.get("market_data_as_of") or prediction.get("as_of")
+        generated_timestamp = prediction.get("generated_at")
+        self.market_data_time_var.set(
+            f"Market data as of: {self._format_timestamp(market_timestamp)}"
+        )
+        self.prediction_time_var.set(
+            f"Prediction generated at: {self._format_timestamp(generated_timestamp)}"
+        )
 
         metrics = metrics or {}
         self.metric_vars["mae"].set(self._format_number(metrics.get("mae")))
@@ -808,6 +836,27 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
             return f"{int(value):,}"
         except (TypeError, ValueError):
             return "-"
+
+    def _format_timestamp(self, value: Any) -> str:
+        if value is None:
+            return "-"
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return "-"
+        try:
+            timestamp = pd.to_datetime(value)
+        except (TypeError, ValueError):
+            return "-"
+        if pd.isna(timestamp):
+            return "-"
+        if isinstance(timestamp, pd.Timestamp):
+            dt_value = timestamp.to_pydatetime()
+        else:
+            dt_value = timestamp
+        if not isinstance(dt_value, datetime):
+            return "-"
+        return dt_value.strftime("%Y-%m-%d %H:%M")
 
     def _convert_currency_value(self, value: Any) -> Optional[float]:
         if value is None:

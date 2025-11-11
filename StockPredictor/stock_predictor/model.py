@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, Optional
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Iterable, Optional
 
 import joblib
 import numpy as np
@@ -26,6 +28,15 @@ from .models import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+class ModelNotFoundError(FileNotFoundError):
+    """Raised when a persisted model for a target cannot be located on disk."""
+
+    def __init__(self, target: str, path: Path) -> None:
+        super().__init__(f"Saved model for target '{target}' not found at {path}.")
+        self.target = target
+        self.path = path
 
 
 class StockPredictorAI:
@@ -80,7 +91,7 @@ class StockPredictorAI:
     def load_model(self, target: str = "close") -> Any:
         path = self.config.model_path_for(target)
         if not path.exists():
-            raise FileNotFoundError(f"Model file {path} not found. Train the model first.")
+            raise ModelNotFoundError(target, path)
         LOGGER.info("Loading %s model for target '%s'", self.config.model_type, target)
         model = joblib.load(path)
         self.models[target] = model
@@ -94,7 +105,7 @@ class StockPredictorAI:
                 indicator_columns = stored.get("indicator_columns")
                 if indicator_columns:
                     self.metadata["indicator_columns"] = indicator_columns
-        return self.model
+        return model
 
     def save_state(self, metrics: Dict[str, Any]) -> None:
         """Persist metrics and feature information to disk."""
@@ -203,7 +214,7 @@ class StockPredictorAI:
         for target in requested_targets:
             try:
                 model = self.models.get(target) or self.load_model(target)
-            except FileNotFoundError:
+            except ModelNotFoundError:
                 LOGGER.warning("Model for target '%s' missing. Triggering training.", target)
                 report = self.train_model(targets=[target])
                 training_report[target] = report.get("targets", {}).get(target, {})
@@ -225,9 +236,32 @@ class StockPredictorAI:
             expected_change = close_prediction - latest_close
             pct_change = expected_change / latest_close if latest_close else 0.0
 
+        prediction_timestamp = datetime.now()
+
+        latest_date = self.metadata.get("latest_date")
+        if isinstance(latest_date, pd.Timestamp):
+            latest_date = latest_date.to_pydatetime()
+
+        def _to_iso(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            if isinstance(value, datetime):
+                return value.isoformat(timespec="seconds")
+            if isinstance(value, str):
+                return value
+            try:
+                timestamp = pd.to_datetime(value)
+            except (TypeError, ValueError):
+                return str(value)
+            if pd.isna(timestamp):
+                return None
+            return timestamp.to_pydatetime().isoformat(timespec="seconds")
+
         result = {
             "ticker": self.config.ticker,
-            "as_of": str(self.metadata.get("latest_date")),
+            "as_of": _to_iso(latest_date) or "",
+            "market_data_as_of": _to_iso(latest_date) or "",
+            "generated_at": _to_iso(prediction_timestamp) or "",
             "last_close": latest_close,
             "predicted_close": close_prediction,
             "expected_change": expected_change,

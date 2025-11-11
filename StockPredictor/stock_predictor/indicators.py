@@ -101,6 +101,6 @@ def compute_indicators(df: pd.DataFrame) -> IndicatorResult:
         indicators["Volume_SMA_20"] = volume.rolling(window=20, min_periods=1).mean()
         indicators["Volume_EMA_20"] = _ema(volume, 20)
 
-    indicators = indicators.fillna(method="ffill").fillna(method="bfill")
+    indicators = indicators.ffill().bfill()
 
     return IndicatorResult(indicators, list(indicators.columns))
