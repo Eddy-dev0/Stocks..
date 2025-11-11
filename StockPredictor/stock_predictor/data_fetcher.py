@@ -1,114 +1,95 @@
-"""Utilities for downloading market and news data from the internet."""
+"""Facade for interacting with the persistent market data store."""
 
 from __future__ import annotations
 
-import json
 import logging
+from datetime import datetime
+from typing import Optional
 
 import pandas as pd
-import requests
-import yfinance as yf
 
 from .config import PredictorConfig
+from .database import Database
+from .etl import MarketDataETL
 
 LOGGER = logging.getLogger(__name__)
 
 
 class DataFetcher:
-    """Download financial time series data and optionally related news."""
-
-    NEWS_ENDPOINT = "https://financialmodelingprep.com/api/v3/stock_news"
+    """High level API for retrieving cached market data."""
 
     def __init__(self, config: PredictorConfig) -> None:
         self.config = config
+        self.database = Database(config.database_url)
+        self.etl = MarketDataETL(config, database=self.database)
+        self._price_source = "database"
+        self._news_source = "database"
 
+    # ------------------------------------------------------------------
+    # Public API used by the pipeline
+    # ------------------------------------------------------------------
     def fetch_price_data(self, force: bool = False) -> pd.DataFrame:
-        """Fetch historical price data for the configured ticker."""
+        """Return price data for the configured ticker, refreshing if required."""
 
-        cache_path = self.config.price_cache_path
-        if cache_path.exists() and not force:
-            LOGGER.info("Loading cached price data from %s", cache_path)
-            return pd.read_csv(cache_path, parse_dates=["Date"])
+        result = self.etl.refresh_prices(force=force)
+        self._price_source = "remote" if result.downloaded or force else "database"
+        return result.data
 
-        LOGGER.info(
-            "Downloading price data for %s (%s - %s)",
-            self.config.ticker,
-            self.config.start_date,
-            self.config.end_date or "today",
-        )
-        df = yf.download(
-            tickers=self.config.ticker,
-            start=self.config.start_date.isoformat(),
-            end=self.config.end_date.isoformat() if self.config.end_date else None,
+    def fetch_news_data(self, force: bool = False) -> pd.DataFrame:
+        """Return cached news articles, refreshing via the API when necessary."""
+
+        result = self.etl.refresh_news(force=force)
+        self._news_source = "remote" if result.downloaded or force else "database"
+        return result.data
+
+    def fetch_indicator_data(self, category: Optional[str] = None) -> pd.DataFrame:
+        """Fetch indicator data for the current ticker and interval."""
+
+        return self.database.get_indicators(
+            ticker=self.config.ticker,
             interval=self.config.interval,
             progress=False,
             auto_adjust=False,
         )
-        if df.empty:
-            raise RuntimeError(
-                f"No price data returned for ticker {self.config.ticker}."
-            )
 
-        df = df.reset_index().rename(columns=str.title)
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(cache_path, index=False)
-        LOGGER.info("Saved price data to %s", cache_path)
-        return df
+    def fetch_fundamentals(self) -> pd.DataFrame:
+        """Fetch cached fundamentals for the configured ticker."""
 
-    def fetch_news_data(self, force: bool = False) -> pd.DataFrame:
-        """Fetch recent news articles for the configured ticker."""
+        return self.database.get_fundamentals(self.config.ticker)
 
-        cache_path = self.config.news_cache_path
-        if cache_path.exists() and not force:
-            LOGGER.info("Loading cached news data from %s", cache_path)
-            return pd.read_csv(cache_path, parse_dates=["publishedDate"])
+    def refresh_all(self, force: bool = False) -> dict[str, int]:
+        """Refresh all supported datasets and return a summary of inserted rows."""
 
-        if not self.config.news_api_key:
-            LOGGER.info(
-                "No API key configured for news download. Skipping news collection."
-            )
-            return pd.DataFrame()
+        summary = self.etl.refresh_all(force=force)
+        if summary.get("downloaded"):
+            self._price_source = "remote"
+            self._news_source = "remote"
+        return summary
 
-        params = {
-            "tickers": self.config.ticker,
-            "limit": self.config.news_limit,
-            "apikey": self.config.news_api_key,
-        }
-        LOGGER.info(
-            "Downloading up to %s news articles for %s",
-            self.config.news_limit,
-            self.config.ticker,
+    # ------------------------------------------------------------------
+    # Convenience helpers for the UI layer
+    # ------------------------------------------------------------------
+    @property
+    def last_price_source(self) -> str:
+        return self._price_source
+
+    @property
+    def last_news_source(self) -> str:
+        return self._news_source
+
+    def get_last_updated(self, category: str) -> Optional[datetime]:
+        """Return the last refresh timestamp recorded for the given category."""
+
+        interval = self._interval_for_category(category)
+        return self.database.get_refresh_timestamp(
+            self.config.ticker, interval, category
         )
-        try:
-            response = requests.get(self.NEWS_ENDPOINT, params=params, timeout=30)
-            response.raise_for_status()
-            articles = response.json()
-        except requests.RequestException as exc:
-            LOGGER.error("Failed to download news data: %s", exc)
-            return pd.DataFrame()
-        except ValueError as exc:  # json decoding error
-            LOGGER.error("Failed to parse news response: %s", exc)
-            return pd.DataFrame()
-        if not isinstance(articles, list):
-            LOGGER.error("Unexpected response for news data: %s", json.dumps(articles)[:200])
-            return pd.DataFrame()
 
-        if not articles:
-            LOGGER.warning("No news articles returned for %s", self.config.ticker)
-            return pd.DataFrame()
+    def _interval_for_category(self, category: str) -> str:
+        if category in {"prices", "indicators", "macro"}:
+            return self.config.interval
+        return "global"
 
-        df = pd.DataFrame(articles)
-        if "publishedDate" in df.columns:
-            df["publishedDate"] = pd.to_datetime(df["publishedDate"], errors="coerce")
-            df = df.dropna(subset=["publishedDate"])
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(cache_path, index=False)
-        LOGGER.info("Saved news data to %s", cache_path)
-        return df
 
-    def download_all(self, force: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """Download price and news data in one call."""
+__all__ = ["DataFetcher"]
 
-        prices = self.fetch_price_data(force=force)
-        news = self.fetch_news_data(force=force)
-        return prices, news

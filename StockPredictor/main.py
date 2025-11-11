@@ -80,6 +80,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Maximum number of news articles to download (default: 50).",
     )
     parser.add_argument(
+        "--database-url",
+        help=(
+            "Database connection URL (defaults to the bundled SQLite file inside the "
+            "data directory)."
+        ),
+    )
+    parser.add_argument(
         "--no-sentiment",
         action="store_true",
         help="Disable sentiment analysis even if news data is available.",
@@ -130,6 +137,7 @@ def main(argv: list[str] | None = None) -> int:
             start_date=args.start_date,
             end_date=args.end_date,
             refresh_data=args.refresh_data,
+            database_url=args.database_url,
         )
         run_app(default_ticker=args.ticker, options=options)
         return 0
@@ -145,6 +153,7 @@ def main(argv: list[str] | None = None) -> int:
         news_api_key=args.news_api_key,
         news_limit=args.news_limit,
         sentiment=not args.no_sentiment,
+        database_url=args.database_url,
     )
 
     ai = StockPredictorAI(config)
@@ -152,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.mode == "download-data":
             result = ai.download_data(force=args.refresh_data)
-            payload: dict[str, Any] = {"status": "ok", "downloaded": {k: str(v) for k, v in result.items()}}
+            payload: dict[str, Any] = {"status": "ok", "refresh": result}
             print(json.dumps(payload, indent=2))
         elif args.mode == "train":
             if args.refresh_data:

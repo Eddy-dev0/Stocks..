@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 import joblib
@@ -35,16 +34,13 @@ class StockPredictorAI:
     # ------------------------------------------------------------------
     # Data acquisition
     # ------------------------------------------------------------------
-    def download_data(self, force: bool = False) -> Dict[str, Path]:
-        """Download raw data and return the cache file paths."""
+    def download_data(self, force: bool = False) -> Dict[str, Any]:
+        """Refresh all datasets and return a summary of the ETL run."""
 
-        LOGGER.info("Starting data download for %s", self.config.ticker)
-        _prices, news = self.fetcher.download_all(force=force)
-        result = {"prices": self.config.price_cache_path}
-        if not news.empty:
-            result["news"] = self.config.news_cache_path
-        LOGGER.info("Data download completed for %s", self.config.ticker)
-        return result
+        LOGGER.info("Starting data refresh for %s", self.config.ticker)
+        summary = self.fetcher.refresh_all(force=force)
+        LOGGER.info("Data refresh completed for %s", self.config.ticker)
+        return summary
 
     # ------------------------------------------------------------------
     # Feature engineering
