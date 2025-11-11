@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import TYPE_CHECKING, Any, Iterable, Iterator
 
 import pandas as pd
 from sqlalchemy import (
@@ -159,6 +159,37 @@ class NewsArticle(Base):
             "Url": self.url,
             "Source": self.source,
         }
+
+
+class ExperimentLog(Base):
+    """Track metadata about training, inference, and backtesting runs."""
+
+    __tablename__ = "experiment_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(String(32), nullable=False)
+    target: Mapped[str] = mapped_column(String(64), nullable=False)
+    run_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    parameters: Mapped[str | None] = mapped_column(Text)
+    metrics: Mapped[str | None] = mapped_column(Text)
+    context: Mapped[str | None] = mapped_column(Text)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "ticker": self.ticker,
+            "target": self.target,
+            "run_type": self.run_type,
+            "created_at": self.created_at,
+            "parameters": json.loads(self.parameters) if self.parameters else None,
+            "metrics": json.loads(self.metrics) if self.metrics else None,
+            "context": json.loads(self.context) if self.context else None,
+        }
+
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .config import PredictorConfig
 
 
 @dataclass(slots=True)
@@ -459,6 +490,46 @@ class Database:
             return None
 
 
+@dataclass(slots=True)
+class ExperimentTracker:
+    """Persist experiment metadata to the configured database."""
+
+    config: "PredictorConfig"
+    database: Database | None = None
+
+    def __post_init__(self) -> None:
+        if self.database is None:
+            self.database = Database(self.config.database_url)
+
+    def log_run(
+        self,
+        target: str,
+        run_type: str,
+        parameters: dict[str, Any] | None = None,
+        metrics: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        if self.database is None:  # pragma: no cover - defensive guard
+            raise RuntimeError("ExperimentTracker is not initialised with a database instance.")
+
+        record = ExperimentLog(
+            ticker=self.config.ticker,
+            target=target,
+            run_type=run_type,
+            parameters=self._dump_json(parameters),
+            metrics=self._dump_json(metrics),
+            context=self._dump_json(context),
+        )
+        with self.database.session() as session:
+            session.add(record)
+
+    @staticmethod
+    def _dump_json(payload: dict[str, Any] | None) -> str | None:
+        if payload is None:
+            return None
+        return json.dumps(payload, default=str)
+
+
 __all__ = [
     "Database",
     "MetaEntry",
@@ -466,5 +537,7 @@ __all__ = [
     "Indicator",
     "Fundamental",
     "NewsArticle",
+    "ExperimentLog",
+    "ExperimentTracker",
 ]
 
