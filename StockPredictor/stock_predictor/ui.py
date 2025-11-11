@@ -696,14 +696,24 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
     def _convert_price_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
         if self.currency_var.get() != "EUR":
             return df.copy()
-        rate = self.usd_to_eur_rate
-        if not rate:
+        if self.usd_to_eur_rate is None:
+            return df.copy()
+        try:
+            rate = float(self.usd_to_eur_rate)
+        except (TypeError, ValueError):
+            LOGGER.warning(
+                "Currency conversion requested but usd_to_eur_rate=%r is not numeric; skipping conversion",
+                self.usd_to_eur_rate,
+            )
             return df.copy()
         converted = df.copy()
-        price_columns = ["Open", "High", "Low", "Close", "Adj Close"]
-        for column in price_columns:
-            if column in converted.columns:
-                converted[column] = converted[column] * rate
+        numeric_cols = converted.select_dtypes(include=["number"]).columns
+        if not len(numeric_cols):
+            LOGGER.warning(
+                "Currency conversion requested but dataframe has no numeric columns; leaving values unchanged"
+            )
+            return converted
+        converted.loc[:, numeric_cols] = converted.loc[:, numeric_cols] * rate
         return converted
 
     def _get_currency_symbol(self) -> str:
