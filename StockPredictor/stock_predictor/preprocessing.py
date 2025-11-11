@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 
+from .elliott import WaveSegment, apply_wave_features
 from .sentiment import aggregate_daily_sentiment, attach_sentiment
 
 LOGGER = logging.getLogger(__name__)
 
 
-def compute_price_features(price_df: pd.DataFrame) -> pd.DataFrame:
+def compute_price_features(price_df: pd.DataFrame) -> Tuple[pd.DataFrame, List[WaveSegment]]:
     """Compute technical indicators and lag features from price data."""
 
     if price_df.empty:
@@ -53,7 +54,7 @@ def compute_price_features(price_df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         raise ValueError("Price dataframe has no valid rows after cleaning.")
 
-    df = df.sort_values("Date")
+    df = df.sort_values("Date").reset_index(drop=True)
     df["Return_1d"] = df["Close"].pct_change()
     df["LogReturn_1d"] = np.log(df["Close"]).diff()
     df["SMA_5"] = df["Close"].rolling(window=5, min_periods=1).mean()
@@ -62,8 +63,9 @@ def compute_price_features(price_df: pd.DataFrame) -> pd.DataFrame:
     df["Volatility_5"] = df["Return_1d"].rolling(window=5, min_periods=1).std()
     df["Volume_Change"] = df["Volume"].pct_change()
 
+    df, waves = apply_wave_features(df)
     df = df.ffill().bfill()
-    return df
+    return df, waves
 
 
 def merge_with_sentiment(
@@ -87,7 +89,7 @@ def build_supervised_dataset(
 ) -> Tuple[pd.DataFrame, pd.Series, Dict[str, object]]:
     """Prepare the feature matrix and target vector."""
 
-    price_features = compute_price_features(price_df)
+    price_features, waves = compute_price_features(price_df)
     sentiment_df = sentiment_df if sentiment_df is not None else pd.DataFrame()
     merged, aggregated = merge_with_sentiment(price_features, sentiment_df)
 
@@ -115,5 +117,6 @@ def build_supervised_dataset(
         "latest_features": latest_row,
         "latest_close": float(price_df.iloc[-1]["Close"]),
         "latest_date": pd.to_datetime(price_df.iloc[-1]["Date"]),
+        "elliott_waves": waves,
     }
     return X, y, metadata
