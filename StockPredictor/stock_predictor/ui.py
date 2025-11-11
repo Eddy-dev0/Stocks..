@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 import pandas as pd
 import tkinter as tk
 from tkinter import messagebox, ttk
+import yfinance as yf
 
 from matplotlib import dates as mdates
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -104,6 +105,7 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         logging.getLogger().addHandler(self.log_handler)
 
         self.price_data = pd.DataFrame()
+        self.price_data_base = pd.DataFrame()
         self.current_ticker: str | None = None
         self.data_source_var = tk.StringVar(value="Data source: -")
         self.last_updated_var = tk.StringVar(value="Last updated: -")
@@ -116,6 +118,8 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         self.absolute_change_var = tk.StringVar(value="-")
         self.percent_change_var = tk.StringVar(value="-")
         self.as_of_var = tk.StringVar(value="-")
+        self.currency_var = tk.StringVar(value="USD")
+        self.currency_button_text = tk.StringVar(value="Display in EUR (€)")
         self.metric_vars: dict[str, tk.StringVar] = {
             "mae": tk.StringVar(value="-"),
             "rmse": tk.StringVar(value="-"),
@@ -126,6 +130,9 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
 
         self.refresh_var = tk.BooleanVar(value=self.options.refresh_data)
         self.ticker_var = tk.StringVar(value=self.default_ticker)
+        self.usd_to_eur_rate: float | None = None
+        self.latest_prediction: Optional[Dict[str, Any]] = None
+        self.latest_metrics: Optional[Dict[str, Any]] = None
 
         self._interactive_widgets: list[tk.Widget] = []
 
@@ -159,6 +166,15 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         refresh_check = ttk.Checkbutton(top_bar, text="Refresh data", variable=self.refresh_var)
         refresh_check.pack(side="left", padx=(15, 0))
         self._interactive_widgets.append(refresh_check)
+
+        currency_button = ttk.Button(
+            top_bar,
+            textvariable=self.currency_button_text,
+            command=self._on_currency_toggle,
+        )
+        currency_button.pack(side="left", padx=(15, 0))
+        self._interactive_widgets.append(currency_button)
+        self.currency_button = currency_button
 
         timeframe_frame = ttk.Frame(top_bar)
         timeframe_frame.pack(side="left", padx=(25, 0))
@@ -196,7 +212,7 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         self.figure = Figure(figsize=(6, 4), dpi=100)
         self.chart_ax = self.figure.add_subplot(111)
         self.chart_ax.set_title("Historical Prices")
-        self.chart_ax.set_ylabel("Price (USD)")
+        self.chart_ax.set_ylabel(f"Price ({self._get_currency_symbol()})")
         self.chart_ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
 
         self.canvas = FigureCanvasTkAgg(self.figure, master=chart_tab)
@@ -383,7 +399,8 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
             )
         except Exception as exc:  # pylint: disable=broad-except
             LOGGER.exception("Prediction failed for %s", ticker)
-            self.after(0, lambda: self._on_prediction_error(str(exc)))
+            message = str(exc)
+            self.after(0, lambda msg=message: self._on_prediction_error(msg))
 
     def _prepare_prices(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
@@ -391,6 +408,14 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
             date_col = next((col for col in df.columns if col.lower() == "date"), None)
             if date_col:
                 df = df.rename(columns={date_col: "Date"})
+            else:
+                fuzzy_date_col = next((col for col in df.columns if "date" in col.lower()), None)
+                if fuzzy_date_col:
+                    df = df.rename(columns={fuzzy_date_col: "Date"})
+        if "Date" not in df.columns and isinstance(df.index, pd.DatetimeIndex):
+            df = df.reset_index().rename(columns={"index": "Date"})
+        if "Date" not in df.columns:
+            raise RuntimeError("Price data is missing a date column.")
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
         df = df.dropna(subset=["Date"])
         rename_map = {col: col.title() for col in df.columns}
@@ -422,9 +447,10 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         data_source: str,
     ) -> None:
         self.current_ticker = ticker
-        self.price_data = prices
-        self._plot_price_data()
-        self._update_prediction_panel(prediction, metrics)
+        self.price_data_base = prices
+        self.latest_prediction = prediction
+        self.latest_metrics = metrics
+        self._refresh_currency_views()
         self.data_source_var.set(f"Data source: {data_source}")
         self.last_updated_var.set(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         self._set_status(f"Prediction ready for {ticker}", error=False)
@@ -442,6 +468,7 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         df = self.price_data
         if df.empty:
             self.chart_ax.clear()
+            self.chart_ax.set_ylabel(f"Price ({self._get_currency_symbol()})")
             self.chart_ax.text(0.5, 0.5, "No price data", ha="center", va="center")
             self.canvas.draw_idle()
             return
@@ -456,7 +483,7 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         self.chart_ax.clear()
         self.chart_ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
         self.chart_ax.set_title(f"{self.current_ticker or ''} Price History")
-        self.chart_ax.set_ylabel("Price (USD)")
+        self.chart_ax.set_ylabel(f"Price ({self._get_currency_symbol()})")
 
         dates = mdates.date2num(window_df["Date"].to_list())
         width = 0.6
@@ -549,12 +576,11 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         self.status_label.configure(foreground=color)
 
     def _format_currency(self, value: Any) -> str:
-        if value is None:
+        converted = self._convert_currency_value(value)
+        if converted is None:
             return "-"
-        try:
-            return f"${float(value):,.2f}"
-        except (TypeError, ValueError):
-            return "-"
+        symbol = self._get_currency_symbol()
+        return f"{symbol}{converted:,.2f}"
 
     def _format_percent(self, value: Any) -> str:
         if value is None:
@@ -579,6 +605,109 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
             return f"{int(value):,}"
         except (TypeError, ValueError):
             return "-"
+
+    def _convert_currency_value(self, value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        if self.currency_var.get() == "EUR":
+            rate = self.usd_to_eur_rate
+            if rate:
+                return numeric * rate
+            LOGGER.warning("Currency set to EUR without available conversion rate; falling back to USD values.")
+        return numeric
+
+    def _fetch_latest_fx_rate(self) -> Optional[float]:
+        try:
+            data = yf.download("EURUSD=X", period="5d", interval="1d", progress=False)
+        except Exception as exc:  # pylint: disable=broad-except
+            LOGGER.warning("Failed to download EUR/USD rate: %s", exc)
+            return None
+        if data.empty or "Close" not in data.columns:
+            return None
+        close_prices = data["Close"].dropna()
+        if close_prices.empty:
+            return None
+        latest = float(close_prices.iloc[-1])
+        if not latest:
+            return None
+        return 1.0 / latest
+
+    def _on_currency_toggle(self) -> None:
+        current = self.currency_var.get()
+        if current == "USD":
+            if self.usd_to_eur_rate is not None:
+                self.currency_button.state(["!disabled"])
+                self.currency_var.set("EUR")
+                self._update_currency_button()
+                self._refresh_currency_views()
+                self._set_status("Displaying prices in EUR", error=False)
+                return
+            self.currency_button.state(["disabled"])
+            self._set_status("Fetching EUR/USD rate…")
+            thread = threading.Thread(target=self._switch_to_eur_async, daemon=True)
+            thread.start()
+        else:
+            self.currency_button.state(["!disabled"])
+            self.currency_var.set("USD")
+            self._update_currency_button()
+            self._refresh_currency_views()
+            self._set_status("Displaying prices in USD", error=False)
+
+    def _switch_to_eur_async(self) -> None:
+        rate = self._fetch_latest_fx_rate()
+        self.after(0, lambda: self._finalise_currency_switch(rate))
+
+    def _finalise_currency_switch(self, rate: Optional[float]) -> None:
+        if rate is None:
+            self.currency_button.state(["!disabled"])
+            self._set_status("Unable to fetch EUR/USD rate", error=True)
+            messagebox.showerror(
+                "Currency conversion",
+                "Der Wechselkurs EUR/USD konnte nicht geladen werden.",
+                parent=self,
+            )
+            return
+        self.usd_to_eur_rate = rate
+        self.currency_var.set("EUR")
+        self._update_currency_button()
+        self._refresh_currency_views()
+        self.currency_button.state(["!disabled"])
+        self._set_status("Displaying prices in EUR", error=False)
+
+    def _update_currency_button(self) -> None:
+        if self.currency_var.get() == "EUR":
+            self.currency_button_text.set("Display in USD ($)")
+        else:
+            self.currency_button_text.set("Display in EUR (€)")
+
+    def _refresh_currency_views(self) -> None:
+        if not self.price_data_base.empty:
+            self.price_data = self._convert_price_dataframe(self.price_data_base)
+        else:
+            self.price_data = pd.DataFrame()
+        self._plot_price_data()
+        if self.latest_prediction is not None:
+            self._update_prediction_panel(self.latest_prediction, self.latest_metrics)
+
+    def _convert_price_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        if self.currency_var.get() != "EUR":
+            return df.copy()
+        rate = self.usd_to_eur_rate
+        if not rate:
+            return df.copy()
+        converted = df.copy()
+        price_columns = ["Open", "High", "Low", "Close", "Adj Close"]
+        for column in price_columns:
+            if column in converted.columns:
+                converted[column] = converted[column] * rate
+        return converted
+
+    def _get_currency_symbol(self) -> str:
+        return "€" if self.currency_var.get() == "EUR" else "$"
 
     def _on_close(self) -> None:
         if self._after_id is not None:
