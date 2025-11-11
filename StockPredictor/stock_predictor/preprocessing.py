@@ -8,13 +8,36 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
-from .elliott import WaveSegment, apply_wave_features
+from .indicators import compute_indicators
 from .sentiment import aggregate_daily_sentiment, attach_sentiment
 
 LOGGER = logging.getLogger(__name__)
 
 
-def compute_price_features(price_df: pd.DataFrame) -> Tuple[pd.DataFrame, List[WaveSegment]]:
+PRICE_BASE_COLUMNS = {"Open", "High", "Low", "Close", "Adj Close"}
+PRICE_PREFIXES = ("SMA_", "EMA_")
+PRICE_EXACT_COLUMNS = {
+    "MACD",
+    "MACD_Signal",
+    "MACD_Hist",
+    "BB_Middle_20",
+    "BB_Upper_20",
+    "BB_Lower_20",
+}
+
+
+def _identify_price_columns(df: pd.DataFrame) -> list[str]:
+    price_columns: list[str] = []
+    for column in df.columns:
+        if column in PRICE_BASE_COLUMNS or column in PRICE_EXACT_COLUMNS:
+            price_columns.append(column)
+            continue
+        if column.startswith(PRICE_PREFIXES):
+            price_columns.append(column)
+    return price_columns
+
+
+def compute_price_features(price_df: pd.DataFrame) -> pd.DataFrame:
     """Compute technical indicators and lag features from price data."""
 
     if price_df.empty:
@@ -63,9 +86,13 @@ def compute_price_features(price_df: pd.DataFrame) -> Tuple[pd.DataFrame, List[W
     df["Volatility_5"] = df["Return_1d"].rolling(window=5, min_periods=1).std()
     df["Volume_Change"] = df["Volume"].pct_change()
 
-    df, waves = apply_wave_features(df)
+    indicator_result = compute_indicators(df)
+    df = pd.concat([df, indicator_result.dataframe], axis=1)
+
     df = df.ffill().bfill()
-    return df, waves
+    df.attrs["indicator_columns"] = list(indicator_result.columns)
+    df.attrs["price_columns"] = _identify_price_columns(df)
+    return df
 
 
 def merge_with_sentiment(
@@ -91,6 +118,8 @@ def build_supervised_dataset(
 
     price_features, waves = compute_price_features(price_df)
     sentiment_df = sentiment_df if sentiment_df is not None else pd.DataFrame()
+    indicator_columns = price_features.attrs.get("indicator_columns", [])
+    price_columns_attr = price_features.attrs.get("price_columns", [])
     merged, aggregated = merge_with_sentiment(price_features, sentiment_df)
 
     dataset = merged.copy()
@@ -117,6 +146,7 @@ def build_supervised_dataset(
         "latest_features": latest_row,
         "latest_close": float(price_df.iloc[-1]["Close"]),
         "latest_date": pd.to_datetime(price_df.iloc[-1]["Date"]),
-        "elliott_waves": waves,
+        "indicator_columns": indicator_columns,
+        "price_columns": price_columns_attr,
     }
     return X, y, metadata
