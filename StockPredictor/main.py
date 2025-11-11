@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import sys
+from typing import Any, Dict
 
 from stock_predictor.config import build_config, load_environment
 from stock_predictor.model import StockPredictorAI
@@ -93,7 +94,123 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="INFO",
         help="Logging level (DEBUG, INFO, WARNING, ...).",
     )
+    parser.add_argument(
+        "--ui",
+        action="store_true",
+        help=(
+            "Display prediction results in a graphical window. Only applies in predict mode."
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def display_prediction_ui(prediction: Dict[str, Any]) -> None:
+    """Render a simple Tkinter window summarizing the prediction."""
+
+    import logging
+    import tkinter as tk
+    from tkinter import ttk
+
+    ticker = prediction.get("ticker", "-")
+    predicted_close = prediction.get("predicted_close")
+    last_close = prediction.get("last_close")
+    change = prediction.get("expected_change")
+    change_pct = prediction.get("expected_change_pct")
+    as_of = prediction.get("as_of", "-")
+    training_metrics = prediction.get("training_metrics")
+
+    logger = logging.getLogger(__name__)
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:  # pragma: no cover - depends on system display
+        logger.warning("Unable to start UI: %s", exc)
+        return
+    root.title(f"Stock Prediction - {ticker}")
+
+    mainframe = ttk.Frame(root, padding=20)
+    mainframe.grid(column=0, row=0, sticky="nsew")
+    root.columnconfigure(0, weight=1)
+    root.rowconfigure(0, weight=1)
+
+    header = ttk.Label(
+        mainframe,
+        text=f"Prediction Summary for {ticker}",
+        font=("Helvetica", 18, "bold"),
+    )
+    header.grid(column=0, row=0, columnspan=2, pady=(0, 15))
+
+    def format_currency(value: Any) -> str:
+        return "-" if value is None else f"${value:,.2f}"
+
+    def format_change(value: Any, pct: Any) -> str:
+        if value is None or pct is None:
+            return "-"
+        arrow = "▲" if value >= 0 else "▼"
+        return f"{arrow} {value:,.2f} ({pct * 100:,.2f}%)"
+
+    rows = [
+        ("As of", as_of),
+        ("Last Close", format_currency(last_close)),
+        ("Predicted Close", format_currency(predicted_close)),
+        ("Expected Change", format_change(change, change_pct)),
+    ]
+
+    for idx, (label, value) in enumerate(rows, start=1):
+        ttk.Label(mainframe, text=label + ":", font=("Helvetica", 12, "bold")).grid(
+            column=0,
+            row=idx,
+            sticky="w",
+            pady=5,
+            padx=(0, 10),
+        )
+        ttk.Label(mainframe, text=value, font=("Helvetica", 12)).grid(
+            column=1,
+            row=idx,
+            sticky="w",
+            pady=5,
+        )
+
+    if isinstance(training_metrics, dict):
+        ttk.Separator(mainframe, orient="horizontal").grid(
+            column=0, row=len(rows) + 1, columnspan=2, sticky="ew", pady=(15, 10)
+        )
+        ttk.Label(
+            mainframe,
+            text="Training Metrics",
+            font=("Helvetica", 14, "bold"),
+        ).grid(column=0, row=len(rows) + 2, columnspan=2, sticky="w")
+
+        metric_rows = [
+            ("MAE", training_metrics.get("mae")),
+            ("RMSE", training_metrics.get("rmse")),
+            ("R²", training_metrics.get("r2")),
+        ]
+
+        for offset, (label, value) in enumerate(metric_rows, start=len(rows) + 3):
+            display_value = "-" if value is None else f"{value:,.4f}"
+            ttk.Label(mainframe, text=label + ":", font=("Helvetica", 12, "bold")).grid(
+                column=0,
+                row=offset,
+                sticky="w",
+                pady=3,
+                padx=(0, 10),
+            )
+            ttk.Label(mainframe, text=display_value, font=("Helvetica", 12)).grid(
+                column=1,
+                row=offset,
+                sticky="w",
+                pady=3,
+            )
+
+    ttk.Button(mainframe, text="Close", command=root.destroy).grid(
+        column=0,
+        row=99,
+        columnspan=2,
+        pady=(20, 0),
+    )
+
+    root.mainloop()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -127,6 +244,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.mode == "predict":
             prediction = ai.predict(refresh_data=args.refresh_data)
             print(json.dumps({"status": "ok", "prediction": prediction}, indent=2))
+            if args.ui:
+                display_prediction_ui(prediction)
         else:
             raise ValueError(f"Unsupported mode: {args.mode}")
     except Exception as exc:  # pylint: disable=broad-except
