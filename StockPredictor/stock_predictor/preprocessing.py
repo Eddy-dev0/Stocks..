@@ -23,6 +23,36 @@ def compute_price_features(price_df: pd.DataFrame) -> pd.DataFrame:
     if "Date" not in df.columns:
         raise ValueError("Expected a 'Date' column in price data.")
 
+    # Ensure the Date column is a datetime so that sorting behaves predictably.
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    if df["Date"].isna().all():
+        raise ValueError("Unable to parse any valid dates from the price data.")
+
+    # Remove rows where we could not parse the date; they cannot be used in time
+    # series calculations and would otherwise propagate NaT values.
+    df = df.dropna(subset=["Date"])
+
+    # Coerce numeric columns to floats/ints so downstream math works as expected.
+    numeric_columns = {
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Adj Close",
+        "Volume",
+    }.intersection(df.columns)
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    # Drop rows where the close price is missing; without a close value we cannot
+    # build any of the derived price-based features.
+    if "Close" not in df.columns:
+        raise ValueError("Expected a 'Close' column in price data.")
+
+    df = df.dropna(subset=[col for col in ["Close", "Volume"] if col in df.columns])
+    if df.empty:
+        raise ValueError("Price dataframe has no valid rows after cleaning.")
+
     df = df.sort_values("Date")
     df["Return_1d"] = df["Close"].pct_change()
     df["LogReturn_1d"] = np.log(df["Close"]).diff()
