@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import queue
 import threading
 from dataclasses import dataclass
@@ -628,11 +629,25 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
             return None
         if data.empty or "Close" not in data.columns:
             return None
-        close_prices = data["Close"].dropna()
+        close_prices = pd.to_numeric(data["Close"], errors="coerce")
         if close_prices.empty:
             return None
-        latest = float(close_prices.iloc[-1])
-        if not latest:
+        finite_mask = close_prices.apply(math.isfinite)
+        filtered_count = int((~finite_mask).sum())
+        if filtered_count:
+            LOGGER.warning(
+                "Filtered out %d non-finite EUR/USD close price value(s) when fetching FX rate.",
+                filtered_count,
+            )
+        finite_prices = close_prices[finite_mask]
+        if finite_prices.empty:
+            return None
+        latest = float(finite_prices.iloc[-1])
+        if not math.isfinite(latest) or latest == 0:
+            LOGGER.warning(
+                "Latest EUR/USD close price %r is not usable for conversion; ignoring value.",
+                latest,
+            )
             return None
         return 1.0 / latest
 
@@ -662,7 +677,24 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         self.after(0, lambda: self._finalise_currency_switch(rate))
 
     def _finalise_currency_switch(self, rate: Optional[float]) -> None:
+        valid_rate: Optional[float]
         if rate is None:
+            valid_rate = None
+        else:
+            try:
+                valid_rate = float(rate)
+            except (TypeError, ValueError):
+                LOGGER.warning(
+                    "Discarding non-numeric EUR/USD rate %r; keeping USD currency display.",
+                    rate,
+                )
+                valid_rate = None
+        if valid_rate is None or not math.isfinite(valid_rate):
+            if valid_rate is not None:
+                LOGGER.warning(
+                    "Discarding non-finite EUR/USD rate %r; keeping USD currency display.",
+                    valid_rate,
+                )
             self.currency_button.state(["!disabled"])
             self._set_status("Unable to fetch EUR/USD rate", error=True)
             messagebox.showerror(
@@ -671,7 +703,7 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
                 parent=self,
             )
             return
-        self.usd_to_eur_rate = rate
+        self.usd_to_eur_rate = valid_rate
         self.currency_var.set("EUR")
         self._update_currency_button()
         self._refresh_currency_views()
