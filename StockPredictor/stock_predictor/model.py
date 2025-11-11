@@ -176,6 +176,8 @@ class StockPredictorAI:
             LOGGER.info("Preparing features prior to prediction.")
             self.prepare_features()
 
+        training_metrics: Dict[str, Any] | None = None
+
         try:
             model = self.model or self.load_model()
         except FileNotFoundError as exc:
@@ -184,6 +186,7 @@ class StockPredictorAI:
                 LOGGER.info("Refreshing data before automatic training.")
                 self.download_data(force=True)
             metrics = self.train_model()
+            training_metrics = metrics
             LOGGER.info(
                 "Automatic training complete for %s (MAE %.4f, RMSE %.4f, R2 %.4f)",
                 self.config.ticker,
@@ -211,6 +214,8 @@ class StockPredictorAI:
             "expected_change_pct": pct_change,
             "as_of": str(self.metadata.get("latest_date")),
         }
+        if training_metrics is not None:
+            result["training_metrics"] = training_metrics
         LOGGER.info(
             "Prediction for %s: %.2f (change %.2f / %.2f%%)",
             self.config.ticker,
