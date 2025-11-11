@@ -95,10 +95,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Logging level (DEBUG, INFO, WARNING, ...).",
     )
     parser.add_argument(
-        "--no-ui",
+        "--ui",
         action="store_true",
         help=(
-            "Disable the graphical window for prediction results. Only applies in predict mode."
+            "Display prediction results in a graphical window. Only applies in predict mode."
         ),
     )
     return parser.parse_args(argv)
@@ -244,7 +244,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.mode == "predict":
             prediction = ai.predict(refresh_data=args.refresh_data)
             print(json.dumps({"status": "ok", "prediction": prediction}, indent=2))
-            if not args.no_ui:
+            if args.ui:
                 display_prediction_ui(prediction)
         else:
             raise ValueError(f"Unsupported mode: {args.mode}")
