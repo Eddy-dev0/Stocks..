@@ -176,7 +176,22 @@ class StockPredictorAI:
             LOGGER.info("Preparing features prior to prediction.")
             self.prepare_features()
 
-        model = self.model or self.load_model()
+        try:
+            model = self.model or self.load_model()
+        except FileNotFoundError as exc:
+            LOGGER.warning("%s. Triggering automatic training.", exc)
+            if refresh_data:
+                LOGGER.info("Refreshing data before automatic training.")
+                self.download_data(force=True)
+            metrics = self.train_model()
+            LOGGER.info(
+                "Automatic training complete for %s (MAE %.4f, RMSE %.4f, R2 %.4f)",
+                self.config.ticker,
+                metrics.get("mae", float("nan")),
+                metrics.get("rmse", float("nan")),
+                metrics.get("r2", float("nan")),
+            )
+            model = self._get_model()
         feature_columns = self.metadata.get("feature_columns")
         latest_features = self.metadata.get("latest_features")
         if latest_features is None or feature_columns is None:
