@@ -1,45 +1,51 @@
-"""Machine learning models for stock prediction."""
+"""High level orchestration for feature engineering, training and inference."""
 
 from __future__ import annotations
 
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import r2_score
 from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 
+from .backtesting import Backtester
 from .config import PredictorConfig
 from .data_fetcher import DataFetcher
-from .preprocessing import build_supervised_dataset
+from .database import ExperimentTracker
+from .features import FeatureAssembler
+from .models import (
+    ModelFactory,
+    classification_metrics,
+    extract_feature_importance,
+    model_supports_proba,
+    regression_metrics,
+)
 
 LOGGER = logging.getLogger(__name__)
 
 
 class StockPredictorAI:
-    """High level interface for training and using stock prediction models."""
+    """Pipeline that assembles features, trains models, and produces forecasts."""
 
     def __init__(self, config: PredictorConfig) -> None:
         self.config = config
         self.fetcher = DataFetcher(config)
-        self.model: Optional[Pipeline] = None
+        self.feature_assembler = FeatureAssembler(config.feature_sets)
+        self.tracker = ExperimentTracker(config)
+        self.models: dict[str, Any] = {}
         self.metadata: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Data acquisition
     # ------------------------------------------------------------------
     def download_data(self, force: bool = False) -> Dict[str, Path]:
-        """Download raw data and return the cache file paths."""
-
         LOGGER.info("Starting data download for %s", self.config.ticker)
-        _prices, news = self.fetcher.download_all(force=force)
+        prices, news = self.fetcher.download_all(force=force)
         result = {"prices": self.config.price_cache_path}
         if not news.empty:
             result["news"] = self.config.news_cache_path
@@ -53,9 +59,7 @@ class StockPredictorAI:
         self,
         price_df: Optional[pd.DataFrame] = None,
         news_df: Optional[pd.DataFrame] = None,
-    ) -> tuple[pd.DataFrame, pd.Series]:
-        """Prepare the feature matrix and target vector."""
-
+    ) -> tuple[pd.DataFrame, dict[str, pd.Series]]:
         if price_df is None:
             price_df = self.fetcher.fetch_price_data()
         if news_df is None and self.config.sentiment:
@@ -63,164 +67,232 @@ class StockPredictorAI:
         elif news_df is None:
             news_df = pd.DataFrame()
 
-        X, y, metadata = build_supervised_dataset(price_df, news_df)
-        self.metadata = metadata
-        return X, y
+        feature_result = self.feature_assembler.build(price_df, news_df, self.config.sentiment)
+        self.metadata = feature_result.metadata
+        return feature_result.features, feature_result.targets
 
     # ------------------------------------------------------------------
     # Model persistence helpers
     # ------------------------------------------------------------------
-    def _get_model(self) -> Pipeline:
-        if self.model is None:
-            raise RuntimeError("Model is not loaded. Call load_model() or train_model() first.")
-        return self.model
+    def _get_model(self, target: str) -> Any:
+        if target not in self.models:
+            raise RuntimeError(f"Model for target '{target}' is not loaded. Train or load it first.")
+        return self.models[target]
 
-    def load_model(self) -> Pipeline:
-        """Load a previously saved model from disk."""
-
-        model_path = self.config.model_path
-        if not model_path.exists():
-            raise FileNotFoundError(
-                f"Model file {model_path} not found. Train the model first."
-            )
-        LOGGER.info("Loading model from %s", model_path)
-        self.model = joblib.load(model_path)
-        metadata_path = self.config.metrics_path
+    def load_model(self, target: str = "close") -> Any:
+        path = self.config.model_path_for(target)
+        if not path.exists():
+            raise FileNotFoundError(f"Model file {path} not found. Train the model first.")
+        LOGGER.info("Loading %s model for target '%s'", self.config.model_type, target)
+        model = joblib.load(path)
+        self.models[target] = model
+        metadata_path = self.config.metrics_path_for(target)
         if metadata_path.exists():
             with open(metadata_path, "r", encoding="utf-8") as handle:
                 stored = json.load(handle)
-                feature_columns = stored.get("feature_columns")
-                if feature_columns:
-                    self.metadata["feature_columns"] = feature_columns
-        return self.model
+                if "feature_columns" in stored:
+                    self.metadata.setdefault("feature_columns", stored["feature_columns"])
+        return model
 
-    def save_state(self, metrics: Dict[str, Any]) -> None:
-        """Persist metrics and feature information to disk."""
-
-        path = self.config.metrics_path
+    def save_state(self, target: str, metrics: Dict[str, Any]) -> None:
         payload = {
             **metrics,
             "feature_columns": self.metadata.get("feature_columns", []),
         }
+        path = self.config.metrics_path_for(target)
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, default=str)
-        LOGGER.info("Saved metrics to %s", path)
+        LOGGER.info("Saved metrics for target '%s' to %s", target, path)
+        if target == "close":
+            with open(self.config.metrics_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, default=str)
 
     # ------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------
-    def train_model(self) -> Dict[str, Any]:
-        """Train the configured machine learning model and persist it."""
+    def train_model(self, targets: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+        X, y_targets = self.prepare_features()
+        feature_columns = self.metadata.get("feature_columns", list(X.columns))
 
-        X, y = self.prepare_features()
-        feature_columns = X.columns.tolist()
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, shuffle=False
-        )
+        requested_targets = list(targets) if targets else list(self.config.prediction_targets)
+        available_targets = {name: y for name, y in y_targets.items() if name in requested_targets}
+        if not available_targets:
+            raise RuntimeError("No matching targets available for training.")
 
-        if self.config.model_type != "random_forest":
-            LOGGER.warning(
-                "Model type '%s' not recognised; falling back to RandomForestRegressor.",
-                self.config.model_type,
+        metrics_by_target: dict[str, Dict[str, float]] = {}
+        summary_metrics: dict[str, float] = {}
+
+        for target, y in available_targets.items():
+            LOGGER.info("Training target '%s' with model type %s", target, self.config.model_type)
+            y_clean = y.dropna()
+            aligned_X = X.loc[y_clean.index]
+            task = "classification" if target == "direction" else "regression"
+            model_params = self.config.model_params.get(target, {})
+            factory = ModelFactory(self.config.model_type, {**self.config.model_params.get("global", {}), **model_params})
+            model = factory.create(task)
+
+            X_train, X_test, y_train, y_test = train_test_split(
+                aligned_X,
+                y_clean,
+                test_size=self.config.test_size,
+                shuffle=self.config.shuffle_training,
+                random_state=42,
+            )
+            model.fit(X_train, y_train)
+            y_pred = model.predict(X_test)
+
+            if task == "classification":
+                metrics = classification_metrics(y_test.to_numpy(), y_pred)
+                metrics["directional_accuracy"] = metrics.get("accuracy", 0.0)
+            else:
+                metrics = regression_metrics(y_test.to_numpy(), y_pred)
+                metrics["r2"] = float(r2_score(y_test, y_pred))
+                metrics["directional_accuracy"] = float(
+                    np.mean(np.sign(y_pred - X_test["Close_Current"]) == np.sign(y_test - X_test["Close_Current"]))
+                )
+
+            metrics["training_rows"] = int(len(X_train))
+            metrics["test_rows"] = int(len(X_test))
+            metrics_by_target[target] = metrics
+
+            self.models[target] = model
+            joblib.dump(model, self.config.model_path_for(target))
+            self.save_state(target, metrics)
+            self.tracker.log_run(
+                target=target,
+                run_type="training",
+                parameters={"model_type": self.config.model_type, **model_params},
+                metrics=metrics,
+                context={"feature_columns": feature_columns},
             )
 
-        model = Pipeline(
-            steps=[
-                ("scaler", StandardScaler()),
-                (
-                    "regressor",
-                    RandomForestRegressor(
-                        n_estimators=200,
-                        random_state=42,
-                        max_depth=10,
-                    ),
-                ),
-            ]
-        )
-        model.fit(X_train, y_train)
-        predictions = model.predict(X_test)
+            if target == "close":
+                summary_metrics.update({k: v for k, v in metrics.items() if isinstance(v, (int, float))})
 
-        metrics = {
-            "mae": float(mean_absolute_error(y_test, predictions)),
-            "rmse": float(np.sqrt(mean_squared_error(y_test, predictions))),
-            "r2": float(r2_score(y_test, predictions)),
-            "training_rows": int(len(X_train)),
-            "test_rows": int(len(X_test)),
-        }
-        LOGGER.info(
-            "Training complete for %s - MAE: %.4f, RMSE: %.4f, R2: %.4f",
-            self.config.ticker,
-            metrics["mae"],
-            metrics["rmse"],
-            metrics["r2"],
-        )
-
-        self.model = model
-        self.metadata["feature_columns"] = feature_columns
-        joblib.dump(model, self.config.model_path)
-        LOGGER.info("Saved model to %s", self.config.model_path)
-
-        self.save_state(metrics)
-        return metrics
+        LOGGER.info("Training complete for targets: %s", ", ".join(metrics_by_target))
+        return {"targets": metrics_by_target, **summary_metrics}
 
     # ------------------------------------------------------------------
     # Inference
     # ------------------------------------------------------------------
-    def predict(self, refresh_data: bool = False) -> Dict[str, Any]:
-        """Generate a prediction for the next trading day."""
-
+    def predict(self, refresh_data: bool = False, targets: Optional[Iterable[str]] = None) -> Dict[str, Any]:
         if refresh_data:
-            LOGGER.info("Refreshing data before prediction.")
+            LOGGER.info("Refreshing data prior to prediction.")
             self.download_data(force=True)
+
         if not self.metadata or refresh_data:
-            LOGGER.info("Preparing features prior to prediction.")
+            LOGGER.info("Preparing features before prediction.")
             self.prepare_features()
 
-        training_metrics: Dict[str, Any] | None = None
-
-        try:
-            model = self.model or self.load_model()
-        except FileNotFoundError as exc:
-            LOGGER.warning("%s. Triggering automatic training.", exc)
-            if refresh_data:
-                LOGGER.info("Refreshing data before automatic training.")
-                self.download_data(force=True)
-            metrics = self.train_model()
-            training_metrics = metrics
-            LOGGER.info(
-                "Automatic training complete for %s (MAE %.4f, RMSE %.4f, R2 %.4f)",
-                self.config.ticker,
-                metrics.get("mae", float("nan")),
-                metrics.get("rmse", float("nan")),
-                metrics.get("r2", float("nan")),
-            )
-            model = self._get_model()
         feature_columns = self.metadata.get("feature_columns")
         latest_features = self.metadata.get("latest_features")
-        if latest_features is None or feature_columns is None:
+        if feature_columns is None or latest_features is None:
             raise RuntimeError("No feature metadata available. Train the model first.")
 
-        latest_features = latest_features[feature_columns]
-        prediction = float(model.predict(latest_features)[0])
-        latest_close = float(self.metadata.get("latest_close"))
-        expected_change = prediction - latest_close
-        pct_change = expected_change / latest_close if latest_close else 0.0
+        requested_targets = list(targets) if targets else list(self.config.prediction_targets)
+        predictions: dict[str, Any] = {}
+        confidences: dict[str, float] = {}
+        training_report: dict[str, Any] = {}
+
+        for target in requested_targets:
+            try:
+                model = self.models.get(target) or self.load_model(target)
+            except FileNotFoundError:
+                LOGGER.warning("Model for target '%s' missing. Triggering training.", target)
+                report = self.train_model(targets=[target])
+                training_report[target] = report.get("targets", {}).get(target, {})
+                model = self._get_model(target)
+
+            current_features = latest_features[feature_columns]
+            pred_value = model.predict(current_features)[0]
+            predictions[target] = float(pred_value)
+
+            if model_supports_proba(model) and target == "direction":
+                proba = model.predict_proba(current_features)[0]
+                confidences[target] = float(max(proba))
+
+        close_prediction = predictions.get("close")
+        latest_close = float(self.metadata.get("latest_close", np.nan))
+        expected_change = None
+        pct_change = None
+        if close_prediction is not None and np.isfinite(latest_close):
+            expected_change = close_prediction - latest_close
+            pct_change = expected_change / latest_close if latest_close else 0.0
 
         result = {
             "ticker": self.config.ticker,
-            "predicted_close": prediction,
+            "as_of": str(self.metadata.get("latest_date")),
             "last_close": latest_close,
+            "predicted_close": close_prediction,
             "expected_change": expected_change,
             "expected_change_pct": pct_change,
-            "as_of": str(self.metadata.get("latest_date")),
+            "predictions": predictions,
         }
-        if training_metrics is not None:
-            result["training_metrics"] = training_metrics
-        LOGGER.info(
-            "Prediction for %s: %.2f (change %.2f / %.2f%%)",
-            self.config.ticker,
-            prediction,
-            expected_change,
-            pct_change * 100,
-        )
+        if confidences:
+            result["confidence"] = confidences
+        if training_report:
+            result["training_metrics"] = training_report
         return result
+
+    # ------------------------------------------------------------------
+    # Feature importance
+    # ------------------------------------------------------------------
+    def feature_importance(self, target: str = "close") -> Dict[str, float]:
+        model = self.models.get(target) or self.load_model(target)
+        feature_columns = self.metadata.get("feature_columns")
+        if not feature_columns:
+            raise RuntimeError("Feature columns unknown; train the model first.")
+        return extract_feature_importance(model, list(feature_columns))
+
+    def list_available_models(self) -> Dict[str, str]:
+        entries = {}
+        for target in self.config.prediction_targets:
+            path = self.config.model_path_for(target)
+            if path.exists():
+                entries[target] = str(path)
+        return entries
+
+    # ------------------------------------------------------------------
+    # Backtesting
+    # ------------------------------------------------------------------
+    def run_backtest(self, targets: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+        X, y_targets = self.prepare_features()
+        requested_targets = list(targets) if targets else list(self.config.prediction_targets)
+        results: dict[str, Any] = {}
+
+        for target in requested_targets:
+            if target not in y_targets:
+                LOGGER.warning("Skipping backtest for target '%s' (no data available).", target)
+                continue
+            factory = ModelFactory(
+                self.config.model_type,
+                {**self.config.model_params.get("global", {}), **self.config.model_params.get(target, {})},
+            )
+            y_clean = y_targets[target].dropna()
+            aligned_X = X.loc[y_clean.index]
+
+            backtester = Backtester(
+                model_factory=factory,
+                strategy=self.config.backtest_strategy,
+                window=self.config.backtest_window,
+                step=self.config.backtest_step,
+            )
+            result = backtester.run(aligned_X, y_clean, target)
+            results[target] = {
+                "aggregate": result.aggregate,
+                "splits": result.splits,
+            }
+            self.tracker.log_run(
+                target=target,
+                run_type="backtest",
+                parameters={
+                    "model_type": self.config.model_type,
+                    "strategy": self.config.backtest_strategy,
+                    "window": self.config.backtest_window,
+                    "step": self.config.backtest_step,
+                },
+                metrics=result.aggregate,
+                context={"splits": result.splits},
+            )
+        return results
+

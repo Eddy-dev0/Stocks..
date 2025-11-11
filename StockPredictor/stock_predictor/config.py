@@ -29,6 +29,18 @@ class PredictorConfig:
     news_api_key: Optional[str] = None
     news_limit: int = 50
     sentiment: bool = True
+    feature_sets: list[str] = field(
+        default_factory=lambda: ["technical", "elliott", "fundamental", "sentiment", "macro"]
+    )
+    prediction_targets: list[str] = field(
+        default_factory=lambda: ["close", "return", "direction"]
+    )
+    model_params: dict[str, dict[str, object]] = field(default_factory=dict)
+    test_size: float = 0.2
+    shuffle_training: bool = False
+    backtest_strategy: str = "rolling"
+    backtest_window: int = 252
+    backtest_step: int = 20
 
     def ensure_directories(self) -> None:
         """Ensure that data and model directories exist."""
@@ -52,6 +64,16 @@ class PredictorConfig:
     def metrics_path(self) -> Path:
         return self.models_dir / f"{self.ticker}_{self.model_type}_metrics.json"
 
+    def model_path_for(self, target: str) -> Path:
+        return self.models_dir / f"{self.ticker}_{self.model_type}_{target}.joblib"
+
+    def metrics_path_for(self, target: str) -> Path:
+        return self.models_dir / f"{self.ticker}_{self.model_type}_{target}_metrics.json"
+
+    @property
+    def database_path(self) -> Path:
+        return self.models_dir / "experiments.sqlite"
+
 
 def load_environment() -> None:
     """Load configuration from an optional ``.env`` file."""
@@ -70,6 +92,14 @@ def build_config(
     news_api_key: Optional[str] = None,
     news_limit: int = 50,
     sentiment: bool = True,
+    feature_sets: Optional[list[str]] = None,
+    prediction_targets: Optional[list[str]] = None,
+    model_params: Optional[dict[str, dict[str, object]]] = None,
+    test_size: float = 0.2,
+    shuffle_training: bool = False,
+    backtest_strategy: str = "rolling",
+    backtest_window: int = 252,
+    backtest_step: int = 20,
 ) -> PredictorConfig:
     """Build a :class:`PredictorConfig` instance from string parameters."""
 
@@ -100,6 +130,14 @@ def build_config(
         or os.getenv("ALPHAVANTAGE_API_KEY"),
         news_limit=news_limit,
         sentiment=sentiment,
+        feature_sets=feature_sets or ["technical", "elliott", "fundamental", "sentiment", "macro"],
+        prediction_targets=prediction_targets or ["close", "return", "direction"],
+        model_params=model_params or {},
+        test_size=test_size,
+        shuffle_training=shuffle_training,
+        backtest_strategy=backtest_strategy,
+        backtest_window=backtest_window,
+        backtest_step=backtest_step,
     )
     config.ensure_directories()
     return config

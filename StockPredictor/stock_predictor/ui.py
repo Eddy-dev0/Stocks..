@@ -376,6 +376,8 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
             prediction = ai.predict(refresh_data=refresh)
 
             metrics = prediction.get("training_metrics")
+            if isinstance(metrics, dict) and "mae" not in metrics:
+                metrics = metrics.get("close") or next(iter(metrics.values()), {})
             if not metrics:
                 metrics = self._load_metrics(config)
 

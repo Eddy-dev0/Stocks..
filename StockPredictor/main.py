@@ -31,7 +31,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=["download-data", "train", "predict"],
+        choices=["download-data", "train", "predict", "backtest", "importance", "list-models"],
         default=default_mode,
         help=(
             "Pipeline mode to run. Defaults to the value of the "
@@ -59,7 +59,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--model-type",
         default="random_forest",
-        help="Model type to use (currently only random_forest is implemented).",
+        help="Model type to use (random_forest, lightgbm, xgboost, hist_gb, mlp, logistic).",
     )
     parser.add_argument(
         "--data-dir",
@@ -88,6 +88,51 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--refresh-data",
         action="store_true",
         help="Force redownload of remote data before processing.",
+    )
+    parser.add_argument(
+        "--targets",
+        help="Comma separated list of prediction targets to train/predict/backtest.",
+    )
+    parser.add_argument(
+        "--feature-sets",
+        help="Comma separated list of feature blocks to enable (technical, elliott, fundamental, sentiment, macro).",
+    )
+    parser.add_argument(
+        "--model-params",
+        help="JSON string describing model hyper-parameters (global/target overrides).",
+    )
+    parser.add_argument(
+        "--test-size",
+        type=float,
+        default=0.2,
+        help="Test set proportion for holdout validation (default: 0.2).",
+    )
+    parser.add_argument(
+        "--shuffle-training",
+        action="store_true",
+        help="Shuffle rows before the train/test split (useful for non-time-series experimentation).",
+    )
+    parser.add_argument(
+        "--backtest-window",
+        type=int,
+        default=252,
+        help="Training window length for rolling/expanding backtests (default: 252).",
+    )
+    parser.add_argument(
+        "--backtest-step",
+        type=int,
+        default=20,
+        help="Number of rows to advance between backtest splits (default: 20).",
+    )
+    parser.add_argument(
+        "--backtest-strategy",
+        choices=["rolling", "expanding"],
+        default="rolling",
+        help="Backtest strategy to use when evaluating models.",
+    )
+    parser.add_argument(
+        "--target",
+        help="Focus on a single target when reporting importance or predictions.",
     )
     parser.add_argument(
         "--log-level",
@@ -134,6 +179,18 @@ def main(argv: list[str] | None = None) -> int:
         run_app(default_ticker=args.ticker, options=options)
         return 0
 
+    def parse_csv(value: str | None) -> list[str] | None:
+        if not value:
+            return None
+        return [item.strip() for item in value.split(",") if item.strip()]
+
+    model_params = None
+    if args.model_params:
+        try:
+            model_params = json.loads(args.model_params)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"Failed to parse --model-params: {exc}") from exc
+
     config = build_config(
         ticker=args.ticker,
         start_date=args.start_date,
@@ -145,6 +202,14 @@ def main(argv: list[str] | None = None) -> int:
         news_api_key=args.news_api_key,
         news_limit=args.news_limit,
         sentiment=not args.no_sentiment,
+        feature_sets=parse_csv(args.feature_sets) or None,
+        prediction_targets=parse_csv(args.targets) or None,
+        model_params=model_params,
+        test_size=args.test_size,
+        shuffle_training=args.shuffle_training,
+        backtest_strategy=args.backtest_strategy,
+        backtest_window=args.backtest_window,
+        backtest_step=args.backtest_step,
     )
 
     ai = StockPredictorAI(config)
@@ -157,11 +222,22 @@ def main(argv: list[str] | None = None) -> int:
         elif args.mode == "train":
             if args.refresh_data:
                 ai.download_data(force=True)
-            metrics = ai.train_model()
+            metrics = ai.train_model(targets=parse_csv(args.targets))
             print(json.dumps({"status": "ok", "metrics": metrics}, indent=2))
         elif args.mode == "predict":
-            prediction = ai.predict(refresh_data=args.refresh_data)
+            targets = parse_csv(args.targets) if args.targets else ([args.target] if args.target else None)
+            prediction = ai.predict(refresh_data=args.refresh_data, targets=targets)
             print(json.dumps({"status": "ok", "prediction": prediction}, indent=2))
+        elif args.mode == "backtest":
+            results = ai.run_backtest(targets=parse_csv(args.targets))
+            print(json.dumps({"status": "ok", "backtest": results}, indent=2))
+        elif args.mode == "importance":
+            target = args.target or "close"
+            importance = ai.feature_importance(target=target)
+            print(json.dumps({"status": "ok", "target": target, "importance": importance}, indent=2))
+        elif args.mode == "list-models":
+            models = ai.list_available_models()
+            print(json.dumps({"status": "ok", "models": models}, indent=2))
         else:
             raise ValueError(f"Unsupported mode: {args.mode}")
     except Exception as exc:  # pylint: disable=broad-except
