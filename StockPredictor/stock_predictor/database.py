@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Iterator
@@ -23,6 +23,7 @@ from sqlalchemy import (
     select,
 )
 from sqlalchemy.dialects.sqlite import insert
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 LOGGER = logging.getLogger(__name__)
@@ -197,6 +198,7 @@ class Database:
     """High level database helper built on top of SQLAlchemy."""
 
     url: str
+    engine: Engine = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.url.startswith("sqlite:///"):
