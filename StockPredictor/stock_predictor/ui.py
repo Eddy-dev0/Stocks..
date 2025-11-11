@@ -25,6 +25,7 @@ from matplotlib.patches import Rectangle
 
 from .config import PredictorConfig, build_config
 from .elliott import WaveSegment, apply_wave_features
+from .etl import NoPriceDataError
 from .model import ModelNotFoundError, StockPredictorAI
 from .preprocessing import compute_price_features
 
@@ -153,6 +154,11 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         self.latest_metrics: Optional[Dict[str, Any]] = None
         self.wave_annotations: list[WaveSegment] = []
         self.wave_annotations_base: list[WaveSegment] = []
+
+        self.explanation_summary_var = tk.StringVar(value="Run a prediction to see explanation details.")
+        self.explanation_reason_vars: dict[str, tk.StringVar] = {}
+        self.feature_importance_tree: ttk.Treeview | None = None
+        self.sources_text: tk.Text | None = None
 
         self._interactive_widgets: list[tk.Widget] = []
 
@@ -353,6 +359,73 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         prediction_tab.columnconfigure(0, weight=1)
         prediction_tab.columnconfigure(1, weight=1)
 
+        # Explanation tab
+        explanation_tab = ttk.Frame(notebook, padding=20)
+        notebook.add(explanation_tab, text="Explanation")
+
+        summary_label = ttk.Label(
+            explanation_tab,
+            textvariable=self.explanation_summary_var,
+            font=("Helvetica", 13, "bold"),
+            justify="left",
+            wraplength=780,
+        )
+        summary_label.grid(column=0, row=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        sections = [
+            ("Technical signals", "technical_reasons"),
+            ("Fundamental context", "fundamental_reasons"),
+            ("Sentiment", "sentiment_reasons"),
+            ("Macro backdrop", "macro_reasons"),
+        ]
+        for index, (title, key) in enumerate(sections, start=1):
+            frame = ttk.LabelFrame(explanation_tab, text=title)
+            frame.grid(column=0, row=index, columnspan=2, sticky="ew", pady=6)
+            frame.columnconfigure(0, weight=1)
+            var = tk.StringVar(value="No signals available yet.")
+            self.explanation_reason_vars[key] = var
+            ttk.Label(
+                frame,
+                textvariable=var,
+                justify="left",
+                wraplength=760,
+            ).grid(column=0, row=0, sticky="w", padx=6, pady=4)
+
+        importance_frame = ttk.LabelFrame(explanation_tab, text="Top features")
+        importance_frame.grid(column=0, row=len(sections) + 1, sticky="nsew", pady=(10, 6))
+        columns = ("feature", "importance", "category")
+        tree = ttk.Treeview(
+            importance_frame,
+            columns=columns,
+            show="headings",
+            height=8,
+        )
+        tree.heading("feature", text="Feature")
+        tree.heading("importance", text="Importance")
+        tree.heading("category", text="Category")
+        tree.column("feature", width=260, anchor="w")
+        tree.column("importance", width=120, anchor="center")
+        tree.column("category", width=120, anchor="center")
+        tree.grid(column=0, row=0, sticky="nsew")
+        importance_frame.columnconfigure(0, weight=1)
+        importance_frame.rowconfigure(0, weight=1)
+        self.feature_importance_tree = tree
+
+        sources_frame = ttk.LabelFrame(explanation_tab, text="Data sources")
+        sources_frame.grid(column=0, row=len(sections) + 2, sticky="nsew", pady=(10, 0))
+        sources_frame.columnconfigure(0, weight=1)
+        text_widget = tk.Text(
+            sources_frame,
+            height=6,
+            wrap="word",
+            state="disabled",
+            font=("Helvetica", 11),
+        )
+        text_widget.grid(column=0, row=0, sticky="nsew")
+        self.sources_text = text_widget
+
+        explanation_tab.columnconfigure(0, weight=1)
+
         # Logs tab
         logs_tab = ttk.Frame(notebook, padding=10)
         notebook.add(logs_tab, text="Details & Logs")
@@ -370,6 +443,8 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         ttk.Label(footer, textvariable=self.last_updated_var, font=("Helvetica", 10)).pack(
             side="left", padx=(20, 0)
         )
+
+        self._clear_explanation_tab()
 
     # ------------------------------------------------------------------
     # UI event handlers
@@ -447,6 +522,9 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
                     last_updated=ai.fetcher.get_last_updated("prices"),
                 ),
             )
+        except NoPriceDataError as exc:
+            LOGGER.error("Prediction failed for %s - no price data", ticker, exc_info=True)
+            self.after(0, lambda msg=str(exc): self._show_error_message(msg))
         except Exception as exc:  # pylint: disable=broad-except
             LOGGER.exception("Prediction failed for %s", ticker)
             if isinstance(exc, ModelNotFoundError):
@@ -516,6 +594,7 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         )
         self._set_status(f"Prediction ready for {ticker}", error=False)
         self._toggle_inputs(state=tk.NORMAL)
+        self._update_explanation_tab(prediction.get("explanation"))
 
     def _on_prediction_error(self, message: str) -> None:
         self._set_status(message, error=True)
@@ -769,6 +848,74 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         self.metric_vars["r2"].set(self._format_number(metrics.get("r2")))
         self.metric_vars["training_rows"].set(self._format_int(metrics.get("training_rows")))
         self.metric_vars["test_rows"].set(self._format_int(metrics.get("test_rows")))
+
+    def _update_explanation_tab(self, explanation: Optional[Dict[str, Any]]) -> None:
+        if explanation is None:
+            self._clear_explanation_tab("No detailed explanation available for this prediction.")
+            return
+
+        summary = explanation.get("summary") or "No summary available."
+        self.explanation_summary_var.set(summary)
+
+        for key, var in self.explanation_reason_vars.items():
+            entries = explanation.get(key) or []
+            if entries:
+                formatted = "\n".join(f"• {item}" for item in entries)
+            else:
+                formatted = "No signals identified."
+            var.set(formatted)
+
+        if self.feature_importance_tree is not None:
+            tree = self.feature_importance_tree
+            for item in tree.get_children():
+                tree.delete(item)
+            items = explanation.get("feature_importance") or []
+            if items:
+                for entry in items:
+                    name = entry.get("name", "-")
+                    importance = entry.get("importance")
+                    try:
+                        importance_str = f"{float(importance):.4f}"
+                    except (TypeError, ValueError):
+                        importance_str = "-"
+                    category = entry.get("category", "-")
+                    tree.insert("", "end", values=(name, importance_str, category))
+            else:
+                tree.insert("", "end", values=("No feature importance available", "-", "-"))
+
+        if self.sources_text is not None:
+            sources = explanation.get("sources") or []
+            self.sources_text.configure(state="normal")
+            self.sources_text.delete("1.0", tk.END)
+            if sources:
+                self.sources_text.insert("1.0", "\n".join(f"• {source}" for source in sources))
+            else:
+                self.sources_text.insert("1.0", "No data sources were recorded for this run.")
+            self.sources_text.configure(state="disabled")
+
+    def _clear_explanation_tab(self, message: str | None = None) -> None:
+        summary = message or "Run a prediction to see explanation details."
+        self.explanation_summary_var.set(summary)
+        for var in self.explanation_reason_vars.values():
+            var.set("No signals available yet.")
+        if self.feature_importance_tree is not None:
+            tree = self.feature_importance_tree
+            for item in tree.get_children():
+                tree.delete(item)
+            tree.insert("", "end", values=("No data", "-", "-"))
+        if self.sources_text is not None:
+            self.sources_text.configure(state="normal")
+            self.sources_text.delete("1.0", tk.END)
+            self.sources_text.insert("1.0", "No sources recorded yet.")
+            self.sources_text.configure(state="disabled")
+
+    def _show_error_message(self, message: str) -> None:
+        self._set_status(message, error=True)
+        try:
+            messagebox.showerror("Prediction error", message, parent=self)
+        except tk.TclError:
+            LOGGER.warning("Unable to display error dialog: %s", message)
+        self._toggle_inputs(state=tk.NORMAL)
 
     # ------------------------------------------------------------------
     # Logging integration

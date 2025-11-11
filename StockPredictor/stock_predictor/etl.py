@@ -4,19 +4,50 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Iterable, Tuple
+from typing import DefaultDict, Dict, Iterable, Tuple
 
 import pandas as pd
 import requests
 import yfinance as yf
+from urllib.error import HTTPError
 
 from .config import PredictorConfig
 from .database import Database
 from .preprocessing import compute_price_features
 
 LOGGER = logging.getLogger(__name__)
+
+YF_PRICES_MISSING_ERROR = getattr(yf, "YFPricesMissingError", None)
+YF_TZ_MISSING_ERROR = getattr(yf, "YFTzMissingError", None)
+
+YFINANCE_DOWNLOAD_ERRORS: tuple[type[Exception], ...] = tuple(
+    exc
+    for exc in (YF_PRICES_MISSING_ERROR, YF_TZ_MISSING_ERROR)
+    if isinstance(exc, type) and issubclass(exc, Exception)
+)
+
+
+class NoPriceDataError(RuntimeError):
+    """Raised when a ticker fails to yield any price observations."""
+
+    def __init__(self, ticker: str, message: str = "") -> None:
+        self.ticker = ticker
+        base = f"No price data returned for ticker {ticker}."
+        if message:
+            base = f"{base} Details: {message}"
+        super().__init__(base)
+
+
+TICKER_HINTS: dict[str, str] = {
+    "RHEINMETALL": "Try RHM.DE (XETRA).",
+    "RHM": "Try RHM.DE (XETRA).",
+    "S&P": "Try ^GSPC for the S&P 500 index.",
+    "SP500": "Try ^GSPC for the S&P 500 index.",
+    "NYSE": "Try ^NYA for NYSE composite.",
+}
 
 TECHNICAL_INDICATORS = [
     "Return_1d",
@@ -51,6 +82,7 @@ class MarketDataETL:
     def __init__(self, config: PredictorConfig, database: Database | None = None) -> None:
         self.config = config
         self.database = database or Database(config.database_url)
+        self._source_log: DefaultDict[str, set[str]] = defaultdict(set)
 
     # ------------------------------------------------------------------
     # Public refresh API
@@ -69,6 +101,10 @@ class MarketDataETL:
             )
         if not force and self._covers_requested_range(existing):
             LOGGER.debug("Price data already present for %s", self.config.ticker)
+            self._record_source(
+                "database",
+                f"Cached price history for {self.config.ticker} ({self.config.interval} interval)",
+            )
             return RefreshResult(existing, downloaded=False)
 
         LOGGER.info(
@@ -77,14 +113,39 @@ class MarketDataETL:
             self.config.start_date,
             self.config.end_date or "today",
         )
-        downloaded = self._download_price_data()
+        try:
+            downloaded = self._download_price_data()
+        except HTTPError as exc:
+            LOGGER.error("HTTP error while downloading prices for %s: %s", self.config.ticker, exc)
+            raise NoPriceDataError(
+                self.config.ticker,
+                self._compose_error_message(str(exc)),
+            ) from exc
+        except Exception as exc:  # pylint: disable=broad-except
+            if YFINANCE_DOWNLOAD_ERRORS and isinstance(exc, YFINANCE_DOWNLOAD_ERRORS):  # type: ignore[arg-type]
+                LOGGER.error("Failed to download prices for %s: %s", self.config.ticker, exc)
+                raise NoPriceDataError(
+                    self.config.ticker,
+                    self._compose_error_message(str(exc)),
+                ) from exc
+            raise
+
         if downloaded.empty:
-            raise RuntimeError(
-                f"No price data returned for ticker {self.config.ticker}."
+            LOGGER.error(
+                "No price data returned for ticker %s in requested range",
+                self.config.ticker,
+            )
+            raise NoPriceDataError(
+                self.config.ticker,
+                self._compose_error_message("Empty dataframe from data provider."),
             )
         self.database.upsert_prices(self.config.ticker, self.config.interval, downloaded)
         self.database.set_refresh_timestamp(
             self.config.ticker, self.config.interval, "prices"
+        )
+        self._record_source(
+            "yfinance",
+            f"Price history for {self.config.ticker} ({self.config.interval} interval)",
         )
         refreshed = self.database.get_prices(
             ticker=self.config.ticker,
@@ -92,6 +153,11 @@ class MarketDataETL:
             start=self.config.start_date,
             end=self.config.end_date,
         )
+        if refreshed.empty:
+            raise NoPriceDataError(
+                self.config.ticker,
+                self._compose_error_message("Cached dataset is empty after refresh."),
+            )
         return RefreshResult(refreshed, downloaded=True)
 
     def refresh_indicators(
@@ -132,6 +198,7 @@ class MarketDataETL:
             self.database.set_refresh_timestamp(
                 self.config.ticker, self.config.interval, "indicators"
             )
+            self._record_source("local", "Derived technical indicators from price history")
         return inserted
 
     def refresh_fundamentals(self, force: bool = False) -> int:
@@ -185,6 +252,7 @@ class MarketDataETL:
             self.database.set_refresh_timestamp(
                 self.config.ticker, "global", "fundamentals"
             )
+            self._record_source("yfinance", f"Fundamental statements for {self.config.ticker}")
         return inserted
 
     def refresh_macro(self, force: bool = False) -> int:
@@ -244,6 +312,11 @@ class MarketDataETL:
         if inserted:
             self.database.set_refresh_timestamp(
                 self.config.ticker, self.config.interval, "macro"
+            )
+            self._record_source(
+                "yfinance",
+                "Macro indicators: "
+                + ", ".join(f"{symbol} ({name})" for symbol, name in MACRO_SYMBOLS.items()),
             )
         return inserted
 
@@ -310,6 +383,7 @@ class MarketDataETL:
             self.database.set_refresh_timestamp(
                 self.config.ticker, "global", "news"
             )
+            self._record_source("news_api", f"News and sentiment articles for {self.config.ticker}")
         refreshed = self.database.get_news(self.config.ticker)
         return RefreshResult(refreshed, downloaded=True)
 
@@ -355,6 +429,29 @@ class MarketDataETL:
         df = df.rename(columns={df.columns[0]: "Date"})
         df.columns = [col.title() if isinstance(col, str) else col for col in df.columns]
         return df
+
+    def list_sources(self) -> list[str]:
+        entries: list[str] = []
+        for provider, descriptions in self._source_log.items():
+            for description in sorted(descriptions):
+                entries.append(f"{provider}: {description}")
+        return entries
+
+    def _record_source(self, provider: str, description: str) -> None:
+        self._source_log[provider].add(description)
+
+    def _compose_error_message(self, message: str | None) -> str:
+        parts: list[str] = []
+        if message:
+            parts.append(message)
+        hint = self._ticker_hint()
+        if hint:
+            parts.append(f"Hint: {hint}")
+        return " ".join(parts)
+
+    def _ticker_hint(self) -> str:
+        ticker_upper = (self.config.ticker or "").upper()
+        return TICKER_HINTS.get(ticker_upper, "")
 
     def _covers_requested_range(self, frame: pd.DataFrame) -> bool:
         if frame.empty:
@@ -406,5 +503,5 @@ class MarketDataETL:
         return records
 
 
-__all__ = ["MarketDataETL", "RefreshResult"]
+__all__ = ["MarketDataETL", "RefreshResult", "NoPriceDataError"]
 

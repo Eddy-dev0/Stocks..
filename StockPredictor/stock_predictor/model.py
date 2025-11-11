@@ -77,7 +77,10 @@ class StockPredictorAI:
             news_df = pd.DataFrame()
 
         feature_result = self.feature_assembler.build(price_df, news_df, self.config.sentiment)
-        self.metadata = feature_result.metadata
+        metadata = dict(feature_result.metadata)
+        metadata.setdefault("sentiment_daily", pd.DataFrame(columns=["Date", "sentiment"]))
+        metadata["data_sources"] = self.fetcher.get_data_sources()
+        self.metadata = metadata
         return feature_result.features, feature_result.targets
 
     # ------------------------------------------------------------------
@@ -272,11 +275,251 @@ class StockPredictorAI:
             result["confidence"] = confidences
         if training_report:
             result["training_metrics"] = training_report
+        explanation = self._build_prediction_explanation(result, predictions)
+        if explanation:
+            result["explanation"] = explanation
         return result
 
     # ------------------------------------------------------------------
     # Feature importance
     # ------------------------------------------------------------------
+    def _build_prediction_explanation(
+        self,
+        prediction: Dict[str, Any],
+        raw_predictions: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        _ = raw_predictions
+        latest_features = self.metadata.get("latest_features")
+        if latest_features is None:
+            return None
+        if not isinstance(latest_features, pd.DataFrame) or latest_features.empty:
+            return None
+
+        try:
+            feature_row = latest_features.iloc[0]
+        except (KeyError, IndexError):
+            LOGGER.debug("Latest feature snapshot is unavailable for explanation generation.")
+            return None
+
+        reasons = {
+            "technical_reasons": self._technical_reasons(feature_row),
+            "fundamental_reasons": self._fundamental_reasons(feature_row),
+            "sentiment_reasons": self._sentiment_reasons(),
+            "macro_reasons": self._macro_reasons(feature_row),
+        }
+
+        summary = self._compose_summary(prediction, reasons)
+        feature_importance = self._collect_feature_importance()
+        sources_raw = self.metadata.get("data_sources") or self.fetcher.get_data_sources()
+        sources = list(sources_raw) if isinstance(sources_raw, (list, tuple, set)) else []
+        if not sources:
+            sources = [f"Database cache: price history for {self.config.ticker}."]
+
+        explanation: Dict[str, Any] = {
+            "summary": summary,
+            **reasons,
+            "feature_importance": feature_importance,
+            "sources": sources,
+        }
+        return explanation
+
+    def _technical_reasons(self, feature_row: pd.Series) -> list[str]:
+        reasons: list[str] = []
+        rsi = self._safe_float(feature_row.get("RSI_14"))
+        if rsi is not None:
+            if rsi >= 70:
+                reasons.append(f"RSI(14) at {rsi:.1f} indicates overbought conditions.")
+            elif rsi <= 30:
+                reasons.append(f"RSI(14) at {rsi:.1f} signals potential oversold rebound.")
+
+        macd = self._safe_float(feature_row.get("MACD"))
+        signal = self._safe_float(feature_row.get("Signal"))
+        if macd is not None and signal is not None:
+            if macd > signal:
+                reasons.append("MACD line above signal line, supporting bullish momentum.")
+            elif macd < signal:
+                reasons.append("MACD line below signal line, indicating bearish momentum.")
+
+        close_price = self._safe_float(self.metadata.get("latest_close"))
+        upper_band = self._safe_float(feature_row.get("Bollinger_Upper"))
+        lower_band = self._safe_float(feature_row.get("Bollinger_Lower"))
+        if close_price is not None and upper_band is not None and close_price > upper_band:
+            reasons.append("Price recently closed above the Bollinger upper band, suggesting mean reversion risk.")
+        if close_price is not None and lower_band is not None and close_price < lower_band:
+            reasons.append("Price recently closed below the Bollinger lower band, signalling potential rebound.")
+
+        sma5 = self._safe_float(feature_row.get("SMA_5"))
+        sma20 = self._safe_float(feature_row.get("SMA_20"))
+        if sma5 is not None and sma20 is not None:
+            if sma5 > sma20:
+                reasons.append("Short-term SMA(5) above SMA(20), highlighting positive short-term momentum.")
+            elif sma5 < sma20:
+                reasons.append("Short-term SMA(5) below SMA(20), highlighting weakening short-term momentum.")
+
+        daily_return = self._safe_float(feature_row.get("Return_1d"))
+        if daily_return is not None and abs(daily_return) >= 0.02:
+            direction = "gain" if daily_return > 0 else "loss"
+            reasons.append(
+                f"Latest session showed a {abs(daily_return) * 100:.2f}% {direction}, influencing near-term trend."
+            )
+
+        volume_change = self._safe_float(feature_row.get("Volume_Change"))
+        if volume_change is not None and abs(volume_change) >= 0.15:
+            if volume_change > 0:
+                reasons.append("Volume expanding versus prior day, confirming the latest move.")
+            else:
+                reasons.append("Volume contraction versus prior day, weakening conviction in the latest move.")
+
+        return reasons
+
+    def _fundamental_reasons(self, feature_row: pd.Series) -> list[str]:
+        reasons: list[str] = []
+        ratio20 = self._safe_float(feature_row.get("Price_to_SMA20"))
+        if ratio20 is not None:
+            if ratio20 > 1.05:
+                reasons.append(
+                    f"Price sits {((ratio20 - 1) * 100):.1f}% above the 20-day average, pointing to stretched valuation versus recent trend."
+                )
+            elif ratio20 < 0.95:
+                reasons.append(
+                    f"Price sits {((1 - ratio20) * 100):.1f}% below the 20-day average, suggesting discounted pricing versus recent trend."
+                )
+
+        ratio200 = self._safe_float(feature_row.get("Price_to_SMA200"))
+        if ratio200 is not None:
+            if ratio200 > 1.10:
+                reasons.append("Price trading well above the 200-day average, reflecting optimistic longer-term positioning.")
+            elif ratio200 < 0.90:
+                reasons.append("Price trading well below the 200-day average, reflecting longer-term pessimism.")
+
+        momentum12 = self._safe_float(feature_row.get("Momentum_12"))
+        if momentum12 is not None and abs(momentum12) >= 0.1:
+            if momentum12 > 0:
+                reasons.append(f"Twelve-month momentum of {momentum12 * 100:.1f}% underscores longer-term strength.")
+            else:
+                reasons.append(f"Twelve-month momentum of {momentum12 * 100:.1f}% highlights longer-term weakness.")
+
+        return reasons
+
+    def _sentiment_reasons(self) -> list[str]:
+        reasons: list[str] = []
+        sentiment_df = self.metadata.get("sentiment_daily")
+        if isinstance(sentiment_df, pd.DataFrame) and not sentiment_df.empty:
+            latest = sentiment_df.iloc[-1]
+            avg = self._safe_float(latest.get("Sentiment_Avg") or latest.get("sentiment"))
+            change = self._safe_float(latest.get("Sentiment_Change"))
+            if avg is not None:
+                if avg >= 0.15:
+                    reasons.append("News sentiment has been positive over the last week.")
+                elif avg <= -0.15:
+                    reasons.append("News sentiment has been negative over the last week.")
+            if change is not None and abs(change) >= 0.1:
+                if change > 0:
+                    reasons.append("Sentiment momentum improving versus the prior period.")
+                else:
+                    reasons.append("Sentiment momentum deteriorating versus the prior period.")
+        return reasons
+
+    def _macro_reasons(self, feature_row: pd.Series) -> list[str]:
+        reasons: list[str] = []
+        vol21 = self._safe_float(feature_row.get("Volatility_21"))
+        if vol21 is not None and vol21 >= 0.03:
+            reasons.append("Short-term realised volatility elevated, indicating choppy market conditions.")
+
+        trend_slope = self._safe_float(feature_row.get("Trend_Slope"))
+        if trend_slope is not None:
+            if trend_slope > 0:
+                reasons.append("Medium-term trend slope positive, supporting upward bias.")
+            elif trend_slope < 0:
+                reasons.append("Medium-term trend slope negative, signalling downward bias.")
+
+        trend_curvature = self._safe_float(feature_row.get("Trend_Curvature"))
+        if trend_curvature is not None and trend_curvature < 0:
+            reasons.append("Trend curvature turning lower, hinting at deceleration in momentum.")
+
+        return reasons
+
+    def _compose_summary(self, prediction: Dict[str, Any], reasons: Dict[str, list[str]]) -> str:
+        change = self._safe_float(prediction.get("expected_change"))
+        pct_change = self._safe_float(prediction.get("expected_change_pct"))
+        if change is None or not np.isfinite(change):
+            direction = "Neutral"
+        elif change > 0:
+            direction = "Bullish"
+        elif change < 0:
+            direction = "Bearish"
+        else:
+            direction = "Neutral"
+
+        highlight = next(
+            (reason for key in ("technical_reasons", "sentiment_reasons", "macro_reasons", "fundamental_reasons") for reason in reasons.get(key, []) if reason),
+            "",
+        )
+        sentences: list[str] = []
+        if highlight and direction != "Neutral":
+            clause = highlight.rstrip(".")
+            if clause:
+                sentences.append(f"{direction} outlook driven by {clause}.")
+            else:
+                sentences.append(f"{direction} outlook.")
+        else:
+            sentences.append(f"{direction} outlook.")
+            if highlight:
+                sentences.append(f"Key driver: {highlight}")
+
+        if pct_change is not None and np.isfinite(pct_change) and pct_change != 0:
+            sentences.append(f"Expected move of {pct_change * 100:.2f}% versus the last close.")
+
+        summary = " ".join(sentence.strip() for sentence in sentences if sentence)
+        return summary.strip()
+
+    def _collect_feature_importance(self, top_n: int = 10) -> list[Dict[str, Any]]:
+        try:
+            importance_map = self.feature_importance("close")
+        except Exception as exc:  # pylint: disable=broad-except
+            LOGGER.debug("Feature importance unavailable: %s", exc)
+            return []
+        if not importance_map:
+            return []
+
+        ordered = sorted(importance_map.items(), key=lambda item: abs(item[1]), reverse=True)[:top_n]
+        results: list[Dict[str, Any]] = []
+        for name, value in ordered:
+            category = self._categorize_feature_name(name)
+            results.append({
+                "name": name,
+                "importance": float(value),
+                "category": category,
+            })
+        return results
+
+    @staticmethod
+    def _categorize_feature_name(name: str) -> str:
+        token = name.lower()
+        if any(keyword in token for keyword in ("rsi", "macd", "bollinger", "sma", "ema", "atr", "return")):
+            return "technical"
+        if "sentiment" in token:
+            return "sentiment"
+        if any(keyword in token for keyword in ("volatility", "trend", "correlation")):
+            return "macro"
+        if any(keyword in token for keyword in ("price_to", "momentum", "liquidity")):
+            return "fundamental"
+        if "volume" in token or "obv" in token:
+            return "price"
+        return "other"
+
+    @staticmethod
+    def _safe_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        if np.isnan(result):
+            return None
+        return result
+
     def feature_importance(self, target: str = "close") -> Dict[str, float]:
         model = self.models.get(target) or self.load_model(target)
         feature_columns = self.metadata.get("feature_columns")

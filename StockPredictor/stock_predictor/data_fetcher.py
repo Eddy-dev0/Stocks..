@@ -85,6 +85,11 @@ class DataFetcher:
             self.config.ticker, interval, category
         )
 
+    def get_data_sources(self) -> list[str]:
+        """Return a human-readable list of data sources touched during the ETL run."""
+
+        return self.etl.list_sources()
+
     def _interval_for_category(self, category: str) -> str:
         if category in {"prices", "indicators", "macro"}:
             return self.config.interval
