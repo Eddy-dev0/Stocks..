@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import queue
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import math
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -22,7 +24,9 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 
 from .config import PredictorConfig, build_config
+from .elliott import WaveSegment, apply_wave_features
 from .model import StockPredictorAI
+from .preprocessing import compute_price_features
 
 LOGGER = logging.getLogger(__name__)
 
@@ -39,6 +43,16 @@ TIMEFRAME_WINDOWS: dict[str, int] = {
 COLOR_GAIN = "#15803d"
 COLOR_LOSS = "#dc2626"
 COLOR_NEUTRAL = "#1f2937"
+
+SMA_COLORS = {
+    "SMA_20": "#2563eb",
+    "SMA_50": "#9333ea",
+    "SMA_200": "#ef4444",
+}
+BOLLINGER_COLOR = "#93c5fd"
+MACD_LINE_COLOR = "#0f172a"
+MACD_SIGNAL_COLOR = "#22d3ee"
+PREDICTION_COLOR = "#f97316"
 
 
 @dataclass(slots=True)
@@ -135,6 +149,8 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         self.usd_to_eur_rate: float | None = None
         self.latest_prediction: Optional[Dict[str, Any]] = None
         self.latest_metrics: Optional[Dict[str, Any]] = None
+        self.wave_annotations: list[WaveSegment] = []
+        self.wave_annotations_base: list[WaveSegment] = []
 
         self._interactive_widgets: list[tk.Widget] = []
 
@@ -212,10 +228,24 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         notebook.add(chart_tab, text="Chart")
 
         self.figure = Figure(figsize=(6, 4), dpi=100)
-        self.chart_ax = self.figure.add_subplot(111)
-        self.chart_ax.set_title("Historical Prices")
-        self.chart_ax.set_ylabel(f"Price ({self._get_currency_symbol()})")
-        self.chart_ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
+        grid = self.figure.add_gridspec(4, 1, height_ratios=[3, 1, 1, 1], hspace=0.06)
+        self.price_ax = self.figure.add_subplot(grid[0])
+        self.rsi_ax = self.figure.add_subplot(grid[1], sharex=self.price_ax)
+        self.macd_ax = self.figure.add_subplot(grid[2], sharex=self.price_ax)
+        self.volume_ax = self.figure.add_subplot(grid[3], sharex=self.price_ax)
+        self.volume_obv_ax = self.volume_ax.twinx()
+        self.chart_ax = self.price_ax
+
+        for axis in (self.price_ax, self.rsi_ax, self.macd_ax, self.volume_ax):
+            axis.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
+
+        self.price_ax.set_title("Historical Prices")
+        self.price_ax.set_ylabel(f"Price ({self._get_currency_symbol()})")
+        self.rsi_ax.set_ylabel("RSI")
+        self.macd_ax.set_ylabel("MACD")
+        self.volume_ax.set_ylabel("Volume")
+        self.volume_obv_ax.set_ylabel("OBV")
+        self.volume_obv_ax.grid(False)
 
         self.canvas = FigureCanvasTkAgg(self.figure, master=chart_tab)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
@@ -427,7 +457,8 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         expected_cols = {"Open", "High", "Low", "Close"}
         if not expected_cols.issubset(df.columns):
             raise RuntimeError("Price data is missing OHLC columns.")
-        return df.sort_values("Date")
+        df = df.sort_values("Date")
+        return compute_price_features(df)
 
     def _load_metrics(self, config: PredictorConfig) -> Optional[Dict[str, Any]]:
         path: Path = config.metrics_path
@@ -474,10 +505,28 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
     # ------------------------------------------------------------------
     def _plot_price_data(self) -> None:
         df = self.price_data
+        axes = [
+            getattr(self, "price_ax", self.chart_ax),
+            getattr(self, "rsi_ax", None),
+            getattr(self, "macd_ax", None),
+            getattr(self, "volume_ax", None),
+            getattr(self, "volume_obv_ax", None),
+        ]
+        for axis in filter(None, axes):
+            axis.clear()
+
         if df.empty:
-            self.chart_ax.clear()
-            self.chart_ax.set_ylabel(f"Price ({self._get_currency_symbol()})")
-            self.chart_ax.text(0.5, 0.5, "No price data", ha="center", va="center")
+            self.price_ax.set_ylabel(f"Price ({self._get_currency_symbol()})")
+            self.price_ax.text(0.5, 0.5, "No price data", ha="center", va="center")
+            if hasattr(self, "rsi_ax"):
+                self.rsi_ax.set_ylabel("RSI")
+                self.rsi_ax.set_ylim(0, 100)
+            if hasattr(self, "macd_ax"):
+                self.macd_ax.set_ylabel("MACD")
+            if hasattr(self, "volume_ax"):
+                self.volume_ax.set_ylabel("Volume")
+            if hasattr(self, "volume_obv_ax"):
+                self.volume_obv_ax.set_ylabel("OBV")
             self.canvas.draw_idle()
             return
 
@@ -488,10 +537,23 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         if window_df.empty:
             window_df = df
 
-        self.chart_ax.clear()
-        self.chart_ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
-        self.chart_ax.set_title(f"{self.current_ticker or ''} Price History")
-        self.chart_ax.set_ylabel(f"Price ({self._get_currency_symbol()})")
+        for axis in (self.price_ax, self.rsi_ax, self.macd_ax, self.volume_ax):
+            axis.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
+
+        self.price_ax.set_title(f"{self.current_ticker or ''} Price History")
+        self.price_ax.set_ylabel(f"Price ({self._get_currency_symbol()})")
+        self.price_ax.tick_params(labelbottom=False)
+        self.rsi_ax.set_ylabel("RSI")
+        self.rsi_ax.set_ylim(0, 100)
+        self.rsi_ax.axhline(70, color=COLOR_LOSS, linestyle="--", linewidth=0.8, alpha=0.7)
+        self.rsi_ax.axhline(30, color=COLOR_GAIN, linestyle="--", linewidth=0.8, alpha=0.7)
+        self.rsi_ax.tick_params(labelbottom=False)
+        self.macd_ax.set_ylabel("MACD")
+        self.macd_ax.axhline(0, color=COLOR_NEUTRAL, linestyle="--", linewidth=0.8)
+        self.macd_ax.tick_params(labelbottom=False)
+        self.volume_ax.set_ylabel("Volume")
+        self.volume_obv_ax.set_ylabel("OBV")
+        self.volume_obv_ax.grid(False)
 
         dates = mdates.date2num(window_df["Date"].to_list())
         width = 0.6
@@ -501,7 +563,7 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
             high_price = float(row["High"])
             low_price = float(row["Low"])
             color = COLOR_GAIN if close_price >= open_price else COLOR_LOSS
-            self.chart_ax.plot([x, x], [low_price, high_price], color=color, linewidth=1.2)
+            self.price_ax.plot([x, x], [low_price, high_price], color=color, linewidth=1.2)
             body_bottom = min(open_price, close_price)
             body_height = max(abs(close_price - open_price), 0.01)
             rect = Rectangle(
@@ -512,11 +574,142 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
                 edgecolor=color,
                 alpha=0.8,
             )
-            self.chart_ax.add_patch(rect)
+            self.price_ax.add_patch(rect)
 
-        self.chart_ax.xaxis_date()
-        self.chart_ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+        for name, color in SMA_COLORS.items():
+            if name in window_df.columns:
+                self.price_ax.plot(dates, window_df[name], color=color, linewidth=1.2, label=name.replace("_", " "))
+
+        if {"BB_Upper_20", "BB_Lower_20"}.issubset(window_df.columns):
+            upper = window_df["BB_Upper_20"].to_numpy()
+            lower = window_df["BB_Lower_20"].to_numpy()
+            self.price_ax.fill_between(
+                dates,
+                lower,
+                upper,
+                color=BOLLINGER_COLOR,
+                alpha=0.15,
+                label="Bollinger Bands",
+            )
+
+        last_close = float(window_df["Close"].iloc[-1])
+        self.price_ax.scatter(dates[-1], last_close, color=COLOR_NEUTRAL, s=35, zorder=5, label="Last Close")
+
+        predicted_value = None
+        if self.latest_prediction:
+            predicted_value = self.latest_prediction.get("predicted_close")
+        if predicted_value is not None:
+            try:
+                predicted_value = float(predicted_value)
+            except (TypeError, ValueError):
+                predicted_value = None
+        if predicted_value is not None and not math.isnan(predicted_value):
+            predicted_date = window_df["Date"].max() + timedelta(days=1)
+            predicted_x = mdates.date2num(predicted_date)
+            converted_prediction = self._convert_currency_value(predicted_value)
+            y_value = converted_prediction if converted_prediction is not None else predicted_value
+            self.price_ax.scatter(
+                predicted_x,
+                y_value,
+                color=PREDICTION_COLOR,
+                marker="*",
+                s=140,
+                zorder=6,
+                label="Predicted Close",
+            )
+            self.price_ax.annotate(
+                self._format_currency(predicted_value),
+                (predicted_x, y_value),
+                xytext=(8, 8),
+                textcoords="offset points",
+                color=PREDICTION_COLOR,
+                fontsize=8,
+            )
+            self.price_ax.set_xlim(dates[0], predicted_x + 1)
+
+        if "RSI_14" in window_df.columns:
+            rsi_values = window_df["RSI_14"].clip(0, 100)
+            self.rsi_ax.plot(dates, rsi_values, color="#6366f1", linewidth=1.2)
+
+        if "MACD" in window_df.columns:
+            self.macd_ax.plot(dates, window_df["MACD"], color=MACD_LINE_COLOR, linewidth=1.2, label="MACD")
+        if "MACD_Signal" in window_df.columns:
+            self.macd_ax.plot(
+                dates,
+                window_df["MACD_Signal"],
+                color=MACD_SIGNAL_COLOR,
+                linewidth=1.1,
+                label="Signal",
+            )
+        if "MACD_Hist" in window_df.columns:
+            hist_series = window_df["MACD_Hist"].fillna(0.0)
+            colors = [COLOR_GAIN if value >= 0 else COLOR_LOSS for value in hist_series]
+            self.macd_ax.bar(dates, hist_series, color=colors, width=0.6, alpha=0.55, label="Histogram")
+
+        if "Volume" in window_df.columns:
+            volume_colors = [
+                COLOR_GAIN if close >= open_ else COLOR_LOSS
+                for close, open_ in zip(window_df["Close"], window_df["Open"])
+            ]
+            self.volume_ax.bar(dates, window_df["Volume"], color=volume_colors, alpha=0.35, label="Volume")
+        if "Volume_SMA_20" in window_df.columns:
+            self.volume_ax.plot(dates, window_df["Volume_SMA_20"], color="#1d4ed8", linewidth=1.1, label="Vol SMA20")
+        if "Volume_EMA_20" in window_df.columns:
+            self.volume_ax.plot(dates, window_df["Volume_EMA_20"], color="#0ea5e9", linewidth=1.1, linestyle="--", label="Vol EMA20")
+        if "OBV" in window_df.columns:
+            self.volume_obv_ax.plot(dates, window_df["OBV"], color="#2563eb", linewidth=1.0, label="OBV")
+
+        price_handles, price_labels = self.price_ax.get_legend_handles_labels()
+        if price_handles:
+            self.price_ax.legend(price_handles, price_labels, loc="upper left", fontsize=8)
+
+        macd_handles, macd_labels = self.macd_ax.get_legend_handles_labels()
+        if macd_handles:
+            self.macd_ax.legend(macd_handles, macd_labels, loc="upper left", fontsize=8)
+
+        volume_handles, volume_labels = self.volume_ax.get_legend_handles_labels()
+        if volume_handles:
+            self.volume_ax.legend(volume_handles, volume_labels, loc="upper left", fontsize=8)
+
+        if hasattr(self.volume_obv_ax, "get_legend_handles_labels"):
+            obv_handles, obv_labels = self.volume_obv_ax.get_legend_handles_labels()
+            if obv_handles:
+                self.volume_obv_ax.legend(obv_handles, obv_labels, loc="upper right", fontsize=8)
+
+        self.volume_ax.xaxis_date()
+        self.volume_ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
         self.figure.autofmt_xdate()
+
+        if self.wave_annotations:
+            start_timestamp = window_df["Date"].min()
+            end_timestamp = window_df["Date"].max()
+            for wave in self.wave_annotations:
+                if pd.isna(wave.start_date) or pd.isna(wave.end_date):
+                    continue
+                if wave.end_date < start_timestamp or wave.start_date > end_timestamp:
+                    continue
+                x1 = mdates.date2num(wave.start_date.to_pydatetime())
+                x2 = mdates.date2num(wave.end_date.to_pydatetime())
+                color = "#2563eb" if wave.direction >= 0 else "#f97316"
+                self.chart_ax.plot(
+                    [x1, x2],
+                    [wave.start_price, wave.end_price],
+                    color=color,
+                    linewidth=1.6,
+                    alpha=0.85,
+                )
+                label_y = wave.end_price * (1.002 if wave.direction >= 0 else 0.998)
+                self.chart_ax.text(
+                    x2,
+                    label_y,
+                    wave.label,
+                    color=color,
+                    fontsize=9,
+                    fontweight="bold",
+                    ha="left",
+                    va="bottom" if wave.direction >= 0 else "top",
+                )
+
         self.canvas.draw_idle()
 
     def _update_prediction_panel(self, prediction: Dict[str, Any], metrics: Optional[Dict[str, Any]]) -> None:
@@ -630,17 +823,37 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
 
     def _fetch_latest_fx_rate(self) -> Optional[float]:
         try:
-            data = yf.download("EURUSD=X", period="5d", interval="1d", progress=False)
+            data = yf.download(
+                "EURUSD=X",
+                period="5d",
+                interval="1d",
+                progress=False,
+                auto_adjust=False,
+            )
         except Exception as exc:  # pylint: disable=broad-except
             LOGGER.warning("Failed to download EUR/USD rate: %s", exc)
             return None
         if data.empty or "Close" not in data.columns:
             return None
-        close_prices = data["Close"].dropna()
+        close_prices = pd.to_numeric(data["Close"], errors="coerce")
         if close_prices.empty:
             return None
-        latest = float(close_prices.iloc[-1])
-        if not latest:
+        finite_mask = close_prices.apply(math.isfinite)
+        filtered_count = int((~finite_mask).sum())
+        if filtered_count:
+            LOGGER.warning(
+                "Filtered out %d non-finite EUR/USD close price value(s) when fetching FX rate.",
+                filtered_count,
+            )
+        finite_prices = close_prices[finite_mask]
+        if finite_prices.empty:
+            return None
+        latest = float(finite_prices.iloc[-1])
+        if not math.isfinite(latest) or latest == 0:
+            LOGGER.warning(
+                "Latest EUR/USD close price %r is not usable for conversion; ignoring value.",
+                latest,
+            )
             return None
         return 1.0 / latest
 
@@ -670,7 +883,24 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         self.after(0, lambda: self._finalise_currency_switch(rate))
 
     def _finalise_currency_switch(self, rate: Optional[float]) -> None:
+        valid_rate: Optional[float]
         if rate is None:
+            valid_rate = None
+        else:
+            try:
+                valid_rate = float(rate)
+            except (TypeError, ValueError):
+                LOGGER.warning(
+                    "Discarding non-numeric EUR/USD rate %r; keeping USD currency display.",
+                    rate,
+                )
+                valid_rate = None
+        if valid_rate is None or not math.isfinite(valid_rate):
+            if valid_rate is not None:
+                LOGGER.warning(
+                    "Discarding non-finite EUR/USD rate %r; keeping USD currency display.",
+                    valid_rate,
+                )
             self.currency_button.state(["!disabled"])
             self._set_status("Unable to fetch EUR/USD rate", error=True)
             messagebox.showerror(
@@ -679,7 +909,7 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
                 parent=self,
             )
             return
-        self.usd_to_eur_rate = rate
+        self.usd_to_eur_rate = valid_rate
         self.currency_var.set("EUR")
         self._update_currency_button()
         self._refresh_currency_views()
@@ -693,10 +923,17 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
             self.currency_button_text.set("Display in EUR (€)")
 
     def _refresh_currency_views(self) -> None:
-        if not self.price_data_base.empty:
-            self.price_data = self._convert_price_dataframe(self.price_data_base)
-        else:
+        if self.price_data_base.empty:
             self.price_data = pd.DataFrame()
+            self.wave_annotations = []
+        elif self.currency_var.get() == "USD":
+            self.price_data = self.price_data_base.copy()
+            self.wave_annotations = list(self.wave_annotations_base)
+        else:
+            converted = self._convert_price_dataframe(self.price_data_base)
+            converted_with_waves, waves = apply_wave_features(converted)
+            self.price_data = converted_with_waves
+            self.wave_annotations = waves
         self._plot_price_data()
         if self.latest_prediction is not None:
             self._update_prediction_panel(self.latest_prediction, self.latest_metrics)
@@ -715,13 +952,24 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
             )
             return df.copy()
         converted = df.copy()
-        numeric_cols = converted.select_dtypes(include=["number"]).columns
-        if not len(numeric_cols):
+        converted.attrs.update(df.attrs)
+        price_columns = df.attrs.get("price_columns")
+        if not price_columns:
+            price_columns = [
+                column
+                for column in converted.columns
+                if column in {"Open", "High", "Low", "Close", "Adj Close"}
+                or column.startswith(("SMA_", "EMA_"))
+                or column in {"MACD", "MACD_Signal", "MACD_Hist", "BB_Middle_20", "BB_Upper_20", "BB_Lower_20"}
+            ]
+        if not price_columns:
             LOGGER.warning(
-                "Currency conversion requested but dataframe has no numeric columns; leaving values unchanged"
+                "Currency conversion requested but dataframe has no price-like columns; leaving values unchanged"
             )
             return converted
-        converted.loc[:, numeric_cols] = converted.loc[:, numeric_cols] * rate
+        for column in price_columns:
+            if column in converted.columns:
+                converted[column] = pd.to_numeric(converted[column], errors="coerce") * rate
         return converted
 
     def _get_currency_symbol(self) -> str:

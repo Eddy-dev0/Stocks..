@@ -88,6 +88,9 @@ class StockPredictorAI:
                 feature_columns = stored.get("feature_columns")
                 if feature_columns:
                     self.metadata["feature_columns"] = feature_columns
+                indicator_columns = stored.get("indicator_columns")
+                if indicator_columns:
+                    self.metadata["indicator_columns"] = indicator_columns
         return self.model
 
     def save_state(self, metrics: Dict[str, Any]) -> None:
@@ -97,6 +100,7 @@ class StockPredictorAI:
         payload = {
             **metrics,
             "feature_columns": self.metadata.get("feature_columns", []),
+            "indicator_columns": self.metadata.get("indicator_columns", []),
         }
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, default=str)

@@ -48,7 +48,8 @@ class DataFetcher:
         return self.database.get_indicators(
             ticker=self.config.ticker,
             interval=self.config.interval,
-            category=category,
+            progress=False,
+            auto_adjust=False,
         )
 
     def fetch_fundamentals(self) -> pd.DataFrame:
