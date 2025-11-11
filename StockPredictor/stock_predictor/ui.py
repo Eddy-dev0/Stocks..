@@ -24,6 +24,7 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 
 from .config import PredictorConfig, build_config
+from .elliott import WaveSegment, apply_wave_features
 from .model import StockPredictorAI
 from .preprocessing import compute_price_features
 
@@ -146,6 +147,8 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         self.usd_to_eur_rate: float | None = None
         self.latest_prediction: Optional[Dict[str, Any]] = None
         self.latest_metrics: Optional[Dict[str, Any]] = None
+        self.wave_annotations: list[WaveSegment] = []
+        self.wave_annotations_base: list[WaveSegment] = []
 
         self._interactive_widgets: list[tk.Widget] = []
 
@@ -668,6 +671,37 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         self.volume_ax.xaxis_date()
         self.volume_ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
         self.figure.autofmt_xdate()
+
+        if self.wave_annotations:
+            start_timestamp = window_df["Date"].min()
+            end_timestamp = window_df["Date"].max()
+            for wave in self.wave_annotations:
+                if pd.isna(wave.start_date) or pd.isna(wave.end_date):
+                    continue
+                if wave.end_date < start_timestamp or wave.start_date > end_timestamp:
+                    continue
+                x1 = mdates.date2num(wave.start_date.to_pydatetime())
+                x2 = mdates.date2num(wave.end_date.to_pydatetime())
+                color = "#2563eb" if wave.direction >= 0 else "#f97316"
+                self.chart_ax.plot(
+                    [x1, x2],
+                    [wave.start_price, wave.end_price],
+                    color=color,
+                    linewidth=1.6,
+                    alpha=0.85,
+                )
+                label_y = wave.end_price * (1.002 if wave.direction >= 0 else 0.998)
+                self.chart_ax.text(
+                    x2,
+                    label_y,
+                    wave.label,
+                    color=color,
+                    fontsize=9,
+                    fontweight="bold",
+                    ha="left",
+                    va="bottom" if wave.direction >= 0 else "top",
+                )
+
         self.canvas.draw_idle()
 
     def _update_prediction_panel(self, prediction: Dict[str, Any], metrics: Optional[Dict[str, Any]]) -> None:
@@ -881,10 +915,17 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
             self.currency_button_text.set("Display in EUR (€)")
 
     def _refresh_currency_views(self) -> None:
-        if not self.price_data_base.empty:
-            self.price_data = self._convert_price_dataframe(self.price_data_base)
-        else:
+        if self.price_data_base.empty:
             self.price_data = pd.DataFrame()
+            self.wave_annotations = []
+        elif self.currency_var.get() == "USD":
+            self.price_data = self.price_data_base.copy()
+            self.wave_annotations = list(self.wave_annotations_base)
+        else:
+            converted = self._convert_price_dataframe(self.price_data_base)
+            converted_with_waves, waves = apply_wave_features(converted)
+            self.price_data = converted_with_waves
+            self.wave_annotations = waves
         self._plot_price_data()
         if self.latest_prediction is not None:
             self._update_prediction_panel(self.latest_prediction, self.latest_metrics)

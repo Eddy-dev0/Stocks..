@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -116,7 +116,7 @@ def build_supervised_dataset(
 ) -> Tuple[pd.DataFrame, pd.Series, Dict[str, object]]:
     """Prepare the feature matrix and target vector."""
 
-    price_features = compute_price_features(price_df)
+    price_features, waves = compute_price_features(price_df)
     sentiment_df = sentiment_df if sentiment_df is not None else pd.DataFrame()
     indicator_columns = price_features.attrs.get("indicator_columns", [])
     price_columns_attr = price_features.attrs.get("price_columns", [])
