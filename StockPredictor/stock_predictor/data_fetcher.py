@@ -42,6 +42,7 @@ class DataFetcher:
             end=self.config.end_date.isoformat() if self.config.end_date else None,
             interval=self.config.interval,
             progress=False,
+            auto_adjust=False,
         )
         if df.empty:
             raise RuntimeError(
