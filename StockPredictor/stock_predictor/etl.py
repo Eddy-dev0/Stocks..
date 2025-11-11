@@ -337,8 +337,15 @@ class MarketDataETL:
         if df.empty:
             return pd.DataFrame()
         df = df.reset_index()
-        if "Date" not in df.columns:
-            df = df.rename(columns={df.columns[0]: "Date"})
+        if isinstance(df.columns, pd.MultiIndex):
+            # Flatten multi-level columns returned by yfinance when requesting a
+            # single ticker so downstream code can access fields using the
+            # expected names (e.g. "Open", "Close"). We only keep the price
+            # field component as the ticker level is redundant once flattened.
+            df.columns = df.columns.get_level_values(0)
+        # Ensure the first column is always normalised to "Date" even when
+        # yfinance labels it differently (e.g. "Datetime").
+        df = df.rename(columns={df.columns[0]: "Date"})
         df.columns = [col.title() if isinstance(col, str) else col for col in df.columns]
         return df
 
