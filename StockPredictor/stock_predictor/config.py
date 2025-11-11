@@ -13,6 +13,11 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
 DEFAULT_MODELS_DIR = PROJECT_ROOT / "models"
+DEFAULT_DATABASE_PATH = DEFAULT_DATA_DIR / "market_data.sqlite"
+
+
+def _default_database_url() -> str:
+    return f"sqlite:///{DEFAULT_DATABASE_PATH}"
 
 
 @dataclass
@@ -29,24 +34,17 @@ class PredictorConfig:
     news_api_key: Optional[str] = None
     news_limit: int = 50
     sentiment: bool = True
-    feature_sets: list[str] = field(
-        default_factory=lambda: ["technical", "elliott", "fundamental", "sentiment", "macro"]
-    )
-    prediction_targets: list[str] = field(
-        default_factory=lambda: ["close", "return", "direction"]
-    )
-    model_params: dict[str, dict[str, object]] = field(default_factory=dict)
-    test_size: float = 0.2
-    shuffle_training: bool = False
-    backtest_strategy: str = "rolling"
-    backtest_window: int = 252
-    backtest_step: int = 20
+    database_url: str = field(default_factory=_default_database_url)
 
     def ensure_directories(self) -> None:
         """Ensure that data and model directories exist."""
 
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.models_dir.mkdir(parents=True, exist_ok=True)
+        if self.database_url.startswith("sqlite:///"):
+            Path(self.database_url.replace("sqlite:///", "")).parent.mkdir(
+                parents=True, exist_ok=True
+            )
 
     @property
     def price_cache_path(self) -> Path:
@@ -64,15 +62,11 @@ class PredictorConfig:
     def metrics_path(self) -> Path:
         return self.models_dir / f"{self.ticker}_{self.model_type}_metrics.json"
 
-    def model_path_for(self, target: str) -> Path:
-        return self.models_dir / f"{self.ticker}_{self.model_type}_{target}.joblib"
-
-    def metrics_path_for(self, target: str) -> Path:
-        return self.models_dir / f"{self.ticker}_{self.model_type}_{target}_metrics.json"
-
     @property
     def database_path(self) -> Path:
-        return self.models_dir / "experiments.sqlite"
+        if not self.database_url.startswith("sqlite:///"):
+            raise ValueError("database_path is only available for SQLite URLs.")
+        return Path(self.database_url.replace("sqlite:///", ""))
 
 
 def load_environment() -> None:
@@ -92,14 +86,7 @@ def build_config(
     news_api_key: Optional[str] = None,
     news_limit: int = 50,
     sentiment: bool = True,
-    feature_sets: Optional[list[str]] = None,
-    prediction_targets: Optional[list[str]] = None,
-    model_params: Optional[dict[str, dict[str, object]]] = None,
-    test_size: float = 0.2,
-    shuffle_training: bool = False,
-    backtest_strategy: str = "rolling",
-    backtest_window: int = 252,
-    backtest_step: int = 20,
+    database_url: Optional[str] = None,
 ) -> PredictorConfig:
     """Build a :class:`PredictorConfig` instance from string parameters."""
 
@@ -111,6 +98,12 @@ def build_config(
     end_dt = date.fromisoformat(end_date) if end_date else None
 
     load_environment()
+
+    db_url = (
+        database_url
+        or os.getenv("STOCK_PREDICTOR_DATABASE_URL")
+        or _default_database_url()
+    )
 
     config = PredictorConfig(
         ticker=ticker.upper(),
@@ -130,14 +123,7 @@ def build_config(
         or os.getenv("ALPHAVANTAGE_API_KEY"),
         news_limit=news_limit,
         sentiment=sentiment,
-        feature_sets=feature_sets or ["technical", "elliott", "fundamental", "sentiment", "macro"],
-        prediction_targets=prediction_targets or ["close", "return", "direction"],
-        model_params=model_params or {},
-        test_size=test_size,
-        shuffle_training=shuffle_training,
-        backtest_strategy=backtest_strategy,
-        backtest_window=backtest_window,
-        backtest_step=backtest_step,
+        database_url=db_url,
     )
     config.ensure_directories()
     return config

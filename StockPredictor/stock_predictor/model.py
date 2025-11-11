@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Optional
 
 import joblib
 import numpy as np
@@ -43,14 +42,13 @@ class StockPredictorAI:
     # ------------------------------------------------------------------
     # Data acquisition
     # ------------------------------------------------------------------
-    def download_data(self, force: bool = False) -> Dict[str, Path]:
-        LOGGER.info("Starting data download for %s", self.config.ticker)
-        prices, news = self.fetcher.download_all(force=force)
-        result = {"prices": self.config.price_cache_path}
-        if not news.empty:
-            result["news"] = self.config.news_cache_path
-        LOGGER.info("Data download completed for %s", self.config.ticker)
-        return result
+    def download_data(self, force: bool = False) -> Dict[str, Any]:
+        """Refresh all datasets and return a summary of the ETL run."""
+
+        LOGGER.info("Starting data refresh for %s", self.config.ticker)
+        summary = self.fetcher.refresh_all(force=force)
+        LOGGER.info("Data refresh completed for %s", self.config.ticker)
+        return summary
 
     # ------------------------------------------------------------------
     # Feature engineering
@@ -90,14 +88,22 @@ class StockPredictorAI:
         if metadata_path.exists():
             with open(metadata_path, "r", encoding="utf-8") as handle:
                 stored = json.load(handle)
-                if "feature_columns" in stored:
-                    self.metadata.setdefault("feature_columns", stored["feature_columns"])
-        return model
+                feature_columns = stored.get("feature_columns")
+                if feature_columns:
+                    self.metadata["feature_columns"] = feature_columns
+                indicator_columns = stored.get("indicator_columns")
+                if indicator_columns:
+                    self.metadata["indicator_columns"] = indicator_columns
+        return self.model
+
+    def save_state(self, metrics: Dict[str, Any]) -> None:
+        """Persist metrics and feature information to disk."""
 
     def save_state(self, target: str, metrics: Dict[str, Any]) -> None:
         payload = {
             **metrics,
             "feature_columns": self.metadata.get("feature_columns", []),
+            "indicator_columns": self.metadata.get("indicator_columns", []),
         }
         path = self.config.metrics_path_for(target)
         with open(path, "w", encoding="utf-8") as handle:

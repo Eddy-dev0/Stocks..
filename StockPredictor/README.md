@@ -16,6 +16,8 @@ workflows easily.
   sentiment information.
 - Machine learning model (Random Forest Regressor) with persisted metrics and
   trained model artefacts.
+- Local SQLite database that stores prices, indicators, fundamentals and news
+  for fast reuse across runs.
 - CLI modes for data collection, training and inference.
 
 ## Project layout
@@ -26,7 +28,9 @@ StockPredictor/
 ├── stock_predictor/
 │   ├── __init__.py
 │   ├── config.py          # Runtime configuration helpers
-│   ├── data_fetcher.py    # Internet data acquisition
+│   ├── data_fetcher.py    # Database-backed data loader
+│   ├── database.py        # SQLAlchemy models and helpers
+│   ├── etl.py             # ETL services for populating the database
 │   ├── model.py           # StockPredictorAI implementation
 │   ├── preprocessing.py   # Feature engineering helpers
 │   └── sentiment.py       # Sentiment scoring utilities
@@ -63,9 +67,10 @@ All commands are executed from the project root (`StockPredictor/`).
 python main.py --mode download-data --ticker TSLA --start-date 2022-01-01 --refresh-data
 ```
 
-This downloads price data (and news if available) and stores them inside the
-`data/` directory. The `--refresh-data` flag forces re-download even when cached
-files already exist.
+This downloads price data (plus indicators, fundamentals, macro metrics and
+news when available) and stores them in the SQLite database at
+`data/market_data.sqlite`. The `--refresh-data` flag forces a re-download even
+when the requested window already exists in the database.
 
 ### Train a model
 
@@ -98,9 +103,22 @@ no overrides are provided.
 
 - `--no-sentiment` disables sentiment processing even when news is available.
 - `--data-dir` and `--models-dir` allow custom storage locations.
+- `--database-url` overrides the default SQLite connection string. Any
+  SQLAlchemy-compatible URL is accepted, e.g.
+  `sqlite:////tmp/stock_predictor.sqlite` or `postgresql://user:pass@host/db`.
 - `--log-level DEBUG` enables more verbose logging for troubleshooting.
 
 Run `python main.py --help` for the full set of options.
+
+## Database configuration
+
+All market data is cached inside a relational database managed through
+SQLAlchemy. By default the application uses SQLite with the database stored at
+`data/market_data.sqlite`. The location can be changed by passing the
+`--database-url` CLI argument or by setting the
+`STOCK_PREDICTOR_DATABASE_URL` environment variable. When pointing at a remote
+database the required driver must be installed (see
+[`requirements.txt`](requirements.txt)).
 
 ## Requirements
 
