@@ -63,7 +63,7 @@ class DataFetcher:
             return pd.read_csv(cache_path, parse_dates=["publishedDate"])
 
         if not self.config.news_api_key:
-            LOGGER.warning(
+            LOGGER.info(
                 "No API key configured for news download. Skipping news collection."
             )
             return pd.DataFrame()
