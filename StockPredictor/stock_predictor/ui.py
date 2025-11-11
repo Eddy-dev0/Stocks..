@@ -837,7 +837,14 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
             return None
         if data.empty or "Close" not in data.columns:
             return None
-        close_prices = pd.to_numeric(data["Close"], errors="coerce")
+        close_data = data["Close"]
+        if isinstance(close_data, pd.DataFrame):
+            if close_data.empty:
+                return None
+            close_series = close_data.iloc[:, -1]
+        else:
+            close_series = close_data
+        close_prices = pd.to_numeric(close_series, errors="coerce")
         if close_prices.empty:
             return None
         finite_mask = close_prices.apply(math.isfinite)
