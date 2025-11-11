@@ -13,6 +13,11 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
 DEFAULT_MODELS_DIR = PROJECT_ROOT / "models"
+DEFAULT_DATABASE_PATH = DEFAULT_DATA_DIR / "market_data.sqlite"
+
+
+def _default_database_url() -> str:
+    return f"sqlite:///{DEFAULT_DATABASE_PATH}"
 
 
 @dataclass
@@ -29,12 +34,17 @@ class PredictorConfig:
     news_api_key: Optional[str] = None
     news_limit: int = 50
     sentiment: bool = True
+    database_url: str = field(default_factory=_default_database_url)
 
     def ensure_directories(self) -> None:
         """Ensure that data and model directories exist."""
 
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.models_dir.mkdir(parents=True, exist_ok=True)
+        if self.database_url.startswith("sqlite:///"):
+            Path(self.database_url.replace("sqlite:///", "")).parent.mkdir(
+                parents=True, exist_ok=True
+            )
 
     @property
     def price_cache_path(self) -> Path:
@@ -51,6 +61,12 @@ class PredictorConfig:
     @property
     def metrics_path(self) -> Path:
         return self.models_dir / f"{self.ticker}_{self.model_type}_metrics.json"
+
+    @property
+    def database_path(self) -> Path:
+        if not self.database_url.startswith("sqlite:///"):
+            raise ValueError("database_path is only available for SQLite URLs.")
+        return Path(self.database_url.replace("sqlite:///", ""))
 
 
 def load_environment() -> None:
@@ -70,6 +86,7 @@ def build_config(
     news_api_key: Optional[str] = None,
     news_limit: int = 50,
     sentiment: bool = True,
+    database_url: Optional[str] = None,
 ) -> PredictorConfig:
     """Build a :class:`PredictorConfig` instance from string parameters."""
 
@@ -81,6 +98,12 @@ def build_config(
     end_dt = date.fromisoformat(end_date) if end_date else None
 
     load_environment()
+
+    db_url = (
+        database_url
+        or os.getenv("STOCK_PREDICTOR_DATABASE_URL")
+        or _default_database_url()
+    )
 
     config = PredictorConfig(
         ticker=ticker.upper(),
@@ -100,6 +123,7 @@ def build_config(
         or os.getenv("ALPHAVANTAGE_API_KEY"),
         news_limit=news_limit,
         sentiment=sentiment,
+        database_url=db_url,
     )
     config.ensure_directories()
     return config

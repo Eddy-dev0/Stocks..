@@ -55,6 +55,7 @@ class UIOptions:
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     refresh_data: bool = False
+    database_url: Optional[str] = None
 
     def to_kwargs(self) -> Dict[str, Any]:
         return {
@@ -67,6 +68,7 @@ class UIOptions:
             "sentiment": self.sentiment,
             "start_date": self.start_date,
             "end_date": self.end_date,
+            "database_url": self.database_url,
         }
 
 
@@ -367,13 +369,14 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
             config = build_config(**kwargs)
             LOGGER.info("Starting prediction workflow for %s", ticker)
 
-            data_source = "Online"
-            if config.price_cache_path.exists() and not refresh:
-                data_source = "Cached CSV"
-
             ai = StockPredictorAI(config)
-            prices = ai.fetcher.fetch_price_data(force=refresh)
             prediction = ai.predict(refresh_data=refresh)
+            source_before_fetch = ai.fetcher.last_price_source
+            prices = ai.fetcher.fetch_price_data(force=False)
+
+            data_source = (
+                "Remote download" if source_before_fetch == "remote" else "Database cache"
+            )
 
             metrics = prediction.get("training_metrics")
             if not metrics:
@@ -395,6 +398,7 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
                     prediction=prediction,
                     metrics=metrics,
                     data_source=data_source,
+                    last_updated=ai.fetcher.get_last_updated("prices"),
                 ),
             )
         except Exception as exc:  # pylint: disable=broad-except
@@ -445,6 +449,7 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         prediction: Dict[str, Any],
         metrics: Optional[Dict[str, Any]],
         data_source: str,
+        last_updated: Optional[datetime],
     ) -> None:
         self.current_ticker = ticker
         self.price_data_base = prices
@@ -452,7 +457,10 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         self.latest_metrics = metrics
         self._refresh_currency_views()
         self.data_source_var.set(f"Data source: {data_source}")
-        self.last_updated_var.set(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        timestamp = last_updated or datetime.now()
+        self.last_updated_var.set(
+            f"Last updated: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
         self._set_status(f"Prediction ready for {ticker}", error=False)
         self._toggle_inputs(state=tk.NORMAL)
 
