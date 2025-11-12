@@ -8,9 +8,11 @@ from stock_predictor.core.config import (
     build_config,
     load_environment,
 )
+from stock_predictor.core.data_pipeline import AsyncDataPipeline
 from stock_predictor.core.modeling import StockPredictorAI, TargetSpec, make_volatility_label
 
 __all__ = [
+    "AsyncDataPipeline",
     "Backtester",
     "PredictorConfig",
     "StockPredictorAI",
