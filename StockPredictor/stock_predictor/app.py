@@ -150,7 +150,7 @@ class StockPredictorApplication:
             sys.executable,
             "-m",
             "uvicorn",
-            "stock_predictor.ui.api.main:app",
+            "stock_predictor.ui.api:app",
             "--host",
             str(api_host),
             "--port",
