@@ -13,8 +13,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from stock_predictor.features import FeatureAssembler, default_feature_toggles
-from stock_predictor.features.feature_registry import (
+from stock_predictor.core.features import FeatureAssembler, default_feature_toggles
+from stock_predictor.core.features.feature_registry import (
     FeatureDependencyError,
     FeatureNotImplementedError,
 )
