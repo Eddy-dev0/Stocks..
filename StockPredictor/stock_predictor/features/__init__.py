@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Iterator, Optional
+from typing import Dict, Iterable, Iterator, Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
 
 from ..sentiment import aggregate_daily_sentiment, attach_sentiment
+from .feature_registry import (
+    FeatureBuildContext,
+    FeatureBuildOutput,
+    FeatureDependencyError,
+    FeatureGroupSpec,
+    FeatureNotImplementedError,
+    build_feature_registry,
+    default_feature_toggles,
+)
 
 
 @dataclass(slots=True)
@@ -35,28 +44,97 @@ class FeatureBlock:
         return ((column, category) for column, category in mapping.items() if column != "Date")
 
 
+def _not_implemented_group_builder(name: str):
+    def _builder(_: FeatureBuildContext) -> FeatureBuildOutput:
+        raise NotImplementedError(f"Feature group '{name}' is not implemented yet.")
+
+    return _builder
+
+
+def _technical_group_builder(context: FeatureBuildContext) -> FeatureBuildOutput:
+    block = _build_technical_features(context.price_df)
+    blocks = [block] if block is not None else []
+    status = "executed" if blocks else "skipped_no_data"
+    return FeatureBuildOutput(blocks=blocks, status=status)
+
+
+def _elliott_group_builder(context: FeatureBuildContext) -> FeatureBuildOutput:
+    block = _build_elliott_wave_descriptors(context.price_df)
+    blocks = [block] if block is not None else []
+    status = "executed" if blocks else "skipped_no_data"
+    return FeatureBuildOutput(blocks=blocks, status=status)
+
+
+def _fundamental_group_builder(context: FeatureBuildContext) -> FeatureBuildOutput:
+    blocks = [block for block in _build_fundamental_blocks(context.price_df) if block is not None]
+    status = "executed" if blocks else "skipped_no_data"
+    return FeatureBuildOutput(blocks=blocks, status=status)
+
+
+def _macro_group_builder(context: FeatureBuildContext) -> FeatureBuildOutput:
+    blocks = [block for block in _build_macro_blocks(context.price_df) if block is not None]
+    status = "executed" if blocks else "skipped_no_data"
+    return FeatureBuildOutput(blocks=blocks, status=status)
+
+
+def _sentiment_group_builder(context: FeatureBuildContext) -> FeatureBuildOutput:
+    metadata: Dict[str, object] = {}
+    if not context.sentiment_enabled:
+        metadata["sentiment_daily"] = _empty_sentiment_frame()
+        return FeatureBuildOutput(blocks=[], metadata=metadata, status="global_disabled")
+
+    news_df = context.news_df
+    if news_df is None or news_df.empty:
+        metadata["sentiment_daily"] = _empty_sentiment_frame()
+        return FeatureBuildOutput(blocks=[], metadata=metadata, status="missing_data")
+
+    block = _build_sentiment_features(news_df)
+    if block is None:
+        metadata["sentiment_daily"] = _empty_sentiment_frame()
+        return FeatureBuildOutput(blocks=[], metadata=metadata, status="missing_data")
+
+    metadata["sentiment_daily"] = block.frame
+    return FeatureBuildOutput(blocks=[block], metadata=metadata, status="executed")
+
+
+FEATURE_REGISTRY: Dict[str, FeatureGroupSpec] = build_feature_registry(
+    technical=_technical_group_builder,
+    elliott=_elliott_group_builder,
+    fundamental=_fundamental_group_builder,
+    macro=_macro_group_builder,
+    sentiment=_sentiment_group_builder,
+    identification=_not_implemented_group_builder("identification"),
+    volume_liquidity=_not_implemented_group_builder("volume_liquidity"),
+    options=_not_implemented_group_builder("options"),
+    esg=_not_implemented_group_builder("esg"),
+)
+
+
 class FeatureAssembler:
-    """Build enriched feature sets from heterogeneous market inputs.
+    """Build enriched feature sets driven by the feature registry."""
 
-    The assembler orchestrates a modular collection of feature builders that
-    generate technical indicators, Elliott wave descriptors, lightweight
-    fundamentals, sentiment aggregates, and macro-style factors derived from
-    historical price series.
-    """
+    def __init__(
+        self,
+        feature_toggles: Mapping[str, bool] | Iterable[str] | None,
+        horizons: Iterable[int] | None = None,
+        *,
+        registry: Mapping[str, FeatureGroupSpec] | None = None,
+    ) -> None:
+        self.registry: Dict[str, FeatureGroupSpec] = dict(registry or FEATURE_REGISTRY)
+        if not self.registry:
+            raise ValueError("Feature registry cannot be empty.")
 
-    SUPPORTED_SETS = {
-        "technical",
-        "elliott",
-        "fundamental",
-        "sentiment",
-        "macro",
-    }
+        self.feature_toggles = self._normalise_toggles(feature_toggles)
+        self.enabled_groups = [name for name, enabled in self.feature_toggles.items() if enabled]
+        if not self.enabled_groups:
+            if "technical" in self.feature_toggles:
+                self.feature_toggles["technical"] = True
+                self.enabled_groups = ["technical"]
+            else:
+                first = next(iter(self.registry))
+                self.feature_toggles[first] = True
+                self.enabled_groups = [first]
 
-    def __init__(self, enabled_sets: Iterable[str], horizons: Iterable[int] | None = None) -> None:
-        self.enabled_sets = {name.lower() for name in enabled_sets if name}
-        self.enabled_sets.intersection_update(self.SUPPORTED_SETS)
-        if not self.enabled_sets:
-            self.enabled_sets = {"technical"}
         if horizons is None:
             horizons = (1,)
         self.horizons = _normalise_horizons(horizons)
@@ -73,38 +151,77 @@ class FeatureAssembler:
         if price_df.empty:
             raise ValueError("Price dataframe cannot be empty when building features.")
 
-        processed = price_df.copy()
-        processed = _ensure_datetime_index(processed)
+        processed = _ensure_datetime_index(price_df)
+        context_news = None
+        if news_df is not None:
+            context_news = news_df.copy()
+        context = FeatureBuildContext(
+            price_df=processed,
+            news_df=context_news,
+            sentiment_enabled=sentiment_enabled,
+        )
 
         feature_blocks: list[FeatureBlock] = []
         metadata: Dict[str, object] = {}
         feature_categories: Dict[str, str] = {}
 
-        if "technical" in self.enabled_sets:
-            block = _build_technical_features(processed)
-            if block is not None:
-                feature_blocks.append(block)
-        if "elliott" in self.enabled_sets:
-            block = _build_elliott_wave_descriptors(processed)
-            if block is not None:
-                feature_blocks.append(block)
-        if "fundamental" in self.enabled_sets:
-            for block in _build_fundamental_blocks(processed):
-                if block is not None:
-                    feature_blocks.append(block)
-        if "macro" in self.enabled_sets:
-            for block in _build_macro_blocks(processed):
-                if block is not None:
-                    feature_blocks.append(block)
+        group_metadata: dict[str, dict[str, object]] = {
+            name: {
+                "configured": bool(self.feature_toggles.get(name, False)),
+                "executed": False,
+                "dependencies": list(spec.dependencies),
+                "implemented": spec.implemented,
+                "description": spec.description,
+                "columns": [],
+                "categories": set(),
+                "status": "configured" if self.feature_toggles.get(name, False) else "disabled",
+            }
+            for name, spec in self.registry.items()
+        }
 
-        if sentiment_enabled and news_df is not None and not news_df.empty:
-            sentiment_block = _build_sentiment_features(news_df)
-            if "sentiment" in self.enabled_sets and sentiment_block is not None:
-                feature_blocks.append(sentiment_block)
-            metadata["sentiment_daily"] = (
-                sentiment_block.frame if sentiment_block is not None else _empty_sentiment_frame()
-            )
-        else:
+        execution_plan = self._resolve_execution_plan()
+
+        for spec in execution_plan:
+            summary = group_metadata[spec.name]
+            if not spec.implemented:
+                raise FeatureNotImplementedError(spec.name)
+
+            if spec.name == "sentiment" and not sentiment_enabled:
+                output = FeatureBuildOutput(
+                    blocks=[],
+                    metadata={"sentiment_daily": _empty_sentiment_frame()},
+                    status="global_disabled",
+                )
+            else:
+                try:
+                    output = spec.builder(context)
+                except NotImplementedError as exc:  # pragma: no cover - defensive
+                    raise FeatureNotImplementedError(spec.name) from exc
+
+            if output is None:
+                output = FeatureBuildOutput(blocks=[], status="skipped_no_data")
+
+            blocks = [block for block in output.blocks if block is not None]
+
+            if spec.name == "sentiment" and "sentiment_daily" not in output.metadata:
+                if blocks:
+                    output.metadata["sentiment_daily"] = blocks[0].frame
+                else:
+                    output.metadata["sentiment_daily"] = _empty_sentiment_frame()
+
+            for block in blocks:
+                feature_blocks.append(block)
+                pairs = list(block.iter_categories())
+                summary["columns"].extend([column for column, _ in pairs])
+                summary["categories"].update(category for _, category in pairs)
+                for column, category in pairs:
+                    feature_categories[column] = category
+
+            summary["status"] = output.status
+            summary["executed"] = bool(blocks)
+            metadata.update(output.metadata)
+
+        if "sentiment_daily" not in metadata:
             metadata["sentiment_daily"] = _empty_sentiment_frame()
 
         if not feature_blocks:
@@ -113,8 +230,6 @@ class FeatureAssembler:
         merged = processed[["Date", "Close"]].copy()
         for block in feature_blocks:
             merged = merged.merge(block.frame, on="Date", how="left")
-            for column, category in block.iter_categories():
-                feature_categories[column] = category
 
         merged = merged.sort_values("Date").reset_index(drop=True)
         merged = merged.replace([np.inf, -np.inf], np.nan)
@@ -139,8 +254,93 @@ class FeatureAssembler:
             }
         )
 
+        for summary in group_metadata.values():
+            columns = summary["columns"]
+            summary["columns"] = sorted(dict.fromkeys(columns))
+            categories_set = summary.pop("categories")
+            summary["categories"] = sorted(categories_set)
+            if not summary["configured"]:
+                summary["status"] = "disabled"
+            elif not summary["executed"] and summary["status"] in {"configured", "executed"}:
+                summary["status"] = "skipped_no_data"
+
+        metadata["feature_groups"] = {
+            name: summary for name, summary in group_metadata.items()
+        }
+
         features = merged[feature_columns]
         return FeatureResult(features=features, targets=targets, metadata=metadata)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _normalise_toggles(
+        self,
+        toggles: Mapping[str, bool] | Iterable[str] | None,
+    ) -> dict[str, bool]:
+        defaults = default_feature_toggles(self.registry)
+        if toggles is None:
+            return defaults
+
+        normalised: dict[str, bool] = {}
+        if isinstance(toggles, Mapping):
+            for key, value in toggles.items():
+                name = str(key).strip().lower()
+                if name in defaults:
+                    normalised[name] = bool(value)
+        else:
+            if isinstance(toggles, str):
+                tokens = [part.strip() for part in toggles.split(",")]
+            else:
+                tokens = [str(item).strip() for item in toggles]
+            for token in tokens:
+                if not token:
+                    continue
+                name = token.lower()
+                if name in defaults:
+                    normalised[name] = True
+
+        defaults.update(normalised)
+        return defaults
+
+    def _resolve_execution_plan(self) -> list[FeatureGroupSpec]:
+        plan: list[FeatureGroupSpec] = []
+        added: set[str] = set()
+        visiting: set[str] = set()
+
+        def visit(name: str) -> None:
+            if name not in self.registry:
+                raise KeyError(f"Unknown feature group '{name}'.")
+            if name in added:
+                return
+            if name in visiting:
+                raise RuntimeError(
+                    f"Circular dependency detected for feature group '{name}'."
+                )
+
+            spec = self.registry[name]
+            visiting.add(name)
+            missing = [dep for dep in spec.dependencies if not self.feature_toggles.get(dep, False)]
+            if missing:
+                raise FeatureDependencyError(spec.name, missing)
+            for dependency in spec.dependencies:
+                visit(dependency)
+            visiting.remove(name)
+
+            if self.feature_toggles.get(spec.name, False):
+                added.add(spec.name)
+                plan.append(spec)
+
+        for name in self.enabled_groups:
+            visit(name)
+
+        ordered: list[FeatureGroupSpec] = []
+        seen: set[str] = set()
+        for spec in plan:
+            if spec.name not in seen:
+                ordered.append(spec)
+                seen.add(spec.name)
+        return ordered
 
 
 # ----------------------------------------------------------------------
