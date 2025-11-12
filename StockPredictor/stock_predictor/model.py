@@ -12,14 +12,20 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.base import clone
 from sklearn.metrics import r2_score
 from sklearn.model_selection import TimeSeriesSplit, train_test_split
+from sklearn.pipeline import Pipeline
 
 from .backtesting import Backtester
 from .config import PredictorConfig
 from .data_fetcher import DataFetcher
 from .database import ExperimentTracker
 from .features import FeatureAssembler
+from .ml_preprocessing import (
+    PreprocessingBuilder,
+    get_feature_names_from_pipeline,
+)
 from .models import (
     ModelFactory,
     classification_metrics,
@@ -56,6 +62,9 @@ class StockPredictorAI:
         )
         self.tracker = ExperimentTracker(config)
         self.models: dict[Tuple[str, int], Any] = {}
+        self.preprocessors: dict[Tuple[str, int], Pipeline] = {}
+        self.preprocessor_templates: dict[int, Pipeline] = {}
+        self.preprocess_options: dict[str, Any] = {}
         self.metadata: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
@@ -76,7 +85,7 @@ class StockPredictorAI:
         self,
         price_df: Optional[pd.DataFrame] = None,
         news_df: Optional[pd.DataFrame] = None,
-    ) -> tuple[pd.DataFrame, dict[int, Dict[str, pd.Series]]]:
+    ) -> tuple[pd.DataFrame, dict[int, Dict[str, pd.Series]], dict[int, Pipeline]]:
         if price_df is None:
             price_df = self.fetcher.fetch_price_data()
         if news_df is None and self.config.sentiment:
@@ -86,14 +95,53 @@ class StockPredictorAI:
 
         feature_result = self.feature_assembler.build(price_df, news_df, self.config.sentiment)
         metadata = dict(feature_result.metadata)
+        raw_feature_columns = list(feature_result.features.columns)
+        metadata.setdefault("feature_columns", raw_feature_columns)
+        metadata["raw_feature_columns"] = raw_feature_columns
         metadata.setdefault("sentiment_daily", pd.DataFrame(columns=["Date", "sentiment"]))
         metadata.setdefault("feature_groups", {})
         metadata["data_sources"] = self.fetcher.get_data_sources()
         metadata.setdefault("target_dates", {})
-        metadata.setdefault("horizons", tuple(self.config.prediction_horizons))
+        horizons = tuple(metadata.get("horizons", tuple(self.config.prediction_horizons)))
+        metadata["horizons"] = horizons
         metadata["active_horizon"] = self.horizon
+
+        preprocess_section = self.config.model_params.get("preprocessing", {})
+        if isinstance(preprocess_section, dict):
+            self.preprocess_options = dict(preprocess_section)
+        else:
+            self.preprocess_options = {}
+        builder = PreprocessingBuilder(**self.preprocess_options)
+
+        templates: dict[int, Pipeline] = {}
+        template_feature_names: dict[int, list[str]] = {}
+        features = feature_result.features
+        for horizon_value in horizons:
+            pipeline = builder.create_pipeline()
+            X_source = features
+            y_source: Optional[pd.Series] = None
+            horizon_targets = feature_result.targets.get(horizon_value)
+            if horizon_targets:
+                candidate = horizon_targets.get("close")
+                if candidate is None:
+                    candidate = next(iter(horizon_targets.values()), None)
+                if candidate is not None:
+                    y_clean = candidate.dropna()
+                    if not y_clean.empty:
+                        aligned_index = y_clean.index.intersection(features.index)
+                        if not aligned_index.empty:
+                            X_source = features.loc[aligned_index]
+                            y_source = y_clean.loc[aligned_index]
+                        else:
+                            y_source = y_clean
+            pipeline.fit(X_source, y_source)
+            templates[horizon_value] = pipeline
+            template_feature_names[horizon_value] = get_feature_names_from_pipeline(pipeline)
+
+        metadata["preprocessed_feature_columns"] = template_feature_names
         self.metadata = metadata
-        return feature_result.features, feature_result.targets
+        self.preprocessor_templates = templates
+        return features, feature_result.targets, templates
 
     # ------------------------------------------------------------------
     # Model persistence helpers
@@ -111,6 +159,26 @@ class StockPredictorAI:
                 f"Model for target '{target}' and horizon {resolved_horizon} is not loaded. Train or load it first."
             )
         return self.models[key]
+
+    def _load_preprocessor(self, target: str, horizon: int) -> Optional[Pipeline]:
+        key = (target, horizon)
+        if key in self.preprocessors:
+            return self.preprocessors[key]
+        path = self.config.preprocessor_path_for(target, horizon)
+        if not path.exists():
+            return None
+        try:
+            pipeline: Pipeline = joblib.load(path)
+        except Exception as exc:  # pragma: no cover - defensive guard around disk IO
+            LOGGER.warning("Failed to load preprocessor for %s horizon %s: %s", target, horizon, exc)
+            return None
+        self.preprocessors[key] = pipeline
+        feature_names = get_feature_names_from_pipeline(pipeline)
+        if feature_names:
+            feature_map = self.metadata.setdefault("feature_columns_by_target", {})
+            feature_map[key] = feature_names
+            self.metadata["feature_columns"] = feature_names
+        return pipeline
 
     def load_model(self, target: str = "close", horizon: Optional[int] = None) -> Any:
         resolved_horizon = self._resolve_horizon(horizon)
@@ -153,6 +221,7 @@ class StockPredictorAI:
                     metrics_store = self.metadata.setdefault("metrics", {})
                     horizon_metrics = metrics_store.setdefault(target, {})
                     horizon_metrics[resolved_horizon] = metrics_payload
+        self._load_preprocessor(target, resolved_horizon)
         self.metadata["active_horizon"] = resolved_horizon
         return model
 
@@ -182,8 +251,8 @@ class StockPredictorAI:
     ) -> Dict[str, Any]:
         resolved_horizon = self._resolve_horizon(horizon)
         self.horizon = resolved_horizon
-        X, targets_by_horizon = self.prepare_features()
-        feature_columns = self.metadata.get("feature_columns", list(X.columns))
+        X, targets_by_horizon, _ = self.prepare_features()
+        raw_feature_columns = self.metadata.get("raw_feature_columns", list(X.columns))
 
         requested_targets = list(targets) if targets else list(self.config.prediction_targets)
         horizon_targets = targets_by_horizon.get(resolved_horizon)
@@ -227,6 +296,7 @@ class StockPredictorAI:
                 calibrate_override = global_params.get("calibrate")
             calibrate_flag = (target == "direction") if calibrate_override is None else bool(calibrate_override)
 
+            template = self.preprocessor_templates.get(resolved_horizon)
             evaluation = self._evaluate_model(
                 factory,
                 aligned_X,
@@ -234,6 +304,7 @@ class StockPredictorAI:
                 task,
                 target,
                 calibrate_flag,
+                template,
             )
             LOGGER.info(
                 "Evaluation summary for target '%s' (horizon %s, strategy %s): %s",
@@ -243,11 +314,28 @@ class StockPredictorAI:
                 evaluation["aggregate"],
             )
 
+            if template is not None:
+                final_pipeline = clone(template)
+            else:
+                builder = PreprocessingBuilder(**self.preprocess_options)
+                final_pipeline = builder.create_pipeline()
+            final_pipeline.fit(aligned_X, y_clean)
+            transformed_X = final_pipeline.transform(aligned_X)
+            feature_names = get_feature_names_from_pipeline(final_pipeline)
+            if not feature_names:
+                feature_names = list(transformed_X.columns)
+            feature_map = self.metadata.setdefault("feature_columns_by_target", {})
+            feature_map[(target, resolved_horizon)] = feature_names
+            self.metadata.setdefault("feature_columns_by_horizon", {})[resolved_horizon] = feature_names
+            preprocessed_map = self.metadata.setdefault("preprocessed_feature_columns", {})
+            preprocessed_map[resolved_horizon] = feature_names
+            self.metadata["feature_columns"] = feature_names
+
             final_model = factory.create(task, calibrate=calibrate_flag)
-            final_model.fit(aligned_X, y_clean)
+            final_model.fit(transformed_X, y_clean)
 
             metrics = dict(evaluation["aggregate"])
-            metrics["training_rows"] = int(len(aligned_X))
+            metrics["training_rows"] = int(len(transformed_X))
             metrics["test_rows"] = int(evaluation.get("evaluation_rows", 0))
             metrics["horizon"] = resolved_horizon
             metrics["evaluation_strategy"] = evaluation["strategy"]
@@ -265,14 +353,16 @@ class StockPredictorAI:
             horizon_metrics[resolved_horizon] = metrics
 
             self.models[(target, resolved_horizon)] = final_model
+            self.preprocessors[(target, resolved_horizon)] = final_pipeline
             joblib.dump(final_model, self.config.model_path_for(target, resolved_horizon))
+            joblib.dump(final_pipeline, self.config.preprocessor_path_for(target, resolved_horizon))
             self.save_state(target, resolved_horizon, metrics)
             self.tracker.log_run(
                 target=target,
                 run_type="training",
                 parameters={"model_type": self.config.model_type, **model_params},
                 metrics=metrics,
-                context={"feature_columns": feature_columns, "horizon": resolved_horizon},
+                context={"feature_columns": feature_names, "horizon": resolved_horizon},
             )
 
             if target == "close":
@@ -282,6 +372,10 @@ class StockPredictorAI:
             "Training complete for targets %s at horizon %s",
             ", ".join(metrics_by_target),
             resolved_horizon,
+        )
+        self.metadata["feature_columns"] = (
+            self.metadata.get("feature_columns_by_horizon", {}).get(resolved_horizon)
+            or self.metadata.get("feature_columns", raw_feature_columns)
         )
         self.metadata["active_horizon"] = resolved_horizon
         return {"horizon": resolved_horizon, "targets": metrics_by_target, **summary_metrics}
@@ -362,6 +456,7 @@ class StockPredictorAI:
         task: str,
         target_name: str,
         calibrate_flag: bool,
+        preprocessor: Optional[Pipeline] = None,
     ) -> Dict[str, Any]:
         strategy = self.config.evaluation_strategy
         evaluation_rows = 0
@@ -376,10 +471,24 @@ class StockPredictorAI:
                 shuffle=self.config.shuffle_training,
                 random_state=42,
             )
+            pipeline = clone(preprocessor) if preprocessor is not None else None
+            if pipeline is not None:
+                pipeline.fit(X_train, y_train)
+                X_train_transformed = pipeline.transform(X_train)
+                X_test_transformed = pipeline.transform(X_test)
+            else:
+                X_train_transformed = X_train
+                X_test_transformed = X_test
             model = factory.create(task, calibrate=calibrate_flag)
-            model.fit(X_train, y_train)
-            y_pred = model.predict(X_test)
-            metrics = self._compute_evaluation_metrics(task, y_test, y_pred, X_test)
+            model.fit(X_train_transformed, y_train)
+            y_pred = model.predict(X_test_transformed)
+            metrics = self._compute_evaluation_metrics(
+                task,
+                y_test,
+                y_pred,
+                X_test_transformed,
+                X_test,
+            )
             metrics.update(
                 {
                     "split": 1,
@@ -405,10 +514,24 @@ class StockPredictorAI:
                     continue
                 X_train, X_test = features.iloc[train_idx], features.iloc[test_idx]
                 y_train, y_test = target_series.iloc[train_idx], target_series.iloc[test_idx]
+                pipeline = clone(preprocessor) if preprocessor is not None else None
+                if pipeline is not None:
+                    pipeline.fit(X_train, y_train)
+                    X_train_transformed = pipeline.transform(X_train)
+                    X_test_transformed = pipeline.transform(X_test)
+                else:
+                    X_train_transformed = X_train
+                    X_test_transformed = X_test
                 model = factory.create(task, calibrate=calibrate_flag)
-                model.fit(X_train, y_train)
-                y_pred = model.predict(X_test)
-                metrics = self._compute_evaluation_metrics(task, y_test, y_pred, X_test)
+                model.fit(X_train_transformed, y_train)
+                y_pred = model.predict(X_test_transformed)
+                metrics = self._compute_evaluation_metrics(
+                    task,
+                    y_test,
+                    y_pred,
+                    X_test_transformed,
+                    X_test,
+                )
                 metrics.update(
                     {
                         "fold": fold,
@@ -431,7 +554,12 @@ class StockPredictorAI:
                 window=self.config.evaluation_window,
                 step=self.config.evaluation_step,
             )
-            result = backtester.run(features, target_series, target_name)
+            result = backtester.run(
+                features,
+                target_series,
+                target_name,
+                preprocessor_template=preprocessor,
+            )
             splits = result.splits
             aggregate = result.aggregate
             evaluation_rows = int(aggregate.get("test_rows", 0))
@@ -457,6 +585,7 @@ class StockPredictorAI:
         y_true: pd.Series,
         y_pred: np.ndarray,
         X_test: pd.DataFrame,
+        raw_X_test: pd.DataFrame,
     ) -> Dict[str, float]:
         if task == "classification":
             metrics = classification_metrics(y_true.to_numpy(), y_pred)
@@ -469,8 +598,8 @@ class StockPredictorAI:
         except ValueError:
             metrics["r2"] = float("nan")
         baseline = (
-            X_test["Close_Current"].to_numpy()
-            if "Close_Current" in X_test
+            raw_X_test["Close_Current"].to_numpy()
+            if "Close_Current" in raw_X_test
             else np.zeros_like(y_pred)
         )
         predicted_direction = np.sign(y_pred - baseline)
@@ -526,10 +655,13 @@ class StockPredictorAI:
             LOGGER.info("Preparing features before prediction.")
             self.prepare_features()
 
-        feature_columns = self.metadata.get("feature_columns")
         latest_features = self.metadata.get("latest_features")
-        if feature_columns is None or latest_features is None:
+        if latest_features is None:
             raise RuntimeError("No feature metadata available. Train the model first.")
+        raw_feature_columns = self.metadata.get("raw_feature_columns")
+        if raw_feature_columns is None:
+            raw_feature_columns = list(latest_features.columns)
+            self.metadata["raw_feature_columns"] = raw_feature_columns
         self.metadata["active_horizon"] = resolved_horizon
 
         requested_targets = list(targets) if targets else list(self.config.prediction_targets)
@@ -554,16 +686,32 @@ class StockPredictorAI:
                 }
                 model = self._get_model(target, resolved_horizon)
 
-            current_features = latest_features[feature_columns]
-            pred_value = model.predict(current_features)[0]
+            pipeline = self.preprocessors.get((target, resolved_horizon))
+            if pipeline is None:
+                pipeline = self._load_preprocessor(target, resolved_horizon)
+            current_raw = latest_features[raw_feature_columns]
+            if pipeline is not None:
+                transformed_features = pipeline.transform(current_raw)
+                feature_names = get_feature_names_from_pipeline(pipeline)
+                if feature_names:
+                    self.metadata.setdefault("feature_columns_by_target", {})[(target, resolved_horizon)] = feature_names
+                    self.metadata["feature_columns"] = feature_names
+                else:
+                    self.metadata["feature_columns"] = list(transformed_features.columns)
+            else:
+                transformed_features = current_raw
+                self.metadata["feature_columns"] = list(transformed_features.columns)
+            self.metadata["latest_transformed_features"] = transformed_features
+
+            pred_value = model.predict(transformed_features)[0]
             predictions[target] = float(pred_value)
 
-            uncertainty = self._estimate_prediction_uncertainty(target, model, current_features)
+            uncertainty = self._estimate_prediction_uncertainty(target, model, transformed_features)
             if uncertainty:
                 uncertainties[target] = uncertainty
 
             if model_supports_proba(model) and target == "direction":
-                proba = model.predict_proba(current_features)[0]
+                proba = model.predict_proba(transformed_features)[0]
                 estimator = model.named_steps.get("estimator")
                 classes = getattr(estimator, "classes_", None)
                 class_prob_map: Dict[Any, float] = {}
@@ -1198,7 +1346,18 @@ class StockPredictorAI:
         model = self.models.get((target, resolved_horizon)) or self.load_model(
             target, resolved_horizon
         )
-        feature_columns = self.metadata.get("feature_columns")
+        pipeline = self.preprocessors.get((target, resolved_horizon))
+        if pipeline is None:
+            pipeline = self._load_preprocessor(target, resolved_horizon)
+        feature_columns: Optional[List[str]] = None
+        if pipeline is not None:
+            feature_columns = get_feature_names_from_pipeline(pipeline)
+        if not feature_columns:
+            mapped = self.metadata.get("feature_columns_by_target", {})
+            if isinstance(mapped, dict):
+                feature_columns = mapped.get((target, resolved_horizon))
+        if not feature_columns:
+            feature_columns = self.metadata.get("feature_columns")
         if not feature_columns:
             raise RuntimeError("Feature columns unknown; train the model first.")
         return extract_feature_importance(model, list(feature_columns))
@@ -1220,7 +1379,7 @@ class StockPredictorAI:
     ) -> Dict[str, Any]:
         resolved_horizon = self._resolve_horizon(horizon)
         self.horizon = resolved_horizon
-        X, targets_by_horizon = self.prepare_features()
+        X, targets_by_horizon, _ = self.prepare_features()
         horizon_targets = targets_by_horizon.get(resolved_horizon)
         if not horizon_targets:
             raise RuntimeError(f"No targets available for horizon {resolved_horizon}.")
@@ -1244,7 +1403,13 @@ class StockPredictorAI:
                 window=self.config.backtest_window,
                 step=self.config.backtest_step,
             )
-            result = backtester.run(aligned_X, y_clean, target)
+            template = self.preprocessor_templates.get(resolved_horizon)
+            result = backtester.run(
+                aligned_X,
+                y_clean,
+                target,
+                preprocessor_template=template,
+            )
             results[target] = {
                 "aggregate": result.aggregate,
                 "splits": result.splits,

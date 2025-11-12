@@ -157,6 +157,14 @@ class PredictorConfig:
             target, resolved_horizon, suffix="_metrics.json"
         )
 
+    def preprocessor_path_for(self, target: str, horizon: Optional[int] = None) -> Path:
+        """Return the filesystem path for the preprocessing pipeline of ``target``."""
+
+        resolved_horizon = self.resolve_horizon(horizon)
+        return self.models_dir / self._build_filename(
+            target, resolved_horizon, suffix="_preprocessor.joblib"
+        )
+
     def resolve_horizon(self, horizon: Optional[int]) -> int:
         """Validate and resolve ``horizon`` against configured horizons."""
 
