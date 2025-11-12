@@ -6,9 +6,10 @@ import logging
 from typing import Any, Dict
 
 import numpy as np
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, mean_absolute_error, mean_squared_error
+from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, mean_squared_error
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -47,32 +48,80 @@ class ModelFactory:
         self.model_type = model_type.lower()
         self.overrides = overrides or {}
 
-    def create(self, task: str) -> Pipeline:
+    def create(
+        self,
+        task: str,
+        *,
+        calibrate: bool = False,
+        calibration_params: Dict[str, Any] | None = None,
+    ) -> Pipeline:
         """Return a pipeline for the requested task (regression or classification)."""
 
         params = self.DEFAULT_PARAMS.get(self.model_type, {}).copy()
         params.update(self.overrides)
 
+        calibrate = bool(params.pop("calibrate", False) or calibrate)
+        calibration_params = calibration_params or params.pop("calibration_params", None) or {}
+        if task == "regression":
+            params.pop("class_weight", None)
+        elif self.model_type == "mlp" and "class_weight" in params:
+            LOGGER.warning(
+                "class_weight not supported for MLPClassifier; removing for model type '%s'.",
+                self.model_type,
+            )
+            params.pop("class_weight", None)
+
+        def _instantiate(factory: Any, arguments: Dict[str, Any]) -> Any:
+            try:
+                return factory(**arguments)
+            except TypeError as exc:
+                if "class_weight" in arguments:
+                    LOGGER.warning(
+                        "Removing unsupported class_weight for model type '%s': %s",
+                        self.model_type,
+                        exc,
+                    )
+                    trimmed = dict(arguments)
+                    trimmed.pop("class_weight", None)
+                    return factory(**trimmed)
+                raise
+
         estimator: Any
         needs_scaler = False
 
         if self.model_type == "random_forest":
-            estimator = RandomForestRegressor(**params) if task == "regression" else RandomForestClassifier(**params)
+            estimator = (
+                _instantiate(RandomForestRegressor, params)
+                if task == "regression"
+                else _instantiate(RandomForestClassifier, params)
+            )
         elif self.model_type == "lightgbm" and LGBMRegressor is not None:
-            estimator = LGBMRegressor(**params) if task == "regression" else LGBMClassifier(**params)
+            estimator = (
+                _instantiate(LGBMRegressor, params)
+                if task == "regression"
+                else _instantiate(LGBMClassifier, params)
+            )
         elif self.model_type == "xgboost" and XGBRegressor is not None:
-            estimator = XGBRegressor(**params) if task == "regression" else XGBClassifier(**params)
+            estimator = (
+                _instantiate(XGBRegressor, params)
+                if task == "regression"
+                else _instantiate(XGBClassifier, params)
+            )
         elif self.model_type == "hist_gb" and HistGradientBoostingRegressor is not None:
             estimator = (
-                HistGradientBoostingRegressor(**params)
+                _instantiate(HistGradientBoostingRegressor, params)
                 if task == "regression"
-                else HistGradientBoostingClassifier(**params)
+                else _instantiate(HistGradientBoostingClassifier, params)
             )
         elif self.model_type == "mlp":
-            estimator = MLPRegressor(**params) if task == "regression" else MLPClassifier(**params)
+            estimator = (
+                _instantiate(MLPRegressor, params)
+                if task == "regression"
+                else _instantiate(MLPClassifier, params)
+            )
             needs_scaler = True
         elif self.model_type == "logistic" and task == "classification":
-            estimator = LogisticRegression(**params)
+            estimator = _instantiate(LogisticRegression, params)
             needs_scaler = True
         else:
             if self.model_type in {"xgboost", "lightgbm", "hist_gb"}:
@@ -80,7 +129,16 @@ class ModelFactory:
                     "Model type '%s' unavailable; falling back to RandomForest.",
                     self.model_type,
                 )
-            estimator = RandomForestRegressor(**params) if task == "regression" else RandomForestClassifier(**params)
+            estimator = (
+                _instantiate(RandomForestRegressor, params)
+                if task == "regression"
+                else _instantiate(RandomForestClassifier, params)
+            )
+
+        if calibrate and task == "classification":
+            calibration_options = {"cv": 5, "method": "sigmoid"}
+            calibration_options.update(calibration_params)
+            estimator = CalibratedClassifierCV(base_estimator=estimator, **calibration_options)
 
         steps: list[tuple[str, Any]] = []
         if needs_scaler:
@@ -98,7 +156,8 @@ def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, floa
 
 def classification_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     accuracy = float(accuracy_score(y_true, y_pred))
-    return {"accuracy": accuracy}
+    f1 = float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
+    return {"accuracy": accuracy, "f1": f1}
 
 
 def extract_feature_importance(model: Pipeline, feature_names: list[str]) -> Dict[str, float]:

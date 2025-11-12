@@ -41,8 +41,6 @@ class Backtester:
         task = "classification" if target == "direction" else "regression"
         splits = list(self._generate_splits(len(X)))
         split_metrics: list[Dict[str, float]] = []
-        predictions: list[float] = []
-        actuals: list[float] = []
 
         for index, (train_slice, test_slice) in enumerate(splits, start=1):
             X_train, y_train = X.iloc[train_slice], y.iloc[train_slice]
@@ -50,7 +48,7 @@ class Backtester:
             if len(y_test) == 0:
                 continue
 
-            model = self.model_factory.create(task)
+            model = self.model_factory.create(task, calibrate=(target == "direction"))
             model.fit(X_train, y_train)
             y_pred = model.predict(X_test)
 
@@ -65,23 +63,34 @@ class Backtester:
                 metrics["directional_accuracy"] = float(
                     np.mean((predicted_direction >= 0) == (actual_direction >= 0))
                 )
+                metrics["signed_error"] = float(np.mean(y_pred - y_test.to_numpy()))
 
             metrics["split"] = index
+            metrics["train_size"] = int(len(y_train))
+            metrics["test_size"] = int(len(y_test))
             split_metrics.append(metrics)
-            predictions.extend(y_pred.tolist())
-            actuals.extend(y_test.tolist())
 
         if not split_metrics:
             raise RuntimeError("Backtest did not produce any splits. Check dataset size or window configuration.")
 
-        if target == "direction":
-            aggregate = classification_metrics(np.array(actuals), np.array(predictions))
-            aggregate["directional_accuracy"] = aggregate.get("accuracy", 0.0)
-        else:
-            aggregate = regression_metrics(np.array(actuals), np.array(predictions))
-            aggregate["directional_accuracy"] = float(
-                np.mean((np.array(predictions) >= 0) == (np.array(actuals) >= 0))
-            )
+        aggregate = {}
+        keys = {
+            key
+            for entry in split_metrics
+            for key in entry.keys()
+            if key not in {"split", "train_size", "test_size"}
+        }
+        for key in keys:
+            values = [
+                entry[key]
+                for entry in split_metrics
+                if isinstance(entry.get(key), (int, float, np.floating))
+                and np.isfinite(entry.get(key))
+            ]
+            if values:
+                aggregate[key] = float(np.mean(values))
+        aggregate["test_rows"] = int(sum(entry.get("test_size", 0) for entry in split_metrics))
+        aggregate["splits"] = int(len(split_metrics))
 
         return BacktestResult(target=target, splits=split_metrics, aggregate=aggregate)
 

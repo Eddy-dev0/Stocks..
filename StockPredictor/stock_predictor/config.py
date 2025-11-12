@@ -74,6 +74,11 @@ class PredictorConfig:
     backtest_strategy: str = DEFAULT_BACKTEST_STRATEGY
     backtest_window: int = DEFAULT_BACKTEST_WINDOW
     backtest_step: int = DEFAULT_BACKTEST_STEP
+    evaluation_strategy: str = "holdout"
+    evaluation_folds: int = 5
+    evaluation_window: int = DEFAULT_BACKTEST_WINDOW
+    evaluation_step: int = DEFAULT_BACKTEST_STEP
+    direction_confidence_threshold: float = 0.55
 
     def __post_init__(self) -> None:
         self.ticker = self.ticker.upper()
@@ -89,12 +94,25 @@ class PredictorConfig:
         self.backtest_strategy = (
             str(self.backtest_strategy).strip().lower() or DEFAULT_BACKTEST_STRATEGY
         )
+        self.evaluation_strategy = str(self.evaluation_strategy).strip().lower() or "holdout"
         if not 0 < self.test_size < 1:
             raise ValueError("test_size must be between 0 and 1.")
         if self.backtest_window <= 0:
             raise ValueError("backtest_window must be positive.")
         if self.backtest_step <= 0:
             raise ValueError("backtest_step must be positive.")
+        if self.evaluation_strategy not in {"holdout", "time_series", "rolling"}:
+            raise ValueError(
+                "evaluation_strategy must be one of 'holdout', 'time_series', or 'rolling'."
+            )
+        if self.evaluation_folds <= 1 and self.evaluation_strategy == "time_series":
+            raise ValueError("evaluation_folds must be greater than 1 for time series cross-validation.")
+        if self.evaluation_window <= 0:
+            raise ValueError("evaluation_window must be positive.")
+        if self.evaluation_step <= 0:
+            raise ValueError("evaluation_step must be positive.")
+        if not 0.5 <= float(self.direction_confidence_threshold) < 1:
+            raise ValueError("direction_confidence_threshold must be between 0.5 and 1.0.")
 
     def ensure_directories(self) -> None:
         """Ensure that data and model directories exist."""
