@@ -102,7 +102,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--feature-sets",
-        help="Comma separated list of feature blocks to enable (technical, elliott, fundamental, sentiment, macro).",
+        help=(
+            "Comma separated list of feature groups to enable (technical, elliott, "
+            "fundamental, macro, sentiment, identification, volume_liquidity, options, esg)."
+        ),
     )
     parser.add_argument(
         "--model-params",
@@ -211,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
         news_limit=args.news_limit,
         sentiment=not args.no_sentiment,
         database_url=args.database_url,
+        feature_sets=args.feature_sets,
     )
 
     ai = StockPredictorAI(config)

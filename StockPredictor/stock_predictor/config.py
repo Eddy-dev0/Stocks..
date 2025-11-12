@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import os
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from dotenv import load_dotenv
+
+from .features import default_feature_toggles
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
@@ -20,14 +23,6 @@ DEFAULT_DATABASE_PATH = DEFAULT_DATA_DIR / "market_data.sqlite"
 def _default_database_url() -> str:
     return f"sqlite:///{DEFAULT_DATABASE_PATH}"
 
-
-DEFAULT_FEATURE_SETS: tuple[str, ...] = (
-    "technical",
-    "elliott",
-    "fundamental",
-    "macro",
-    "sentiment",
-)
 
 DEFAULT_PREDICTION_TARGETS: tuple[str, ...] = (
     "close",
@@ -59,7 +54,7 @@ class PredictorConfig:
     news_limit: int = 50
     sentiment: bool = True
     database_url: str = field(default_factory=_default_database_url)
-    feature_sets: tuple[str, ...] = field(default_factory=lambda: DEFAULT_FEATURE_SETS)
+    feature_toggles: dict[str, bool] = field(default_factory=default_feature_toggles)
     prediction_targets: tuple[str, ...] = field(
         default_factory=lambda: DEFAULT_PREDICTION_TARGETS
     )
@@ -82,9 +77,7 @@ class PredictorConfig:
 
     def __post_init__(self) -> None:
         self.ticker = self.ticker.upper()
-        self.feature_sets = self._normalise_collection(
-            self.feature_sets, DEFAULT_FEATURE_SETS
-        )
+        self.feature_toggles = _coerce_feature_toggles(self.feature_toggles)
         self.prediction_targets = self._normalise_collection(
             self.prediction_targets, DEFAULT_PREDICTION_TARGETS
         )
@@ -95,6 +88,8 @@ class PredictorConfig:
             str(self.backtest_strategy).strip().lower() or DEFAULT_BACKTEST_STRATEGY
         )
         self.evaluation_strategy = str(self.evaluation_strategy).strip().lower() or "holdout"
+        if not self.sentiment:
+            self.feature_toggles["sentiment"] = False
         if not 0 < self.test_size < 1:
             raise ValueError("test_size must be between 0 and 1.")
         if self.backtest_window <= 0:
@@ -258,7 +253,8 @@ def build_config(
     news_limit: int = 50,
     sentiment: bool = True,
     database_url: Optional[str] = None,
-    feature_sets: Optional[Iterable[str] | str] = None,
+    feature_sets: Optional[Mapping[str, Any] | Iterable[str] | str] = None,
+    feature_toggles: Optional[Mapping[str, Any] | Iterable[str] | str] = None,
     prediction_targets: Optional[Iterable[str] | str] = None,
     prediction_horizons: Optional[Iterable[int] | str] = None,
     model_params: Optional[Mapping[str, Mapping[str, Any]]] = None,
@@ -304,7 +300,9 @@ def build_config(
         news_limit=news_limit,
         sentiment=sentiment,
         database_url=db_url,
-        feature_sets=_coerce_iterable(feature_sets, DEFAULT_FEATURE_SETS),
+        feature_toggles=_coerce_feature_toggles(
+            feature_toggles if feature_toggles is not None else feature_sets
+        ),
         prediction_targets=_coerce_iterable(
             prediction_targets, DEFAULT_PREDICTION_TARGETS
         ),
@@ -322,6 +320,36 @@ def build_config(
     )
     config.ensure_directories()
     return config
+
+
+def _coerce_feature_toggles(
+    value: Optional[Mapping[str, Any] | Iterable[str] | str],
+    default: Optional[Mapping[str, bool]] = None,
+) -> dict[str, bool]:
+    defaults = dict(default or default_feature_toggles())
+    if value is None:
+        return defaults
+
+    toggles: dict[str, bool] = {}
+    if isinstance(value, Mapping):
+        for key, enabled in value.items():
+            name = str(key).strip().lower()
+            if name in defaults:
+                toggles[name] = bool(enabled)
+    else:
+        if isinstance(value, str):
+            tokens = [part.strip() for part in value.split(",")]
+        else:
+            tokens = [str(item).strip() for item in value]
+        for token in tokens:
+            if not token:
+                continue
+            name = token.lower()
+            if name in defaults:
+                toggles[name] = True
+
+    defaults.update(toggles)
+    return defaults
 
 
 def _coerce_iterable(
@@ -365,3 +393,79 @@ def _coerce_int_iterable(
             continue
         result.append(number)
     return tuple(result) if result else tuple(default)
+
+
+def load_config_from_mapping(payload: Mapping[str, Any]) -> PredictorConfig:
+    """Create a :class:`PredictorConfig` from a mapping (JSON/YAML)."""
+
+    if "ticker" not in payload:
+        raise KeyError("Configuration mapping must include a 'ticker' value.")
+
+    load_environment()
+
+    known_fields = {field.name for field in fields(PredictorConfig)}
+    data: dict[str, Any] = {
+        key: value for key, value in payload.items() if key in known_fields
+    }
+
+    toggles_input = (
+        payload.get("feature_toggles")
+        or payload.get("feature_groups")
+        or payload.get("feature_sets")
+    )
+    if toggles_input is not None:
+        data["feature_toggles"] = _coerce_feature_toggles(toggles_input)
+    elif "feature_toggles" in data:
+        data["feature_toggles"] = _coerce_feature_toggles(data["feature_toggles"])
+
+    if "sentiment" in data:
+        data["sentiment"] = _coerce_bool(data["sentiment"], default=True)
+    if "shuffle_training" in data:
+        data["shuffle_training"] = _coerce_bool(data["shuffle_training"], default=True)
+
+    if "start_date" in data and isinstance(data["start_date"], str) and data["start_date"]:
+        data["start_date"] = date.fromisoformat(data["start_date"])
+    if "end_date" in data and isinstance(data["end_date"], str) and data["end_date"]:
+        data["end_date"] = date.fromisoformat(data["end_date"])
+
+    for key in ("data_dir", "models_dir"):
+        if key in data and data[key]:
+            data[key] = Path(str(data[key])).expanduser().resolve()
+
+    if "prediction_targets" in data:
+        data["prediction_targets"] = _coerce_iterable(
+            data["prediction_targets"], DEFAULT_PREDICTION_TARGETS
+        )
+    if "prediction_horizons" in data:
+        data["prediction_horizons"] = _coerce_int_iterable(
+            data["prediction_horizons"], DEFAULT_PREDICTION_HORIZONS
+        )
+
+    if "model_params" not in data or data["model_params"] is None:
+        data["model_params"] = {"global": {}}
+
+    config = PredictorConfig(**data)  # type: ignore[arg-type]
+    config.ensure_directories()
+    return config
+
+
+def load_config_from_file(path: str | Path) -> PredictorConfig:
+    """Load configuration from a JSON or YAML file."""
+
+    resolved = Path(path).expanduser().resolve()
+    with resolved.open("r", encoding="utf-8") as handle:
+        if resolved.suffix.lower() in {".yaml", ".yml"}:
+            try:
+                import yaml  # type: ignore[import-not-found]
+            except ImportError as exc:  # pragma: no cover - optional dependency
+                raise RuntimeError(
+                    "PyYAML is required to load YAML configuration files."
+                ) from exc
+            payload = yaml.safe_load(handle) or {}
+        else:
+            payload = json.load(handle)
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("Configuration file must define a mapping of values.")
+
+    return load_config_from_mapping(payload)

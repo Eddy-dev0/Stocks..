@@ -52,7 +52,7 @@ class StockPredictorAI:
         self.horizon = self.config.resolve_horizon(horizon)
         self.fetcher = DataFetcher(config)
         self.feature_assembler = FeatureAssembler(
-            config.feature_sets, config.prediction_horizons
+            config.feature_toggles, config.prediction_horizons
         )
         self.tracker = ExperimentTracker(config)
         self.models: dict[Tuple[str, int], Any] = {}
@@ -87,6 +87,7 @@ class StockPredictorAI:
         feature_result = self.feature_assembler.build(price_df, news_df, self.config.sentiment)
         metadata = dict(feature_result.metadata)
         metadata.setdefault("sentiment_daily", pd.DataFrame(columns=["Date", "sentiment"]))
+        metadata.setdefault("feature_groups", {})
         metadata["data_sources"] = self.fetcher.get_data_sources()
         metadata.setdefault("target_dates", {})
         metadata.setdefault("horizons", tuple(self.config.prediction_horizons))
