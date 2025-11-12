@@ -6,13 +6,14 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple
+from numbers import Real
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import joblib
 import numpy as np
 import pandas as pd
 from sklearn.metrics import r2_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import TimeSeriesSplit, train_test_split
 
 from .backtesting import Backtester
 from .config import PredictorConfig
@@ -186,39 +187,65 @@ class StockPredictorAI:
         for target, y in available_targets.items():
             LOGGER.info("Training target '%s' with model type %s", target, self.config.model_type)
             y_clean = y.dropna()
+            if y_clean.empty:
+                LOGGER.warning(
+                    "Target '%s' has no usable samples after dropping NaNs. Skipping horizon %s.",
+                    target,
+                    resolved_horizon,
+                )
+                continue
             aligned_X = X.loc[y_clean.index]
+            self._log_target_distribution(target, resolved_horizon, y_clean)
+            self._validate_no_nans(target, resolved_horizon, aligned_X, y_clean)
+
             task = "classification" if target == "direction" else "regression"
             model_params = self.config.model_params.get(target, {})
-            factory = ModelFactory(self.config.model_type, {**self.config.model_params.get("global", {}), **model_params})
-            model = factory.create(task)
+            global_params = self.config.model_params.get("global", {})
+            factory = ModelFactory(
+                self.config.model_type,
+                {**global_params, **model_params},
+            )
 
-            X_train, X_test, y_train, y_test = train_test_split(
+            calibrate_override = model_params.get("calibrate")
+            if calibrate_override is None:
+                calibrate_override = global_params.get("calibrate")
+            calibrate_flag = (target == "direction") if calibrate_override is None else bool(calibrate_override)
+
+            evaluation = self._evaluate_model(
+                factory,
                 aligned_X,
                 y_clean,
-                test_size=self.config.test_size,
-                shuffle=self.config.shuffle_training,
-                random_state=42,
+                task,
+                target,
+                calibrate_flag,
             )
-            model.fit(X_train, y_train)
-            y_pred = model.predict(X_test)
+            LOGGER.info(
+                "Evaluation summary for target '%s' (horizon %s, strategy %s): %s",
+                target,
+                resolved_horizon,
+                evaluation["strategy"],
+                evaluation["aggregate"],
+            )
 
-            if task == "classification":
-                metrics = classification_metrics(y_test.to_numpy(), y_pred)
-                metrics["directional_accuracy"] = metrics.get("accuracy", 0.0)
-            else:
-                metrics = regression_metrics(y_test.to_numpy(), y_pred)
-                metrics["r2"] = float(r2_score(y_test, y_pred))
-                metrics["directional_accuracy"] = float(
-                    np.mean(np.sign(y_pred - X_test["Close_Current"]) == np.sign(y_test - X_test["Close_Current"]))
-                )
+            final_model = factory.create(task, calibrate=calibrate_flag)
+            final_model.fit(aligned_X, y_clean)
 
-            metrics["training_rows"] = int(len(X_train))
-            metrics["test_rows"] = int(len(X_test))
+            metrics = dict(evaluation["aggregate"])
+            metrics["training_rows"] = int(len(aligned_X))
+            metrics["test_rows"] = int(evaluation.get("evaluation_rows", 0))
             metrics["horizon"] = resolved_horizon
+            metrics["evaluation_strategy"] = evaluation["strategy"]
+            metrics["evaluation"] = {
+                "strategy": evaluation["strategy"],
+                "splits": evaluation["splits"],
+                "aggregate": evaluation["aggregate"],
+                "parameters": evaluation.get("parameters", {}),
+                "samples": int(evaluation.get("evaluation_rows", 0)),
+            }
             metrics_by_target[target] = metrics
 
-            self.models[(target, resolved_horizon)] = model
-            joblib.dump(model, self.config.model_path_for(target, resolved_horizon))
+            self.models[(target, resolved_horizon)] = final_model
+            joblib.dump(final_model, self.config.model_path_for(target, resolved_horizon))
             self.save_state(target, resolved_horizon, metrics)
             self.tracker.log_run(
                 target=target,
@@ -238,6 +265,227 @@ class StockPredictorAI:
         )
         self.metadata["active_horizon"] = resolved_horizon
         return {"horizon": resolved_horizon, "targets": metrics_by_target, **summary_metrics}
+
+    def _log_target_distribution(
+        self,
+        target: str,
+        horizon: int,
+        series: pd.Series,
+    ) -> None:
+        numeric = pd.to_numeric(series, errors="coerce")
+        if numeric.isna().any() or not np.isfinite(numeric.to_numpy()).all():
+            raise ValueError(
+                f"Non-finite values detected in target '{target}' for horizon {horizon}."
+            )
+
+        stats = {
+            "count": int(numeric.count()),
+            "mean": float(numeric.mean()),
+            "std": float(numeric.std(ddof=0)),
+            "min": float(numeric.min()),
+            "max": float(numeric.max()),
+        }
+        quantiles = numeric.quantile([0.1, 0.5, 0.9]).to_dict()
+        quantiles = {f"q{int(q * 100)}": float(value) for q, value in quantiles.items()}
+        stats.update(quantiles)
+
+        if target == "direction":
+            counts = series.value_counts().to_dict()
+            ratios = (
+                series.value_counts(normalize=True)
+                .mul(100)
+                .round(2)
+                .to_dict()
+            )
+            LOGGER.info(
+                "Target distribution for '%s' (horizon %s): counts=%s ratios=%s stats=%s",
+                target,
+                horizon,
+                counts,
+                {key: f"{value:.2f}%" for key, value in ratios.items()},
+                stats,
+            )
+        else:
+            LOGGER.info(
+                "Target distribution for '%s' (horizon %s): %s",
+                target,
+                horizon,
+                stats,
+            )
+
+    def _validate_no_nans(
+        self,
+        target: str,
+        horizon: int,
+        features: pd.DataFrame,
+        series: pd.Series,
+    ) -> None:
+        feature_check = features.replace([np.inf, -np.inf], np.nan)
+        if feature_check.isna().any().any():
+            columns = feature_check.columns[feature_check.isna().any()].tolist()
+            raise ValueError(
+                "Non-finite feature values detected for target '%s' at horizon %s in columns %s"
+                % (target, horizon, ", ".join(columns))
+            )
+
+        numeric_series = pd.to_numeric(series, errors="coerce")
+        if numeric_series.isna().any() or not np.isfinite(numeric_series.to_numpy()).all():
+            raise ValueError(
+                f"Non-finite values detected in target '{target}' for horizon {horizon}."
+            )
+
+    def _evaluate_model(
+        self,
+        factory: ModelFactory,
+        features: pd.DataFrame,
+        target_series: pd.Series,
+        task: str,
+        target_name: str,
+        calibrate_flag: bool,
+    ) -> Dict[str, Any]:
+        strategy = self.config.evaluation_strategy
+        evaluation_rows = 0
+        parameters: Dict[str, Any] = {}
+        splits: List[Dict[str, Any]] = []
+
+        if strategy == "holdout":
+            X_train, X_test, y_train, y_test = train_test_split(
+                features,
+                target_series,
+                test_size=self.config.test_size,
+                shuffle=self.config.shuffle_training,
+                random_state=42,
+            )
+            model = factory.create(task, calibrate=calibrate_flag)
+            model.fit(X_train, y_train)
+            y_pred = model.predict(X_test)
+            metrics = self._compute_evaluation_metrics(task, y_test, y_pred, X_test)
+            metrics.update(
+                {
+                    "split": 1,
+                    "train_size": int(len(X_train)),
+                    "test_size": int(len(X_test)),
+                }
+            )
+            splits.append(metrics)
+            aggregate = {
+                key: float(value)
+                for key, value in metrics.items()
+                if key not in {"split", "train_size", "test_size"} and isinstance(value, Real)
+            }
+            evaluation_rows = int(len(X_test))
+            parameters = {
+                "test_size": float(self.config.test_size),
+                "shuffle": bool(self.config.shuffle_training),
+            }
+        elif strategy == "time_series":
+            splitter = TimeSeriesSplit(n_splits=self.config.evaluation_folds)
+            for fold, (train_idx, test_idx) in enumerate(splitter.split(features, target_series), start=1):
+                if len(test_idx) == 0:
+                    continue
+                X_train, X_test = features.iloc[train_idx], features.iloc[test_idx]
+                y_train, y_test = target_series.iloc[train_idx], target_series.iloc[test_idx]
+                model = factory.create(task, calibrate=calibrate_flag)
+                model.fit(X_train, y_train)
+                y_pred = model.predict(X_test)
+                metrics = self._compute_evaluation_metrics(task, y_test, y_pred, X_test)
+                metrics.update(
+                    {
+                        "fold": fold,
+                        "train_size": int(len(train_idx)),
+                        "test_size": int(len(test_idx)),
+                    }
+                )
+                splits.append(metrics)
+            if not splits:
+                raise RuntimeError(
+                    "Time series cross-validation produced no evaluation splits."
+                )
+            aggregate = self._aggregate_evaluation_metrics(splits)
+            evaluation_rows = int(sum(item.get("test_size", 0) for item in splits))
+            parameters = {"folds": int(self.config.evaluation_folds)}
+        elif strategy == "rolling":
+            backtester = Backtester(
+                model_factory=factory,
+                strategy=self.config.backtest_strategy,
+                window=self.config.evaluation_window,
+                step=self.config.evaluation_step,
+            )
+            result = backtester.run(features, target_series, target_name)
+            splits = result.splits
+            aggregate = result.aggregate
+            evaluation_rows = int(aggregate.get("test_rows", 0))
+            parameters = {
+                "window": int(self.config.evaluation_window),
+                "step": int(self.config.evaluation_step),
+                "mode": self.config.backtest_strategy,
+            }
+        else:  # pragma: no cover - configuration guard
+            raise ValueError(f"Unknown evaluation strategy: {strategy}")
+
+        return {
+            "strategy": strategy,
+            "splits": splits,
+            "aggregate": aggregate,
+            "evaluation_rows": evaluation_rows,
+            "parameters": parameters,
+        }
+
+    def _compute_evaluation_metrics(
+        self,
+        task: str,
+        y_true: pd.Series,
+        y_pred: np.ndarray,
+        X_test: pd.DataFrame,
+    ) -> Dict[str, float]:
+        if task == "classification":
+            metrics = classification_metrics(y_true.to_numpy(), y_pred)
+            metrics["directional_accuracy"] = metrics.get("accuracy", 0.0)
+            return metrics
+
+        metrics = regression_metrics(y_true.to_numpy(), y_pred)
+        try:
+            metrics["r2"] = float(r2_score(y_true, y_pred))
+        except ValueError:
+            metrics["r2"] = float("nan")
+        baseline = (
+            X_test["Close_Current"].to_numpy()
+            if "Close_Current" in X_test
+            else np.zeros_like(y_pred)
+        )
+        predicted_direction = np.sign(y_pred - baseline)
+        actual_direction = np.sign(y_true.to_numpy() - baseline)
+        if len(actual_direction) > 0:
+            metrics["directional_accuracy"] = float(
+                np.mean((predicted_direction >= 0) == (actual_direction >= 0))
+            )
+        else:
+            metrics["directional_accuracy"] = 0.0
+        metrics["signed_error"] = float(np.mean(y_pred - y_true.to_numpy()))
+        return metrics
+
+    def _aggregate_evaluation_metrics(
+        self, splits: List[Dict[str, Any]]
+    ) -> Dict[str, float]:
+        if not splits:
+            return {}
+        aggregate: Dict[str, float] = {}
+        keys = {
+            key
+            for entry in splits
+            for key in entry.keys()
+            if key not in {"split", "fold", "train_size", "test_size"}
+        }
+        for key in keys:
+            values: List[float] = []
+            for entry in splits:
+                value = entry.get(key)
+                if isinstance(value, Real) and np.isfinite(value):
+                    values.append(float(value))
+            if values:
+                aggregate[key] = float(np.mean(values))
+        aggregate["folds"] = int(len(splits))
+        return aggregate
 
     # ------------------------------------------------------------------
     # Inference
@@ -267,6 +515,8 @@ class StockPredictorAI:
         requested_targets = list(targets) if targets else list(self.config.prediction_targets)
         predictions: dict[str, Any] = {}
         confidences: dict[str, float] = {}
+        probabilities: dict[str, Dict[str, float]] = {}
+        prediction_warnings: List[str] = []
         training_report: dict[str, Any] = {}
 
         for target in requested_targets:
@@ -289,7 +539,38 @@ class StockPredictorAI:
 
             if model_supports_proba(model) and target == "direction":
                 proba = model.predict_proba(current_features)[0]
-                confidences[target] = float(max(proba))
+                estimator = model.named_steps.get("estimator")
+                classes = getattr(estimator, "classes_", None)
+                class_prob_map: Dict[Any, float] = {}
+                if classes is not None:
+                    class_prob_map = {
+                        cls: float(prob)
+                        for cls, prob in zip(classes, proba)
+                    }
+                up_prob = float(
+                    class_prob_map.get(1)
+                    or class_prob_map.get(1.0)
+                    or class_prob_map.get("1")
+                    or class_prob_map.get(True)
+                    or (float(proba[1]) if len(proba) > 1 else 0.0)
+                )
+                down_prob = float(
+                    class_prob_map.get(0)
+                    or class_prob_map.get(0.0)
+                    or class_prob_map.get("0")
+                    or class_prob_map.get(False)
+                    or (float(proba[0]) if len(proba) > 0 else 0.0)
+                )
+                probabilities[target] = {"up": up_prob, "down": down_prob}
+                confidence_value = float(max(up_prob, down_prob))
+                confidences[target] = confidence_value
+                threshold = float(self.config.direction_confidence_threshold)
+                if confidence_value < threshold:
+                    warning_msg = (
+                        f"Direction model confidence {confidence_value:.3f} below threshold {threshold:.2f}."
+                    )
+                    LOGGER.warning(warning_msg)
+                    prediction_warnings.append(warning_msg)
 
         close_prediction = predictions.get("close")
         latest_close = float(self.metadata.get("latest_close", np.nan))
@@ -340,8 +621,12 @@ class StockPredictorAI:
         }
         if confidences:
             result["confidence"] = confidences
+        if probabilities:
+            result["probabilities"] = probabilities
         if training_report:
             result["training_metrics"] = training_report
+        if prediction_warnings:
+            result["warnings"] = prediction_warnings
         explanation = self._build_prediction_explanation(result, predictions)
         if explanation:
             result["explanation"] = explanation
