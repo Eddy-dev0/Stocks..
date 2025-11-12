@@ -201,6 +201,51 @@ class CorporateEvent(Base):
         }
 
 
+class ResearchArtifact(Base):
+    """Persisted research notes produced by the research services."""
+
+    __tablename__ = "research_artifacts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="crawler")
+    raw_content: Mapped[str] = mapped_column(Text, nullable=False)
+    extractive_summary: Mapped[str | None] = mapped_column(Text)
+    abstractive_summary: Mapped[str | None] = mapped_column(Text)
+    sentiment_label: Mapped[str | None] = mapped_column(String(16))
+    sentiment_score: Mapped[float | None] = mapped_column(Float)
+    metadata_json: Mapped[str | None] = mapped_column("metadata", Text)
+
+    __table_args__ = (
+        UniqueConstraint("url", "content_hash", name="uq_research_artifact"),
+        {"sqlite_autoincrement": True},
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = {
+            "id": self.id,
+            "url": self.url,
+            "content_hash": self.content_hash,
+            "captured_at": self.captured_at,
+            "source": self.source,
+            "raw_content": self.raw_content,
+            "extractive_summary": self.extractive_summary,
+            "abstractive_summary": self.abstractive_summary,
+            "sentiment_label": self.sentiment_label,
+            "sentiment_score": self.sentiment_score,
+        }
+        if self.metadata_json:
+            try:
+                payload["metadata"] = json.loads(self.metadata_json)
+            except (TypeError, json.JSONDecodeError):
+                payload["metadata"] = self.metadata_json
+        else:
+            payload["metadata"] = None
+        return payload
+
+
 class OptionSurfacePoint(Base):
     """Point-in-time option greeks and implied volatility metrics."""
 
@@ -891,6 +936,55 @@ class Database:
             data = [row.to_frame_dict() for row in rows]
         return pd.DataFrame(data)
 
+    def upsert_research_artifact(self, record: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(record)
+        payload.setdefault("source", "crawler")
+        payload.setdefault("captured_at", datetime.utcnow())
+        metadata_payload = payload.pop("metadata", None)
+        payload["metadata_json"] = self._dump_json(metadata_payload)
+        with self.session() as session:
+            existing = (
+                session.execute(
+                    select(ResearchArtifact).where(
+                        ResearchArtifact.url == payload["url"],
+                        ResearchArtifact.content_hash == payload["content_hash"],
+                    )
+                )
+                .scalars()
+                .one_or_none()
+            )
+            if existing is None:
+                entry = ResearchArtifact(**payload)
+                session.add(entry)
+                session.flush()
+                session.refresh(entry)
+                return entry.to_dict()
+
+            existing.captured_at = payload["captured_at"]
+            existing.source = payload.get("source", existing.source)
+            existing.raw_content = payload.get("raw_content", existing.raw_content)
+            existing.extractive_summary = payload.get("extractive_summary")
+            existing.abstractive_summary = payload.get("abstractive_summary")
+            existing.sentiment_label = payload.get("sentiment_label")
+            existing.sentiment_score = payload.get("sentiment_score")
+            existing.metadata_json = payload.get("metadata_json")
+            session.add(existing)
+            session.flush()
+            session.refresh(existing)
+            return existing.to_dict()
+
+    def get_research_artifacts(self, limit: int = 50) -> list[dict[str, Any]]:
+        if limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        stmt = (
+            select(ResearchArtifact)
+            .order_by(ResearchArtifact.captured_at.desc())
+            .limit(int(limit))
+        )
+        with self.session() as session:
+            rows = session.execute(stmt).scalars().all()
+            return [row.to_dict() for row in rows]
+
     def get_ownership_flows(
         self,
         ticker: str,
@@ -1030,6 +1124,7 @@ __all__ = [
     "SentimentSignal",
     "ESGMetricEntry",
     "OwnershipFlow",
+    "ResearchArtifact",
     "ExperimentLog",
     "ExperimentTracker",
 ]
