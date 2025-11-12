@@ -471,9 +471,18 @@ class StockPredictorDesktopApp:
     def _build_overview_tab(self) -> None:
         frame = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(frame, text="Overview")
+        frame.grid_rowconfigure(0, weight=1)
+        frame.grid_columnconfigure(0, weight=1)
 
-        summary_frame = ttk.Frame(frame)
-        summary_frame.pack(fill=tk.X, padx=4, pady=(0, 12))
+        overview = ttk.Panedwindow(frame, orient="vertical")
+        overview.grid(row=0, column=0, sticky="nsew")
+        overview.grid_rowconfigure(0, weight=1)
+        overview.grid_columnconfigure(0, weight=1)
+
+        summary_frame = ttk.Frame(overview, padding=(4, 4, 4, 12))
+        chart_container = ttk.Frame(overview)
+        overview.add(summary_frame, weight=0)
+        overview.add(chart_container, weight=1)
 
         self.metric_vars: dict[str, tk.StringVar] = {}
         metric_specs = [
@@ -484,23 +493,37 @@ class StockPredictorDesktopApp:
             ("expected_change", "Expected change"),
             ("direction", "Direction"),
         ]
-        columns = 3
+        for column in range(4):
+            weight = 1 if column % 2 == 1 else 0
+            summary_frame.grid_columnconfigure(column, weight=weight)
         for idx, (key, label) in enumerate(metric_specs):
-            column = idx % columns
-            row = idx // columns
-            container = ttk.Frame(summary_frame, padding=4)
-            container.grid(row=row, column=column, sticky=tk.W)
-            ttk.Label(container, text=f"{label}:", font=("TkDefaultFont", 9, "bold")).pack(anchor=tk.W)
+            row = idx // 2
+            column = (idx % 2) * 2
+            caption = ttk.Label(summary_frame, text=f"{label}:", anchor=tk.E)
+            caption.grid(row=row, column=column, sticky=tk.E, padx=(4, 8), pady=2)
             var = tk.StringVar(value="—")
-            ttk.Label(container, textvariable=var).pack(anchor=tk.W)
+            value = ttk.Label(
+                summary_frame,
+                textvariable=var,
+                anchor=tk.E,
+                font=("TkDefaultFont", 10, "bold"),
+            )
+            value.grid(row=row, column=column + 1, sticky=tk.E, padx=(0, 8), pady=2)
             self.metric_vars[key] = var
 
-        self.pnl_label = ttk.Label(frame, textvariable=self.pnl_var)
-        self._pnl_pack_options = {"anchor": tk.W, "padx": 8, "pady": (0, 12)}
-        self.pnl_label.pack(**self._pnl_pack_options)
+        self.pnl_label = ttk.Label(
+            summary_frame,
+            textvariable=self.pnl_var,
+            anchor=tk.W,
+            font=("TkDefaultFont", 10, "bold"),
+        )
+        self._pnl_grid_options = {"row": 3, "column": 0, "columnspan": 4, "sticky": tk.W, "pady": (12, 0)}
+        self.pnl_label.grid(**self._pnl_grid_options)
 
-        chart_frame = ttk.LabelFrame(frame, text="Price history", padding=8)
-        chart_frame.pack(fill=tk.BOTH, expand=True)
+        chart_container.grid_rowconfigure(0, weight=1)
+        chart_container.grid_columnconfigure(0, weight=1)
+        chart_frame = ttk.LabelFrame(chart_container, text="Price history", padding=8)
+        chart_frame.grid(row=0, column=0, sticky="nsew")
         self.price_figure = Figure(figsize=(8, 4), dpi=100)
         self.price_ax = self.price_figure.add_subplot(111)
         self.price_canvas = FigureCanvasTkAgg(self.price_figure, master=chart_frame)
@@ -684,6 +707,7 @@ class StockPredictorDesktopApp:
             return
         self._apply_horizon_selection(label)
         self._update_forecast_label()
+        self._refresh_overview()
         self._on_predict()
 
     def _on_currency_default_changed(self, _event: Any | None = None) -> None:
@@ -783,7 +807,7 @@ class StockPredictorDesktopApp:
         self._set_status(f"FX rate updated to {rate:.4f}.")
 
     def _on_position_size_changed(self, *_args: Any) -> None:
-        self._recompute_pnl()
+        self._refresh_overview()
 
     def _on_ticker_submitted(self, _event: Any) -> None:
         self._apply_ticker_change(self.ticker_var.get())
@@ -886,6 +910,7 @@ class StockPredictorDesktopApp:
         self.market_holidays = []
         self.current_forecast_date = None
         self.forecast_date_var.set("Forecast date: —")
+        self._refresh_overview()
         self._run_async(self._refresh_and_predict, f"Loading data for {self.config.ticker}…")
 
     # ------------------------------------------------------------------
@@ -1409,16 +1434,23 @@ class StockPredictorDesktopApp:
             return list(value)
         return [value]
 
-    def _refresh_numeric_views(self) -> None:
-        metrics_updated = False
+    def _refresh_overview(self) -> bool:
+        refreshed = False
         if hasattr(self, "metric_vars"):
-            metrics_updated = True
             self._update_metrics()
+            refreshed = True
+        elif hasattr(self, "pnl_label"):
+            self._recompute_pnl()
+            refreshed = True
+        return refreshed
+
+    def _refresh_numeric_views(self) -> None:
+        overview_refreshed = self._refresh_overview()
         if hasattr(self, "price_ax"):
             self._update_price_chart()
         if hasattr(self, "indicator_tree"):
             self._update_indicator_view()
-        if not metrics_updated and hasattr(self, "pnl_label"):
+        if not overview_refreshed and hasattr(self, "pnl_label"):
             self._recompute_pnl()
 
     def _currency_label(self, mode: str | None = None) -> str:
@@ -1577,10 +1609,10 @@ class StockPredictorDesktopApp:
             return
         if self.show_pnl_var.get():
             if not self.pnl_label.winfo_ismapped():
-                self.pnl_label.pack(**getattr(self, "_pnl_pack_options", {}))
+                self.pnl_label.grid(**getattr(self, "_pnl_grid_options", {}))
         else:
             if self.pnl_label.winfo_manager():
-                self.pnl_label.pack_forget()
+                self.pnl_label.grid_remove()
 
     def _apply_theme(self) -> None:
         enabled = self.dark_mode_enabled
