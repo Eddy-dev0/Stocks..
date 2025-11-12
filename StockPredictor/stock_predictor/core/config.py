@@ -8,6 +8,8 @@ import os
 from dataclasses import dataclass, field, fields
 from datetime import date, timedelta
 from pathlib import Path
+import re
+
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from dotenv import load_dotenv
@@ -38,6 +40,25 @@ DEFAULT_BACKTEST_STRATEGY = "rolling"
 DEFAULT_BACKTEST_WINDOW = 252
 DEFAULT_BACKTEST_STEP = 21
 DEFAULT_VOLATILITY_WINDOW = 20
+
+
+HORIZON_UNIT_TO_DAYS: dict[str, int] = {
+    "d": 1,
+    "day": 1,
+    "days": 1,
+    "bd": 1,
+    "businessday": 1,
+    "businessdays": 1,
+    "w": 5,
+    "wk": 5,
+    "wks": 5,
+    "week": 5,
+    "weeks": 5,
+    "m": 21,
+    "mo": 21,
+    "month": 21,
+    "months": 21,
+}
 
 
 @dataclass
@@ -191,10 +212,7 @@ class PredictorConfig:
 
         if horizon is None:
             return self.prediction_horizons[0]
-        try:
-            value = int(horizon)
-        except (TypeError, ValueError) as exc:  # pragma: no cover - defensive
-            raise ValueError("horizon must be an integer") from exc
+        value = self._coerce_horizon_value(horizon)
         if value <= 0:
             raise ValueError("horizon must be a positive integer")
         if value not in self.prediction_horizons:
@@ -202,6 +220,26 @@ class PredictorConfig:
                 f"horizon {value} is not configured. Available: {self.prediction_horizons}."
             )
         return value
+
+    def _coerce_horizon_value(self, horizon: Any) -> int:
+        if isinstance(horizon, int):
+            return horizon
+        if isinstance(horizon, str):
+            cleaned = horizon.strip().lower()
+            if not cleaned:
+                raise ValueError("horizon must be an integer or supported label")
+            try:
+                return int(cleaned)
+            except ValueError:
+                pass
+            match = re.fullmatch(r"(?P<value>\d+)\s*(?P<unit>[a-z]+)", cleaned)
+            if match:
+                base = int(match.group("value"))
+                unit = match.group("unit")
+                mapped = HORIZON_UNIT_TO_DAYS.get(unit)
+                if mapped:
+                    return base * mapped
+        raise ValueError("horizon must be an integer or supported label")
 
     @property
     def default_horizon(self) -> int:
