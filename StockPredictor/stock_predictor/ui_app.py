@@ -21,6 +21,26 @@ from stock_predictor.core import DEFAULT_PREDICTION_HORIZONS, StockPredictorAI
 LOGGER = logging.getLogger(__name__)
 
 
+KNOWN_CURRENCY_SYMBOLS = (
+    "$",
+    "€",
+    "£",
+    "¥",
+    "₹",
+    "₩",
+    "₽",
+    "₪",
+    "₫",
+    "₱",
+    "฿",
+    "₦",
+    "₴",
+    "₭",
+    "₲",
+    "₵",
+)
+
+
 def _safe_float(value: Any) -> float | None:
     """Best-effort conversion used for rendering numeric values."""
 
@@ -31,6 +51,42 @@ def _safe_float(value: Any) -> float | None:
     if not np.isfinite(numeric):
         return None
     return numeric
+
+
+def _detect_currency_symbol(label: str, fallback: str = "$") -> str:
+    """Extract a representative currency symbol from a display label."""
+
+    for char in label:
+        if char in KNOWN_CURRENCY_SYMBOLS:
+            return char
+    trimmed = label.strip()
+    if len(trimmed) == 1 and not trimmed.isdigit():
+        return trimmed
+    return fallback
+
+
+def fmt_ccy(value: Any, symbol: str, *, decimals: int = 2) -> str:
+    """Format a numeric value as currency with thousands separators."""
+
+    numeric = _safe_float(value)
+    if numeric is None:
+        return "—"
+    formatted = f"{abs(numeric):,.{decimals}f}"
+    sign = "-" if numeric < 0 else ""
+    clean_symbol = symbol or ""
+    return f"{sign}{clean_symbol}{formatted}" if clean_symbol else f"{sign}{formatted}"
+
+
+def fmt_pct(value: Any, *, decimals: int = 2, show_sign: bool = False) -> str:
+    """Format a numeric value as a percentage string."""
+
+    numeric = _safe_float(value)
+    if numeric is None:
+        return "—"
+    scaled = numeric * 100
+    if show_sign:
+        return f"{scaled:+.{decimals}f}%"
+    return f"{scaled:.{decimals}f}%"
 
 
 @dataclass(slots=True)
@@ -48,53 +104,6 @@ HORIZON_OPTIONS: tuple[HorizonOption, ...] = (
     HorizonOption("1 Month", "1m", 21),
     HorizonOption("3 Months", "3m", 63),
 )
-
-
-@dataclass(slots=True)
-class CurrencyFormatter:
-    """Utility that handles currency selection and formatting."""
-
-    labels: dict[str, str]
-    rates: dict[str, float]
-    mode: str = "local"
-
-    def set_mode(self, mode: str) -> None:
-        """Switch between currency modes."""
-
-        if mode not in self.labels:
-            LOGGER.debug("Unsupported currency mode '%s'; defaulting to local", mode)
-            mode = "local"
-        self.mode = mode
-
-    def set_rate(self, mode: str, rate: float) -> None:
-        """Update the FX conversion rate for a specific mode."""
-
-        if rate <= 0:
-            raise ValueError("FX rate must be positive.")
-        if mode not in self.labels:
-            raise ValueError(f"Unknown currency mode '{mode}'")
-        self.rates[mode] = rate
-
-    def get_label(self, mode: str | None = None) -> str:
-        return self.labels.get(mode or self.mode, self.labels.get("local", ""))
-
-    def get_rate(self, mode: str | None = None) -> float:
-        return self.rates.get(mode or self.mode, 1.0)
-
-    def format(self, value: Any, *, allow_sign: bool = True) -> str:
-        """Format a numeric value according to the active mode."""
-
-        numeric = _safe_float(value)
-        if numeric is None:
-            return "—"
-        label = self.get_label()
-        rendered = numeric * self.get_rate()
-        formatted = f"{abs(rendered):,.2f}"
-        if not allow_sign:
-            return f"{label} {formatted}".strip()
-        if rendered < 0:
-            return f"{label} -{formatted}"
-        return f"{label} {formatted}"
 
 
 class Tooltip:
@@ -143,18 +152,19 @@ class StockPredictorDesktopApp:
         self.ticker_var = tk.StringVar(value=self.config.ticker)
         base_currency = os.environ.get("STOCK_PREDICTOR_UI_BASE_CURRENCY", "Local")
         usd_rate = self._resolve_fx_rate(os.environ.get("STOCK_PREDICTOR_UI_FX_RATE"))
-        self.currency_formatter = CurrencyFormatter(
-            labels={
-                "local": base_currency,
-                "usd": "USD $",
-                "eur": "EUR €",
-            },
-            rates={
-                "local": 1.0,
-                "usd": usd_rate,
-                "eur": 1.0,
-            },
-        )
+        base_symbol = _detect_currency_symbol(base_currency, fallback="$")
+        self.currency_profiles: dict[str, dict[str, str]] = {
+            "local": {"label": base_currency, "symbol": base_symbol.strip()},
+            "usd": {"label": "USD $", "symbol": "$"},
+            "eur": {"label": "EUR €", "symbol": "€"},
+        }
+        self.currency_rates: dict[str, float] = {
+            "local": 1.0,
+            "usd": usd_rate,
+            "eur": 1.0,
+        }
+        self.currency_mode: str = "local"
+        self.currency_symbol: str = self._currency_symbol("local")
 
         horizons = self.config.prediction_horizons or DEFAULT_PREDICTION_HORIZONS
         self.horizon_options = HORIZON_OPTIONS
@@ -171,8 +181,8 @@ class StockPredictorDesktopApp:
         self.forecast_date_var = tk.StringVar(value="Forecast date: —")
 
         self.currency_mode_var = tk.StringVar(value="local")
-        self.currency_button_text = tk.StringVar(value=self.currency_formatter.get_label("local"))
-        self.currency_rate_var = tk.StringVar(value=f"{self.currency_formatter.get_rate('usd'):.4f}")
+        self.currency_button_text = tk.StringVar(value=self._currency_label("local"))
+        self.currency_rate_var = tk.StringVar(value=f"{self._currency_rate('usd'):.4f}")
 
         self._busy = False
 
@@ -245,7 +255,7 @@ class StockPredictorDesktopApp:
         )
         self.currency_menu = tk.Menu(self.currency_menu_button, tearoff=False)
         for code in ("local", "usd", "eur"):
-            label = self.currency_formatter.get_label(code)
+            label = self._currency_label(code)
             self.currency_menu.add_radiobutton(
                 label=label,
                 value=code,
@@ -301,13 +311,12 @@ class StockPredictorDesktopApp:
             ("last_close", "Last close"),
             ("predicted_close", "Predicted close"),
             ("expected_change", "Expected change"),
-            ("expected_change_pct", "Expected change %"),
-            ("direction_probability_up", "Direction ↑"),
-            ("direction_probability_down", "Direction ↓"),
+            ("direction", "Direction"),
         ]
+        columns = 3
         for idx, (key, label) in enumerate(metric_specs):
-            column = idx % 4
-            row = idx // 4
+            column = idx % columns
+            row = idx // columns
             container = ttk.Frame(summary_frame, padding=4)
             container.grid(row=row, column=column, sticky=tk.W)
             ttk.Label(container, text=f"{label}:", font=("TkDefaultFont", 9, "bold")).pack(anchor=tk.W)
@@ -454,9 +463,13 @@ class StockPredictorDesktopApp:
         self._on_predict()
 
     def _on_currency_mode_changed(self, mode: str) -> None:
-        self.currency_formatter.set_mode(mode)
-        self.currency_button_text.set(self.currency_formatter.get_label(mode))
-        rate = self.currency_formatter.get_rate(mode)
+        if mode not in self.currency_profiles:
+            LOGGER.debug("Unsupported currency mode '%s'; defaulting to local", mode)
+            mode = "local"
+        self.currency_mode = mode
+        self.currency_symbol = self._currency_symbol(mode)
+        self.currency_button_text.set(self._currency_label(mode))
+        rate = self._currency_rate(mode)
         self.currency_rate_var.set(f"{rate:.4f}")
         if self._busy:
             entry_state = tk.DISABLED
@@ -471,6 +484,10 @@ class StockPredictorDesktopApp:
         self.fx_rate_button.configure(state=button_state)
         if hasattr(self, "metric_vars"):
             self._update_metrics()
+        if hasattr(self, "price_ax"):
+            self._update_price_chart()
+        if hasattr(self, "indicator_tree"):
+            self._update_indicator_view()
 
     def _on_currency_rate_submit(self, _event: Any) -> None:
         self._on_currency_rate_button()
@@ -484,15 +501,17 @@ class StockPredictorDesktopApp:
             rate = float(raw)
         except (TypeError, ValueError):
             messagebox.showwarning("Invalid FX rate", "Please provide a numeric FX conversion rate.")
-            self.currency_rate_var.set(f"{self.currency_formatter.get_rate(mode):.4f}")
+            self.currency_rate_var.set(f"{self._currency_rate(mode):.4f}")
             return
         if rate <= 0:
             messagebox.showwarning("Invalid FX rate", "FX conversion rate must be positive.")
-            self.currency_rate_var.set(f"{self.currency_formatter.get_rate(mode):.4f}")
+            self.currency_rate_var.set(f"{self._currency_rate(mode):.4f}")
             return
-        self.currency_formatter.set_rate(mode, rate)
-        self.currency_rate_var.set(f"{self.currency_formatter.get_rate(mode):.4f}")
+        self._set_currency_rate(mode, rate)
+        self.currency_rate_var.set(f"{self._currency_rate(mode):.4f}")
         self._update_metrics()
+        self._update_price_chart()
+        self._update_indicator_view()
 
     def _on_ticker_submitted(self, _event: Any) -> None:
         self._apply_ticker_change(self.ticker_var.get())
@@ -728,20 +747,25 @@ class StockPredictorDesktopApp:
 
         return pd.Timestamp.today().normalize()
 
-    def _update_forecast_label(self, target_date: Any | None = None) -> None:
-        display = "Forecast date: —"
-        forecast: pd.Timestamp | None = None
+    def _compute_forecast_date(self, target_date: Any | None = None) -> pd.Timestamp | None:
         parsed = pd.to_datetime(target_date, errors="coerce") if target_date is not None else None
         if pd.notna(parsed):
-            forecast = pd.Timestamp(parsed).normalize()
-        else:
-            option = self.selected_horizon_option
-            base_date = self._forecast_base_date()
-            try:
-                offset = pd.tseries.offsets.BusinessDay(option.business_days)
-                forecast = (base_date + offset).normalize()
-            except Exception:
-                forecast = (base_date + pd.to_timedelta(option.business_days, unit="D")).normalize()
+            return pd.Timestamp(parsed).normalize()
+
+        option = self.selected_horizon_option
+        if option is None:
+            return None
+        base_date = self._forecast_base_date()
+        try:
+            offset = pd.tseries.offsets.BusinessDay(option.business_days)
+            forecast = (base_date + offset).normalize()
+        except Exception:
+            forecast = (base_date + pd.to_timedelta(option.business_days, unit="D")).normalize()
+        return forecast
+
+    def _update_forecast_label(self, target_date: Any | None = None) -> None:
+        display = "Forecast date: —"
+        forecast = self._compute_forecast_date(target_date)
         if forecast is not None:
             display = f"Forecast date: {forecast.date().isoformat()}"
         self.forecast_date_var.set(display)
@@ -760,22 +784,43 @@ class StockPredictorDesktopApp:
         expected_change = prediction.get("expected_change")
         expected_change_pct = prediction.get("expected_change_pct")
 
-        self.metric_vars["last_close"].set(self.currency_formatter.format(last_close))
-        self.metric_vars["predicted_close"].set(self.currency_formatter.format(predicted_close))
-        self.metric_vars["expected_change"].set(self.currency_formatter.format(expected_change))
+        last_close_converted = self._convert_currency(last_close)
+        predicted_converted = self._convert_currency(predicted_close)
+        change_converted = self._convert_currency(expected_change)
 
-        pct = _safe_float(expected_change_pct)
-        if pct is None:
-            self.metric_vars["expected_change_pct"].set("—")
+        self.metric_vars["last_close"].set(fmt_ccy(last_close_converted, self.currency_symbol))
+
+        forecast = self._compute_forecast_date(self.current_prediction.get("target_date"))
+        predicted_display = fmt_ccy(predicted_converted, self.currency_symbol)
+        if forecast is not None:
+            forecast_str = forecast.date().isoformat()
+            if predicted_display == "—":
+                predicted_display = f"— ({forecast_str})"
+            else:
+                predicted_display = f"{predicted_display} ({forecast_str})"
+        self.metric_vars["predicted_close"].set(predicted_display)
+
+        change_display = fmt_ccy(change_converted, self.currency_symbol)
+        pct_display = fmt_pct(expected_change_pct, show_sign=True)
+        if change_display == "—" and pct_display == "—":
+            self.metric_vars["expected_change"].set("—")
+        elif change_display == "—":
+            self.metric_vars["expected_change"].set(pct_display)
+        elif pct_display == "—":
+            self.metric_vars["expected_change"].set(change_display)
         else:
-            self.metric_vars["expected_change_pct"].set(f"{pct * 100:+.2f}%")
+            self.metric_vars["expected_change"].set(f"{change_display} ({pct_display})")
 
         prob_up = prediction.get("direction_probability_up")
         prob_down = prediction.get("direction_probability_down")
-        prob_up_str = self._format_probability(prob_up)
-        prob_down_str = self._format_probability(prob_down)
-        self.metric_vars["direction_probability_up"].set(prob_up_str)
-        self.metric_vars["direction_probability_down"].set(prob_down_str)
+        prob_up_str = fmt_pct(prob_up, decimals=1)
+        prob_down_str = fmt_pct(prob_down, decimals=1)
+        parts: list[str] = []
+        if prob_up_str != "—":
+            parts.append(f"↑ {prob_up_str}")
+        if prob_down_str != "—":
+            parts.append(f"↓ {prob_down_str}")
+        self.metric_vars["direction"].set("   ".join(parts) if parts else "—")
 
         if explanation and isinstance(explanation, Mapping):
             summary = explanation.get("summary")
@@ -804,25 +849,33 @@ class StockPredictorDesktopApp:
             if close_column is None:
                 close_column = frame.select_dtypes(include=[np.number]).columns[0]
             series = pd.to_numeric(frame[close_column], errors="coerce")
+            rate = self._currency_rate()
+            series = series * rate
             self.price_ax.plot(x_values, series, label="Close")
             predicted_close = _safe_float(self.current_prediction.get("predicted_close"))
             if predicted_close is not None:
                 target_date = self.current_prediction.get("target_date") or self.current_prediction.get("horizon")
-                self.price_ax.axhline(predicted_close, color="tab:orange", linestyle="--", label="Predicted close")
+                converted_prediction = predicted_close * rate
+                self.price_ax.axhline(
+                    converted_prediction, color="tab:orange", linestyle="--", label="Predicted close"
+                )
                 if hasattr(x_values, "iloc"):
                     last_x = x_values.iloc[-1]
                 else:
                     last_x = x_values[-1]
                 self.price_ax.text(
                     last_x,
-                    predicted_close,
-                    f"Predicted: {predicted_close:.2f}",
+                    converted_prediction,
+                    f"Predicted: {fmt_ccy(converted_prediction, self.currency_symbol)}",
                     color="tab:orange",
                     va="bottom",
                 )
                 if target_date:
                     self.price_ax.set_title(f"Forecast horizon: {target_date}")
-            self.price_ax.set_ylabel("Price")
+            ylabel = "Price"
+            if self.currency_symbol:
+                ylabel = f"Price ({self.currency_symbol})"
+            self.price_ax.set_ylabel(ylabel)
             self.price_ax.grid(True, linestyle="--", alpha=0.3)
             self.price_ax.legend(loc="best")
         else:
@@ -844,11 +897,12 @@ class StockPredictorDesktopApp:
                 if numeric is None:
                     continue
                 category = categories.get(column, "feature")
+                display_value = self._format_price_like_value(column, numeric, decimals=4)
                 self.indicator_tree.insert(
                     "",
                     tk.END,
                     iid=str(column),
-                    values=(str(column), f"{numeric:.4f}", str(category)),
+                    values=(str(column), display_value, str(category)),
                 )
         if not self.indicator_tree.get_children() and isinstance(self.indicator_history, pd.DataFrame):
             frame = self.indicator_history
@@ -870,11 +924,12 @@ class StockPredictorDesktopApp:
                     numeric = _safe_float(row.get(value_col))
                     if numeric is None:
                         continue
+                    display_value = self._format_price_like_value(name, numeric, decimals=4)
                     self.indicator_tree.insert(
                         "",
                         tk.END,
                         iid=name,
-                        values=(name, f"{numeric:.4f}", "indicator"),
+                        values=(name, display_value, "indicator"),
                     )
         if isinstance(self.feature_history, pd.DataFrame):
             cleaned_history = self.feature_history.copy()
@@ -952,17 +1007,49 @@ class StockPredictorDesktopApp:
     # ------------------------------------------------------------------
     # Utility helpers
     # ------------------------------------------------------------------
+    def _currency_label(self, mode: str | None = None) -> str:
+        profile = self.currency_profiles.get(mode or self.currency_mode, {})
+        return str(profile.get("label") or "")
+
+    def _currency_symbol(self, mode: str | None = None) -> str:
+        profile = self.currency_profiles.get(mode or self.currency_mode, {})
+        symbol = str(profile.get("symbol") or "").strip()
+        if not symbol:
+            label = str(profile.get("label") or "")
+            symbol = _detect_currency_symbol(label, fallback="")
+        return symbol
+
+    def _currency_rate(self, mode: str | None = None) -> float:
+        return float(self.currency_rates.get(mode or self.currency_mode, 1.0))
+
+    def _set_currency_rate(self, mode: str, rate: float) -> None:
+        if rate <= 0:
+            raise ValueError("FX rate must be positive.")
+        if mode not in self.currency_rates:
+            raise ValueError(f"Unknown currency mode '{mode}'")
+        self.currency_rates[mode] = rate
+
+    def _convert_currency(self, value: Any) -> float | None:
+        numeric = _safe_float(value)
+        if numeric is None:
+            return None
+        return numeric * self._currency_rate()
+
+    def _format_price_like_value(self, name: Any, value: Any, *, decimals: int = 4) -> str:
+        numeric = _safe_float(value)
+        if numeric is None:
+            return "—"
+        label = str(name).lower()
+        if any(keyword in label for keyword in ("price", "close", "open", "high", "low")):
+            converted = self._convert_currency(numeric)
+            return fmt_ccy(converted, self.currency_symbol, decimals=decimals)
+        return f"{numeric:.{decimals}f}"
+
     def _set_text(self, widget: tk.Text, value: str) -> None:
         widget.configure(state=tk.NORMAL)
         widget.delete("1.0", tk.END)
         widget.insert(tk.END, value)
         widget.configure(state=tk.DISABLED)
-
-    def _format_probability(self, value: Any) -> str:
-        numeric = _safe_float(value)
-        if numeric is None:
-            return "—"
-        return f"{numeric * 100:.1f}%"
 
     def _resolve_fx_rate(self, raw: str | None) -> float:
         if raw is None:
