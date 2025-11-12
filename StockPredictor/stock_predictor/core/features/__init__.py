@@ -81,6 +81,13 @@ def _macro_group_builder(context: FeatureBuildContext) -> FeatureBuildOutput:
     return FeatureBuildOutput(blocks=blocks, status=status)
 
 
+def _volume_liquidity_group_builder(context: FeatureBuildContext) -> FeatureBuildOutput:
+    block = _build_volume_liquidity_block(context.price_df)
+    if block is None:
+        return FeatureBuildOutput(blocks=[], status="missing_data")
+    return FeatureBuildOutput(blocks=[block], status="executed")
+
+
 def _sentiment_group_builder(context: FeatureBuildContext) -> FeatureBuildOutput:
     metadata: Dict[str, object] = {}
     if not context.sentiment_enabled:
@@ -108,7 +115,7 @@ FEATURE_REGISTRY: Dict[str, FeatureGroupSpec] = build_feature_registry(
     macro=_macro_group_builder,
     sentiment=_sentiment_group_builder,
     identification=_not_implemented_group_builder("identification"),
-    volume_liquidity=_not_implemented_group_builder("volume_liquidity"),
+    volume_liquidity=_volume_liquidity_group_builder,
     options=_not_implemented_group_builder("options"),
     esg=_not_implemented_group_builder("esg"),
 )
@@ -458,6 +465,80 @@ def _get_numeric_series(df: pd.DataFrame, column: str, default: float = np.nan) 
 
 def _safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     return numerator / denominator.replace(0, np.nan)
+
+
+def _build_volume_liquidity_block(price_df: pd.DataFrame) -> FeatureBlock | None:
+    if price_df.empty or "Volume" not in price_df:
+        return None
+
+    df = price_df.sort_values("Date").reset_index(drop=True)
+    raw_volume = pd.to_numeric(df["Volume"], errors="coerce")
+    if raw_volume.isna().all():
+        return None
+    volume = raw_volume.fillna(0.0)
+    if np.allclose(volume, 0.0):
+        return None
+
+    close = _get_numeric_series(df, "Close", default=np.nan)
+    high = _get_numeric_series(df, "High", default=np.nan).fillna(close)
+    low = _get_numeric_series(df, "Low", default=np.nan).fillna(close)
+    adj_close = _get_numeric_series(df, "Adj Close", default=np.nan)
+
+    typical_price = (high + low + close) / 3.0
+    price_change = close.diff().fillna(0.0)
+
+    obv_direction = np.sign(price_change)
+    obv_direction.iloc[0] = 0.0
+    on_balance_volume = (obv_direction * volume).cumsum()
+
+    pct_change = close.pct_change().fillna(0.0)
+    volume_price_trend = (pct_change * volume).cumsum()
+
+    raw_money_flow = typical_price * volume
+    price_delta = typical_price.diff().fillna(0.0)
+    positive_flow = raw_money_flow.where(price_delta > 0, 0.0)
+    negative_flow = raw_money_flow.where(price_delta < 0, 0.0).abs()
+    money_ratio = positive_flow.rolling(window=14, min_periods=1).sum() / (
+        negative_flow.rolling(window=14, min_periods=1).sum().replace(0, np.nan)
+    )
+    money_flow_index = 100 - (100 / (1 + money_ratio))
+
+    turnover_value = close.fillna(0.0) * volume
+    if adj_close.notna().any():
+        turnover_value = adj_close.fillna(close).fillna(0.0) * volume
+
+    liquidity_frame = pd.DataFrame({"Date": df["Date"].reset_index(drop=True)})
+    liquidity_frame["OBV"] = on_balance_volume
+    liquidity_frame["VPT"] = volume_price_trend
+    liquidity_frame["MoneyFlowIndex_14"] = money_flow_index
+    liquidity_frame["Volume_RollingMean_10"] = volume.rolling(window=10, min_periods=1).mean()
+    liquidity_frame["Volume_RollingMean_20"] = volume.rolling(window=20, min_periods=1).mean()
+    liquidity_frame["Volume_RollingStd_20"] = volume.rolling(window=20, min_periods=2).std()
+    liquidity_frame["Turnover_Value"] = turnover_value
+    liquidity_frame["Volume_to_Avg20"] = _safe_divide(
+        volume, volume.rolling(window=20, min_periods=1).mean()
+    )
+    liquidity_frame["Volume_Price_Elasticity"] = _safe_divide(volume.diff(), price_change.replace(0, np.nan))
+
+    column_categories = {
+        "OBV": "volume_trend",
+        "VPT": "volume_trend",
+        "MoneyFlowIndex_14": "liquidity_oscillator",
+        "Volume_RollingMean_10": "volume_level",
+        "Volume_RollingMean_20": "volume_level",
+        "Volume_RollingStd_20": "volume_volatility",
+        "Turnover_Value": "liquidity_turnover",
+        "Volume_to_Avg20": "volume_relative",
+        "Volume_Price_Elasticity": "liquidity_sensitivity",
+    }
+
+    liquidity_frame = liquidity_frame.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    return FeatureBlock(
+        liquidity_frame,
+        category="volume_liquidity",
+        column_categories=column_categories,
+    )
 
 
 def _build_elliott_wave_descriptors(price_df: pd.DataFrame) -> FeatureBlock | None:

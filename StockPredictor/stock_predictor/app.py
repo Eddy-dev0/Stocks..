@@ -7,7 +7,7 @@ import os
 import platform
 import signal
 from multiprocessing import Process
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -85,6 +85,21 @@ class StockPredictorApplication:
 
         LOGGER.info("Generating predictions (refresh=%s)", refresh)
         return self.pipeline.predict(targets=targets, refresh_data=refresh, horizon=horizon)
+
+    def update_ticker(self, ticker: str) -> None:
+        """Update the active ticker and rebuild dependent components."""
+
+        new_ticker = ticker.strip().upper()
+        if not new_ticker:
+            raise ValueError("Ticker symbol cannot be empty.")
+        if new_ticker == self.config.ticker:
+            return
+
+        updated_config = replace(self.config, ticker=new_ticker)
+        updated_config.ensure_directories()
+        self.config = updated_config
+        self.pipeline = StockPredictorAI(updated_config)
+        LOGGER.info("Switched application context to ticker %s", new_ticker)
 
     def backtest(self, *, targets: Iterable[str] | None = None) -> dict[str, Any]:
         """Run historical simulations to evaluate the active models."""

@@ -86,6 +86,7 @@ class StockPredictorDesktopApp:
         self.root.title(f"Stock Predictor – {self.config.ticker}")
         self.root.geometry("1280x840")
 
+        self.ticker_var = tk.StringVar(value=self.config.ticker)
         base_currency = os.environ.get("STOCK_PREDICTOR_UI_BASE_CURRENCY", "Local")
         quote_currency = os.environ.get("STOCK_PREDICTOR_UI_QUOTE_CURRENCY", "USD")
         fx_rate = self._resolve_fx_rate(os.environ.get("STOCK_PREDICTOR_UI_FX_RATE"))
@@ -137,6 +138,20 @@ class StockPredictorDesktopApp:
         )
         self.horizon_box.pack(side=tk.LEFT, padx=(4, 12))
         self.horizon_box.bind("<<ComboboxSelected>>", self._on_horizon_changed)
+
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+
+        ttk.Label(toolbar, text="Ticker").pack(side=tk.LEFT, padx=(0, 4))
+        self.ticker_entry = ttk.Entry(toolbar, width=10, textvariable=self.ticker_var)
+        self.ticker_entry.pack(side=tk.LEFT)
+        self.ticker_entry.bind("<Return>", self._on_ticker_submitted)
+        self.ticker_entry.bind("<FocusOut>", self._on_ticker_focus_out)
+        self.ticker_apply_button = ttk.Button(
+            toolbar,
+            text="Apply",
+            command=self._on_ticker_button,
+        )
+        self.ticker_apply_button.pack(side=tk.LEFT, padx=(4, 12))
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
 
@@ -373,6 +388,19 @@ class StockPredictorDesktopApp:
         self.fx_rate_var.set(f"{self.currency_formatter.fx_rate:.4f}")
         self._update_metrics()
 
+    def _on_ticker_submitted(self, _event: Any) -> None:
+        self._apply_ticker_change(self.ticker_var.get())
+
+    def _on_ticker_focus_out(self, _event: Any) -> None:
+        value = (self.ticker_var.get() or "").strip().upper()
+        if not value:
+            self.ticker_var.set(self.config.ticker)
+        else:
+            self.ticker_var.set(value)
+
+    def _on_ticker_button(self) -> None:
+        self._apply_ticker_change(self.ticker_var.get())
+
     def _on_indicator_selected(self, _event: Any) -> None:
         selection = self.indicator_tree.selection()
         if not selection:
@@ -420,6 +448,34 @@ class StockPredictorDesktopApp:
         self.config.feature_toggles.update(new_toggles)
         self.application.pipeline = StockPredictorAI(self.config)
         self._set_status("Feature toggles updated. Re-run prediction to apply changes.")
+
+    def _apply_ticker_change(self, raw_value: str | None) -> None:
+        if self._busy:
+            self._set_status("Operation in progress. Please wait before changing the ticker.")
+            self.ticker_var.set(self.config.ticker)
+            return
+
+        ticker = (raw_value or "").strip().upper()
+        if not ticker:
+            messagebox.showwarning("Invalid ticker", "Please provide a non-empty ticker symbol.")
+            self.ticker_var.set(self.config.ticker)
+            return
+        if ticker == self.config.ticker:
+            self.ticker_var.set(ticker)
+            return
+
+        try:
+            self.application.update_ticker(ticker)
+        except Exception as exc:  # pragma: no cover - defensive path
+            LOGGER.exception("Failed to update ticker to %s", ticker)
+            messagebox.showerror("Ticker update failed", str(exc))
+            self.ticker_var.set(self.config.ticker)
+            return
+
+        self.config = self.application.config
+        self.root.title(f"Stock Predictor – {self.config.ticker}")
+        self.ticker_var.set(self.config.ticker)
+        self._run_async(self._refresh_and_predict, f"Loading data for {self.config.ticker}…")
 
     # ------------------------------------------------------------------
     # Core actions
@@ -481,10 +537,10 @@ class StockPredictorDesktopApp:
             try:
                 result = func()
             except Exception as exc:  # pragma: no cover - defensive wrapper around worker
-                LOGGER.exception("Desktop worker failed: %%s", exc)
-                self.root.after(0, lambda: self._on_async_failure(exc))
+                LOGGER.exception("Desktop worker failed: %s", exc)
+                self.root.after(0, lambda err=exc: self._on_async_failure(err))
             else:
-                self.root.after(0, lambda: self._on_async_success(result))
+                self.root.after(0, lambda payload=result: self._on_async_success(payload))
 
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
@@ -523,6 +579,8 @@ class StockPredictorDesktopApp:
             self.refresh_button,
             self.predict_button,
             self.horizon_box,
+            self.ticker_entry,
+            self.ticker_apply_button,
             self.base_currency_button,
             self.quote_currency_button,
             self.fx_rate_entry,
@@ -669,7 +727,15 @@ class StockPredictorDesktopApp:
                         values=(name, f"{numeric:.4f}", "indicator"),
                     )
         if isinstance(self.feature_history, pd.DataFrame):
-            self.feature_history = self.feature_history.apply(pd.to_numeric, errors="ignore")
+            cleaned_history = self.feature_history.copy()
+            for column in cleaned_history.columns:
+                try:
+                    numeric = pd.to_numeric(cleaned_history[column], errors="coerce")
+                except Exception:  # pragma: no cover - defensive conversion
+                    continue
+                if not numeric.isna().all():
+                    cleaned_history[column] = numeric
+            self.feature_history = cleaned_history
 
     def _update_explanation(self) -> None:
         prediction = self.current_prediction or {}

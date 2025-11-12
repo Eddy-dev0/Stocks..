@@ -109,7 +109,7 @@ REGISTRY_BLUEPRINT: Dict[str, dict[str, object]] = {
         "description": "Advanced volume and liquidity analytics (planned).",
         "dependencies": ("technical",),
         "default_enabled": False,
-        "implemented": False,
+        "implemented": True,
     },
     "options": {
         "description": "Options market derived features and Greeks (planned).",
