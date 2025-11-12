@@ -1,7 +1,7 @@
-"""Lightweight database facade used for unit tests."""
+"""Compatibility helpers that bridge the core layer to provider services."""
 
 from __future__ import annotations
 
-from ..providers.database import ExperimentTracker
+from ..providers.database import Database, ExperimentTracker
 
-__all__ = ["ExperimentTracker"]
+__all__ = ["Database", "ExperimentTracker"]
