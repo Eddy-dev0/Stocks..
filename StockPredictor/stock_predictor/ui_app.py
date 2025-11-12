@@ -34,28 +34,52 @@ def _safe_float(value: Any) -> float | None:
 
 
 @dataclass(slots=True)
+class HorizonOption:
+    """Represents a forecast horizon option exposed in the UI."""
+
+    label: str
+    code: str
+    business_days: int
+
+
+HORIZON_OPTIONS: tuple[HorizonOption, ...] = (
+    HorizonOption("Tomorrow", "1d", 1),
+    HorizonOption("1 Week", "1w", 5),
+    HorizonOption("1 Month", "1m", 21),
+    HorizonOption("3 Months", "3m", 63),
+)
+
+
+@dataclass(slots=True)
 class CurrencyFormatter:
     """Utility that handles currency selection and formatting."""
 
-    base_label: str
-    quote_label: str
-    fx_rate: float = 1.0
-    mode: str = "base"
+    labels: dict[str, str]
+    rates: dict[str, float]
+    mode: str = "local"
 
     def set_mode(self, mode: str) -> None:
-        """Switch between base and quote currency modes."""
+        """Switch between currency modes."""
 
-        if mode not in {"base", "quote"}:
-            LOGGER.debug("Unsupported currency mode '%s'; defaulting to base", mode)
-            mode = "base"
+        if mode not in self.labels:
+            LOGGER.debug("Unsupported currency mode '%s'; defaulting to local", mode)
+            mode = "local"
         self.mode = mode
 
-    def set_rate(self, rate: float) -> None:
-        """Update the FX conversion rate."""
+    def set_rate(self, mode: str, rate: float) -> None:
+        """Update the FX conversion rate for a specific mode."""
 
         if rate <= 0:
             raise ValueError("FX rate must be positive.")
-        self.fx_rate = rate
+        if mode not in self.labels:
+            raise ValueError(f"Unknown currency mode '{mode}'")
+        self.rates[mode] = rate
+
+    def get_label(self, mode: str | None = None) -> str:
+        return self.labels.get(mode or self.mode, self.labels.get("local", ""))
+
+    def get_rate(self, mode: str | None = None) -> float:
+        return self.rates.get(mode or self.mode, 1.0)
 
     def format(self, value: Any, *, allow_sign: bool = True) -> str:
         """Format a numeric value according to the active mode."""
@@ -63,17 +87,47 @@ class CurrencyFormatter:
         numeric = _safe_float(value)
         if numeric is None:
             return "—"
-        label = self.base_label
-        rendered = numeric
-        if self.mode == "quote":
-            label = self.quote_label
-            rendered = numeric * self.fx_rate
+        label = self.get_label()
+        rendered = numeric * self.get_rate()
         formatted = f"{abs(rendered):,.2f}"
         if not allow_sign:
             return f"{label} {formatted}".strip()
         if rendered < 0:
             return f"{label} -{formatted}"
         return f"{label} {formatted}"
+
+
+class Tooltip:
+    """Lightweight tooltip helper for Tkinter widgets."""
+
+    def __init__(self, widget: tk.Widget, text: str) -> None:
+        self.widget = widget
+        self.text = text
+        self.tip_window: tk.Toplevel | None = None
+        self.widget.bind("<Enter>", self._on_enter)
+        self.widget.bind("<Leave>", self._on_leave)
+
+    def _on_enter(self, _event: Any) -> None:
+        if self.tip_window is not None:
+            return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tip_window = tk.Toplevel(self.widget)
+        self.tip_window.wm_overrideredirect(True)
+        self.tip_window.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(
+            self.tip_window,
+            text=self.text,
+            bg="white",
+            relief=tk.SOLID,
+            borderwidth=1,
+        )
+        label.pack(ipadx=6, ipady=3)
+
+    def _on_leave(self, _event: Any) -> None:
+        if self.tip_window is not None:
+            self.tip_window.destroy()
+            self.tip_window = None
 
 
 class StockPredictorDesktopApp:
@@ -88,22 +142,38 @@ class StockPredictorDesktopApp:
 
         self.ticker_var = tk.StringVar(value=self.config.ticker)
         base_currency = os.environ.get("STOCK_PREDICTOR_UI_BASE_CURRENCY", "Local")
-        quote_currency = os.environ.get("STOCK_PREDICTOR_UI_QUOTE_CURRENCY", "USD")
-        fx_rate = self._resolve_fx_rate(os.environ.get("STOCK_PREDICTOR_UI_FX_RATE"))
+        usd_rate = self._resolve_fx_rate(os.environ.get("STOCK_PREDICTOR_UI_FX_RATE"))
         self.currency_formatter = CurrencyFormatter(
-            base_label=base_currency,
-            quote_label=quote_currency,
-            fx_rate=fx_rate,
+            labels={
+                "local": base_currency,
+                "usd": "USD $",
+                "eur": "EUR €",
+            },
+            rates={
+                "local": 1.0,
+                "usd": usd_rate,
+                "eur": 1.0,
+            },
         )
 
         horizons = self.config.prediction_horizons or DEFAULT_PREDICTION_HORIZONS
-        self.selected_horizon = horizons[0]
+        self.horizon_options = HORIZON_OPTIONS
+        self.horizon_option_map = {option.label: option for option in self.horizon_options}
+        self.code_to_horizon = {option.code: option for option in self.horizon_options}
+        self.label_to_code = {option.label: option.code for option in self.horizon_options}
+        self.selected_horizon_option = self._resolve_initial_horizon(horizons)
         self.current_prediction: dict[str, Any] = {}
         self.price_history: pd.DataFrame | None = None
         self.feature_snapshot: pd.DataFrame | None = None
         self.feature_history: pd.DataFrame | None = None
         self.indicator_history: pd.DataFrame | None = None
         self.feature_toggle_vars: dict[str, tk.BooleanVar] = {}
+        self.forecast_date_var = tk.StringVar(value="Forecast date: —")
+
+        self.currency_mode_var = tk.StringVar(value="local")
+        self.currency_button_text = tk.StringVar(value=self.currency_formatter.get_label("local"))
+        self.currency_rate_var = tk.StringVar(value=f"{self.currency_formatter.get_rate('usd'):.4f}")
+
         self._busy = False
 
         self._build_layout(horizons)
@@ -112,12 +182,20 @@ class StockPredictorDesktopApp:
     # ------------------------------------------------------------------
     # Layout helpers
     # ------------------------------------------------------------------
+    def _resolve_initial_horizon(self, horizons: Iterable[int]) -> HorizonOption:
+        for value in horizons:
+            for option in self.horizon_options:
+                if option.business_days == value:
+                    return option
+        return self.horizon_options[0]
+
     def _build_layout(self, horizons: Iterable[int]) -> None:
         self._build_toolbar(list(horizons))
         self._build_notebook()
         self._build_statusbar()
+        self._on_currency_mode_changed(self.currency_mode_var.get())
 
-    def _build_toolbar(self, horizons: list[int]) -> None:
+    def _build_toolbar(self, _horizons: list[int]) -> None:
         toolbar = ttk.Frame(self.root, padding=(12, 6))
         toolbar.pack(fill=tk.X)
 
@@ -128,16 +206,19 @@ class StockPredictorDesktopApp:
         self.predict_button.pack(side=tk.LEFT, padx=(0, 12))
 
         ttk.Label(toolbar, text="Horizon").pack(side=tk.LEFT)
-        self.horizon_var = tk.StringVar(value=str(self.selected_horizon))
+        self.horizon_var = tk.StringVar(value=self.selected_horizon_option.label)
         self.horizon_box = ttk.Combobox(
             toolbar,
-            width=6,
+            width=12,
             state="readonly",
             textvariable=self.horizon_var,
-            values=[str(value) for value in horizons],
+            values=[option.label for option in self.horizon_options],
         )
-        self.horizon_box.pack(side=tk.LEFT, padx=(4, 12))
+        self.horizon_box.pack(side=tk.LEFT, padx=(4, 8))
         self.horizon_box.bind("<<ComboboxSelected>>", self._on_horizon_changed)
+
+        self.forecast_label = ttk.Label(toolbar, textvariable=self.forecast_date_var)
+        self.forecast_label.pack(side=tk.LEFT, padx=(4, 12))
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
 
@@ -151,40 +232,42 @@ class StockPredictorDesktopApp:
             text="Apply",
             command=self._on_ticker_button,
         )
-        self.ticker_apply_button.pack(side=tk.LEFT, padx=(4, 12))
+        self.ticker_apply_button.pack(side=tk.LEFT, padx=(4, 4))
+
+        self.ticker_help = ttk.Label(toolbar, text="?", width=2, anchor=tk.CENTER, cursor="question_arrow")
+        self.ticker_help.pack(side=tk.LEFT, padx=(0, 12))
+        Tooltip(self.ticker_help, "Use official symbols (e.g., RHM.DE, ^GSPC).")
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
 
-        ttk.Label(toolbar, text="Currency").pack(side=tk.LEFT, padx=(0, 4))
-        self.currency_var = tk.StringVar(value="base")
-        self.base_currency_button = ttk.Radiobutton(
-            toolbar,
-            text=self.currency_formatter.base_label,
-            value="base",
-            variable=self.currency_var,
-            command=self._on_currency_changed,
+        self.currency_menu_button = ttk.Menubutton(
+            toolbar, textvariable=self.currency_button_text, direction="below"
         )
-        self.base_currency_button.pack(side=tk.LEFT)
-        self.quote_currency_button = ttk.Radiobutton(
-            toolbar,
-            text=self.currency_formatter.quote_label,
-            value="quote",
-            variable=self.currency_var,
-            command=self._on_currency_changed,
-        )
-        self.quote_currency_button.pack(side=tk.LEFT, padx=(4, 8))
+        self.currency_menu = tk.Menu(self.currency_menu_button, tearoff=False)
+        for code in ("local", "usd", "eur"):
+            label = self.currency_formatter.get_label(code)
+            self.currency_menu.add_radiobutton(
+                label=label,
+                value=code,
+                variable=self.currency_mode_var,
+                command=lambda mode=code: self._on_currency_mode_changed(mode),
+            )
+        self.currency_menu_button.configure(menu=self.currency_menu)
+        self.currency_menu_button.pack(side=tk.LEFT, padx=(0, 6))
 
-        ttk.Label(toolbar, text="FX rate").pack(side=tk.LEFT)
-        self.fx_rate_var = tk.StringVar(value=f"{self.currency_formatter.fx_rate:.4f}")
-        self.fx_rate_entry = ttk.Entry(toolbar, width=10, textvariable=self.fx_rate_var)
-        self.fx_rate_entry.pack(side=tk.LEFT, padx=(4, 12))
-        self.fx_rate_entry.bind("<Return>", self._on_fx_rate_changed)
-        self.fx_rate_entry.bind("<FocusOut>", self._on_fx_rate_changed)
+        self.fx_rate_entry = ttk.Entry(toolbar, width=10, textvariable=self.currency_rate_var, state=tk.DISABLED)
+        self.fx_rate_entry.pack(side=tk.LEFT)
+        self.fx_rate_entry.bind("<Return>", self._on_currency_rate_submit)
+
+        self.fx_rate_button = ttk.Button(toolbar, text="Update rate", command=self._on_currency_rate_button)
+        self.fx_rate_button.pack(side=tk.LEFT, padx=(4, 12))
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
 
         self.progress = ttk.Progressbar(toolbar, mode="indeterminate", length=180)
         self.progress.pack(side=tk.RIGHT)
+
+        self._update_forecast_label()
 
     def _build_notebook(self) -> None:
         self.notebook = ttk.Notebook(self.root)
@@ -360,32 +443,55 @@ class StockPredictorDesktopApp:
         self._run_async(self._predict_only, "Generating prediction…")
 
     def _on_horizon_changed(self, _event: Any) -> None:
-        try:
-            self.selected_horizon = int(self.horizon_var.get())
-        except (TypeError, ValueError):
+        label = self.horizon_var.get()
+        option = self.horizon_option_map.get(label)
+        if option is None:
             messagebox.showwarning("Invalid horizon", "Please select a valid horizon value.")
-            self.horizon_var.set(str(self.selected_horizon))
+            self.horizon_var.set(self.selected_horizon_option.label)
             return
+        self.selected_horizon_option = option
+        self._update_forecast_label()
         self._on_predict()
 
-    def _on_currency_changed(self) -> None:
-        self.currency_formatter.set_mode(self.currency_var.get())
-        self._update_metrics()
+    def _on_currency_mode_changed(self, mode: str) -> None:
+        self.currency_formatter.set_mode(mode)
+        self.currency_button_text.set(self.currency_formatter.get_label(mode))
+        rate = self.currency_formatter.get_rate(mode)
+        self.currency_rate_var.set(f"{rate:.4f}")
+        if self._busy:
+            entry_state = tk.DISABLED
+            button_state = tk.DISABLED
+        elif mode == "local":
+            entry_state = tk.DISABLED
+            button_state = tk.DISABLED
+        else:
+            entry_state = tk.NORMAL
+            button_state = tk.NORMAL
+        self.fx_rate_entry.configure(state=entry_state)
+        self.fx_rate_button.configure(state=button_state)
+        if hasattr(self, "metric_vars"):
+            self._update_metrics()
 
-    def _on_fx_rate_changed(self, _event: Any) -> None:
-        raw = self.fx_rate_var.get()
+    def _on_currency_rate_submit(self, _event: Any) -> None:
+        self._on_currency_rate_button()
+
+    def _on_currency_rate_button(self) -> None:
+        mode = self.currency_mode_var.get()
+        if mode == "local":
+            return
+        raw = self.currency_rate_var.get()
         try:
             rate = float(raw)
         except (TypeError, ValueError):
             messagebox.showwarning("Invalid FX rate", "Please provide a numeric FX conversion rate.")
-            self.fx_rate_var.set(f"{self.currency_formatter.fx_rate:.4f}")
+            self.currency_rate_var.set(f"{self.currency_formatter.get_rate(mode):.4f}")
             return
         if rate <= 0:
             messagebox.showwarning("Invalid FX rate", "FX conversion rate must be positive.")
-            self.fx_rate_var.set(f"{self.currency_formatter.fx_rate:.4f}")
+            self.currency_rate_var.set(f"{self.currency_formatter.get_rate(mode):.4f}")
             return
-        self.currency_formatter.set_rate(rate)
-        self.fx_rate_var.set(f"{self.currency_formatter.fx_rate:.4f}")
+        self.currency_formatter.set_rate(mode, rate)
+        self.currency_rate_var.set(f"{self.currency_formatter.get_rate(mode):.4f}")
         self._update_metrics()
 
     def _on_ticker_submitted(self, _event: Any) -> None:
@@ -491,7 +597,7 @@ class StockPredictorDesktopApp:
         return self._predict_payload()
 
     def _predict_payload(self) -> dict[str, Any]:
-        prediction = self.application.predict(horizon=self.selected_horizon)
+        prediction = self.application.predict(horizon=self.selected_horizon_option.business_days)
         metadata = self.application.pipeline.metadata
         snapshot = metadata.get("latest_features") if isinstance(metadata, Mapping) else None
         feature_history: pd.DataFrame | None = None
@@ -562,6 +668,7 @@ class StockPredictorDesktopApp:
         self.feature_history = feature_history if isinstance(feature_history, pd.DataFrame) else None
         self.price_history = price_history if isinstance(price_history, pd.DataFrame) else None
         self.indicator_history = indicator_history if isinstance(indicator_history, pd.DataFrame) else None
+        self._update_forecast_label(self.current_prediction.get("target_date"))
         self._update_metrics()
         self._update_price_chart()
         self._update_indicator_view()
@@ -581,11 +688,15 @@ class StockPredictorDesktopApp:
             self.horizon_box,
             self.ticker_entry,
             self.ticker_apply_button,
-            self.base_currency_button,
-            self.quote_currency_button,
-            self.fx_rate_entry,
+            self.currency_menu_button,
+            self.fx_rate_button,
         ):
             widget.configure(state=state)
+        if busy:
+            self.fx_rate_entry.configure(state=tk.DISABLED)
+            self.fx_rate_button.configure(state=tk.DISABLED)
+        else:
+            self._on_currency_mode_changed(self.currency_mode_var.get())
         if busy:
             self.progress.start(12)
         else:
@@ -595,6 +706,45 @@ class StockPredictorDesktopApp:
 
     def _set_status(self, message: str) -> None:
         self.status_var.set(message)
+
+    def _forecast_base_date(self) -> pd.Timestamp:
+        prediction = self.current_prediction or {}
+        as_of = prediction.get("market_data_as_of") if isinstance(prediction, Mapping) else None
+        timestamp = pd.to_datetime(as_of, errors="coerce") if as_of is not None else None
+        if pd.notna(timestamp):
+            return pd.Timestamp(timestamp).normalize()
+
+        if isinstance(self.price_history, pd.DataFrame) and not self.price_history.empty:
+            frame = self.price_history.copy()
+            lower_map = {str(column).lower(): column for column in frame.columns}
+            if "date" in lower_map:
+                dates = pd.to_datetime(frame[lower_map["date"]], errors="coerce").dropna()
+                if not dates.empty:
+                    return pd.Timestamp(dates.iloc[-1]).normalize()
+            index_dates = pd.to_datetime(frame.index, errors="coerce")
+            index_series = pd.Series(index_dates).dropna()
+            if not index_series.empty:
+                return pd.Timestamp(index_series.iloc[-1]).normalize()
+
+        return pd.Timestamp.today().normalize()
+
+    def _update_forecast_label(self, target_date: Any | None = None) -> None:
+        display = "Forecast date: —"
+        forecast: pd.Timestamp | None = None
+        parsed = pd.to_datetime(target_date, errors="coerce") if target_date is not None else None
+        if pd.notna(parsed):
+            forecast = pd.Timestamp(parsed).normalize()
+        else:
+            option = self.selected_horizon_option
+            base_date = self._forecast_base_date()
+            try:
+                offset = pd.tseries.offsets.BusinessDay(option.business_days)
+                forecast = (base_date + offset).normalize()
+            except Exception:
+                forecast = (base_date + pd.to_timedelta(option.business_days, unit="D")).normalize()
+        if forecast is not None:
+            display = f"Forecast date: {forecast.date().isoformat()}"
+        self.forecast_date_var.set(display)
 
     # ------------------------------------------------------------------
     # UI updates
