@@ -162,6 +162,195 @@ class NewsArticle(Base):
         }
 
 
+class CorporateEvent(Base):
+    """Corporate actions such as dividends, splits or earnings calls."""
+
+    __tablename__ = "corporate_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(String(32), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    event_date: Mapped[date] = mapped_column(Date, nullable=False)
+    reference: Mapped[str] = mapped_column(String(64), default="general", nullable=False)
+    value: Mapped[float | None] = mapped_column(Float)
+    currency: Mapped[str | None] = mapped_column(String(16))
+    details: Mapped[str | None] = mapped_column(Text)
+    source: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "ticker", "event_type", "event_date", "reference", name="uq_corporate_event"
+        ),
+        {"sqlite_autoincrement": True},
+    )
+
+    def to_frame_dict(self) -> dict[str, Any]:
+        payload = json.loads(self.details) if self.details else None
+        return {
+            "Ticker": self.ticker,
+            "EventType": self.event_type,
+            "EventDate": pd.to_datetime(self.event_date),
+            "Reference": self.reference,
+            "Value": self.value,
+            "Currency": self.currency,
+            "Details": payload,
+            "Source": self.source,
+        }
+
+
+class OptionSurfacePoint(Base):
+    """Point-in-time option greeks and implied volatility metrics."""
+
+    __tablename__ = "option_surface"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(String(32), nullable=False)
+    as_of: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    expiration: Mapped[date] = mapped_column(Date, nullable=False)
+    strike: Mapped[float] = mapped_column(Float, nullable=False)
+    option_type: Mapped[str] = mapped_column(String(8), nullable=False)
+    metric: Mapped[str] = mapped_column(String(64), nullable=False)
+    value: Mapped[float | None] = mapped_column(Float)
+    source: Mapped[str | None] = mapped_column(String(64))
+    extra: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "ticker",
+            "as_of",
+            "expiration",
+            "strike",
+            "option_type",
+            "metric",
+            name="uq_option_surface_point",
+        ),
+        {"sqlite_autoincrement": True},
+    )
+
+    def to_frame_dict(self) -> dict[str, Any]:
+        extra_payload = json.loads(self.extra) if self.extra else None
+        return {
+            "Ticker": self.ticker,
+            "AsOf": pd.to_datetime(self.as_of),
+            "Expiration": pd.to_datetime(self.expiration),
+            "Strike": self.strike,
+            "OptionType": self.option_type,
+            "Metric": self.metric,
+            "Value": self.value,
+            "Source": self.source,
+            "Extra": extra_payload,
+        }
+
+
+class SentimentSignal(Base):
+    """Sentiment and alternative signals aligned to a ticker."""
+
+    __tablename__ = "sentiment_signals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(String(32), nullable=False)
+    as_of: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    signal_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    score: Mapped[float | None] = mapped_column(Float)
+    magnitude: Mapped[float | None] = mapped_column(Float)
+    payload: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "ticker", "as_of", "provider", "signal_type", name="uq_sentiment_signal"
+        ),
+        {"sqlite_autoincrement": True},
+    )
+
+    def to_frame_dict(self) -> dict[str, Any]:
+        payload = json.loads(self.payload) if self.payload else None
+        return {
+            "Ticker": self.ticker,
+            "AsOf": pd.to_datetime(self.as_of),
+            "Provider": self.provider,
+            "SignalType": self.signal_type,
+            "Score": self.score,
+            "Magnitude": self.magnitude,
+            "Payload": payload,
+        }
+
+
+class ESGMetricEntry(Base):
+    """Environmental, Social and Governance metrics."""
+
+    __tablename__ = "esg_metrics"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(String(32), nullable=False)
+    as_of: Mapped[date] = mapped_column(Date, nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    metric: Mapped[str] = mapped_column(String(64), nullable=False)
+    value: Mapped[float | None] = mapped_column(Float)
+    raw: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "ticker", "as_of", "provider", "metric", name="uq_esg_metric"
+        ),
+        {"sqlite_autoincrement": True},
+    )
+
+    def to_frame_dict(self) -> dict[str, Any]:
+        raw_payload = json.loads(self.raw) if self.raw else None
+        return {
+            "Ticker": self.ticker,
+            "AsOf": pd.to_datetime(self.as_of),
+            "Provider": self.provider,
+            "Metric": self.metric,
+            "Value": self.value,
+            "Raw": raw_payload,
+        }
+
+
+class OwnershipFlow(Base):
+    """Ownership and fund flow metrics for a ticker."""
+
+    __tablename__ = "ownership_flows"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(String(32), nullable=False)
+    as_of: Mapped[date] = mapped_column(Date, nullable=False)
+    holder: Mapped[str] = mapped_column(String(128), nullable=False)
+    holder_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    metric: Mapped[str] = mapped_column(String(64), nullable=False)
+    value: Mapped[float | None] = mapped_column(Float)
+    raw: Mapped[str | None] = mapped_column(Text)
+    source: Mapped[str | None] = mapped_column(String(64))
+
+    __table_args__ = (
+        UniqueConstraint(
+            "ticker",
+            "as_of",
+            "holder",
+            "metric",
+            name="uq_ownership_flow",
+        ),
+        {"sqlite_autoincrement": True},
+    )
+
+    def to_frame_dict(self) -> dict[str, Any]:
+        raw_payload = json.loads(self.raw) if self.raw else None
+        return {
+            "Ticker": self.ticker,
+            "AsOf": pd.to_datetime(self.as_of),
+            "Holder": self.holder,
+            "HolderType": self.holder_type,
+            "Metric": self.metric,
+            "Value": self.value,
+            "Raw": raw_payload,
+            "Source": self.source,
+        }
+
+
 class ExperimentLog(Base):
     """Track metadata about training, inference, and backtesting runs."""
 
@@ -381,6 +570,186 @@ class Database:
             session.execute(stmt)
         return len(payload)
 
+    def upsert_corporate_events(self, records: Iterable[dict[str, Any]]) -> int:
+        payload = []
+        for record in records:
+            payload.append(
+                {
+                    "ticker": record["Ticker"],
+                    "event_type": record["EventType"],
+                    "event_date": self._coerce_date(record["EventDate"]),
+                    "reference": record.get("Reference", "general"),
+                    "value": self._coerce_float(record.get("Value")),
+                    "currency": record.get("Currency"),
+                    "details": self._dump_json(record.get("Details")),
+                    "source": record.get("Source"),
+                }
+            )
+        if not payload:
+            return 0
+        stmt = insert(CorporateEvent).values(payload)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[
+                CorporateEvent.ticker,
+                CorporateEvent.event_type,
+                CorporateEvent.event_date,
+                CorporateEvent.reference,
+            ],
+            set_={
+                "value": stmt.excluded.value,
+                "currency": stmt.excluded.currency,
+                "details": stmt.excluded.details,
+                "source": stmt.excluded.source,
+            },
+        )
+        with self.session() as session:
+            session.execute(stmt)
+        return len(payload)
+
+    def upsert_option_surface(self, records: Iterable[dict[str, Any]]) -> int:
+        payload = []
+        for record in records:
+            strike_value = self._coerce_float(record.get("Strike"))
+            if strike_value is None:
+                LOGGER.debug("Skipping option surface record with missing strike: %s", record)
+                continue
+            payload.append(
+                {
+                    "ticker": record["Ticker"],
+                    "as_of": self._coerce_datetime(record["AsOf"]),
+                    "expiration": self._coerce_date(record["Expiration"]),
+                    "strike": strike_value,
+                    "option_type": record["OptionType"],
+                    "metric": record["Metric"],
+                    "value": self._coerce_float(record.get("Value")),
+                    "source": record.get("Source"),
+                    "extra": self._dump_json(record.get("Extra")),
+                }
+            )
+        if not payload:
+            return 0
+        stmt = insert(OptionSurfacePoint).values(payload)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[
+                OptionSurfacePoint.ticker,
+                OptionSurfacePoint.as_of,
+                OptionSurfacePoint.expiration,
+                OptionSurfacePoint.strike,
+                OptionSurfacePoint.option_type,
+                OptionSurfacePoint.metric,
+            ],
+            set_={
+                "value": stmt.excluded.value,
+                "source": stmt.excluded.source,
+                "extra": stmt.excluded.extra,
+            },
+        )
+        with self.session() as session:
+            session.execute(stmt)
+        return len(payload)
+
+    def upsert_sentiment_signals(self, records: Iterable[dict[str, Any]]) -> int:
+        payload = []
+        for record in records:
+            payload.append(
+                {
+                    "ticker": record["Ticker"],
+                    "as_of": self._coerce_datetime(record["AsOf"]),
+                    "provider": record["Provider"],
+                    "signal_type": record["SignalType"],
+                    "score": self._coerce_float(record.get("Score")),
+                    "magnitude": self._coerce_float(record.get("Magnitude")),
+                    "payload": self._dump_json(record.get("Payload")),
+                }
+            )
+        if not payload:
+            return 0
+        stmt = insert(SentimentSignal).values(payload)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[
+                SentimentSignal.ticker,
+                SentimentSignal.as_of,
+                SentimentSignal.provider,
+                SentimentSignal.signal_type,
+            ],
+            set_={
+                "score": stmt.excluded.score,
+                "magnitude": stmt.excluded.magnitude,
+                "payload": stmt.excluded.payload,
+            },
+        )
+        with self.session() as session:
+            session.execute(stmt)
+        return len(payload)
+
+    def upsert_esg_metrics(self, records: Iterable[dict[str, Any]]) -> int:
+        payload = []
+        for record in records:
+            payload.append(
+                {
+                    "ticker": record["Ticker"],
+                    "as_of": self._coerce_date(record["AsOf"]),
+                    "provider": record["Provider"],
+                    "metric": record["Metric"],
+                    "value": self._coerce_float(record.get("Value")),
+                    "raw": self._dump_json(record.get("Raw")),
+                }
+            )
+        if not payload:
+            return 0
+        stmt = insert(ESGMetricEntry).values(payload)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[
+                ESGMetricEntry.ticker,
+                ESGMetricEntry.as_of,
+                ESGMetricEntry.provider,
+                ESGMetricEntry.metric,
+            ],
+            set_={
+                "value": stmt.excluded.value,
+                "raw": stmt.excluded.raw,
+            },
+        )
+        with self.session() as session:
+            session.execute(stmt)
+        return len(payload)
+
+    def upsert_ownership_flows(self, records: Iterable[dict[str, Any]]) -> int:
+        payload = []
+        for record in records:
+            payload.append(
+                {
+                    "ticker": record["Ticker"],
+                    "as_of": self._coerce_date(record["AsOf"]),
+                    "holder": record["Holder"],
+                    "holder_type": record.get("HolderType", "unknown"),
+                    "metric": record["Metric"],
+                    "value": self._coerce_float(record.get("Value")),
+                    "raw": self._dump_json(record.get("Raw")),
+                    "source": record.get("Source"),
+                }
+            )
+        if not payload:
+            return 0
+        stmt = insert(OwnershipFlow).values(payload)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[
+                OwnershipFlow.ticker,
+                OwnershipFlow.as_of,
+                OwnershipFlow.holder,
+                OwnershipFlow.metric,
+            ],
+            set_={
+                "holder_type": stmt.excluded.holder_type,
+                "value": stmt.excluded.value,
+                "raw": stmt.excluded.raw,
+                "source": stmt.excluded.source,
+            },
+        )
+        with self.session() as session:
+            session.execute(stmt)
+        return len(payload)
+
     # ------------------------------------------------------------------
     # Read helpers
     # ------------------------------------------------------------------
@@ -447,6 +816,98 @@ class Database:
             return pd.DataFrame()
         return pd.DataFrame(data)
 
+    def get_corporate_events(
+        self,
+        ticker: str,
+        event_type: str | None = None,
+        start: date | None = None,
+        end: date | None = None,
+    ) -> pd.DataFrame:
+        stmt = select(CorporateEvent).where(CorporateEvent.ticker == ticker)
+        if event_type:
+            stmt = stmt.where(CorporateEvent.event_type == event_type)
+        if start:
+            stmt = stmt.where(CorporateEvent.event_date >= start)
+        if end:
+            stmt = stmt.where(CorporateEvent.event_date <= end)
+        stmt = stmt.order_by(CorporateEvent.event_date.desc())
+        with self.session() as session:
+            rows = session.execute(stmt).scalars().all()
+            data = [row.to_frame_dict() for row in rows]
+        return pd.DataFrame(data)
+
+    def get_option_surface(
+        self,
+        ticker: str,
+        as_of: datetime | None = None,
+        expiration: date | None = None,
+    ) -> pd.DataFrame:
+        stmt = select(OptionSurfacePoint).where(OptionSurfacePoint.ticker == ticker)
+        if as_of:
+            stmt = stmt.where(OptionSurfacePoint.as_of >= as_of)
+        if expiration:
+            stmt = stmt.where(OptionSurfacePoint.expiration == expiration)
+        stmt = stmt.order_by(
+            OptionSurfacePoint.as_of.desc(),
+            OptionSurfacePoint.expiration.asc(),
+            OptionSurfacePoint.strike.asc(),
+        )
+        with self.session() as session:
+            rows = session.execute(stmt).scalars().all()
+            data = [row.to_frame_dict() for row in rows]
+        return pd.DataFrame(data)
+
+    def get_sentiment_signals(
+        self,
+        ticker: str,
+        provider: str | None = None,
+        signal_type: str | None = None,
+    ) -> pd.DataFrame:
+        stmt = select(SentimentSignal).where(SentimentSignal.ticker == ticker)
+        if provider:
+            stmt = stmt.where(SentimentSignal.provider == provider)
+        if signal_type:
+            stmt = stmt.where(SentimentSignal.signal_type == signal_type)
+        stmt = stmt.order_by(SentimentSignal.as_of.desc())
+        with self.session() as session:
+            rows = session.execute(stmt).scalars().all()
+            data = [row.to_frame_dict() for row in rows]
+        return pd.DataFrame(data)
+
+    def get_esg_metrics(
+        self,
+        ticker: str,
+        provider: str | None = None,
+        metric: str | None = None,
+    ) -> pd.DataFrame:
+        stmt = select(ESGMetricEntry).where(ESGMetricEntry.ticker == ticker)
+        if provider:
+            stmt = stmt.where(ESGMetricEntry.provider == provider)
+        if metric:
+            stmt = stmt.where(ESGMetricEntry.metric == metric)
+        stmt = stmt.order_by(ESGMetricEntry.as_of.desc())
+        with self.session() as session:
+            rows = session.execute(stmt).scalars().all()
+            data = [row.to_frame_dict() for row in rows]
+        return pd.DataFrame(data)
+
+    def get_ownership_flows(
+        self,
+        ticker: str,
+        holder_type: str | None = None,
+        metric: str | None = None,
+    ) -> pd.DataFrame:
+        stmt = select(OwnershipFlow).where(OwnershipFlow.ticker == ticker)
+        if holder_type:
+            stmt = stmt.where(OwnershipFlow.holder_type == holder_type)
+        if metric:
+            stmt = stmt.where(OwnershipFlow.metric == metric)
+        stmt = stmt.order_by(OwnershipFlow.as_of.desc())
+        with self.session() as session:
+            rows = session.execute(stmt).scalars().all()
+            data = [row.to_frame_dict() for row in rows]
+        return pd.DataFrame(data)
+
     # ------------------------------------------------------------------
     # Convenience helpers
     # ------------------------------------------------------------------
@@ -505,6 +966,17 @@ class Database:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _dump_json(value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(value, default=str)
+        except (TypeError, ValueError):
+            return str(value)
+
 
 @dataclass(slots=True)
 class ExperimentTracker:
@@ -553,6 +1025,11 @@ __all__ = [
     "Indicator",
     "Fundamental",
     "NewsArticle",
+    "CorporateEvent",
+    "OptionSurfacePoint",
+    "SentimentSignal",
+    "ESGMetricEntry",
+    "OwnershipFlow",
     "ExperimentLog",
     "ExperimentTracker",
 ]

@@ -22,8 +22,15 @@ class DataFetcher:
         self.config = config
         self.database = Database(config.database_url)
         self.etl = MarketDataETL(config, database=self.database)
-        self._price_source = "database"
-        self._news_source = "database"
+        self._sources: dict[str, str] = {
+            "prices": "database",
+            "news": "database",
+            "corporate_events": "database",
+            "options_surface": "database",
+            "sentiment_signals": "database",
+            "esg_metrics": "database",
+            "ownership_flows": "database",
+        }
 
     # ------------------------------------------------------------------
     # Public API used by the pipeline
@@ -32,14 +39,14 @@ class DataFetcher:
         """Return price data for the configured ticker, refreshing if required."""
 
         result = self.etl.refresh_prices(force=force)
-        self._price_source = "remote" if result.downloaded or force else "database"
+        self._set_source("prices", result.downloaded or force)
         return result.data
 
     def fetch_news_data(self, force: bool = False) -> pd.DataFrame:
         """Return cached news articles, refreshing via the API when necessary."""
 
         result = self.etl.refresh_news(force=force)
-        self._news_source = "remote" if result.downloaded or force else "database"
+        self._set_source("news", result.downloaded or force)
         return result.data
 
     def fetch_indicator_data(self, category: Optional[str] = None) -> pd.DataFrame:
@@ -48,8 +55,7 @@ class DataFetcher:
         return self.database.get_indicators(
             ticker=self.config.ticker,
             interval=self.config.interval,
-            progress=False,
-            auto_adjust=False,
+            category=category,
         )
 
     def fetch_fundamentals(self) -> pd.DataFrame:
@@ -57,13 +63,48 @@ class DataFetcher:
 
         return self.database.get_fundamentals(self.config.ticker)
 
+    def fetch_corporate_events(self, force: bool = False) -> pd.DataFrame:
+        """Fetch corporate action events, refreshing the cache if necessary."""
+
+        result = self.etl.refresh_corporate_events(force=force)
+        self._set_source("corporate_events", result.downloaded or force)
+        return result.data
+
+    def fetch_options_surface(self, force: bool = False) -> pd.DataFrame:
+        """Fetch option surface metrics for the configured ticker."""
+
+        result = self.etl.refresh_options_surface(force=force)
+        self._set_source("options_surface", result.downloaded or force)
+        return result.data
+
+    def fetch_sentiment_signals(self, force: bool = False) -> pd.DataFrame:
+        """Fetch aggregated sentiment and alternative signals."""
+
+        result = self.etl.refresh_sentiment_signals(force=force)
+        self._set_source("sentiment_signals", result.downloaded or force)
+        return result.data
+
+    def fetch_esg_metrics(self, force: bool = False) -> pd.DataFrame:
+        """Fetch ESG metrics for the configured ticker."""
+
+        result = self.etl.refresh_esg_metrics(force=force)
+        self._set_source("esg_metrics", result.downloaded or force)
+        return result.data
+
+    def fetch_ownership_flows(self, force: bool = False) -> pd.DataFrame:
+        """Fetch ownership and flow datasets for the configured ticker."""
+
+        result = self.etl.refresh_ownership_flows(force=force)
+        self._set_source("ownership_flows", result.downloaded or force)
+        return result.data
+
     def refresh_all(self, force: bool = False) -> dict[str, int]:
         """Refresh all supported datasets and return a summary of inserted rows."""
 
         summary = self.etl.refresh_all(force=force)
         if summary.get("downloaded"):
-            self._price_source = "remote"
-            self._news_source = "remote"
+            for key in self._sources:
+                self._sources[key] = "remote"
         return summary
 
     # ------------------------------------------------------------------
@@ -71,11 +112,16 @@ class DataFetcher:
     # ------------------------------------------------------------------
     @property
     def last_price_source(self) -> str:
-        return self._price_source
+        return self._sources.get("prices", "database")
 
     @property
     def last_news_source(self) -> str:
-        return self._news_source
+        return self._sources.get("news", "database")
+
+    def get_last_source(self, category: str) -> Optional[str]:
+        """Return the last known data source for a dataset category."""
+
+        return self._sources.get(category)
 
     def get_last_updated(self, category: str) -> Optional[datetime]:
         """Return the last refresh timestamp recorded for the given category."""
@@ -94,6 +140,9 @@ class DataFetcher:
         if category in {"prices", "indicators", "macro"}:
             return self.config.interval
         return "global"
+
+    def _set_source(self, category: str, downloaded: bool) -> None:
+        self._sources[category] = "remote" if downloaded else "database"
 
 
 __all__ = ["DataFetcher"]
