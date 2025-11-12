@@ -124,7 +124,7 @@ class StockPredictorApplication:
         api_host: str = "127.0.0.1",
         api_port: int = 8000,
         ui_port: int = 8501,
-        ui_headless: bool = False,
+        ui_headless: bool | None = None,
         ui_api_key: str | None = None,
     ) -> int:
         """Launch the dashboard alongside the embedded API service."""
@@ -144,6 +144,25 @@ class StockPredictorApplication:
             env["PYTHONPATH"] = root_str
         env.setdefault("STOCK_PREDICTOR_DEFAULT_TICKER", self.config.ticker)
         env.setdefault("STOCK_PREDICTOR_API_URL", f"http://{api_host}:{api_port}")
+
+        gather_stats_env = env.get("STREAMLIT_BROWSER_GATHER_USAGE_STATS")
+        if gather_stats_env is None:
+            gather_stats_value = "false"
+        else:
+            gather_stats_value = gather_stats_env.lower()
+        env["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = gather_stats_value
+
+        headless_value: str
+        if ui_headless is not None:
+            headless_value = "true" if ui_headless else "false"
+        else:
+            headless_env = env.get("STREAMLIT_HEADLESS")
+            if headless_env is None:
+                headless_value = "true"
+            else:
+                headless_value = headless_env.lower()
+        env["STREAMLIT_HEADLESS"] = headless_value
+
         if ui_api_key:
             env["STOCK_PREDICTOR_UI_API_KEY"] = ui_api_key
             env["STOCK_PREDICTOR_UI_API_KEYS"] = ui_api_key
@@ -175,8 +194,8 @@ class StockPredictorApplication:
             "--server.port",
             str(ui_port),
         ]
-        if ui_headless:
-            ui_cmd.extend(["--server.headless", "true"])
+        ui_cmd.extend(["--server.headless", headless_value])
+        ui_cmd.extend(["--browser.gatherUsageStats", gather_stats_value])
 
         api_process = subprocess.Popen(api_cmd, env=env, cwd=PROJECT_ROOT)
         try:

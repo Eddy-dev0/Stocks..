@@ -155,8 +155,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--ui-headless",
-        action="store_true",
-        help="Launch the dashboard without opening a browser window.",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Launch the dashboard without opening a browser window (use --no-ui-headless "
+            "to allow Streamlit to open a browser)."
+        ),
     )
     parser.add_argument(
         "--ui-api-key",
