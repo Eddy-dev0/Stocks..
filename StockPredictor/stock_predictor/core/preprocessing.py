@@ -8,7 +8,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
-from .indicators import compute_indicators
+from .indicator_bundle import compute_indicators
 from .sentiment import aggregate_daily_sentiment, attach_sentiment
 
 LOGGER = logging.getLogger(__name__)
