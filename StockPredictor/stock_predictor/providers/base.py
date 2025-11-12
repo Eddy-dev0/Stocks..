@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 LOGGER = logging.getLogger(__name__)
 
@@ -47,9 +47,11 @@ class DatasetType(str):
 class RecordModel(BaseModel):
     """Base class for structured provider payloads."""
 
-    class Config:
-        arbitrary_types_allowed = True
-        allow_population_by_field_name = True
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        validate_by_name=True,
+        populate_by_name=True,
+    )
 
 
 class PriceBar(RecordModel):
@@ -148,8 +150,10 @@ class ProviderRequest(BaseModel):
     symbol: str
     params: Mapping[str, Any] = Field(default_factory=dict)
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        validate_by_name=True,
+    )
 
 
 class ProviderResult(BaseModel):
@@ -162,8 +166,10 @@ class ProviderResult(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
     from_cache: bool = False
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        validate_by_name=True,
+    )
 
 
 class _TTLCache:
