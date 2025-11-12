@@ -6,7 +6,10 @@ import argparse
 import json
 import logging
 import os
+import signal
+import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 from stock_predictor.app import StockPredictorApplication
@@ -28,7 +31,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=["download-data", "train", "predict", "backtest", "importance", "list-models"],
+        choices=[
+            "download-data",
+            "train",
+            "predict",
+            "backtest",
+            "importance",
+            "list-models",
+            "dashboard",
+        ],
         default=default_mode,
         help="Pipeline mode to run (default: %(default)s).",
     )
@@ -88,7 +99,44 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="INFO",
         help="Logging level (DEBUG, INFO, WARNING, ...).",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--api-host",
+        default="127.0.0.1",
+        help="Host for the embedded API server when launching the dashboard.",
+    )
+    parser.add_argument(
+        "--api-port",
+        type=int,
+        default=8000,
+        help="Port for the embedded API server when launching the dashboard.",
+    )
+    parser.add_argument(
+        "--ui-port",
+        type=int,
+        default=8501,
+        help="Port for the Streamlit dashboard when launching the UI.",
+    )
+    parser.add_argument(
+        "--ui-headless",
+        action="store_true",
+        help="Launch the dashboard without opening a browser window.",
+    )
+    parser.add_argument(
+        "--ui-api-key",
+        help="API key injected into the dashboard session for authenticated API calls.",
+    )
+
+    args = parser.parse_args(argv)
+
+    supplied_argv = sys.argv[1:] if argv is None else list(argv)
+    provided_mode = any(arg.startswith("--mode") for arg in supplied_argv)
+    if not provided_mode and args.mode == default_mode == "predict":
+        setattr(args, "_auto_mode", "dashboard")
+        args.mode = "dashboard"
+    else:
+        setattr(args, "_auto_mode", None)
+
+    return args
 
 
 def _parse_csv(value: str | None) -> list[str] | None:
@@ -105,6 +153,11 @@ def main(argv: list[str] | None = None) -> int:
         "The command line interface is deprecated. Instantiate StockPredictorApplication "
         "and use the API or UI packages instead."
     )
+
+    if getattr(args, "_auto_mode", None):
+        logging.info(
+            "No mode supplied. Launching the interactive dashboard instead (override with --mode)."
+        )
 
     try:
         model_params = json.loads(args.model_params) if args.model_params else None
@@ -132,6 +185,9 @@ def main(argv: list[str] | None = None) -> int:
         "volatility_window": args.volatility_window,
     }
 
+    if args.mode == "dashboard":
+        return launch_dashboard(args, overrides)
+
     app = StockPredictorApplication.from_environment(**overrides)
 
     try:
@@ -151,6 +207,68 @@ def main(argv: list[str] | None = None) -> int:
     output = {"status": result.status, **result.payload}
     print(json.dumps(output, indent=2))
     return 0
+
+
+def launch_dashboard(args: argparse.Namespace, overrides: dict[str, Any]) -> int:
+    """Launch the embedded API service and Streamlit dashboard."""
+
+    frontend_path = Path(__file__).resolve().parent / "ui" / "frontend" / "app.py"
+    if not frontend_path.exists():
+        logging.error("Streamlit dashboard entry point not found at %s", frontend_path)
+        return 1
+
+    env = os.environ.copy()
+    default_ticker = overrides.get("ticker") or env.get("STOCK_PREDICTOR_DEFAULT_TICKER") or "AAPL"
+    env.setdefault("STOCK_PREDICTOR_DEFAULT_TICKER", default_ticker)
+    env.setdefault("STOCK_PREDICTOR_API_URL", f"http://{args.api_host}:{args.api_port}")
+    if args.ui_api_key:
+        env["STOCK_PREDICTOR_UI_API_KEY"] = args.ui_api_key
+        env["STOCK_PREDICTOR_UI_API_KEYS"] = args.ui_api_key
+
+    logging.info(
+        "Starting API server on http://%s:%s and dashboard on http://localhost:%s",
+        args.api_host,
+        args.api_port,
+        args.ui_port,
+    )
+
+    api_cmd = [
+        sys.executable,
+        "-m",
+        "uvicorn",
+        "stock_predictor.ui.api.main:app",
+        "--host",
+        str(args.api_host),
+        "--port",
+        str(args.api_port),
+    ]
+
+    ui_cmd = [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        str(frontend_path),
+        "--server.port",
+        str(args.ui_port),
+    ]
+    if args.ui_headless:
+        ui_cmd.extend(["--server.headless", "true"])
+
+    api_process = subprocess.Popen(api_cmd, env=env)
+    try:
+        result = subprocess.run(ui_cmd, env=env, check=False)
+        return result.returncode
+    except KeyboardInterrupt:
+        logging.info("Dashboard interrupted by user.")
+        return 0
+    finally:
+        api_process.send_signal(signal.SIGINT)
+        try:
+            api_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            logging.debug("Force terminating API server")
+            api_process.kill()
 
 
 if __name__ == "__main__":
