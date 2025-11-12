@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from tkinter import messagebox, ttk
 from typing import Any, Callable, Iterable, Mapping
 
-import matplotlib.dates as mdates
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -19,6 +18,7 @@ from pandas.tseries.offsets import BDay
 from matplotlib import style as mpl_style
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+from matplotlib.dates import DateFormatter
 
 from stock_predictor.app import StockPredictorApplication
 from stock_predictor.core import DEFAULT_PREDICTION_HORIZONS, StockPredictorAI
@@ -524,10 +524,18 @@ class StockPredictorDesktopApp:
         chart_container.grid_columnconfigure(0, weight=1)
         chart_frame = ttk.LabelFrame(chart_container, text="Price history", padding=8)
         chart_frame.grid(row=0, column=0, sticky="nsew")
-        self.price_figure = Figure(figsize=(8, 4), dpi=100)
+        chart_frame.grid_rowconfigure(0, weight=1)
+        chart_frame.grid_columnconfigure(0, weight=1)
+        self.price_figure = Figure(figsize=(8, 4.8), dpi=100, constrained_layout=True)
+        self.price_figure.patch.set_facecolor("white")
         self.price_ax = self.price_figure.add_subplot(111)
+        self.price_ax.set_facecolor("white")
         self.price_canvas = FigureCanvasTkAgg(self.price_figure, master=chart_frame)
-        self.price_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.price_canvas_widget = self.price_canvas.get_tk_widget()
+        self.price_canvas_widget.grid(row=0, column=0, sticky="nsew")
+        self.price_chart_message = ttk.Label(
+            chart_frame, text="No data loaded yet", anchor=tk.CENTER, justify=tk.CENTER
+        )
 
     def _build_indicators_tab(self) -> None:
         frame = ttk.Frame(self.notebook, padding=12)
@@ -1166,7 +1174,18 @@ class StockPredictorDesktopApp:
         self._recompute_pnl()
 
     def _update_price_chart(self) -> None:
-        self.price_ax.clear()
+        ax = self.price_ax
+        canvas = self.price_canvas
+        canvas_widget = getattr(self, "price_canvas_widget", None)
+        empty_label = getattr(self, "price_chart_message", None)
+
+        def show_empty_state() -> None:
+            if canvas_widget is not None:
+                canvas_widget.grid_remove()
+            if empty_label is not None:
+                empty_label.grid(row=0, column=0, sticky="nsew")
+
+        ax.clear()
         prediction = self.current_prediction or {}
         forecast = self.current_forecast_date
         if forecast is None:
@@ -1175,97 +1194,122 @@ class StockPredictorDesktopApp:
         title = "Forecast date: —"
         if forecast is not None:
             title = f"Forecast date: {forecast.date().isoformat()}"
-        self.price_ax.set_title(title)
+        ax.set_title(title)
+
         frame_source: pd.DataFrame | None = None
         if isinstance(self.price_history_converted, pd.DataFrame) and not self.price_history_converted.empty:
             frame_source = self.price_history_converted
         elif isinstance(self.price_history, pd.DataFrame) and not self.price_history.empty:
             frame_source = self.price_history
-        if isinstance(frame_source, pd.DataFrame) and not frame_source.empty:
-            frame = frame_source.copy()
-            lower_map = {str(column).lower(): column for column in frame.columns}
-            if "date" in lower_map:
-                frame[lower_map["date"]] = pd.to_datetime(frame[lower_map["date"]], errors="coerce")
-                frame = frame.dropna(subset=[lower_map["date"]])
-                frame = frame.sort_values(lower_map["date"])
-                x_values = frame[lower_map["date"]]
-            else:
-                frame.index = pd.to_datetime(frame.index, errors="coerce")
-                frame = frame.dropna(subset=[frame.columns[0]])
-                x_values = frame.index
-            close_column = None
-            for candidate in ("close", "adjclose", "adj_close"):
-                if candidate in lower_map:
-                    close_column = lower_map[candidate]
-                    break
-            if close_column is None:
-                close_column = frame.select_dtypes(include=[np.number]).columns[0]
-            series = pd.to_numeric(frame[close_column], errors="coerce")
-            plotted_series = pd.Series(series.to_numpy(), index=pd.Index(x_values)).dropna()
-            close_label = "Close (price)" if not self.currency_symbol else f"Close ({self.currency_symbol})"
-            self.price_ax.plot(plotted_series.index, plotted_series.values, label=close_label, color="tab:blue")
-            if not plotted_series.empty:
-                last_x = plotted_series.index[-1]
-                last_y = plotted_series.iloc[-1]
-                last_display = fmt_ccy(last_y, self.currency_symbol, decimals=self.price_decimal_places)
-                self.price_ax.scatter([last_x], [last_y], color="tab:blue", zorder=5)
-                self.price_ax.annotate(
-                    f"Last: {last_display}",
-                    xy=(last_x, last_y),
-                    xytext=(8, 0),
-                    textcoords="offset points",
-                    va="center",
-                    ha="left",
-                    color="tab:blue",
-                )
-            predicted_close = _safe_float(prediction.get("predicted_close"))
-            if predicted_close is not None:
-                converted_prediction = self._convert_currency(predicted_close)
-            else:
-                converted_prediction = None
-            if converted_prediction is not None:
-                predicted_label = (
-                    "Predicted close (price)"
-                    if not self.currency_symbol
-                    else f"Predicted close ({self.currency_symbol})"
-                )
-                self.price_ax.axhline(
-                    converted_prediction, color="tab:orange", linestyle="--", label=predicted_label
-                )
-                if not plotted_series.empty:
-                    annotate_x = plotted_series.index[-1]
-                elif hasattr(x_values, "iloc"):
-                    annotate_x = x_values.iloc[-1]
-                else:
-                    annotate_x = x_values[-1]
-                annotation_text = fmt_ccy(
-                    converted_prediction,
-                    self.currency_symbol,
-                    decimals=self.price_decimal_places,
-                )
-                if forecast is not None:
-                    annotation_text = f"{annotation_text} ({forecast.date().isoformat()})"
-                self.price_ax.annotate(
-                    annotation_text,
-                    xy=(annotate_x, converted_prediction),
-                    xytext=(8, 0),
-                    textcoords="offset points",
-                    va="center",
-                    ha="left",
-                    color="tab:orange",
-                )
-            ylabel = "Price"
-            if self.currency_symbol:
-                ylabel = f"Price ({self.currency_symbol})"
-            self.price_ax.set_ylabel(ylabel)
-            self.price_ax.grid(True, linestyle="--", alpha=0.3)
-            self.price_ax.legend(loc="best")
-            self.price_ax.xaxis.set_major_formatter(mdates.DateFormatter("%b-%Y"))
+
+        if not isinstance(frame_source, pd.DataFrame) or frame_source.empty:
+            show_empty_state()
+            self._style_figure(self.price_figure)
+            canvas.draw_idle()
+            return
+
+        frame = frame_source.copy()
+        lower_map = {str(column).lower(): column for column in frame.columns}
+        if "date" in lower_map:
+            frame[lower_map["date"]] = pd.to_datetime(frame[lower_map["date"]], errors="coerce")
+            frame = frame.dropna(subset=[lower_map["date"]])
+            frame = frame.sort_values(lower_map["date"])
+            x_values = frame[lower_map["date"]]
         else:
-            self.price_ax.text(0.5, 0.5, "Price history unavailable", ha="center", va="center")
-        self.price_figure.tight_layout()
+            frame.index = pd.to_datetime(frame.index, errors="coerce")
+            frame = frame.dropna(subset=[frame.columns[0]])
+            x_values = frame.index
+
+        close_column = None
+        for candidate in ("close", "adjclose", "adj_close"):
+            if candidate in lower_map:
+                close_column = lower_map[candidate]
+                break
+        if close_column is None:
+            numeric_columns = frame.select_dtypes(include=[np.number]).columns
+            if not len(numeric_columns):
+                show_empty_state()
+                self._style_figure(self.price_figure)
+                canvas.draw_idle()
+                return
+            close_column = numeric_columns[0]
+
+        series = pd.to_numeric(frame[close_column], errors="coerce")
+        plotted_series = pd.Series(series.to_numpy(), index=pd.Index(x_values)).dropna()
+        if plotted_series.empty:
+            show_empty_state()
+            self._style_figure(self.price_figure)
+            canvas.draw_idle()
+            return
+
+        if empty_label is not None:
+            empty_label.grid_remove()
+        if canvas_widget is not None:
+            canvas_widget.grid()
+
+        close_label = "Close (price)" if not self.currency_symbol else f"Close ({self.currency_symbol})"
+        ax.plot(plotted_series.index, plotted_series.values, label=close_label, color="tab:blue")
+
+        last_x = plotted_series.index[-1]
+        last_y = plotted_series.iloc[-1]
+        last_display = fmt_ccy(last_y, self.currency_symbol, decimals=self.price_decimal_places)
+        ax.scatter([last_x], [last_y], color="tab:blue", zorder=5)
+        ax.annotate(
+            f"Last: {last_display}",
+            xy=(last_x, last_y),
+            xytext=(8, 0),
+            textcoords="offset points",
+            va="center",
+            ha="left",
+            color="tab:blue",
+        )
+
+        predicted_close = _safe_float(prediction.get("predicted_close"))
+        converted_prediction = self._convert_currency(predicted_close) if predicted_close is not None else None
+        if converted_prediction is not None:
+            predicted_label = (
+                "Predicted close (price)"
+                if not self.currency_symbol
+                else f"Predicted close ({self.currency_symbol})"
+            )
+            if forecast is not None:
+                line_end = forecast
+            else:
+                line_end = pd.to_datetime(last_x) + pd.Timedelta(days=1)
+            ax.plot(
+                [last_x, line_end],
+                [converted_prediction, converted_prediction],
+                color="tab:orange",
+                linestyle="--",
+                label=predicted_label,
+            )
+            annotation_text = fmt_ccy(
+                converted_prediction,
+                self.currency_symbol,
+                decimals=self.price_decimal_places,
+            )
+            if forecast is not None:
+                annotation_text = f"{annotation_text} ({forecast.date().isoformat()})"
+            ax.annotate(
+                annotation_text,
+                xy=(pd.to_datetime(line_end), converted_prediction),
+                xytext=(8, 0),
+                textcoords="offset points",
+                va="center",
+                ha="left",
+                color="tab:orange",
+            )
+
+        ylabel = "Price"
+        if self.currency_symbol:
+            ylabel = f"Price ({self.currency_symbol})"
+        ax.set_ylabel(ylabel)
+        ax.grid(True, linestyle="--", alpha=0.3)
+        ax.legend(loc="best")
+        ax.xaxis.set_major_formatter(DateFormatter("%b-%Y"))
+
         self._style_figure(self.price_figure)
-        self.price_canvas.draw_idle()
+        canvas.draw_idle()
 
     def _update_indicator_view(self) -> None:
         for item in self.indicator_tree.get_children():
