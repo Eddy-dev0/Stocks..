@@ -8,6 +8,7 @@ from typing import Dict, Iterable, Iterator, Mapping, Optional, Sequence
 import numpy as np
 import pandas as pd
 
+from ..indicator_bundle import DEFAULT_INDICATOR_CONFIG, compute_indicators
 from ..sentiment import aggregate_daily_sentiment, attach_sentiment
 from .feature_registry import (
     FeatureBuildContext,
@@ -52,7 +53,10 @@ def _not_implemented_group_builder(name: str):
 
 
 def _technical_group_builder(context: FeatureBuildContext) -> FeatureBuildOutput:
-    block = _build_technical_features(context.price_df)
+    block = _build_technical_features(
+        context.price_df,
+        indicator_config=context.technical_indicator_config,
+    )
     blocks = [block] if block is not None else []
     status = "executed" if blocks else "skipped_no_data"
     return FeatureBuildOutput(blocks=blocks, status=status)
@@ -119,10 +123,13 @@ class FeatureAssembler:
         horizons: Iterable[int] | None = None,
         *,
         registry: Mapping[str, FeatureGroupSpec] | None = None,
+        technical_indicator_config: Mapping[str, Mapping[str, object]] | None = None,
     ) -> None:
         self.registry: Dict[str, FeatureGroupSpec] = dict(registry or FEATURE_REGISTRY)
         if not self.registry:
             raise ValueError("Feature registry cannot be empty.")
+
+        self.technical_indicator_config = self._build_indicator_config(technical_indicator_config)
 
         self.feature_toggles = self._normalise_toggles(feature_toggles)
         self.enabled_groups = [name for name, enabled in self.feature_toggles.items() if enabled]
@@ -159,6 +166,7 @@ class FeatureAssembler:
             price_df=processed,
             news_df=context_news,
             sentiment_enabled=sentiment_enabled,
+            technical_indicator_config=self.technical_indicator_config,
         )
 
         feature_blocks: list[FeatureBlock] = []
@@ -303,6 +311,20 @@ class FeatureAssembler:
         defaults.update(normalised)
         return defaults
 
+    @staticmethod
+    def _build_indicator_config(
+        overrides: Mapping[str, Mapping[str, object]] | None,
+    ) -> dict[str, dict[str, object]]:
+        config = {
+            name: dict(DEFAULT_INDICATOR_CONFIG[name]) for name in DEFAULT_INDICATOR_CONFIG
+        }
+        if overrides:
+            for name, params in overrides.items():
+                if name not in config:
+                    continue
+                config[name].update(params)
+        return config
+
     def _resolve_execution_plan(self) -> list[FeatureGroupSpec]:
         plan: list[FeatureGroupSpec] = []
         added: set[str] = set()
@@ -370,7 +392,11 @@ def _ensure_datetime_index(price_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _build_technical_features(price_df: pd.DataFrame) -> FeatureBlock | None:
+def _build_technical_features(
+    price_df: pd.DataFrame,
+    *,
+    indicator_config: Mapping[str, Mapping[str, object]] | None,
+) -> FeatureBlock | None:
     if price_df.empty:
         return None
 
@@ -380,70 +406,48 @@ def _build_technical_features(price_df: pd.DataFrame) -> FeatureBlock | None:
     high = _get_numeric_series(df, "High", default=np.nan).fillna(close)
     low = _get_numeric_series(df, "Low", default=np.nan).fillna(close)
 
-    features: Dict[str, pd.Series] = {}
+    indicator_result = compute_indicators(df, indicator_config)
+    indicator_frame = indicator_result.dataframe.reset_index(drop=True)
 
-    features["Return_1d"] = close.pct_change()
-    features["LogReturn_1d"] = np.log(close.replace(0, np.nan)).diff()
+    feature_frame = pd.DataFrame({"Date": df["Date"].reset_index(drop=True)})
+    feature_frame["Return_1d"] = close.pct_change()
+    feature_frame["LogReturn_1d"] = np.log(close.replace(0, np.nan)).diff()
 
-    sma_windows = (5, 10, 20, 50, 100, 200)
-    ema_windows = (10, 20, 50, 100, 200)
-    for window in sma_windows:
+    for window in (5, 10):
         sma = close.rolling(window=window, min_periods=1).mean()
-        features[f"SMA_{window}"] = sma
-        features[f"Price_to_SMA_{window}"] = _safe_divide(close, sma)
+        feature_frame[f"SMA_{window}"] = sma
 
-    for span in ema_windows:
+    for span in (10, 20, 50, 100, 200):
         ema = close.ewm(span=span, adjust=False, min_periods=1).mean()
-        features[f"EMA_{span}"] = ema
-        features[f"Price_to_EMA_{span}"] = _safe_divide(close, ema)
-
-    macd_configs = ((12, 26, 9), (8, 17, 9), (5, 35, 5))
-    for fast, slow, signal in macd_configs:
-        macd_line, signal_line, hist = _compute_macd(close, fast, slow, signal)
-        prefix = f"MACD_{fast}_{slow}_{signal}"
-        features[f"{prefix}_Line"] = macd_line
-        features[f"{prefix}_Signal"] = signal_line
-        features[f"{prefix}_Hist"] = hist
-
-    for window in (7, 14, 21):
-        features[f"RSI_{window}"] = _compute_rsi(close, window=window)
-
-    for window, num_std in ((20, 2.0), (50, 2.0)):
-        mid, upper, lower, bandwidth, percent_b = _bollinger(close, window, num_std)
-        prefix = f"Bollinger_{window}"
-        features[f"{prefix}_Mid"] = mid
-        features[f"{prefix}_Upper"] = upper
-        features[f"{prefix}_Lower"] = lower
-        features[f"{prefix}_Bandwidth"] = bandwidth
-        features[f"{prefix}_PercentB"] = percent_b
-
-    stochastic_k, stochastic_d = _compute_stochastic(close, high, low, window=14, smooth_k=3, smooth_d=3)
-    features["Stochastic_%K"] = stochastic_k
-    features["Stochastic_%D"] = stochastic_d
+        feature_frame[f"EMA_{span}"] = ema
 
     for window in (5, 10, 20, 63, 126):
-        features[f"ROC_{window}"] = close.pct_change(periods=window)
-
-    for window in (7, 14, 21):
-        features[f"ATR_{window}"] = _compute_atr(df.assign(High=high, Low=low, Close=close), window=window)
+        feature_frame[f"ROC_{window}"] = close.pct_change(periods=window)
 
     volume_change = volume.pct_change()
-    features["Volume_Change"] = volume_change
+    feature_frame["Volume_Change"] = volume_change
     if not volume.isna().all():
         for window in (10, 20, 50):
             rolling_vol = volume.rolling(window=window, min_periods=1).mean()
             rolling_std = volume.rolling(window=window, min_periods=1).std()
-            features[f"Volume_SMA_{window}"] = rolling_vol
-            features[f"Volume_EMA_{window}"] = volume.ewm(span=window, adjust=False, min_periods=1).mean()
-            features[f"Volume_ZScore_{window}"] = (volume - rolling_vol) / rolling_std.replace(0, np.nan)
-        price_volume = _safe_divide(volume, close)
-        features["Volume_to_Price"] = price_volume
+            feature_frame[f"Volume_SMA_{window}"] = rolling_vol
+            feature_frame[f"Volume_EMA_{window}"] = volume.ewm(span=window, adjust=False, min_periods=1).mean()
+            feature_frame[f"Volume_ZScore_{window}"] = (volume - rolling_vol) / rolling_std.replace(0, np.nan)
+        feature_frame["Volume_to_Price"] = _safe_divide(volume, close)
 
-    feature_frame = pd.DataFrame({"Date": df["Date"]})
-    for name, series in features.items():
-        feature_frame[name] = series
+    combined = pd.concat([feature_frame, indicator_frame], axis=1)
 
-    return FeatureBlock(feature_frame, category="technical")
+    for window in (20, 50, 100, 200):
+        column = f"SMA_{window}"
+        if column in combined:
+            combined[f"Price_to_SMA_{window}"] = _safe_divide(close, combined[column])
+
+    for span in (12, 26):
+        column = f"EMA_{span}"
+        if column in combined:
+            combined[f"Price_to_EMA_{span}"] = _safe_divide(close, combined[column])
+
+    return FeatureBlock(combined, category="technical")
 
 
 def _get_numeric_series(df: pd.DataFrame, column: str, default: float = np.nan) -> pd.Series:
@@ -454,72 +458,6 @@ def _get_numeric_series(df: pd.DataFrame, column: str, default: float = np.nan) 
 
 def _safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     return numerator / denominator.replace(0, np.nan)
-
-
-def _compute_macd(
-    close: pd.Series, fast: int, slow: int, signal: int
-) -> tuple[pd.Series, pd.Series, pd.Series]:
-    fast_ema = close.ewm(span=fast, adjust=False, min_periods=1).mean()
-    slow_ema = close.ewm(span=slow, adjust=False, min_periods=1).mean()
-    macd_line = fast_ema - slow_ema
-    signal_line = macd_line.ewm(span=signal, adjust=False, min_periods=1).mean()
-    histogram = macd_line - signal_line
-    return macd_line, signal_line, histogram
-
-
-def _bollinger(
-    series: pd.Series, window: int, num_std: float
-) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
-    mid = series.rolling(window=window, min_periods=1).mean()
-    std = series.rolling(window=window, min_periods=1).std(ddof=0)
-    upper = mid + num_std * std
-    lower = mid - num_std * std
-    bandwidth = (upper - lower) / mid.replace(0, np.nan)
-    percent_b = (series - lower) / (upper - lower).replace(0, np.nan)
-    return mid, upper, lower, bandwidth, percent_b
-
-
-def _compute_stochastic(
-    close: pd.Series,
-    high: pd.Series,
-    low: pd.Series,
-    window: int = 14,
-    smooth_k: int = 3,
-    smooth_d: int = 3,
-) -> tuple[pd.Series, pd.Series]:
-    lowest_low = low.rolling(window=window, min_periods=1).min()
-    highest_high = high.rolling(window=window, min_periods=1).max()
-    raw_k = 100 * _safe_divide(close - lowest_low, (highest_high - lowest_low))
-    smooth_k_series = raw_k.rolling(window=smooth_k, min_periods=1).mean()
-    smooth_d_series = smooth_k_series.rolling(window=smooth_d, min_periods=1).mean()
-    return smooth_k_series, smooth_d_series
-
-
-def _compute_rsi(series: pd.Series, window: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(window=window, min_periods=1).mean()
-    avg_loss = loss.rolling(window=window, min_periods=1).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
-
-
-def _compute_atr(price_df: pd.DataFrame, window: int = 14) -> pd.Series:
-    high = price_df.get("High", price_df["Close"])
-    low = price_df.get("Low", price_df["Close"])
-    close = price_df["Close"].shift(1)
-    tr = pd.concat(
-        [
-            (high - low).abs(),
-            (high - close).abs(),
-            (low - close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    atr = tr.rolling(window=window, min_periods=1).mean()
-    return atr
 
 
 def _build_elliott_wave_descriptors(price_df: pd.DataFrame) -> FeatureBlock | None:
