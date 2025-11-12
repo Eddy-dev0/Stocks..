@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
+import signal
+import subprocess
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable
 
 from stock_predictor.core import (
@@ -109,6 +114,74 @@ class StockPredictorApplication:
 
         payload = handlers[mode]()
         return RunResult(status="ok", payload={mode.replace("-", "_"): payload})
+
+    def launch_dashboard(
+        self,
+        *,
+        api_host: str = "127.0.0.1",
+        api_port: int = 8000,
+        ui_port: int = 8501,
+        ui_headless: bool = False,
+        ui_api_key: str | None = None,
+    ) -> int:
+        """Launch the dashboard alongside the embedded API service."""
+
+        frontend_path = Path(__file__).resolve().parent.parent / "ui" / "frontend" / "app.py"
+        if not frontend_path.exists():
+            LOGGER.error("Streamlit dashboard entry point not found at %s", frontend_path)
+            return 1
+
+        env = os.environ.copy()
+        env.setdefault("STOCK_PREDICTOR_DEFAULT_TICKER", self.config.ticker)
+        env.setdefault("STOCK_PREDICTOR_API_URL", f"http://{api_host}:{api_port}")
+        if ui_api_key:
+            env["STOCK_PREDICTOR_UI_API_KEY"] = ui_api_key
+            env["STOCK_PREDICTOR_UI_API_KEYS"] = ui_api_key
+
+        LOGGER.info(
+            "Starting API server on http://%s:%s and dashboard on http://localhost:%s",
+            api_host,
+            api_port,
+            ui_port,
+        )
+
+        api_cmd = [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "stock_predictor.ui.api.main:app",
+            "--host",
+            str(api_host),
+            "--port",
+            str(api_port),
+        ]
+
+        ui_cmd = [
+            sys.executable,
+            "-m",
+            "streamlit",
+            "run",
+            str(frontend_path),
+            "--server.port",
+            str(ui_port),
+        ]
+        if ui_headless:
+            ui_cmd.extend(["--server.headless", "true"])
+
+        api_process = subprocess.Popen(api_cmd, env=env)
+        try:
+            result = subprocess.run(ui_cmd, env=env, check=False)
+            return result.returncode
+        except KeyboardInterrupt:
+            LOGGER.info("Dashboard interrupted by user.")
+            return 0
+        finally:
+            api_process.send_signal(signal.SIGINT)
+            try:
+                api_process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                LOGGER.debug("Force terminating API server")
+                api_process.kill()
 
 
 __all__ = ["StockPredictorApplication", "RunResult"]
