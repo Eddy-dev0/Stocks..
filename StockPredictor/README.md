@@ -26,6 +26,8 @@ front-ends.
   responses are cached when available and fall back to documented placeholders
   when upstream APIs return no data).
 - CLI modes for data collection, training and inference.
+- FastAPI backend (`ui/api`) secured with API keys and a Streamlit dashboard (`ui/frontend`) for
+  interactive exploration of data, forecasts, backtests and research artefacts.
 
 ## Project layout
 
@@ -65,6 +67,31 @@ StockPredictor/
 ## Usage
 
 All commands are executed from the project root (`StockPredictor/`).
+
+### Web dashboard
+
+The easiest way to explore predictions and research summaries is via the bundled
+web experience.
+
+1. (Optional) generate a comma-separated list of API keys and expose it as an
+   environment variable before starting the containers:
+
+   ```bash
+   export STOCK_PREDICTOR_UI_API_KEYS="my-secret-key"
+   ```
+
+2. Launch the API and Streamlit frontend using Docker Compose:
+
+   ```bash
+   docker compose up --build
+   ```
+
+   The FastAPI service is available at `http://localhost:8000` (documented via
+   `/docs`) and the dashboard runs on `http://localhost:8501`.
+
+3. When the dashboard loads provide the API base URL and key (if configured)
+   through the sidebar. Use the controls to fetch market data, trigger
+   forecasts, run backtests and download research summaries.
 
 ### Download data
 

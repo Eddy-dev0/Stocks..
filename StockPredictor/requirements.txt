@@ -11,3 +11,6 @@ SQLAlchemy>=2.0,<3.0
 httpx>=0.25,<0.28
 pydantic>=1.10,<2.0
 beautifulsoup4>=4.12,<5.0
+fastapi>=0.109,<1.0
+uvicorn[standard]>=0.24,<1.0
+streamlit>=1.31,<2.0
