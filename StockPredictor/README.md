@@ -73,25 +73,37 @@ All commands are executed from the project root (`StockPredictor/`).
 The easiest way to explore predictions and research summaries is via the bundled
 web experience.
 
-1. (Optional) generate a comma-separated list of API keys and expose it as an
-   environment variable before starting the containers:
+- **Quick start:** simply run `python main.py` with no additional arguments. The
+  CLI now launches the embedded FastAPI service together with the Streamlit
+  dashboard. A browser window/tab opens automatically (use `--ui-headless` to
+  skip this). Press `Ctrl+C` in the terminal to stop both services.
 
-   ```bash
-   export STOCK_PREDICTOR_UI_API_KEYS="my-secret-key"
-   ```
+- **Custom launch:** the dashboard can also be started explicitly via
+  `python main.py --mode dashboard`. Additional options such as
+  `--api-host`, `--api-port`, `--ui-port` and `--ui-api-key` control the
+  underlying services.
 
-2. Launch the API and Streamlit frontend using Docker Compose:
+- **Docker setup:**
 
-   ```bash
-   docker compose up --build
-   ```
+  1. (Optional) generate a comma-separated list of API keys and expose it as an
+     environment variable before starting the containers:
 
-   The FastAPI service is available at `http://localhost:8000` (documented via
-   `/docs`) and the dashboard runs on `http://localhost:8501`.
+     ```bash
+     export STOCK_PREDICTOR_UI_API_KEYS="my-secret-key"
+     ```
 
-3. When the dashboard loads provide the API base URL and key (if configured)
-   through the sidebar. Use the controls to fetch market data, trigger
-   forecasts, run backtests and download research summaries.
+  2. Launch the API and Streamlit frontend using Docker Compose:
+
+     ```bash
+     docker compose up --build
+     ```
+
+     The FastAPI service is available at `http://localhost:8000` (documented via
+     `/docs`) and the dashboard runs on `http://localhost:8501`.
+
+  3. When the dashboard loads provide the API base URL and key (if configured)
+     through the sidebar. Use the controls to fetch market data, trigger
+     forecasts, run backtests and download research summaries.
 
 ### Download data
 
@@ -125,11 +137,11 @@ and returns a JSON blob with the predicted closing price for the next trading
 day, the absolute and percentage change relative to the latest observed close
 and metadata about the run.
 
-Running `python main.py` without arguments uses defaults. Set
+Running `python main.py` without arguments launches the dashboard. Set
 `STOCK_PREDICTOR_DEFAULT_MODE` and `STOCK_PREDICTOR_DEFAULT_TICKER` in your
-environment (or `.env`) to customise the implicit `mode` and `ticker`. The
-application falls back to `predict` for the mode and `AAPL` for the ticker when
-no overrides are provided.
+environment (or `.env`) to customise the implicit `mode` and `ticker`. When a
+different default mode is configured, the CLI continues to honour it; otherwise
+the dashboard is selected automatically and the ticker defaults to `AAPL`.
 
 ### Additional options
 
