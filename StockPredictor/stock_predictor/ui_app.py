@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import tkinter as tk
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from typing import Any, Callable, Iterable, Mapping
 import matplotlib.dates as mdates
 import numpy as np
 import pandas as pd
+import yfinance as yf
 from matplotlib import style as mpl_style
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
@@ -186,12 +188,17 @@ class StockPredictorDesktopApp:
         self.feature_snapshot: pd.DataFrame | None = None
         self.feature_history: pd.DataFrame | None = None
         self.indicator_history: pd.DataFrame | None = None
+        self.price_history_converted: pd.DataFrame | None = None
+        self.feature_snapshot_converted: pd.DataFrame | None = None
+        self.feature_history_converted: pd.DataFrame | None = None
+        self.indicator_history_converted: pd.DataFrame | None = None
         self.feature_toggle_vars: dict[str, tk.BooleanVar] = {}
         self.forecast_date_var = tk.StringVar(value="Forecast date: —")
 
         self.currency_mode_var = tk.StringVar(value="local")
         self.currency_button_text = tk.StringVar(value=self._currency_label("local"))
         self.currency_rate_var = tk.StringVar(value=f"{self._currency_rate('usd'):.4f}")
+        self._suspend_rate_updates = False
 
         self.currency_choice_map = {"Local": "local", "USD": "usd", "EUR": "eur"}
         self.currency_display_map = {value: key for key, value in self.currency_choice_map.items()}
@@ -294,6 +301,11 @@ class StockPredictorDesktopApp:
                 variable=self.currency_mode_var,
                 command=lambda mode=code: self._on_currency_mode_changed(mode),
             )
+        self.currency_menu.add_separator()
+        self.currency_menu.add_command(
+            label="Update rate",
+            command=lambda: self._on_fetch_fx_rate(silent=False),
+        )
         self.currency_menu_button.configure(menu=self.currency_menu)
         self.currency_menu_button.pack(side=tk.LEFT, padx=(0, 6))
 
@@ -301,7 +313,11 @@ class StockPredictorDesktopApp:
         self.fx_rate_entry.pack(side=tk.LEFT)
         self.fx_rate_entry.bind("<Return>", self._on_currency_rate_submit)
 
-        self.fx_rate_button = ttk.Button(toolbar, text="Update rate", command=self._on_currency_rate_button)
+        self.fx_rate_button = ttk.Button(
+            toolbar,
+            text="Update rate",
+            command=self._on_currency_rate_button,
+        )
         self.fx_rate_button.pack(side=tk.LEFT, padx=(4, 12))
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
@@ -595,9 +611,11 @@ class StockPredictorDesktopApp:
         self._refresh_numeric_views()
 
     def _on_currency_mode_changed(self, mode: str) -> None:
+        previous_mode = getattr(self, "currency_mode", "local")
         if mode not in self.currency_profiles:
             LOGGER.debug("Unsupported currency mode '%s'; defaulting to local", mode)
             mode = "local"
+        changed = mode != previous_mode
         self.currency_mode = mode
         self.currency_symbol = self._currency_symbol(mode)
         self.currency_button_text.set(self._currency_label(mode))
@@ -605,8 +623,6 @@ class StockPredictorDesktopApp:
             display_label = self.currency_display_map.get(mode, "Local")
             if self.currency_default_var.get() != display_label:
                 self.currency_default_var.set(display_label)
-        rate = self._currency_rate(mode)
-        self.currency_rate_var.set(f"{rate:.4f}")
         if self._busy:
             entry_state = tk.DISABLED
             button_state = tk.DISABLED
@@ -618,36 +634,56 @@ class StockPredictorDesktopApp:
             button_state = tk.NORMAL
         self.fx_rate_entry.configure(state=entry_state)
         self.fx_rate_button.configure(state=button_state)
-        if hasattr(self, "metric_vars"):
-            self._update_metrics()
-        if hasattr(self, "price_ax"):
-            self._update_price_chart()
-        if hasattr(self, "indicator_tree"):
-            self._update_indicator_view()
+        rate = self._currency_rate(mode)
+        if not changed:
+            self._set_currency_rate_var(rate)
+            self._on_currency_changed(mode, rate)
+            return
+        if mode == "local":
+            self._set_currency_rate_var(rate)
+            self._on_currency_changed(mode, rate)
+            return
+        updated_rate = self._on_fetch_fx_rate(mode, silent=True, apply=False)
+        if updated_rate is None:
+            self._set_currency_rate_var(rate)
+            self._on_currency_changed(mode, rate)
+        else:
+            self._on_currency_changed(mode, updated_rate)
 
     def _on_currency_rate_submit(self, _event: Any) -> None:
-        self._on_currency_rate_button()
+        self._apply_manual_fx_rate()
 
     def _on_currency_rate_button(self) -> None:
+        result = self._on_fetch_fx_rate()
+        if result is None:
+            self._set_status("Failed to update FX rate. Using previous value.")
+
+    def _apply_manual_fx_rate(self) -> None:
         mode = self.currency_mode_var.get()
         if mode == "local":
+            messagebox.showinfo(
+                "Local currency",
+                "Local currency does not require a conversion rate.",
+            )
+            self._set_currency_rate_var(self._currency_rate(mode))
             return
         raw = self.currency_rate_var.get()
         try:
             rate = float(raw)
         except (TypeError, ValueError):
-            messagebox.showwarning("Invalid FX rate", "Please provide a numeric FX conversion rate.")
-            self.currency_rate_var.set(f"{self._currency_rate(mode):.4f}")
+            messagebox.showwarning(
+                "Invalid FX rate", "Please provide a numeric FX conversion rate."
+            )
+            self._set_currency_rate_var(self._currency_rate(mode))
             return
         if rate <= 0:
             messagebox.showwarning("Invalid FX rate", "FX conversion rate must be positive.")
-            self.currency_rate_var.set(f"{self._currency_rate(mode):.4f}")
+            self._set_currency_rate_var(self._currency_rate(mode))
             return
         self._set_currency_rate(mode, rate)
-        self.currency_rate_var.set(f"{self._currency_rate(mode):.4f}")
-        self._update_metrics()
-        self._update_price_chart()
-        self._update_indicator_view()
+        self._set_currency_rate_var(self._currency_rate(mode))
+        self._on_fx_rate_changed(mode, rate)
+        self._set_status(f"FX rate updated to {rate:.4f}.")
 
     def _on_position_size_changed(self, *_args: Any) -> None:
         self._recompute_pnl()
@@ -671,15 +707,25 @@ class StockPredictorDesktopApp:
             return
         indicator = selection[0]
         series = None
-        if isinstance(self.feature_history, pd.DataFrame) and indicator in self.feature_history.columns:
-            series = pd.to_numeric(self.feature_history[indicator], errors="coerce").dropna()
-        elif isinstance(self.indicator_history, pd.DataFrame):
-            columns = {str(column).lower(): column for column in self.indicator_history.columns}
+        feature_history = (
+            self.feature_history_converted
+            if isinstance(self.feature_history_converted, pd.DataFrame)
+            else self.feature_history
+        )
+        indicator_history = (
+            self.indicator_history_converted
+            if isinstance(self.indicator_history_converted, pd.DataFrame)
+            else self.indicator_history
+        )
+        if isinstance(feature_history, pd.DataFrame) and indicator in feature_history.columns:
+            series = pd.to_numeric(feature_history[indicator], errors="coerce").dropna()
+        elif isinstance(indicator_history, pd.DataFrame):
+            columns = {str(column).lower(): column for column in indicator_history.columns}
             indicator_col = columns.get("indicator")
             value_col = columns.get("value")
             date_col = columns.get("date")
             if indicator_col and value_col:
-                subset = self.indicator_history[self.indicator_history[indicator_col] == indicator]
+                subset = indicator_history[indicator_history[indicator_col] == indicator]
                 if date_col:
                     subset = subset.copy()
                     subset[date_col] = pd.to_datetime(subset[date_col], errors="coerce")
@@ -827,6 +873,7 @@ class StockPredictorDesktopApp:
         self.feature_history = feature_history if isinstance(feature_history, pd.DataFrame) else None
         self.price_history = price_history if isinstance(price_history, pd.DataFrame) else None
         self.indicator_history = indicator_history if isinstance(indicator_history, pd.DataFrame) else None
+        self._apply_currency(self._currency_rate())
         self._update_forecast_label(self.current_prediction.get("target_date"))
         self._update_metrics()
         self._update_price_chart()
@@ -982,8 +1029,13 @@ class StockPredictorDesktopApp:
         if forecast is not None:
             title = f"Forecast date: {forecast.date().isoformat()}"
         self.price_ax.set_title(title)
-        if isinstance(self.price_history, pd.DataFrame) and not self.price_history.empty:
-            frame = self.price_history.copy()
+        frame_source: pd.DataFrame | None = None
+        if isinstance(self.price_history_converted, pd.DataFrame) and not self.price_history_converted.empty:
+            frame_source = self.price_history_converted
+        elif isinstance(self.price_history, pd.DataFrame) and not self.price_history.empty:
+            frame_source = self.price_history
+        if isinstance(frame_source, pd.DataFrame) and not frame_source.empty:
+            frame = frame_source.copy()
             lower_map = {str(column).lower(): column for column in frame.columns}
             if "date" in lower_map:
                 frame[lower_map["date"]] = pd.to_datetime(frame[lower_map["date"]], errors="coerce")
@@ -1002,8 +1054,6 @@ class StockPredictorDesktopApp:
             if close_column is None:
                 close_column = frame.select_dtypes(include=[np.number]).columns[0]
             series = pd.to_numeric(frame[close_column], errors="coerce")
-            rate = self._currency_rate()
-            series = series * rate
             plotted_series = pd.Series(series.to_numpy(), index=pd.Index(x_values)).dropna()
             close_label = "Close (price)" if not self.currency_symbol else f"Close ({self.currency_symbol})"
             self.price_ax.plot(plotted_series.index, plotted_series.values, label=close_label, color="tab:blue")
@@ -1023,7 +1073,10 @@ class StockPredictorDesktopApp:
                 )
             predicted_close = _safe_float(prediction.get("predicted_close"))
             if predicted_close is not None:
-                converted_prediction = predicted_close * rate
+                converted_prediction = self._convert_currency(predicted_close)
+            else:
+                converted_prediction = None
+            if converted_prediction is not None:
                 predicted_label = (
                     "Predicted close (price)"
                     if not self.currency_symbol
@@ -1067,8 +1120,13 @@ class StockPredictorDesktopApp:
     def _update_indicator_view(self) -> None:
         for item in self.indicator_tree.get_children():
             self.indicator_tree.delete(item)
-        if self.feature_snapshot is not None and not self.feature_snapshot.empty:
-            row = self.feature_snapshot.iloc[0]
+        snapshot_frame = (
+            self.feature_snapshot_converted
+            if isinstance(self.feature_snapshot_converted, pd.DataFrame)
+            else self.feature_snapshot
+        )
+        if snapshot_frame is not None and not snapshot_frame.empty:
+            row = snapshot_frame.iloc[0]
             metadata = self.application.pipeline.metadata
             categories = {}
             if isinstance(metadata, Mapping):
@@ -1085,8 +1143,16 @@ class StockPredictorDesktopApp:
                     iid=str(column),
                     values=(str(column), display_value, str(category)),
                 )
-        if not self.indicator_tree.get_children() and isinstance(self.indicator_history, pd.DataFrame):
-            frame = self.indicator_history
+        if not self.indicator_tree.get_children():
+            indicator_frame = (
+                self.indicator_history_converted
+                if isinstance(self.indicator_history_converted, pd.DataFrame)
+                else self.indicator_history
+            )
+        else:
+            indicator_frame = None
+        if not self.indicator_tree.get_children() and isinstance(indicator_frame, pd.DataFrame):
+            frame = indicator_frame
             columns = {str(column).lower(): column for column in frame.columns}
             indicator_col = columns.get("indicator")
             value_col = columns.get("value")
@@ -1222,6 +1288,129 @@ class StockPredictorDesktopApp:
         if mode not in self.currency_rates:
             raise ValueError(f"Unknown currency mode '{mode}'")
         self.currency_rates[mode] = rate
+
+    def _set_currency_rate_var(self, rate: float) -> None:
+        if self._suspend_rate_updates:
+            return
+        self._suspend_rate_updates = True
+        try:
+            self.currency_rate_var.set(f"{float(rate):.4f}")
+        finally:
+            self._suspend_rate_updates = False
+
+    def _currency_code(self, mode: str) -> str | None:
+        profile = self.currency_profiles.get(mode, {})
+        label = str(profile.get("label") or "")
+        match = re.search(r"([A-Z]{3})", label.upper())
+        if match:
+            return match.group(1)
+        fallback_map = {"usd": "USD", "eur": "EUR"}
+        return fallback_map.get(mode)
+
+    def _resolve_currency_pair(self, target_mode: str) -> str | None:
+        if target_mode == "local":
+            return None
+        base_code = self._currency_code("local")
+        target_code = self._currency_code(target_mode)
+        if not base_code or not target_code or base_code == target_code:
+            return None
+        return f"{base_code}{target_code}=X"
+
+    def _fetch_fx_rate(self, mode: str | None = None) -> float | None:
+        target_mode = mode or self.currency_mode_var.get()
+        if target_mode == "local":
+            return 1.0
+        pair = self._resolve_currency_pair(target_mode)
+        if not pair:
+            LOGGER.warning("No FX pair available for mode '%s'", target_mode)
+            return None
+        try:
+            data = yf.download(pair, period="5d", auto_adjust=True, progress=False)
+        except Exception as exc:  # pragma: no cover - network errors
+            LOGGER.warning("Failed to download FX rate for %s: %s", pair, exc)
+            return None
+        if data.empty:
+            LOGGER.warning("Empty FX dataset returned for %s", pair)
+            return None
+        try:
+            last_row = data.iloc[-1]
+        except IndexError:  # pragma: no cover - defensive guard
+            LOGGER.warning("FX dataset for %s did not contain rows", pair)
+            return None
+        rate: float | None = None
+        for column in ("Adj Close", "Close", "close"):
+            if column in last_row:
+                rate = _safe_float(last_row[column])
+                if rate is not None:
+                    break
+        if rate is None:
+            rate = _safe_float(last_row.squeeze())
+        if rate is None or rate <= 0:
+            LOGGER.warning("Invalid FX rate %s returned for %s", rate, pair)
+            return None
+        return rate
+
+    def _on_fetch_fx_rate(
+        self, mode: str | None = None, *, silent: bool = False, apply: bool = True
+    ) -> float | None:
+        target_mode = mode or self.currency_mode_var.get()
+        rate = self._fetch_fx_rate(target_mode)
+        if rate is None:
+            if not silent:
+                messagebox.showwarning(
+                    "FX rate update failed",
+                    "Unable to retrieve the latest FX rate. Previous values will be used.",
+                )
+            return None
+        try:
+            self._set_currency_rate(target_mode, rate)
+        except ValueError as exc:  # pragma: no cover - defensive path
+            LOGGER.warning("Rejected FX rate %s for %s: %s", rate, target_mode, exc)
+            return None
+        self._set_currency_rate_var(rate)
+        if apply:
+            self._on_fx_rate_changed(target_mode, rate)
+        if not silent:
+            self._set_status(f"FX rate updated to {rate:.4f}.")
+        return rate
+
+    def _apply_currency(self, rate: float) -> None:
+        def _convert_frame(frame: pd.DataFrame | None) -> pd.DataFrame | None:
+            if not isinstance(frame, pd.DataFrame) or frame.empty:
+                return None
+            converted = frame.copy()
+            numeric_columns: list[str] = []
+            for column in converted.columns:
+                series = converted[column]
+                if pd.api.types.is_numeric_dtype(series):
+                    numeric_columns.append(column)
+                    continue
+                try:
+                    coerced = pd.to_numeric(series, errors="coerce")
+                except Exception:  # pragma: no cover - defensive conversion
+                    continue
+                if coerced.isna().all():
+                    continue
+                converted[column] = coerced
+                numeric_columns.append(column)
+            if numeric_columns:
+                converted.loc[:, numeric_columns] = (
+                    converted.loc[:, numeric_columns].astype(float) * float(rate)
+                )
+            return converted
+
+        self.price_history_converted = _convert_frame(self.price_history)
+        self.feature_snapshot_converted = _convert_frame(self.feature_snapshot)
+        self.feature_history_converted = _convert_frame(self.feature_history)
+        self.indicator_history_converted = _convert_frame(self.indicator_history)
+
+    def _on_currency_changed(self, mode: str, rate: float) -> None:
+        self._apply_currency(rate)
+        self._refresh_numeric_views()
+
+    def _on_fx_rate_changed(self, mode: str, rate: float) -> None:
+        self._apply_currency(rate)
+        self._refresh_numeric_views()
 
     def _convert_currency(self, value: Any) -> float | None:
         numeric = _safe_float(value)
