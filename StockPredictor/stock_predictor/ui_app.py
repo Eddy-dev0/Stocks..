@@ -13,6 +13,7 @@ from typing import Any, Callable, Iterable, Mapping
 import matplotlib.dates as mdates
 import numpy as np
 import pandas as pd
+from matplotlib import style as mpl_style
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
@@ -72,7 +73,11 @@ def fmt_ccy(value: Any, symbol: str, *, decimals: int = 2) -> str:
     numeric = _safe_float(value)
     if numeric is None:
         return "—"
-    formatted = f"{abs(numeric):,.{decimals}f}"
+    try:
+        decimals_int = max(0, int(decimals))
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        decimals_int = 2
+    formatted = f"{abs(numeric):,.{decimals_int}f}"
     sign = "-" if numeric < 0 else ""
     clean_symbol = symbol or ""
     return f"{sign}{clean_symbol}{formatted}" if clean_symbol else f"{sign}{formatted}"
@@ -150,6 +155,9 @@ class StockPredictorDesktopApp:
         self.root.title(f"Stock Predictor – {self.config.ticker}")
         self.root.geometry("1280x840")
 
+        self.style = ttk.Style()
+        self.default_theme = self.style.theme_use()
+
         self.ticker_var = tk.StringVar(value=self.config.ticker)
         base_currency = os.environ.get("STOCK_PREDICTOR_UI_BASE_CURRENCY", "Local")
         usd_rate = self._resolve_fx_rate(os.environ.get("STOCK_PREDICTOR_UI_FX_RATE"))
@@ -185,6 +193,24 @@ class StockPredictorDesktopApp:
         self.currency_button_text = tk.StringVar(value=self._currency_label("local"))
         self.currency_rate_var = tk.StringVar(value=f"{self._currency_rate('usd'):.4f}")
 
+        self.currency_choice_map = {"Local": "local", "USD": "usd", "EUR": "eur"}
+        self.currency_display_map = {value: key for key, value in self.currency_choice_map.items()}
+        self.price_decimal_places = 2
+        self.decimal_option_map = {
+            "2 decimals": 2,
+            "3 decimals": 3,
+            "4 decimals": 4,
+        }
+        self.decimal_display_map = {value: label for label, value in self.decimal_option_map.items()}
+        self.currency_default_var = tk.StringVar(
+            value=self.currency_display_map.get(self.currency_mode, "Local")
+        )
+        self.number_format_var = tk.StringVar(value=self.decimal_display_map[self.price_decimal_places])
+        self.show_pnl_var = tk.BooleanVar(value=True)
+        self.dark_mode_var = tk.BooleanVar(value=False)
+        self.text_widgets: list[tk.Text] = []
+        self.dark_mode_enabled = False
+
         self.position_size_var = tk.IntVar(value=1)
         self.pnl_var = tk.StringVar(value="Expected P&L for 1 share: —")
         self.position_size_var.trace_add("write", self._on_position_size_changed)
@@ -192,6 +218,7 @@ class StockPredictorDesktopApp:
         self._busy = False
 
         self._build_layout(horizons)
+        self._apply_theme()
         self.root.after(200, self._initialise_prediction)
 
     # ------------------------------------------------------------------
@@ -347,7 +374,8 @@ class StockPredictorDesktopApp:
         ttk.Label(controls_frame, text="shares").grid(row=0, column=2, sticky=tk.W)
 
         self.pnl_label = ttk.Label(frame, textvariable=self.pnl_var)
-        self.pnl_label.pack(anchor=tk.W, padx=8, pady=(0, 12))
+        self._pnl_pack_options = {"anchor": tk.W, "padx": 8, "pady": (0, 12)}
+        self.pnl_label.pack(**self._pnl_pack_options)
 
         chart_frame = ttk.LabelFrame(frame, text="Price history", padding=8)
         chart_frame.pack(fill=tk.BOTH, expand=True)
@@ -392,6 +420,7 @@ class StockPredictorDesktopApp:
         summary_box.pack(fill=tk.BOTH, expand=False)
         self.summary_text = tk.Text(summary_box, height=8, wrap=tk.WORD, state=tk.DISABLED)
         self.summary_text.pack(fill=tk.BOTH, expand=True)
+        self.text_widgets.append(self.summary_text)
 
         reasons_frame = ttk.Frame(frame)
         reasons_frame.pack(fill=tk.BOTH, expand=True, pady=12)
@@ -411,6 +440,7 @@ class StockPredictorDesktopApp:
             widget = tk.Text(box, height=8, wrap=tk.WORD, state=tk.DISABLED)
             widget.pack(fill=tk.BOTH, expand=True)
             self.reason_lists[key] = widget
+            self.text_widgets.append(widget)
 
         self.feature_importance_frame = ttk.LabelFrame(frame, text="Feature importance", padding=8)
         self.feature_importance_frame.pack(fill=tk.BOTH, expand=True)
@@ -451,6 +481,54 @@ class StockPredictorDesktopApp:
         ttk.Label(info_box, text=f"Model: {self.config.model_type}").pack(anchor=tk.W)
         ttk.Label(info_box, text=f"Prediction targets: {', '.join(self.config.prediction_targets)}").pack(anchor=tk.W)
 
+        display_box = ttk.LabelFrame(frame, text="Display preferences", padding=8)
+        display_box.pack(fill=tk.X, pady=(12, 0))
+
+        currency_row = ttk.Frame(display_box)
+        currency_row.pack(fill=tk.X, pady=4)
+        ttk.Label(currency_row, text="Currency default:").grid(row=0, column=0, sticky=tk.W)
+        self.currency_default_box = ttk.Combobox(
+            currency_row,
+            state="readonly",
+            width=16,
+            values=list(self.currency_choice_map.keys()),
+            textvariable=self.currency_default_var,
+        )
+        self.currency_default_box.grid(row=0, column=1, padx=(8, 0), sticky=tk.W)
+        self.currency_default_box.bind("<<ComboboxSelected>>", self._on_currency_default_changed)
+
+        number_row = ttk.Frame(display_box)
+        number_row.pack(fill=tk.X, pady=4)
+        ttk.Label(number_row, text="Number format:").grid(row=0, column=0, sticky=tk.W)
+        self.number_format_box = ttk.Combobox(
+            number_row,
+            state="readonly",
+            width=16,
+            values=list(self.decimal_option_map.keys()),
+            textvariable=self.number_format_var,
+        )
+        self.number_format_box.grid(row=0, column=1, padx=(8, 0), sticky=tk.W)
+        self.number_format_box.bind("<<ComboboxSelected>>", self._on_number_format_changed)
+
+        toggles_preferences = ttk.Frame(display_box)
+        toggles_preferences.pack(fill=tk.X, pady=(4, 0))
+        self.pnl_toggle = ttk.Checkbutton(
+            toggles_preferences,
+            text="Show position P&L box",
+            variable=self.show_pnl_var,
+            command=self._on_pnl_toggle,
+        )
+        self.pnl_toggle.grid(row=0, column=0, sticky=tk.W)
+        self.dark_mode_toggle = ttk.Checkbutton(
+            toggles_preferences,
+            text="Dark mode",
+            variable=self.dark_mode_var,
+            command=self._on_dark_mode_toggle,
+        )
+        self.dark_mode_toggle.grid(row=0, column=1, sticky=tk.W, padx=(12, 0))
+
+        self._update_pnl_visibility()
+
         toggles_box = ttk.LabelFrame(frame, text="Feature toggles", padding=8)
         toggles_box.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
 
@@ -487,6 +565,35 @@ class StockPredictorDesktopApp:
         self._update_forecast_label()
         self._on_predict()
 
+    def _on_currency_default_changed(self, _event: Any | None = None) -> None:
+        label = self.currency_default_var.get()
+        mode = self.currency_choice_map.get(label, "local")
+        if self.currency_mode_var.get() != mode:
+            self.currency_mode_var.set(mode)
+        self._on_currency_mode_changed(mode)
+
+    def _on_number_format_changed(self, _event: Any | None = None) -> None:
+        label = self.number_format_var.get()
+        decimals = self.decimal_option_map.get(label, self.price_decimal_places)
+        if decimals == self.price_decimal_places:
+            return
+        self.price_decimal_places = decimals
+        display_label = self.decimal_display_map.get(decimals)
+        if display_label and display_label != label:
+            self.number_format_var.set(display_label)
+        self._refresh_numeric_views()
+
+    def _on_pnl_toggle(self) -> None:
+        self._update_pnl_visibility()
+
+    def _on_dark_mode_toggle(self) -> None:
+        enabled = bool(self.dark_mode_var.get())
+        if enabled == self.dark_mode_enabled:
+            return
+        self.dark_mode_enabled = enabled
+        self._apply_theme()
+        self._refresh_numeric_views()
+
     def _on_currency_mode_changed(self, mode: str) -> None:
         if mode not in self.currency_profiles:
             LOGGER.debug("Unsupported currency mode '%s'; defaulting to local", mode)
@@ -494,6 +601,10 @@ class StockPredictorDesktopApp:
         self.currency_mode = mode
         self.currency_symbol = self._currency_symbol(mode)
         self.currency_button_text.set(self._currency_label(mode))
+        if hasattr(self, "currency_default_var"):
+            display_label = self.currency_display_map.get(mode, "Local")
+            if self.currency_default_var.get() != display_label:
+                self.currency_default_var.set(display_label)
         rate = self._currency_rate(mode)
         self.currency_rate_var.set(f"{rate:.4f}")
         if self._busy:
@@ -592,6 +703,7 @@ class StockPredictorDesktopApp:
         self.indicator_ax.grid(True, linestyle="--", alpha=0.3)
         self.indicator_ax.legend(loc="best")
         self.indicator_figure.tight_layout()
+        self._style_figure(self.indicator_figure)
         self.indicator_canvas.draw_idle()
 
     def _on_feature_toggle_changed(self) -> None:
@@ -816,10 +928,13 @@ class StockPredictorDesktopApp:
         predicted_converted = self._convert_currency(predicted_close)
         change_converted = self._convert_currency(expected_change)
 
-        self.metric_vars["last_close"].set(fmt_ccy(last_close_converted, self.currency_symbol))
+        decimals = self.price_decimal_places
+        self.metric_vars["last_close"].set(
+            fmt_ccy(last_close_converted, self.currency_symbol, decimals=decimals)
+        )
 
         forecast = self._compute_forecast_date(self.current_prediction.get("target_date"))
-        predicted_display = fmt_ccy(predicted_converted, self.currency_symbol)
+        predicted_display = fmt_ccy(predicted_converted, self.currency_symbol, decimals=decimals)
         if forecast is not None:
             forecast_str = forecast.date().isoformat()
             if predicted_display == "—":
@@ -828,7 +943,7 @@ class StockPredictorDesktopApp:
                 predicted_display = f"{predicted_display} ({forecast_str})"
         self.metric_vars["predicted_close"].set(predicted_display)
 
-        change_display = fmt_ccy(change_converted, self.currency_symbol)
+        change_display = fmt_ccy(change_converted, self.currency_symbol, decimals=decimals)
         pct_display = fmt_pct(expected_change_pct, show_sign=True)
         if change_display == "—" and pct_display == "—":
             self.metric_vars["expected_change"].set("—")
@@ -895,7 +1010,7 @@ class StockPredictorDesktopApp:
             if not plotted_series.empty:
                 last_x = plotted_series.index[-1]
                 last_y = plotted_series.iloc[-1]
-                last_display = fmt_ccy(last_y, self.currency_symbol)
+                last_display = fmt_ccy(last_y, self.currency_symbol, decimals=self.price_decimal_places)
                 self.price_ax.scatter([last_x], [last_y], color="tab:blue", zorder=5)
                 self.price_ax.annotate(
                     f"Last: {last_display}",
@@ -924,7 +1039,11 @@ class StockPredictorDesktopApp:
                 else:
                     annotate_x = x_values[-1]
                 self.price_ax.annotate(
-                    fmt_ccy(converted_prediction, self.currency_symbol),
+                    fmt_ccy(
+                        converted_prediction,
+                        self.currency_symbol,
+                        decimals=self.price_decimal_places,
+                    ),
                     xy=(annotate_x, converted_prediction),
                     xytext=(8, 0),
                     textcoords="offset points",
@@ -942,6 +1061,7 @@ class StockPredictorDesktopApp:
         else:
             self.price_ax.text(0.5, 0.5, "Price history unavailable", ha="center", va="center")
         self.price_figure.tight_layout()
+        self._style_figure(self.price_figure)
         self.price_canvas.draw_idle()
 
     def _update_indicator_view(self) -> None:
@@ -958,7 +1078,7 @@ class StockPredictorDesktopApp:
                 if numeric is None:
                     continue
                 category = categories.get(column, "feature")
-                display_value = self._format_price_like_value(column, numeric, decimals=4)
+                display_value = self._format_price_like_value(column, numeric)
                 self.indicator_tree.insert(
                     "",
                     tk.END,
@@ -985,7 +1105,7 @@ class StockPredictorDesktopApp:
                     numeric = _safe_float(row.get(value_col))
                     if numeric is None:
                         continue
-                    display_value = self._format_price_like_value(name, numeric, decimals=4)
+                    display_value = self._format_price_like_value(name, numeric)
                     self.indicator_tree.insert(
                         "",
                         tk.END,
@@ -1055,6 +1175,7 @@ class StockPredictorDesktopApp:
             self.feature_ax.set_ylabel("Feature")
             self.feature_ax.grid(True, axis="x", linestyle="--", alpha=0.3)
         self.feature_figure.tight_layout()
+        self._style_figure(self.feature_figure)
         self.feature_canvas.draw_idle()
 
     def _clear_explanation(self) -> None:
@@ -1068,6 +1189,18 @@ class StockPredictorDesktopApp:
     # ------------------------------------------------------------------
     # Utility helpers
     # ------------------------------------------------------------------
+    def _refresh_numeric_views(self) -> None:
+        metrics_updated = False
+        if hasattr(self, "metric_vars"):
+            metrics_updated = True
+            self._update_metrics()
+        if hasattr(self, "price_ax"):
+            self._update_price_chart()
+        if hasattr(self, "indicator_tree"):
+            self._update_indicator_view()
+        if not metrics_updated and hasattr(self, "pnl_label"):
+            self._recompute_pnl()
+
     def _currency_label(self, mode: str | None = None) -> str:
         profile = self.currency_profiles.get(mode or self.currency_mode, {})
         return str(profile.get("label") or "")
@@ -1095,6 +1228,125 @@ class StockPredictorDesktopApp:
         if numeric is None:
             return None
         return numeric * self._currency_rate()
+
+    def _update_pnl_visibility(self) -> None:
+        if not hasattr(self, "pnl_label"):
+            return
+        if self.show_pnl_var.get():
+            if not self.pnl_label.winfo_ismapped():
+                self.pnl_label.pack(**getattr(self, "_pnl_pack_options", {}))
+        else:
+            if self.pnl_label.winfo_manager():
+                self.pnl_label.pack_forget()
+
+    def _apply_theme(self) -> None:
+        enabled = self.dark_mode_enabled
+        mpl_style.use("dark_background" if enabled else "default")
+        if enabled:
+            bg = "#1e1e1e"
+            fg = "#f0f0f0"
+            field_bg = "#262626"
+            accent = "#3a7bd5"
+            self.style.theme_use("clam")
+            self.style.configure("TFrame", background=bg)
+            self.style.configure("TLabelframe", background=bg, foreground=fg)
+            self.style.configure("TLabelframe.Label", background=bg, foreground=fg)
+            self.style.configure("TLabel", background=bg, foreground=fg)
+            self.style.configure("TButton", background=bg, foreground=fg)
+            self.style.configure("TCheckbutton", background=bg, foreground=fg)
+            self.style.configure("TNotebook", background=bg)
+            self.style.configure("TNotebook.Tab", background=bg, foreground=fg)
+            self.style.configure(
+                "Treeview",
+                background=field_bg,
+                fieldbackground=field_bg,
+                foreground=fg,
+                bordercolor=field_bg,
+            )
+            self.style.configure("Treeview.Heading", background=bg, foreground=fg)
+            self.style.map("Treeview", background=[("selected", accent)], foreground=[("selected", fg)])
+            self.style.configure("TCombobox", fieldbackground=field_bg, foreground=fg, background=field_bg)
+            self.style.map("TCombobox", fieldbackground=[("readonly", field_bg)])
+            self.style.configure("TEntry", fieldbackground=field_bg, foreground=fg, background=field_bg)
+            self.style.configure("TMenubutton", background=bg, foreground=fg)
+            self.style.configure("TSpinbox", background=field_bg, foreground=fg)
+            self.style.configure("TProgressbar", background=accent, troughcolor=field_bg)
+            root_bg = bg
+        else:
+            self.style.theme_use(self.default_theme)
+            for style_name in (
+                "TFrame",
+                "TLabelframe",
+                "TLabelframe.Label",
+                "TLabel",
+                "TButton",
+                "TCheckbutton",
+                "TNotebook",
+                "TNotebook.Tab",
+                "Treeview",
+                "Treeview.Heading",
+                "TCombobox",
+                "TEntry",
+                "TMenubutton",
+                "TSpinbox",
+                "TProgressbar",
+            ):
+                self.style.configure(style_name, background="", foreground="", fieldbackground="")
+            self.style.map("Treeview", background="", foreground="")
+            self.style.map("TCombobox", fieldbackground="")
+            field_bg = self.style.lookup("TEntry", "fieldbackground") or "white"
+            fg = self.style.lookup("TLabel", "foreground") or "black"
+            root_bg = self.style.lookup("TFrame", "background") or "SystemButtonFace"
+        self.root.configure(bg=root_bg)
+        text_bg = field_bg if enabled else "white"
+        text_fg = fg
+        for widget in self.text_widgets:
+            widget.configure(
+                bg=text_bg,
+                fg=text_fg,
+                insertbackground=text_fg,
+                highlightbackground=root_bg,
+                highlightcolor=root_bg,
+            )
+        for figure in (
+            getattr(self, "price_figure", None),
+            getattr(self, "indicator_figure", None),
+            getattr(self, "feature_figure", None),
+        ):
+            self._style_figure(figure)
+        for canvas in (
+            getattr(self, "price_canvas", None),
+            getattr(self, "indicator_canvas", None),
+            getattr(self, "feature_canvas", None),
+        ):
+            if canvas is not None:
+                canvas.draw_idle()
+
+    def _style_figure(self, figure: Figure | None) -> None:
+        if figure is None:
+            return
+        enabled = self.dark_mode_enabled
+        fig_bg = "#1e1e1e" if enabled else "white"
+        ax_bg = "#242424" if enabled else "white"
+        fg = "#f0f0f0" if enabled else "#000000"
+        figure.patch.set_facecolor(fig_bg)
+        for ax in figure.axes:
+            ax.set_facecolor(ax_bg)
+            ax.tick_params(colors=fg)
+            ax.yaxis.label.set_color(fg)
+            ax.xaxis.label.set_color(fg)
+            ax.title.set_color(fg)
+            for spine in ax.spines.values():
+                spine.set_color(fg)
+            grid_color = "#444444" if enabled else "#cccccc"
+            for grid_line in ax.get_xgridlines() + ax.get_ygridlines():
+                grid_line.set_color(grid_color)
+            legend = ax.get_legend()
+            if legend:
+                legend.get_frame().set_facecolor(ax_bg)
+                legend.get_frame().set_edgecolor(fg)
+                for text in legend.get_texts():
+                    text.set_color(fg)
 
     def _recompute_pnl(self) -> None:
         try:
@@ -1128,21 +1380,22 @@ class StockPredictorDesktopApp:
         if pct_change is None and last_raw != 0:
             pct_change = (predicted_raw - last_raw) / last_raw
 
-        pnl_display = fmt_ccy(pnl_value, self.currency_symbol)
+        pnl_display = fmt_ccy(pnl_value, self.currency_symbol, decimals=self.price_decimal_places)
         pct_display = fmt_pct(pct_change, show_sign=True)
         if pct_display == "—":
             self.pnl_var.set(prefix + pnl_display)
         else:
             self.pnl_var.set(f"{prefix}{pnl_display} ({pct_display})")
 
-    def _format_price_like_value(self, name: Any, value: Any, *, decimals: int = 4) -> str:
+    def _format_price_like_value(self, name: Any, value: Any) -> str:
         numeric = _safe_float(value)
         if numeric is None:
             return "—"
         label = str(name).lower()
         if any(keyword in label for keyword in ("price", "close", "open", "high", "low")):
             converted = self._convert_currency(numeric)
-            return fmt_ccy(converted, self.currency_symbol, decimals=decimals)
+            return fmt_ccy(converted, self.currency_symbol, decimals=self.price_decimal_places)
+        decimals = self.price_decimal_places
         return f"{numeric:.{decimals}f}"
 
     def _set_text(self, widget: tk.Text, value: str) -> None:
