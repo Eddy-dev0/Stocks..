@@ -8,10 +8,16 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-
-from .models import ModelFactory, classification_metrics, regression_metrics
 from sklearn.base import clone
 from sklearn.pipeline import Pipeline
+
+from .ml_preprocessing import get_feature_names_from_pipeline
+from .models import (
+    ModelFactory,
+    classification_metrics,
+    extract_feature_importance,
+    regression_metrics,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -21,10 +27,11 @@ class BacktestResult:
     target: str
     splits: List[Dict[str, float]]
     aggregate: Dict[str, float]
+    feature_importance: Dict[str, float]
 
 
 class Backtester:
-    """Perform rolling or expanding window backtests on prepared datasets."""
+    """Perform walk-forward, event-driven backtests on prepared datasets."""
 
     def __init__(
         self,
@@ -33,11 +40,22 @@ class Backtester:
         strategy: str,
         window: int,
         step: int,
+        slippage_bps: float = 1.0,
+        fee_bps: float = 1.0,
+        neutral_threshold: float = 0.001,
+        trading_days: int = 252,
+        risk_free_rate: float = 0.0,
     ) -> None:
         self.model_factory = model_factory
         self.strategy = strategy
         self.window = max(20, window)
         self.step = max(1, step)
+        self.slippage_bps = max(0.0, float(slippage_bps))
+        self.fee_bps = max(0.0, float(fee_bps))
+        self.neutral_threshold = float(neutral_threshold)
+        self.trading_days = max(1, int(trading_days))
+        self.risk_free_rate = float(risk_free_rate)
+        self.cost_per_turn = (self.slippage_bps + self.fee_bps) / 10000.0
 
     def run(
         self,
@@ -46,10 +64,13 @@ class Backtester:
         target: str,
         *,
         preprocessor_template: Optional[Pipeline] = None,
+        auxiliary_targets: Optional[pd.DataFrame] = None,
     ) -> BacktestResult:
         task = "classification" if target == "direction" else "regression"
         splits = list(self._generate_splits(len(X)))
         split_metrics: list[Dict[str, float]] = []
+        feature_totals: Dict[str, float] = {}
+        feature_counts: Dict[str, int] = {}
 
         for index, (train_slice, test_slice) in enumerate(splits, start=1):
             X_train, y_train = X.iloc[train_slice], y.iloc[train_slice]
@@ -70,32 +91,215 @@ class Backtester:
             model.fit(X_train_transformed, y_train)
             y_pred = model.predict(X_test_transformed)
 
-            if task == "classification":
-                metrics = classification_metrics(y_test.to_numpy(), y_pred)
-                metrics["directional_accuracy"] = metrics.get("accuracy", 0.0)
-            else:
-                metrics = regression_metrics(y_test.to_numpy(), y_pred)
-                baseline = (
-                    X_test["Close_Current"].to_numpy()
-                    if "Close_Current" in X_test
-                    else np.zeros_like(y_pred)
-                )
-                predicted_direction = np.sign(y_pred - baseline)
-                actual_direction = np.sign(y_test.to_numpy() - baseline)
-                metrics["directional_accuracy"] = float(
-                    np.mean((predicted_direction >= 0) == (actual_direction >= 0))
-                )
-                metrics["signed_error"] = float(np.mean(y_pred - y_test.to_numpy()))
-
+            metrics = self._score_predictions(task, y_test, y_pred, X_test)
+            auxiliary_test = (
+                auxiliary_targets.iloc[test_slice]
+                if auxiliary_targets is not None
+                else None
+            )
+            trading_metrics = self._simulate_trading(
+                target,
+                y_pred,
+                y_test,
+                X_test,
+                auxiliary_test,
+            )
+            metrics.update(trading_metrics)
             metrics["split"] = index
             metrics["train_size"] = int(len(y_train))
             metrics["test_size"] = int(len(y_test))
             split_metrics.append(metrics)
 
+            feature_names = self._resolve_feature_names(pipeline, X_train_transformed)
+            importance = extract_feature_importance(model, feature_names)
+            for name, value in importance.items():
+                feature_totals[name] = feature_totals.get(name, 0.0) + float(value)
+                feature_counts[name] = feature_counts.get(name, 0) + 1
+
         if not split_metrics:
             raise RuntimeError("Backtest did not produce any splits. Check dataset size or window configuration.")
 
-        aggregate = {}
+        aggregate = self._aggregate_metrics(split_metrics)
+        aggregated_importance = self._normalise_feature_importance(feature_totals, feature_counts)
+
+        return BacktestResult(
+            target=target,
+            splits=split_metrics,
+            aggregate=aggregate,
+            feature_importance=aggregated_importance,
+        )
+
+    def _score_predictions(
+        self,
+        task: str,
+        y_true: pd.Series,
+        y_pred: np.ndarray,
+        raw_X: pd.DataFrame,
+    ) -> Dict[str, float]:
+        if task == "classification":
+            metrics = classification_metrics(y_true.to_numpy(), y_pred)
+            metrics["directional_accuracy"] = metrics.get("accuracy", 0.0)
+            return metrics
+
+        metrics = regression_metrics(y_true.to_numpy(), y_pred)
+        baseline = (
+            raw_X["Close_Current"].to_numpy()
+            if "Close_Current" in raw_X
+            else np.zeros_like(y_pred)
+        )
+        predicted_direction = np.sign(y_pred - baseline)
+        actual_direction = np.sign(y_true.to_numpy() - baseline)
+        metrics["directional_accuracy"] = float(
+            np.mean((predicted_direction >= 0) == (actual_direction >= 0))
+        )
+        metrics["signed_error"] = float(np.mean(y_pred - y_true.to_numpy()))
+        return metrics
+
+    def _simulate_trading(
+        self,
+        target: str,
+        predictions: np.ndarray,
+        y_test: pd.Series,
+        raw_X: pd.DataFrame,
+        auxiliary_test: Optional[pd.DataFrame],
+    ) -> Dict[str, float]:
+        actual_returns = self._actual_returns(target, y_test, raw_X, auxiliary_test)
+        if actual_returns.size == 0:
+            return {
+                "turnover": 0.0,
+                "cagr": 0.0,
+                "sharpe": 0.0,
+                "sortino": 0.0,
+                "max_drawdown": 0.0,
+                "hit_rate": 0.0,
+                "net_return": 0.0,
+            }
+
+        signals = self._signal_from_predictions(target, predictions, raw_X)
+        if signals.size == 0:
+            return {
+                "turnover": 0.0,
+                "cagr": 0.0,
+                "sharpe": 0.0,
+                "sortino": 0.0,
+                "max_drawdown": 0.0,
+                "hit_rate": 0.0,
+                "net_return": 0.0,
+            }
+
+        position_changes = np.diff(np.concatenate(([0.0], signals)))
+        turnover = float(np.sum(np.abs(position_changes)))
+        transaction_costs = np.abs(position_changes) * self.cost_per_turn
+        gross_returns = signals * actual_returns
+        net_returns = gross_returns - transaction_costs
+        equity_curve = np.cumprod(1 + net_returns)
+
+        stats = self._performance_statistics(net_returns, equity_curve)
+        stats.update(
+            {
+                "turnover": turnover,
+                "hit_rate": float(np.mean(net_returns > 0)) if net_returns.size else 0.0,
+                "avg_position": float(np.mean(np.abs(signals))) if signals.size else 0.0,
+                "trades": float(np.sum(np.abs(position_changes) > 0)),
+                "gross_return": float(np.prod(1 + gross_returns) - 1) if gross_returns.size else 0.0,
+                "net_return": float(equity_curve[-1] - 1) if equity_curve.size else 0.0,
+            }
+        )
+        return stats
+
+    def _performance_statistics(
+        self,
+        net_returns: np.ndarray,
+        equity_curve: np.ndarray,
+    ) -> Dict[str, float]:
+        if net_returns.size == 0:
+            return {"cagr": 0.0, "sharpe": 0.0, "sortino": 0.0, "max_drawdown": 0.0}
+
+        cumulative = float(equity_curve[-1]) if equity_curve.size else 1.0
+        periods = net_returns.size
+        result: Dict[str, float] = {"cagr": 0.0, "sharpe": 0.0, "sortino": 0.0, "max_drawdown": 0.0}
+
+        if cumulative > 0 and periods > 0:
+            result["cagr"] = float(cumulative ** (self.trading_days / periods) - 1)
+
+        excess = net_returns - (self.risk_free_rate / self.trading_days)
+        std = float(np.std(excess, ddof=1)) if periods > 1 else 0.0
+        if std > 0:
+            result["sharpe"] = float(np.mean(excess) / std * np.sqrt(self.trading_days))
+
+        downside = excess[excess < 0]
+        downside_std = float(np.std(downside, ddof=1)) if downside.size > 1 else 0.0
+        if downside.size == 1:
+            downside_std = float(np.std(downside))
+        if downside_std > 0:
+            result["sortino"] = float(np.mean(excess) / downside_std * np.sqrt(self.trading_days))
+
+        if equity_curve.size:
+            running_max = np.maximum.accumulate(equity_curve)
+            safe_running = np.where(running_max == 0, 1.0, running_max)
+            drawdowns = equity_curve / safe_running - 1.0
+            result["max_drawdown"] = float(np.min(drawdowns))
+
+        return result
+
+    def _actual_returns(
+        self,
+        target: str,
+        y_test: pd.Series,
+        raw_X: pd.DataFrame,
+        auxiliary_test: Optional[pd.DataFrame],
+    ) -> np.ndarray:
+        if target == "return":
+            return y_test.to_numpy(dtype=float)
+
+        if target == "close":
+            baseline = (
+                raw_X["Close_Current"].to_numpy(dtype=float)
+                if "Close_Current" in raw_X
+                else np.zeros_like(y_test.to_numpy(dtype=float))
+            )
+            denominator = np.clip(np.abs(baseline), 1e-6, None)
+            return (y_test.to_numpy(dtype=float) - baseline) / denominator
+
+        if target == "direction":
+            if auxiliary_test is not None and "return" in auxiliary_test:
+                return auxiliary_test["return"].to_numpy(dtype=float)
+            return np.where(y_test.to_numpy(dtype=float) > 0, 0.01, -0.01)
+
+        if target == "volatility":
+            if auxiliary_test is not None and "return" in auxiliary_test:
+                return auxiliary_test["return"].to_numpy(dtype=float)
+            return np.zeros_like(y_test.to_numpy(dtype=float))
+
+        return y_test.to_numpy(dtype=float)
+
+    def _signal_from_predictions(
+        self,
+        target: str,
+        predictions: np.ndarray,
+        raw_X: pd.DataFrame,
+    ) -> np.ndarray:
+        forecast = np.asarray(predictions, dtype=float)
+        if forecast.size == 0:
+            return np.array([])
+
+        if target == "direction":
+            return np.where(forecast >= 0.5, 1.0, -1.0)
+
+        if target == "close" and "Close_Current" in raw_X:
+            baseline = raw_X["Close_Current"].to_numpy(dtype=float)
+            denominator = np.clip(np.abs(baseline), 1e-6, None)
+            forecast = (forecast - baseline) / denominator
+
+        threshold = self.neutral_threshold
+        return np.where(
+            forecast > threshold,
+            1.0,
+            np.where(forecast < -threshold, -1.0, 0.0),
+        )
+
+    def _aggregate_metrics(self, split_metrics: List[Dict[str, float]]) -> Dict[str, float]:
+        aggregate: Dict[str, float] = {}
         keys = {
             key
             for entry in split_metrics
@@ -113,8 +317,37 @@ class Backtester:
                 aggregate[key] = float(np.mean(values))
         aggregate["test_rows"] = int(sum(entry.get("test_size", 0) for entry in split_metrics))
         aggregate["splits"] = int(len(split_metrics))
+        return aggregate
 
-        return BacktestResult(target=target, splits=split_metrics, aggregate=aggregate)
+    def _normalise_feature_importance(
+        self,
+        totals: Dict[str, float],
+        counts: Dict[str, int],
+    ) -> Dict[str, float]:
+        if not totals:
+            return {}
+        averaged = {
+            name: totals[name] / max(1, counts.get(name, 1))
+            for name in totals
+        }
+        return dict(
+            sorted(averaged.items(), key=lambda item: item[1], reverse=True)
+        )
+
+    def _resolve_feature_names(
+        self,
+        pipeline: Optional[Pipeline],
+        transformed: pd.DataFrame | np.ndarray,
+    ) -> List[str]:
+        if pipeline is not None:
+            names = get_feature_names_from_pipeline(pipeline)
+            if names:
+                return list(names)
+        if isinstance(transformed, pd.DataFrame):
+            return list(transformed.columns)
+        if hasattr(transformed, "shape") and transformed.shape[1] > 0:
+            return [f"feature_{idx}" for idx in range(transformed.shape[1])]
+        return []
 
     def _generate_splits(self, n_samples: int) -> Iterable[Tuple[slice, slice]]:
         if self.strategy == "expanding":
