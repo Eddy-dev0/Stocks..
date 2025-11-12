@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import inspect
 from typing import Any, Dict
 
 import numpy as np
@@ -138,7 +139,11 @@ class ModelFactory:
         if calibrate and task == "classification":
             calibration_options = {"cv": 5, "method": "sigmoid"}
             calibration_options.update(calibration_params)
-            estimator = CalibratedClassifierCV(base_estimator=estimator, **calibration_options)
+            cal_params = inspect.signature(CalibratedClassifierCV).parameters
+            if "estimator" in cal_params:
+                estimator = CalibratedClassifierCV(estimator=estimator, **calibration_options)
+            else:
+                estimator = CalibratedClassifierCV(base_estimator=estimator, **calibration_options)
 
         steps: list[tuple[str, Any]] = []
         if needs_scaler:
