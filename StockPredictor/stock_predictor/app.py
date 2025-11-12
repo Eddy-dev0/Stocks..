@@ -6,22 +6,30 @@ import logging
 import os
 import platform
 import signal
-import subprocess
-import sys
+from multiprocessing import Process
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from stock_predictor.api_app import run_api
 from stock_predictor.core import (
     PredictorConfig,
     StockPredictorAI,
     build_config,
     load_environment,
 )
+from stock_predictor.dashboard_app import run_streamlit_app
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _run_api_process(host: str, port: int, env: dict[str, str]) -> None:
+    """Entry point used when launching the API server in a separate process."""
+
+    os.environ.update(env)
+    run_api(host=host, port=port)
 
 
 @dataclass(slots=True)
@@ -129,19 +137,16 @@ class StockPredictorApplication:
     ) -> int:
         """Launch the dashboard alongside the embedded API service."""
 
-        frontend_path = PROJECT_ROOT / "ui" / "frontend" / "app.py"
-        if not frontend_path.exists():
-            LOGGER.error("Streamlit dashboard entry point not found at %s", frontend_path)
-            return 1
-
         env = os.environ.copy()
         root_str = str(PROJECT_ROOT)
         pythonpath = env.get("PYTHONPATH")
         if pythonpath:
-            if root_str not in pythonpath.split(os.pathsep):
+            paths = pythonpath.split(os.pathsep)
+            if root_str not in paths:
                 env["PYTHONPATH"] = os.pathsep.join([root_str, pythonpath])
         else:
             env["PYTHONPATH"] = root_str
+
         env.setdefault("STOCK_PREDICTOR_DEFAULT_TICKER", self.config.ticker)
         env.setdefault("STOCK_PREDICTOR_API_URL", f"http://{api_host}:{api_port}")
 
@@ -151,8 +156,8 @@ class StockPredictorApplication:
         else:
             gather_stats_value = gather_stats_env.lower()
         env["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = gather_stats_value
+        gather_stats_flag = gather_stats_value == "true"
 
-        headless_value: str
         if ui_headless is not None:
             headless_value = "true" if ui_headless else "false"
         else:
@@ -162,6 +167,7 @@ class StockPredictorApplication:
             else:
                 headless_value = headless_env.lower()
         env["STREAMLIT_HEADLESS"] = headless_value
+        headless_flag = headless_value == "true"
 
         if ui_api_key:
             env["STOCK_PREDICTOR_UI_API_KEY"] = ui_api_key
@@ -174,50 +180,41 @@ class StockPredictorApplication:
             ui_port,
         )
 
-        api_cmd = [
-            sys.executable,
-            "-m",
-            "uvicorn",
-            "stock_predictor.ui.api:app",
-            "--host",
-            str(api_host),
-            "--port",
-            str(api_port),
-        ]
+        api_process = Process(
+            target=_run_api_process,
+            kwargs={
+                "host": api_host,
+                "port": api_port,
+                "env": {key: value for key, value in env.items()},
+            },
+            daemon=True,
+        )
+        api_process.start()
 
-        ui_cmd = [
-            sys.executable,
-            "-m",
-            "streamlit",
-            "run",
-            str(frontend_path),
-            "--server.port",
-            str(ui_port),
-        ]
-        ui_cmd.extend(["--server.headless", headless_value])
-        ui_cmd.extend(["--browser.gatherUsageStats", gather_stats_value])
-
-        api_process = subprocess.Popen(api_cmd, env=env, cwd=PROJECT_ROOT)
         try:
-            result = subprocess.run(ui_cmd, env=env, check=False, cwd=PROJECT_ROOT)
-            return result.returncode
+            return run_streamlit_app(
+                port=ui_port,
+                headless=headless_flag,
+                gather_usage_stats=gather_stats_flag,
+                env=env,
+            )
         except KeyboardInterrupt:
             LOGGER.info("Dashboard interrupted by user.")
             return 0
         finally:
-            try:
-                if platform.system() == "Windows":
-                    api_process.terminate()
-                else:
-                    api_process.send_signal(signal.SIGINT)
-            except (OSError, ValueError):  # pragma: no cover - best effort cleanup
-                LOGGER.debug("Failed to gracefully stop API server", exc_info=True)
+            if api_process.is_alive():
+                try:
+                    if platform.system() == "Windows":
+                        api_process.terminate()
+                    else:
+                        os.kill(api_process.pid, signal.SIGINT)
+                except (OSError, ValueError):  # pragma: no cover - best effort cleanup
+                    LOGGER.debug("Failed to gracefully stop API server", exc_info=True)
 
-            try:
-                api_process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                LOGGER.debug("Force terminating API server")
-                api_process.kill()
+                api_process.join(timeout=10)
+                if api_process.is_alive():
+                    LOGGER.debug("Force terminating API server")
+                    api_process.kill()
 
 
 __all__ = ["StockPredictorApplication", "RunResult"]

@@ -24,32 +24,35 @@ class DashboardLaunchTests(TestCase):
         app.config = SimpleNamespace(ticker="TEST")
 
         api_process = MagicMock()
-        api_process.wait.return_value = None
+        api_process.is_alive.side_effect = [True, False]
 
-        with patch("stock_predictor.app.Path.exists", return_value=True), patch(
-            "stock_predictor.app.subprocess.Popen", return_value=api_process
-        ) as mock_popen, patch(
-            "stock_predictor.app.subprocess.run", side_effect=KeyboardInterrupt
-        ) as mock_run, patch(
+        with patch("stock_predictor.app.Process", return_value=api_process) as mock_process, patch(
+            "stock_predictor.app.run_streamlit_app", side_effect=KeyboardInterrupt
+        ) as mock_streamlit, patch(
             "stock_predictor.app.platform.system", return_value="Windows"
         ), patch.dict("stock_predictor.app.os.environ", {}, clear=True):
             result = app.launch_dashboard()
 
         self.assertEqual(result, 0)
+        api_process.start.assert_called_once()
         api_process.terminate.assert_called_once()
-        api_process.send_signal.assert_not_called()
-        api_process.wait.assert_called_once_with(timeout=10)
         api_process.kill.assert_not_called()
+        api_process.join.assert_called_once_with(timeout=10)
 
-        _, popen_kwargs = mock_popen.call_args
-        self.assertEqual(popen_kwargs.get("cwd"), PROJECT_ROOT)
-        env = popen_kwargs.get("env")
-        self.assertIsNotNone(env)
+        mock_process.assert_called_once()
+        _, process_kwargs = mock_process.call_args
+        self.assertTrue(process_kwargs["daemon"])
+        self.assertEqual(process_kwargs["kwargs"]["host"], "127.0.0.1")
+        self.assertEqual(process_kwargs["kwargs"]["port"], 8000)
+
+        env = process_kwargs["kwargs"]["env"]
+        self.assertIsInstance(env, dict)
         self.assertEqual(env["PYTHONPATH"].split(os.pathsep)[0], str(PROJECT_ROOT))
 
-        _, run_kwargs = mock_run.call_args
-        self.assertEqual(run_kwargs.get("cwd"), PROJECT_ROOT)
-        self.assertEqual(run_kwargs.get("env"), env)
+        mock_streamlit.assert_called_once()
+        _, streamlit_kwargs = mock_streamlit.call_args
+        self.assertEqual(streamlit_kwargs["port"], 8501)
+        self.assertEqual(streamlit_kwargs["env"], env)
 
 
 if __name__ == "__main__":  # pragma: no cover - test harness
