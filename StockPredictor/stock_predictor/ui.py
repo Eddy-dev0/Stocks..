@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import math
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 import pandas as pd
 import tkinter as tk
@@ -39,6 +39,13 @@ TIMEFRAME_WINDOWS: dict[str, int] = {
     "1M": 30,
     "3M": 90,
     "1Y": 365,
+}
+
+HORIZON_OPTIONS: dict[str, int] = {
+    "1D": 1,
+    "1W": 5,
+    "1M": 21,
+    "3M": 63,
 }
 
 COLOR_GAIN = "#15803d"
@@ -129,6 +136,7 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         self.version_var = tk.StringVar(value=APP_VERSION)
         self.status_var = tk.StringVar(value="Enter a ticker symbol and click Predict")
         self.timeframe_var = tk.StringVar(value="3M")
+        self.horizon_var = tk.StringVar(value=self._default_horizon_key())
 
         self.predicted_close_var = tk.StringVar(value="-")
         self.last_close_var = tk.StringVar(value="-")
@@ -154,6 +162,13 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
             "test_rows": tk.StringVar(value="-"),
         }
 
+        self.explanation_horizon_var = tk.StringVar(value="Horizon: -")
+        self.explanation_target_var = tk.StringVar(value="Target date: -")
+        self.explanation_return_var = tk.StringVar(value="Projected return: -")
+        self.explanation_volatility_var = tk.StringVar(value="Projected volatility: -")
+        self.explanation_prob_up_var = tk.StringVar(value="Upside probability: -")
+        self.explanation_prob_down_var = tk.StringVar(value="Downside probability: -")
+
         self.refresh_var = tk.BooleanVar(value=self.options.refresh_data)
         self.ticker_var = tk.StringVar(value=self.default_ticker)
         self.usd_to_eur_rate: float | None = None
@@ -168,6 +183,9 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         self.sources_text: tk.Text | None = None
 
         self._interactive_widgets: list[tk.Widget] = []
+        self._horizon_controls: dict[str, ttk.Radiobutton] = {}
+        self._available_horizons: tuple[int, ...] = tuple(HORIZON_OPTIONS.values())
+        self._inputs_disabled = False
 
         self._build_ui()
         self._after_id = self.after(150, self._poll_log_queue)
@@ -222,6 +240,24 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
             )
             button.pack(side="left", padx=4)
             self._interactive_widgets.append(button)
+
+        horizon_frame = ttk.Frame(top_bar)
+        horizon_frame.pack(side="left", padx=(25, 0))
+        ttk.Label(
+            horizon_frame,
+            text="Forecast horizon:",
+            font=("Helvetica", 11, "bold"),
+        ).pack(side="left")
+        for label in HORIZON_OPTIONS:
+            button = ttk.Radiobutton(
+                horizon_frame,
+                text=label,
+                value=label,
+                variable=self.horizon_var,
+            )
+            button.pack(side="left", padx=4)
+            self._interactive_widgets.append(button)
+            self._horizon_controls[label] = button
 
         status_label = ttk.Label(
             top_bar,
@@ -426,6 +462,27 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         explanation_tab = ttk.Frame(notebook, padding=20)
         notebook.add(explanation_tab, text="Explanation")
 
+        meta_frame = ttk.Frame(explanation_tab)
+        meta_frame.grid(column=0, row=0, columnspan=2, sticky="ew", pady=(0, 10))
+        meta_frame.columnconfigure(0, weight=1)
+        meta_frame.columnconfigure(1, weight=1)
+
+        meta_labels = [
+            (self.explanation_horizon_var, 0, 0),
+            (self.explanation_target_var, 0, 1),
+            (self.explanation_return_var, 1, 0),
+            (self.explanation_volatility_var, 1, 1),
+            (self.explanation_prob_up_var, 2, 0),
+            (self.explanation_prob_down_var, 2, 1),
+        ]
+        for var, row_index, column_index in meta_labels:
+            ttk.Label(
+                meta_frame,
+                textvariable=var,
+                font=("Helvetica", 11),
+                justify="left",
+            ).grid(column=column_index, row=row_index, sticky="w", padx=(0, 12), pady=2)
+
         summary_label = ttk.Label(
             explanation_tab,
             textvariable=self.explanation_summary_var,
@@ -433,7 +490,7 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
             justify="left",
             wraplength=780,
         )
-        summary_label.grid(column=0, row=0, columnspan=2, sticky="w", pady=(0, 10))
+        summary_label.grid(column=0, row=1, columnspan=2, sticky="w", pady=(0, 10))
 
         sections = [
             ("Technical signals", "technical_reasons"),
@@ -443,7 +500,7 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         ]
         for index, (title, key) in enumerate(sections, start=1):
             frame = ttk.LabelFrame(explanation_tab, text=title)
-            frame.grid(column=0, row=index, columnspan=2, sticky="ew", pady=6)
+            frame.grid(column=0, row=index + 1, columnspan=2, sticky="ew", pady=6)
             frame.columnconfigure(0, weight=1)
             var = tk.StringVar(value="No signals available yet.")
             self.explanation_reason_vars[key] = var
@@ -455,7 +512,7 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
             ).grid(column=0, row=0, sticky="w", padx=6, pady=4)
 
         importance_frame = ttk.LabelFrame(explanation_tab, text="Top features")
-        importance_frame.grid(column=0, row=len(sections) + 1, sticky="nsew", pady=(10, 6))
+        importance_frame.grid(column=0, row=len(sections) + 2, sticky="nsew", pady=(10, 6))
         columns = ("feature", "importance", "category")
         tree = ttk.Treeview(
             importance_frame,
@@ -475,7 +532,7 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         self.feature_importance_tree = tree
 
         sources_frame = ttk.LabelFrame(explanation_tab, text="Data sources")
-        sources_frame.grid(column=0, row=len(sections) + 2, sticky="nsew", pady=(10, 0))
+        sources_frame.grid(column=0, row=len(sections) + 3, sticky="nsew", pady=(10, 0))
         sources_frame.columnconfigure(0, weight=1)
         text_widget = tk.Text(
             sources_frame,
@@ -508,6 +565,7 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         )
 
         self._clear_explanation_tab()
+        self._refresh_horizon_states(self._available_horizons)
 
     # ------------------------------------------------------------------
     # UI event handlers
@@ -536,6 +594,7 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
                     widget.configure(state=state)
             except tk.TclError:
                 continue
+        self._inputs_disabled = state == tk.DISABLED
 
     # ------------------------------------------------------------------
     # Prediction pipeline glue
@@ -543,15 +602,33 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
     def _run_prediction(self, ticker: str) -> None:
         refresh = self.refresh_var.get()
         try:
+            selected_horizon_label = self.horizon_var.get()
+            selected_horizon_value = self._horizon_value_from_label(selected_horizon_label)
             kwargs = {k: v for k, v in self.options.to_kwargs().items() if v is not None}
             if "start_date" not in kwargs:
                 days = max(TIMEFRAME_WINDOWS.values())
                 kwargs["start_date"] = (datetime.today() - timedelta(days=days)).date().isoformat()
             kwargs["ticker"] = ticker
             config = build_config(**kwargs)
+            self._available_horizons = tuple(int(h) for h in config.prediction_horizons)
+            self.after(
+                0,
+                lambda horizons=self._available_horizons: self._refresh_horizon_states(horizons),
+            )
+
+            try:
+                resolved_horizon = config.resolve_horizon(selected_horizon_value)
+            except ValueError:
+                resolved_horizon = config.default_horizon
+
+            resolved_label = self._label_for_horizon(resolved_horizon)
+            if resolved_label:
+                if resolved_label != self.horizon_var.get():
+                    self.after(0, lambda label=resolved_label: self.horizon_var.set(label))
+
             LOGGER.info("Starting prediction workflow for %s", ticker)
 
-            ai = StockPredictorAI(config)
+            ai = StockPredictorAI(config, horizon=resolved_horizon)
             prediction = ai.predict(refresh_data=refresh)
             source_before_fetch = ai.fetcher.last_price_source
             prices = ai.fetcher.fetch_price_data(force=False)
@@ -657,12 +734,14 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         )
         self._set_status(f"Prediction ready for {ticker}", error=False)
         self._toggle_inputs(state=tk.NORMAL)
-        self._update_explanation_tab(prediction.get("explanation"))
+        self._update_explanation_tab(prediction.get("explanation"), prediction)
+        self._refresh_horizon_states(self._available_horizons)
 
     def _on_prediction_error(self, message: str) -> None:
         self._set_status(message, error=True)
         messagebox.showerror("Prediction failed", message, parent=self)
         self._toggle_inputs(state=tk.NORMAL)
+        self._refresh_horizon_states(self._available_horizons)
 
     # ------------------------------------------------------------------
     # Rendering helpers
@@ -924,9 +1003,10 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         except (TypeError, ValueError):
             horizon_value = None
         if horizon_value and horizon_value > 0:
-            suffix = f" (H{horizon_value})"
-            day_label = "day" if horizon_value == 1 else "days"
-            self.horizon_info_var.set(f"Horizon: {horizon_value} trading {day_label}")
+            horizon_display = self._format_horizon_display(horizon_value)
+            self.horizon_info_var.set(f"Horizon: {horizon_display}")
+            horizon_label = self._label_for_horizon(horizon_value)
+            suffix = f" ({horizon_label})" if horizon_label else f" (H{horizon_value})"
         else:
             suffix = ""
             self.horizon_info_var.set("Horizon: -")
@@ -970,13 +1050,43 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         self.metric_vars["training_rows"].set(self._format_int(metrics.get("training_rows")))
         self.metric_vars["test_rows"].set(self._format_int(metrics.get("test_rows")))
 
-    def _update_explanation_tab(self, explanation: Optional[Dict[str, Any]]) -> None:
+    def _update_explanation_tab(
+        self,
+        explanation: Optional[Dict[str, Any]],
+        prediction: Optional[Dict[str, Any]] = None,
+    ) -> None:
         if explanation is None:
             self._clear_explanation_tab("No detailed explanation available for this prediction.")
             return
 
         summary = explanation.get("summary") or "No summary available."
         self.explanation_summary_var.set(summary)
+
+        context_prediction = prediction or self.latest_prediction or {}
+        horizon_value = explanation.get("horizon")
+        if horizon_value is None:
+            horizon_value = context_prediction.get("horizon")
+        horizon_display = self._format_horizon_display(horizon_value)
+        self.explanation_horizon_var.set(f"Horizon: {horizon_display}")
+
+        target_date = context_prediction.get("target_date") or explanation.get("target_date")
+        target_display = self._format_timestamp(target_date)
+        if target_display != "-" and " " in target_display:
+            target_display = target_display.split(" ")[0]
+        self.explanation_target_var.set(f"Target date: {target_display}")
+
+        self.explanation_return_var.set(
+            f"Projected return: {self._format_percent(context_prediction.get('predicted_return'))}"
+        )
+        self.explanation_volatility_var.set(
+            f"Projected volatility: {self._format_percent(context_prediction.get('predicted_volatility'))}"
+        )
+        self.explanation_prob_up_var.set(
+            f"Upside probability: {self._format_percent(context_prediction.get('direction_probability_up'))}"
+        )
+        self.explanation_prob_down_var.set(
+            f"Downside probability: {self._format_percent(context_prediction.get('direction_probability_down'))}"
+        )
 
         for key, var in self.explanation_reason_vars.items():
             entries = explanation.get(key) or []
@@ -1029,6 +1139,12 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
             self.sources_text.delete("1.0", tk.END)
             self.sources_text.insert("1.0", "No sources recorded yet.")
             self.sources_text.configure(state="disabled")
+        self.explanation_horizon_var.set("Horizon: -")
+        self.explanation_target_var.set("Target date: -")
+        self.explanation_return_var.set("Projected return: -")
+        self.explanation_volatility_var.set("Projected volatility: -")
+        self.explanation_prob_up_var.set("Upside probability: -")
+        self.explanation_prob_down_var.set("Downside probability: -")
 
     def _show_error_message(self, message: str) -> None:
         self._set_status(message, error=True)
@@ -1064,6 +1180,74 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
     # ------------------------------------------------------------------
     # Utility helpers
     # ------------------------------------------------------------------
+    def _default_horizon_key(self) -> str:
+        return next(iter(HORIZON_OPTIONS.keys()), "1D")
+
+    def _horizon_value_from_label(self, label: Optional[str]) -> Optional[int]:
+        if not label:
+            return None
+        lookup = label.strip().upper()
+        if not lookup:
+            return None
+        return HORIZON_OPTIONS.get(lookup)
+
+    def _label_for_horizon(self, horizon: Optional[int]) -> str:
+        if horizon is None:
+            return ""
+        try:
+            numeric = int(horizon)
+        except (TypeError, ValueError):
+            return ""
+        for label, value in HORIZON_OPTIONS.items():
+            if value == numeric:
+                return label
+        return f"H{numeric}"
+
+    def _format_horizon_display(self, horizon: Optional[int]) -> str:
+        if horizon is None:
+            return "-"
+        try:
+            numeric = int(horizon)
+        except (TypeError, ValueError):
+            return "-"
+        if numeric <= 0:
+            return "-"
+        label = self._label_for_horizon(numeric)
+        day_label = "trading day" if numeric == 1 else "trading days"
+        if label and label.startswith("H") and label[1:].isdigit():
+            return f"{numeric} {day_label}"
+        if label:
+            return f"{label} ({numeric} {day_label})"
+        return f"{numeric} {day_label}"
+
+    def _refresh_horizon_states(self, available_horizons: Iterable[int]) -> None:
+        available_set: set[int] = set()
+        for value in available_horizons:
+            try:
+                numeric = int(value)
+            except (TypeError, ValueError):
+                continue
+            if numeric > 0:
+                available_set.add(numeric)
+        if not available_set:
+            available_set = set(HORIZON_OPTIONS.values())
+        for label, widget in self._horizon_controls.items():
+            value = HORIZON_OPTIONS.get(label)
+            if widget is None or value is None:
+                continue
+            if value in available_set:
+                if not self._inputs_disabled:
+                    widget.state(["!disabled"])
+            else:
+                widget.state(["disabled"])
+        current_value = self._horizon_value_from_label(self.horizon_var.get())
+        if current_value not in available_set:
+            fallback_label = next(
+                (label for label, value in HORIZON_OPTIONS.items() if value in available_set),
+                self._default_horizon_key(),
+            )
+            self.horizon_var.set(fallback_label)
+
     def _set_status(self, message: str, error: bool | None = None) -> None:
         if error is None:
             color = COLOR_NEUTRAL
