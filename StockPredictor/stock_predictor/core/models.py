@@ -43,6 +43,7 @@ class ModelFactory:
         "mlp": {"hidden_layer_sizes": (128, 64), "activation": "relu", "max_iter": 300},
         "hist_gb": {"max_depth": 8, "learning_rate": 0.05, "max_iter": 400},
         "logistic": {"C": 1.0, "max_iter": 500},
+        "ensemble": {"interval_alpha": 0.2},
     }
 
     def __init__(self, model_type: str, overrides: Dict[str, Any] | None = None) -> None:
@@ -124,6 +125,12 @@ class ModelFactory:
         elif self.model_type == "logistic" and task == "classification":
             estimator = _instantiate(LogisticRegression, params)
             needs_scaler = True
+        elif self.model_type == "ensemble":
+            if task != "regression":
+                raise ValueError("Ensemble model only supports regression targets.")
+            from .modeling import create_default_regression_ensemble
+
+            estimator = create_default_regression_ensemble(**params)
         else:
             if self.model_type in {"xgboost", "lightgbm", "hist_gb"}:
                 LOGGER.warning(

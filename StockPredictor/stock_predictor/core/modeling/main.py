@@ -18,16 +18,16 @@ from sklearn.metrics import r2_score
 from sklearn.model_selection import TimeSeriesSplit, train_test_split
 from sklearn.pipeline import Pipeline
 
-from .backtesting import Backtester
-from .config import PredictorConfig
-from .data_fetcher import DataFetcher
-from .database import ExperimentTracker
-from .features import FeatureAssembler
-from .ml_preprocessing import (
+from ..backtesting import Backtester
+from ..config import PredictorConfig
+from ..data_fetcher import DataFetcher
+from ..database import ExperimentTracker
+from ..features import FeatureAssembler
+from ..ml_preprocessing import (
     PreprocessingBuilder,
     get_feature_names_from_pipeline,
 )
-from .models import (
+from ..models import (
     ModelFactory,
     classification_metrics,
     extract_feature_importance,
@@ -462,6 +462,9 @@ class StockPredictorAI:
 
             final_model = factory.create(task, calibrate=calibrate_flag)
             final_model.fit(transformed_X, y_clean)
+            distribution_summary = self._estimate_prediction_uncertainty(
+                target, final_model, transformed_X
+            )
 
             metrics = dict(evaluation["aggregate"])
             metrics["training_rows"] = int(len(transformed_X))
@@ -475,6 +478,11 @@ class StockPredictorAI:
                 "parameters": evaluation.get("parameters", {}),
                 "samples": int(evaluation.get("evaluation_rows", 0)),
             }
+            if isinstance(distribution_summary, dict) and distribution_summary:
+                metrics["forecast_distribution"] = distribution_summary
+                self.metadata.setdefault("forecast_distribution", {})[
+                    (target, resolved_horizon)
+                ] = distribution_summary
             metrics_by_target[target] = metrics
 
             metrics_store = self.metadata.setdefault("metrics", {})
@@ -802,6 +810,8 @@ class StockPredictorAI:
         confidences: dict[str, float] = {}
         probabilities: dict[str, Dict[str, float]] = {}
         uncertainties: dict[str, Dict[str, float]] = {}
+        quantile_forecasts: dict[str, Dict[str, float]] = {}
+        prediction_intervals: dict[str, Dict[str, float]] = {}
         prediction_warnings: List[str] = []
         training_report: dict[str, Any] = {}
 
@@ -863,7 +873,23 @@ class StockPredictorAI:
 
             uncertainty = self._estimate_prediction_uncertainty(target, model, transformed_features)
             if uncertainty:
-                uncertainties[target] = uncertainty
+                metrics_block = uncertainty.get("metrics") if isinstance(uncertainty, dict) else None
+                quantiles_block = uncertainty.get("quantiles") if isinstance(uncertainty, dict) else None
+                interval_block = uncertainty.get("interval") if isinstance(uncertainty, dict) else None
+                if isinstance(metrics_block, dict) and metrics_block:
+                    uncertainties[target] = metrics_block
+                if isinstance(quantiles_block, dict) and quantiles_block:
+                    quantile_forecasts[target] = {
+                        str(key): float(value)
+                        for key, value in quantiles_block.items()
+                        if self._safe_float(value) is not None
+                    }
+                if isinstance(interval_block, dict) and interval_block:
+                    prediction_intervals[target] = {
+                        str(key): float(value)
+                        for key, value in interval_block.items()
+                        if self._safe_float(value) is not None
+                    }
 
             if model_supports_proba(model) and target == "direction":
                 proba = model.predict_proba(transformed_features)[0]
@@ -976,6 +1002,10 @@ class StockPredictorAI:
             result["probabilities"] = probabilities
         if uncertainty_clean:
             result["prediction_uncertainty"] = uncertainty_clean
+        if quantile_forecasts:
+            result["quantile_forecasts"] = quantile_forecasts
+        if prediction_intervals:
+            result["prediction_intervals"] = prediction_intervals
         if training_report:
             result["training_metrics"] = training_report
         if prediction_warnings:
@@ -983,6 +1013,9 @@ class StockPredictorAI:
         explanation = self._build_prediction_explanation(result, predictions)
         if explanation:
             result["explanation"] = explanation
+        recommendation = self._generate_recommendation(result)
+        if recommendation:
+            result["recommendation"] = recommendation
         return result
 
     def _estimate_prediction_uncertainty(
@@ -990,7 +1023,7 @@ class StockPredictorAI:
         target: str,
         model: Any,
         features: pd.DataFrame,
-    ) -> Optional[Dict[str, float]]:
+    ) -> Optional[Dict[str, Any]]:
         if not hasattr(model, "named_steps"):
             return None
         estimator = model.named_steps.get("estimator")
@@ -1007,34 +1040,93 @@ class StockPredictorAI:
         if isinstance(transformed, pd.DataFrame):
             transformed = transformed.to_numpy()
 
-        samples: list[float] = []
+        metrics: Dict[str, float] = {}
+        quantiles_payload: Optional[Dict[str, float]] = None
+        interval_payload: Optional[Dict[str, float]] = None
 
-        if hasattr(estimator, "estimators_"):
-            estimators = getattr(estimator, "estimators_")
-            for member in estimators:
-                try:
-                    if target == "direction" and hasattr(member, "predict_proba"):
-                        proba = member.predict_proba(transformed)[0]
-                        if len(proba) > 1:
-                            samples.append(float(proba[1]))
-                        elif len(proba) == 1:
-                            samples.append(float(proba[0]))
-                    elif hasattr(member, "predict"):
-                        prediction = member.predict(transformed)[0]
-                        samples.append(float(prediction))
-                except Exception:  # pragma: no cover - estimator specific quirks
-                    continue
+        if hasattr(estimator, "get_uncertainty_summary"):
+            try:
+                summary = estimator.get_uncertainty_summary(transformed)
+            except Exception:  # pragma: no cover - estimator specific quirks
+                summary = {}
+            if summary:
+                quantiles = summary.pop("quantiles", None)
+                interval = summary.pop("interval", None)
+                metrics.update({
+                    key: float(value)
+                    for key, value in summary.items()
+                    if self._safe_float(value) is not None
+                })
+                if isinstance(quantiles, dict):
+                    quantiles_payload = {
+                        str(key): float(self._safe_float(value) or 0.0)
+                        for key, value in quantiles.items()
+                    }
+                if isinstance(interval, dict):
+                    interval_payload = {
+                        str(key): float(self._safe_float(value) or 0.0)
+                        for key, value in interval.items()
+                    }
 
-        if not samples:
+        if not metrics:
+            samples: list[float] = []
+            if hasattr(estimator, "estimators_"):
+                estimators = getattr(estimator, "estimators_")
+                for member in estimators:
+                    try:
+                        if target == "direction" and hasattr(member, "predict_proba"):
+                            proba = member.predict_proba(transformed)[0]
+                            if len(proba) > 1:
+                                samples.append(float(proba[1]))
+                            elif len(proba) == 1:
+                                samples.append(float(proba[0]))
+                        elif hasattr(member, "predict"):
+                            prediction = member.predict(transformed)[0]
+                            samples.append(float(prediction))
+                    except Exception:  # pragma: no cover - estimator specific quirks
+                        continue
+
+            if samples:
+                values = np.asarray(samples, dtype=float)
+                if values.size and not np.isnan(values).all():
+                    metrics["std"] = float(np.nanstd(values, ddof=1) if values.size > 1 else 0.0)
+                    metrics["range"] = float(np.nanmax(values) - np.nanmin(values))
+
+        if hasattr(estimator, "predict_quantiles") and quantiles_payload is None:
+            try:
+                quantile_values = estimator.predict_quantiles(transformed)
+            except Exception:  # pragma: no cover - estimator quirks
+                quantile_values = {}
+            if isinstance(quantile_values, dict):
+                quantiles_payload = {
+                    str(key): float(np.nanmean(value))
+                    for key, value in quantile_values.items()
+                    if isinstance(value, (list, tuple, np.ndarray)) and len(value) > 0
+                }
+
+        if hasattr(estimator, "prediction_interval") and interval_payload is None:
+            try:
+                interval_values = estimator.prediction_interval(transformed)
+            except Exception:  # pragma: no cover - estimator quirks
+                interval_values = {}
+            if isinstance(interval_values, dict):
+                interval_payload = {
+                    str(key): float(np.nanmean(value))
+                    for key, value in interval_values.items()
+                    if isinstance(value, (list, tuple, np.ndarray)) and len(value) > 0
+                }
+
+        if not metrics and quantiles_payload is None and interval_payload is None:
             return None
 
-        values = np.asarray(samples, dtype=float)
-        if values.size == 0 or np.isnan(values).all():
-            return None
-
-        std = float(np.nanstd(values, ddof=1) if values.size > 1 else 0.0)
-        spread = float(np.nanmax(values) - np.nanmin(values))
-        return {"std": std, "range": spread}
+        result: Dict[str, Any] = {}
+        if metrics:
+            result["metrics"] = metrics
+        if quantiles_payload:
+            result["quantiles"] = quantiles_payload
+        if interval_payload:
+            result["interval"] = interval_payload
+        return result or None
 
     # ------------------------------------------------------------------
     # Feature importance
@@ -1096,6 +1188,102 @@ class StockPredictorAI:
             "sources": sources,
         }
         return explanation
+
+    def _generate_recommendation(self, prediction: Dict[str, Any]) -> Dict[str, Any]:
+        expected_return = self._safe_float(prediction.get("predicted_return"))
+        if expected_return is None:
+            expected_return = self._safe_float(prediction.get("expected_change_pct"))
+        threshold = max(0.0, float(getattr(self.config, "backtest_neutral_threshold", 0.001)))
+        action = "hold"
+        if expected_return is not None:
+            if expected_return > threshold:
+                action = "long"
+            elif expected_return < -threshold:
+                action = "short"
+
+        probabilities = prediction.get("probabilities")
+        direction_probs = probabilities.get("direction") if isinstance(probabilities, dict) else None
+        prob_score = None
+        if isinstance(direction_probs, dict):
+            candidates = [self._safe_float(direction_probs.get(key)) for key in ("up", "down")]
+            candidates = [value for value in candidates if value is not None]
+            if candidates:
+                prob_score = max(candidates)
+
+        uncertainty_block = prediction.get("prediction_uncertainty")
+        uncertainty_metrics = None
+        if isinstance(uncertainty_block, dict):
+            if "close" in uncertainty_block:
+                uncertainty_metrics = uncertainty_block.get("close")
+            else:
+                uncertainty_metrics = next(iter(uncertainty_block.values()), None)
+        std_uncertainty = None
+        if isinstance(uncertainty_metrics, dict):
+            std_uncertainty = self._safe_float(
+                uncertainty_metrics.get("std")
+                or uncertainty_metrics.get("median_std")
+                or uncertainty_metrics.get("range")
+            )
+
+        volatility = self._safe_float(prediction.get("predicted_volatility"))
+        quantiles = None
+        if isinstance(prediction.get("quantile_forecasts"), dict):
+            quantiles = prediction["quantile_forecasts"].get("close")
+        interval = None
+        if isinstance(prediction.get("prediction_intervals"), dict):
+            interval = prediction["prediction_intervals"].get("close")
+
+        confidence = 0.5
+        if prob_score is not None:
+            confidence = prob_score
+        elif expected_return is not None:
+            confidence = min(0.95, 0.5 + min(0.4, abs(expected_return)))
+        if std_uncertainty is not None and std_uncertainty > 0:
+            confidence *= max(0.25, 1.0 / (1.0 + std_uncertainty))
+        confidence = float(np.clip(confidence, 0.0, 1.0))
+
+        allocation = 0.0
+        if expected_return is not None:
+            if std_uncertainty is not None and std_uncertainty > 0:
+                allocation = float(np.clip(abs(expected_return) / (std_uncertainty * 2.0), 0.0, 1.0))
+            else:
+                allocation = float(np.clip(abs(expected_return), 0.0, 1.0))
+        if action == "hold":
+            allocation = 0.0
+
+        key_drivers: List[str] = []
+        explanation = prediction.get("explanation") or {}
+        if isinstance(explanation, dict):
+            top_drivers = explanation.get("top_feature_drivers") or {}
+            if isinstance(top_drivers, dict):
+                for category, names in top_drivers.items():
+                    if not names:
+                        continue
+                    label = str(category).replace("_", " ").title()
+                    joined = ", ".join(names)
+                    key_drivers.append(f"{label}: {joined}")
+
+        risk_guidance: Dict[str, Any] = {"suggested_allocation": allocation}
+        if volatility is not None:
+            risk_guidance["volatility"] = volatility
+        if std_uncertainty is not None:
+            risk_guidance["uncertainty_std"] = std_uncertainty
+        if interval:
+            risk_guidance["interval"] = interval
+        if quantiles:
+            risk_guidance["quantiles"] = quantiles
+
+        expected_pct_value = (
+            float(expected_return * 100) if expected_return is not None else None
+        )
+
+        return {
+            "action": action,
+            "confidence": confidence,
+            "expected_return_pct": expected_pct_value,
+            "key_drivers": key_drivers,
+            "risk_guidance": risk_guidance,
+        }
 
     def _technical_reasons(self, feature_row: pd.Series) -> list[str]:
         reasons: list[str] = []
@@ -1413,6 +1601,36 @@ class StockPredictorAI:
             if uncertainty_block:
                 indicators["uncertainty"] = uncertainty_block
 
+        quantiles_raw = prediction.get("quantile_forecasts")
+        if isinstance(quantiles_raw, dict):
+            quantile_block = quantiles_raw.get("close") or next(
+                (values for values in quantiles_raw.values() if isinstance(values, dict)),
+                None,
+            )
+            if isinstance(quantile_block, dict):
+                filtered = {
+                    str(key): float(value)
+                    for key, value in quantile_block.items()
+                    if self._safe_float(value) is not None
+                }
+                if filtered:
+                    indicators["quantiles"] = filtered
+
+        intervals_raw = prediction.get("prediction_intervals")
+        if isinstance(intervals_raw, dict):
+            interval_block = intervals_raw.get("close") or next(
+                (values for values in intervals_raw.values() if isinstance(values, dict)),
+                None,
+            )
+            if isinstance(interval_block, dict):
+                filtered_interval = {
+                    str(key): float(value)
+                    for key, value in interval_block.items()
+                    if self._safe_float(value) is not None
+                }
+                if filtered_interval:
+                    indicators["interval"] = filtered_interval
+
         validation_scores = self._validation_metrics("close", horizon)
         if validation_scores:
             indicators["validation_scores"] = validation_scores
@@ -1552,11 +1770,24 @@ class StockPredictorAI:
             y_clean = horizon_targets[target].dropna()
             aligned_X = X.loc[y_clean.index]
 
+            auxiliary_columns: Dict[str, pd.Series] = {}
+            for aux_name, series in horizon_targets.items():
+                if aux_name == target:
+                    continue
+                auxiliary_columns[aux_name] = series.reindex(aligned_X.index)
+            auxiliary_df = None
+            if auxiliary_columns:
+                auxiliary_df = pd.DataFrame(auxiliary_columns, index=aligned_X.index).fillna(0.0)
+
             backtester = Backtester(
                 model_factory=factory,
                 strategy=self.config.backtest_strategy,
                 window=self.config.backtest_window,
                 step=self.config.backtest_step,
+                slippage_bps=self.config.backtest_slippage_bps,
+                fee_bps=self.config.backtest_fee_bps,
+                neutral_threshold=self.config.backtest_neutral_threshold,
+                risk_free_rate=self.config.risk_free_rate,
             )
             template = self.preprocessor_templates.get(resolved_horizon)
             result = backtester.run(
@@ -1564,10 +1795,12 @@ class StockPredictorAI:
                 y_clean,
                 target,
                 preprocessor_template=template,
+                auxiliary_targets=auxiliary_df,
             )
             results[target] = {
                 "aggregate": result.aggregate,
                 "splits": result.splits,
+                "feature_importance": result.feature_importance,
             }
             self.tracker.log_run(
                 target=target,
@@ -1577,9 +1810,15 @@ class StockPredictorAI:
                     "strategy": self.config.backtest_strategy,
                     "window": self.config.backtest_window,
                     "step": self.config.backtest_step,
+                    "slippage_bps": self.config.backtest_slippage_bps,
+                    "fee_bps": self.config.backtest_fee_bps,
                 },
                 metrics=result.aggregate,
-                context={"splits": result.splits, "horizon": resolved_horizon},
+                context={
+                    "splits": result.splits,
+                    "horizon": resolved_horizon,
+                    "feature_importance": result.feature_importance,
+                },
             )
         self.metadata["active_horizon"] = resolved_horizon
         return results

@@ -70,12 +70,16 @@ class PredictorConfig:
     backtest_strategy: str = DEFAULT_BACKTEST_STRATEGY
     backtest_window: int = DEFAULT_BACKTEST_WINDOW
     backtest_step: int = DEFAULT_BACKTEST_STEP
+    backtest_slippage_bps: float = 1.0
+    backtest_fee_bps: float = 1.0
+    backtest_neutral_threshold: float = 0.001
     evaluation_strategy: str = "holdout"
     evaluation_folds: int = 5
     evaluation_window: int = DEFAULT_BACKTEST_WINDOW
     evaluation_step: int = DEFAULT_BACKTEST_STEP
     direction_confidence_threshold: float = 0.55
     volatility_window: int = DEFAULT_VOLATILITY_WINDOW
+    risk_free_rate: float = 0.0
     research_api_keys: tuple[str, ...] = field(default_factory=tuple)
     research_allow_list: tuple[str, ...] = field(default_factory=tuple)
 
@@ -100,6 +104,11 @@ class PredictorConfig:
             raise ValueError("backtest_window must be positive.")
         if self.backtest_step <= 0:
             raise ValueError("backtest_step must be positive.")
+        self.backtest_slippage_bps = max(0.0, float(self.backtest_slippage_bps))
+        self.backtest_fee_bps = max(0.0, float(self.backtest_fee_bps))
+        self.backtest_neutral_threshold = float(self.backtest_neutral_threshold)
+        if self.backtest_neutral_threshold < 0:
+            raise ValueError("backtest_neutral_threshold must be non-negative.")
         if self.evaluation_strategy not in {"holdout", "time_series", "rolling"}:
             raise ValueError(
                 "evaluation_strategy must be one of 'holdout', 'time_series', or 'rolling'."
@@ -115,6 +124,7 @@ class PredictorConfig:
         if int(self.volatility_window) <= 0:
             raise ValueError("volatility_window must be a positive integer.")
         self.volatility_window = int(self.volatility_window)
+        self.risk_free_rate = float(self.risk_free_rate)
         self.research_api_keys = self._normalise_strings(self.research_api_keys)
         self.research_allow_list = self._normalise_strings(
             self.research_allow_list, lower=True
