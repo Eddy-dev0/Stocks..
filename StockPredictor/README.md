@@ -18,6 +18,10 @@ workflows easily.
   trained model artefacts.
 - Local SQLite database that stores prices, indicators, fundamentals and news
   for fast reuse across runs.
+- Extended database coverage for corporate events, options analytics,
+  sentiment-derived feeds, ESG metrics and ownership/flow datasets (provider
+  responses are cached when available and fall back to documented placeholders
+  when upstream APIs return no data).
 - CLI modes for data collection, training and inference.
 
 ## Project layout
@@ -119,6 +123,23 @@ SQLAlchemy. By default the application uses SQLite with the database stored at
 `STOCK_PREDICTOR_DATABASE_URL` environment variable. When pointing at a remote
 database the required driver must be installed (see
 [`requirements.txt`](requirements.txt)).
+
+### Extended datasets & placeholders
+
+The ETL pipeline now captures additional datasets alongside prices and
+fundamentals:
+
+- Corporate actions (dividends, splits, earnings dates)
+- Option surface metrics (mid price, implied volatility, volume/open interest)
+- Daily aggregated sentiment signals derived from cached news headlines
+- ESG sustainability scores
+- Ownership and fund flow statistics
+
+Data is sourced from `yfinance` when available. When an upstream provider does
+not return data the refresh tasks still populate the corresponding tables with a
+single placeholder row that documents the missing feed. These placeholders make
+it easy to distinguish “no data yet” from “not refreshed” states and allow the
+schema bootstrap to remain idempotent.
 
 ## Requirements
 
