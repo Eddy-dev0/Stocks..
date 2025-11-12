@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from tkinter import messagebox, ttk
 from typing import Any, Callable, Iterable, Mapping
 
+import matplotlib.dates as mdates
 import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -858,6 +859,14 @@ class StockPredictorDesktopApp:
 
     def _update_price_chart(self) -> None:
         self.price_ax.clear()
+        prediction = self.current_prediction or {}
+        forecast = self._compute_forecast_date(
+            prediction.get("target_date") or prediction.get("horizon")
+        )
+        title = "Forecast date: —"
+        if forecast is not None:
+            title = f"Forecast date: {forecast.date().isoformat()}"
+        self.price_ax.set_title(title)
         if isinstance(self.price_history, pd.DataFrame) and not self.price_history.empty:
             frame = self.price_history.copy()
             lower_map = {str(column).lower(): column for column in frame.columns}
@@ -880,33 +889,56 @@ class StockPredictorDesktopApp:
             series = pd.to_numeric(frame[close_column], errors="coerce")
             rate = self._currency_rate()
             series = series * rate
-            self.price_ax.plot(x_values, series, label="Close")
-            predicted_close = _safe_float(self.current_prediction.get("predicted_close"))
+            plotted_series = pd.Series(series.to_numpy(), index=pd.Index(x_values)).dropna()
+            close_label = "Close (price)" if not self.currency_symbol else f"Close ({self.currency_symbol})"
+            self.price_ax.plot(plotted_series.index, plotted_series.values, label=close_label, color="tab:blue")
+            if not plotted_series.empty:
+                last_x = plotted_series.index[-1]
+                last_y = plotted_series.iloc[-1]
+                last_display = fmt_ccy(last_y, self.currency_symbol)
+                self.price_ax.scatter([last_x], [last_y], color="tab:blue", zorder=5)
+                self.price_ax.annotate(
+                    f"Last: {last_display}",
+                    xy=(last_x, last_y),
+                    xytext=(8, 0),
+                    textcoords="offset points",
+                    va="center",
+                    ha="left",
+                    color="tab:blue",
+                )
+            predicted_close = _safe_float(prediction.get("predicted_close"))
             if predicted_close is not None:
-                target_date = self.current_prediction.get("target_date") or self.current_prediction.get("horizon")
                 converted_prediction = predicted_close * rate
+                predicted_label = (
+                    "Predicted close (price)"
+                    if not self.currency_symbol
+                    else f"Predicted close ({self.currency_symbol})"
+                )
                 self.price_ax.axhline(
-                    converted_prediction, color="tab:orange", linestyle="--", label="Predicted close"
+                    converted_prediction, color="tab:orange", linestyle="--", label=predicted_label
                 )
-                if hasattr(x_values, "iloc"):
-                    last_x = x_values.iloc[-1]
+                if not plotted_series.empty:
+                    annotate_x = plotted_series.index[-1]
+                elif hasattr(x_values, "iloc"):
+                    annotate_x = x_values.iloc[-1]
                 else:
-                    last_x = x_values[-1]
-                self.price_ax.text(
-                    last_x,
-                    converted_prediction,
-                    f"Predicted: {fmt_ccy(converted_prediction, self.currency_symbol)}",
+                    annotate_x = x_values[-1]
+                self.price_ax.annotate(
+                    fmt_ccy(converted_prediction, self.currency_symbol),
+                    xy=(annotate_x, converted_prediction),
+                    xytext=(8, 0),
+                    textcoords="offset points",
+                    va="center",
+                    ha="left",
                     color="tab:orange",
-                    va="bottom",
                 )
-                if target_date:
-                    self.price_ax.set_title(f"Forecast horizon: {target_date}")
             ylabel = "Price"
             if self.currency_symbol:
                 ylabel = f"Price ({self.currency_symbol})"
             self.price_ax.set_ylabel(ylabel)
             self.price_ax.grid(True, linestyle="--", alpha=0.3)
             self.price_ax.legend(loc="best")
+            self.price_ax.xaxis.set_major_formatter(mdates.DateFormatter("%b-%Y"))
         else:
             self.price_ax.text(0.5, 0.5, "Price history unavailable", ha="center", va="center")
         self.price_figure.tight_layout()
