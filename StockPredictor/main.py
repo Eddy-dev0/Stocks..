@@ -12,6 +12,32 @@ from typing import Any
 from stock_predictor.ui import StockPredictorApplication
 
 
+def _ensure_dashboard_dependencies() -> bool:
+    """Verify that optional dashboard dependencies are available."""
+
+    missing: list[str] = []
+
+    try:  # pragma: no cover - runtime guard for optional dependency
+        import uvicorn  # noqa: F401  # pylint: disable=unused-import
+    except ModuleNotFoundError:  # pragma: no cover - runtime guard
+        missing.append("uvicorn")
+
+    try:  # pragma: no cover - runtime guard for optional dependency
+        import streamlit  # noqa: F401  # pylint: disable=unused-import
+    except ModuleNotFoundError:  # pragma: no cover - runtime guard
+        missing.append("streamlit")
+
+    if missing:
+        formatted = ", ".join(missing)
+        print(
+            "Missing dependency: dashboard mode requires the following packages: "
+            f"{formatted}. Install them with `pip install streamlit uvicorn`."
+        )
+        return False
+
+    return True
+
+
 def configure_logging(level: str) -> None:
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
@@ -180,6 +206,8 @@ def main(argv: list[str] | None = None) -> int:
     app = StockPredictorApplication.from_environment(**overrides)
 
     if args.mode == "dashboard":
+        if not _ensure_dashboard_dependencies():
+            return 1
         return app.launch_dashboard(
             api_host=args.api_host,
             api_port=args.api_port,
