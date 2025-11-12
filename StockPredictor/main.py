@@ -1,16 +1,20 @@
-"""Command line interface for the stock predictor platform."""
+"""Entry point for launching the Stock Predictor user interfaces."""
 
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
+import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
-from stock_predictor.ui import StockPredictorApplication
+from stock_predictor.api_app import run_api
+from stock_predictor.dashboard_app import run_streamlit_app
+from stock_predictor import dashboard_app as dashboard_module
+from stock_predictor.ui_app import run_tkinter_app
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent
@@ -26,240 +30,266 @@ else:
     os.environ["PYTHONPATH"] = str(REPOSITORY_ROOT)
 
 
-def _ensure_dashboard_dependencies() -> bool:
-    """Verify that optional dashboard dependencies are available."""
+LOGGER = logging.getLogger(__name__)
+
+
+def _ensure_dependencies(*, require_api: bool, require_dashboard: bool) -> bool:
+    """Verify optional dependencies needed for the requested mode."""
 
     missing: list[str] = []
 
-    try:  # pragma: no cover - runtime guard for optional dependency
-        import uvicorn  # noqa: F401  # pylint: disable=unused-import
-    except ModuleNotFoundError:  # pragma: no cover - runtime guard
-        missing.append("uvicorn")
+    if require_api:
+        try:  # pragma: no cover - runtime guard for optional dependency
+            import uvicorn  # noqa: F401  # pylint: disable=unused-import
+        except ModuleNotFoundError:  # pragma: no cover - runtime guard
+            missing.append("uvicorn")
 
-    try:  # pragma: no cover - runtime guard for optional dependency
-        import streamlit  # noqa: F401  # pylint: disable=unused-import
-    except ModuleNotFoundError:  # pragma: no cover - runtime guard
-        missing.append("streamlit")
+    if require_dashboard:
+        try:  # pragma: no cover - runtime guard for optional dependency
+            import streamlit  # noqa: F401  # pylint: disable=unused-import
+        except ModuleNotFoundError:  # pragma: no cover - runtime guard
+            missing.append("streamlit")
 
     if missing:
-        formatted = ", ".join(missing)
+        formatted = ", ".join(sorted(missing))
         print(
-            "Missing dependency: dashboard mode requires the following packages: "
-            f"{formatted}. Install them with `pip install streamlit uvicorn`."
+            "Missing dependency: the requested mode requires the following packages: "
+            f"{formatted}. Install them with `pip install {formatted}`.",
+            file=sys.stderr,
         )
         return False
 
     return True
 
 
-def configure_logging(level: str) -> None:
+def _configure_logging(level: str) -> None:
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    default_mode = os.getenv("STOCK_PREDICTOR_DEFAULT_MODE", "predict")
-    default_ticker = os.getenv("STOCK_PREDICTOR_DEFAULT_TICKER", "AAPL")
+def _build_streamlit_environment() -> tuple[dict[str, str], bool, bool]:
+    """Prepare environment variables for launching the Streamlit dashboard."""
 
+    env = os.environ.copy()
+    root_str = str(dashboard_module.PROJECT_ROOT)
+    pythonpath = env.get("PYTHONPATH")
+    if pythonpath:
+        paths = pythonpath.split(os.pathsep)
+        if root_str not in paths:
+            env["PYTHONPATH"] = os.pathsep.join([root_str, pythonpath])
+    else:
+        env["PYTHONPATH"] = root_str
+
+    gather_stats_env = env.get("STREAMLIT_BROWSER_GATHER_USAGE_STATS")
+    gather_stats_value = gather_stats_env.lower() if gather_stats_env else "false"
+    env["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = gather_stats_value
+    gather_stats_flag = gather_stats_value == "true"
+
+    headless_env = env.get("STREAMLIT_HEADLESS")
+    headless_value = headless_env.lower() if headless_env else "true"
+    env["STREAMLIT_HEADLESS"] = headless_value
+    headless_flag = headless_value == "true"
+
+    return env, headless_flag, gather_stats_flag
+
+
+def _spawn_streamlit_process(port: int, env: dict[str, str], *, headless: bool, gather_usage_stats: bool) -> subprocess.Popen[Any]:
+    """Launch Streamlit as a subprocess and return the handle."""
+
+    command = [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        str(dashboard_module.FRONTEND_PATH),
+        "--server.port",
+        str(port),
+        "--server.headless",
+        "true" if headless else "false",
+        "--browser.gatherUsageStats",
+        "true" if gather_usage_stats else "false",
+    ]
+
+    LOGGER.info("Starting Streamlit dashboard on http://localhost:%s", port)
+    return subprocess.Popen(command, env=env, cwd=dashboard_module.PROJECT_ROOT)
+
+
+def _start_api_thread(host: str, port: int) -> threading.Thread:
+    """Launch the FastAPI service in a daemon thread."""
+
+    def _run() -> None:
+        run_api(host=host, port=port, log_level="info")
+
+    thread = threading.Thread(target=_run, name="uvicorn-server", daemon=True)
+    thread.start()
+    return thread
+
+
+def _apply_ui_flags(*, no_train: bool, no_refresh: bool) -> None:
+    """Expose UI-specific toggles via environment variables."""
+
+    if no_train:
+        os.environ["STOCK_PREDICTOR_UI_DISABLE_TRAINING"] = "1"
+    if no_refresh:
+        os.environ["STOCK_PREDICTOR_UI_DISABLE_REFRESH"] = "1"
+
+
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Legacy CLI interface for the Stock Predictor application.",
+        description="Launch the Stock Predictor desktop UI, API server, or dashboard.",
     )
     parser.add_argument(
         "--mode",
-        choices=[
-            "download-data",
-            "train",
-            "predict",
-            "backtest",
-            "importance",
-            "list-models",
-            "dashboard",
-        ],
-        default=default_mode,
-        help="Pipeline mode to run (default: %(default)s).",
-    )
-    parser.add_argument("--ticker", default=default_ticker, help="Ticker symbol to process.")
-    parser.add_argument("--start-date", help="Historical start date (YYYY-MM-DD).")
-    parser.add_argument("--end-date", help="Historical end date (YYYY-MM-DD).")
-    parser.add_argument("--interval", default="1d", help="Historical data interval (default: 1d).")
-    parser.add_argument(
-        "--model-type",
-        default="random_forest",
-        help="Model type to use (random_forest, lightgbm, xgboost, hist_gb, mlp, logistic).",
-    )
-    parser.add_argument("--data-dir", help="Directory to store downloaded data.")
-    parser.add_argument("--models-dir", help="Directory to store trained models.")
-    parser.add_argument("--news-api-key", help="API key for the news provider integration.")
-    parser.add_argument("--news-limit", type=int, default=50, help="Maximum number of news items.")
-    parser.add_argument("--database-url", help="Database connection URL.")
-    parser.add_argument(
-        "--no-sentiment",
-        action="store_true",
-        help="Disable sentiment analysis even if news data is available.",
-    )
-    parser.add_argument(
-        "--refresh-data",
-        action="store_true",
-        help="Force redownload of remote data before processing.",
-    )
-    parser.add_argument(
-        "--targets",
+        choices=["tk", "dash", "api", "both", "full"],
+        default="tk",
         help=(
-            "Comma separated list of prediction targets to train/predict/backtest "
-            "(default: close,direction,return,volatility)."
+            "Execution mode: 'tk' launches the desktop UI, 'dash' launches only the "
+            "Streamlit dashboard, 'api' starts the FastAPI service, 'both' launches "
+            "the desktop UI together with the API, and 'full' launches all three."
         ),
     )
     parser.add_argument(
-        "--feature-sets",
-        help=(
-            "Comma separated list of feature groups to enable (technical, elliott, "
-            "fundamental, macro, sentiment, identification, volume_liquidity, options, esg)."
-        ),
-    )
-    parser.add_argument("--model-params", help="JSON string of model hyper-parameters.")
-    parser.add_argument(
-        "--volatility-window",
-        type=int,
-        default=20,
-        help="Rolling window (in days) for volatility label generation.",
+        "--host",
+        default=os.getenv("STOCK_PREDICTOR_API_HOST", "127.0.0.1"),
+        help="Host interface for the FastAPI service (api/both/full modes).",
     )
     parser.add_argument(
-        "--horizon",
+        "--port",
         type=int,
-        help="Override the default prediction horizon for training/prediction.",
+        default=int(os.getenv("STOCK_PREDICTOR_API_PORT", "8000")),
+        help="Port for the FastAPI service (api/both/full modes).",
     )
-    parser.add_argument("--target", help="Focus on a single target when reporting importance.")
+    parser.add_argument(
+        "--dash-port",
+        type=int,
+        default=int(os.getenv("STOCK_PREDICTOR_DASHBOARD_PORT", "8501")),
+        help="Port for the Streamlit dashboard (dash/full modes).",
+    )
     parser.add_argument(
         "--log-level",
-        default="INFO",
+        default=os.getenv("STOCK_PREDICTOR_LOG_LEVEL", "INFO"),
         help="Logging level (DEBUG, INFO, WARNING, ...).",
     )
     parser.add_argument(
-        "--api-host",
-        default="127.0.0.1",
-        help="Host for the embedded API server when launching the dashboard.",
-    )
-    parser.add_argument(
-        "--api-port",
-        type=int,
-        default=8000,
-        help="Port for the embedded API server when launching the dashboard.",
-    )
-    parser.add_argument(
-        "--ui-port",
-        type=int,
-        default=8501,
-        help="Port for the Streamlit dashboard when launching the UI.",
-    )
-    parser.add_argument(
-        "--ui-headless",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help=(
-            "Launch the dashboard without opening a browser window (use --no-ui-headless "
-            "to allow Streamlit to open a browser)."
-        ),
-    )
-    parser.add_argument(
-        "--ui-api-key",
-        help="API key injected into the dashboard session for authenticated API calls.",
-    )
-    parser.add_argument(
-        "--no-dashboard",
+        "--no-train",
         action="store_true",
-        help=(
-            "Disable automatic dashboard launch when --mode is omitted and the default is predict."
-        ),
+        help="Disable training-related controls in the Tkinter UI (tk/both/full modes).",
+    )
+    parser.add_argument(
+        "--no-refresh",
+        action="store_true",
+        help="Disable refresh controls in the Tkinter UI (tk/both/full modes).",
+    )
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command line arguments."""
+
+    parser = _build_parser()
+    return parser.parse_args(argv)
+
+
+def _run_tk_mode(args: argparse.Namespace) -> int:
+    _apply_ui_flags(no_train=args.no_train, no_refresh=args.no_refresh)
+    LOGGER.info("Launching the Tkinter desktop application. Close the window to exit.")
+    run_tkinter_app()
+    return 0
+
+
+def _run_api_mode(args: argparse.Namespace) -> int:
+    LOGGER.info(
+        "Starting the FastAPI service on http://%s:%s (press Ctrl+C to stop)",
+        args.host,
+        args.port,
+    )
+    run_api(host=args.host, port=args.port)
+    return 0
+
+
+def _run_dash_mode(args: argparse.Namespace) -> int:
+    env, headless_flag, gather_flag = _build_streamlit_environment()
+    return run_streamlit_app(
+        port=args.dash_port,
+        headless=headless_flag,
+        gather_usage_stats=gather_flag,
+        env=env,
     )
 
-    args = parser.parse_args(argv)
 
-    supplied_argv = sys.argv[1:] if argv is None else list(argv)
-    provided_mode = any(arg.startswith("--mode") for arg in supplied_argv)
-    auto_mode: str | None = None
-    if not args.no_dashboard and not provided_mode and args.mode == default_mode == "predict":
-        auto_mode = "dashboard"
-        args.mode = "dashboard"
-
-    setattr(args, "_auto_mode", auto_mode)
-
-    return args
+def _run_both_mode(args: argparse.Namespace) -> int:
+    LOGGER.info(
+        "Starting the FastAPI service on http://%s:%s in the background.",
+        args.host,
+        args.port,
+    )
+    _start_api_thread(args.host, args.port)
+    return _run_tk_mode(args)
 
 
-def _parse_csv(value: str | None) -> list[str] | None:
-    if not value:
-        return None
-    return [item.strip() for item in value.split(",") if item.strip()]
+def _run_full_mode(args: argparse.Namespace) -> int:
+    LOGGER.info(
+        "Starting the FastAPI service on http://%s:%s in the background.",
+        args.host,
+        args.port,
+    )
+    _start_api_thread(args.host, args.port)
+
+    env, headless_flag, gather_flag = _build_streamlit_environment()
+    streamlit_process = _spawn_streamlit_process(
+        args.dash_port,
+        env,
+        headless=headless_flag,
+        gather_usage_stats=gather_flag,
+    )
+
+    exit_code = 0
+    try:
+        exit_code = _run_tk_mode(args)
+    finally:
+        if streamlit_process.poll() is None:
+            LOGGER.info("Closing Streamlit dashboard...")
+            streamlit_process.terminate()
+            try:
+                streamlit_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:  # pragma: no cover - defensive shutdown
+                streamlit_process.kill()
+        else:
+            exit_code = streamlit_process.returncode
+
+    return exit_code
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    configure_logging(args.log_level)
+    _configure_logging(args.log_level)
 
-    if getattr(args, "_auto_mode", None):
-        logging.info(
-            "No mode supplied. Launching the interactive dashboard instead (override with --mode)."
-        )
+    mode = args.mode
+    require_api = mode in {"api", "both", "full"}
+    require_dashboard = mode in {"dash", "full"}
 
-    try:
-        model_params = json.loads(args.model_params) if args.model_params else None
-    except json.JSONDecodeError as exc:  # pragma: no cover - user error path
-        print(json.dumps({"status": "error", "message": str(exc)}), file=sys.stderr)
+    if not _ensure_dependencies(require_api=require_api, require_dashboard=require_dashboard):
         return 1
 
-    targets = _parse_csv(args.targets)
-
-    overrides: dict[str, Any] = {
-        "ticker": args.ticker,
-        "start_date": args.start_date,
-        "end_date": args.end_date,
-        "interval": args.interval,
-        "model_type": args.model_type,
-        "data_dir": args.data_dir,
-        "models_dir": args.models_dir,
-        "news_api_key": args.news_api_key,
-        "news_limit": args.news_limit,
-        "sentiment": not args.no_sentiment,
-        "database_url": args.database_url,
-        "feature_sets": args.feature_sets,
-        "prediction_targets": targets,
-        "model_params": model_params,
-        "volatility_window": args.volatility_window,
-    }
-
-    app = StockPredictorApplication.from_environment(**overrides)
-
-    if args.mode == "dashboard":
-        if not _ensure_dashboard_dependencies():
-            return 1
-        return app.launch_dashboard(
-            api_host=args.api_host,
-            api_port=args.api_port,
-            ui_port=args.ui_port,
-            ui_headless=args.ui_headless,
-            ui_api_key=args.ui_api_key,
-        )
-
     try:
-        result = app.run(
-            args.mode,
-            targets=targets,
-            refresh=args.refresh_data,
-            force=args.refresh_data,
-            horizon=args.horizon,
-            target=args.target,
-        )
-    except Exception as exc:  # pylint: disable=broad-except
-        logging.exception("Pipeline execution failed")
-        print(json.dumps({"status": "error", "message": str(exc)}), file=sys.stderr)
-        return 1
+        if mode == "tk":
+            return _run_tk_mode(args)
+        if mode == "api":
+            return _run_api_mode(args)
+        if mode == "dash":
+            return _run_dash_mode(args)
+        if mode == "both":
+            return _run_both_mode(args)
+        if mode == "full":
+            return _run_full_mode(args)
+    except KeyboardInterrupt:  # pragma: no cover - interactive exit
+        LOGGER.info("Interrupted by user. Shutting down...")
+        return 0
 
-    output = {"status": result.status, **result.payload}
-    print(json.dumps(output, indent=2))
-    return 0
+    raise ValueError(f"Unsupported mode: {mode}")  # pragma: no cover - defensive guard
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - CLI entry point
     raise SystemExit(main())
