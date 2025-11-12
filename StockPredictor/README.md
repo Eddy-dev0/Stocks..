@@ -5,9 +5,10 @@ downloading financial market data, engineering features, training a predictive
 model and generating forecasts. The modernised architecture centres around the
 ``StockPredictorApplication`` orchestrator which wires together the analytical
 core, external data providers, research extensions and user interfaces. A
-backwards-compatible (but deprecated) command line entry point remains available
-for automation scenarios while new FastAPI helpers power web or Streamlit
-front-ends.
+dedicated launcher (`main.py`) now focuses on starting the interactive
+interfaces—Tkinter desktop, FastAPI backend and Streamlit dashboard—while the
+underlying orchestration APIs remain available for automation or scripting
+scenarios.
 
 ## Features
 
@@ -25,7 +26,6 @@ front-ends.
   sentiment-derived feeds, ESG metrics and ownership/flow datasets (provider
   responses are cached when available and fall back to documented placeholders
   when upstream APIs return no data).
-- CLI modes for data collection, training and inference.
 - FastAPI backend (`ui/api`) secured with API keys and a Streamlit dashboard (`ui/frontend`) for
   interactive exploration of data, forecasts, backtests and research artefacts.
 
@@ -33,7 +33,7 @@ front-ends.
 
 ```
 StockPredictor/
-├── main.py                # Deprecated CLI shim using the new orchestrator
+├── main.py                # Unified launcher for desktop, API and dashboard interfaces
 ├── stock_predictor/
 │   ├── app.py             # StockPredictorApplication orchestrator
 │   ├── core/              # Pipelines, modelling and feature engineering
@@ -68,91 +68,49 @@ StockPredictor/
 
 All commands are executed from the project root (`StockPredictor/`).
 
-### Web dashboard
+### Desktop interface (Tkinter)
 
-The easiest way to explore predictions and research summaries is via the bundled
-web experience.
+- **Quick start:** run `python main.py` to open the Tkinter desktop experience.
+  Close the window (or press `Ctrl+C` in the terminal) to exit. Use
+  `--no-train` or `--no-refresh` to disable the corresponding controls when
+  launching automated kiosks or demos.
+- **Combined launch:** run `python main.py --mode both` to start the Tkinter UI
+  while simultaneously exposing the FastAPI service. This is helpful when the
+  desktop interface should share data refreshes or predictions with other
+  processes on the same machine.
 
-- **Quick start:** simply run `python main.py` with no additional arguments. The
-  CLI now launches the embedded FastAPI service together with the Streamlit
-  dashboard. A browser window/tab opens automatically (use `--ui-headless` to
-  skip this). Press `Ctrl+C` in the terminal to stop both services.
+### Web dashboard (Streamlit)
 
-- **Custom launch:** the dashboard can also be started explicitly via
-  `python main.py --mode dashboard`. Additional options such as
-  `--api-host`, `--api-port`, `--ui-port` and `--ui-api-key` control the
-  underlying services.
-
-- **Docker setup:**
-
-  1. (Optional) generate a comma-separated list of API keys and expose it as an
-     environment variable before starting the containers:
-
-     ```bash
-     export STOCK_PREDICTOR_UI_API_KEYS="my-secret-key"
-     ```
-
-  2. Launch the API and Streamlit frontend using Docker Compose:
-
-     ```bash
-     docker compose up --build
-     ```
-
-     The FastAPI service is available at `http://localhost:8000` (documented via
-     `/docs`) and the dashboard runs on `http://localhost:8501`.
-
-  3. When the dashboard loads provide the API base URL and key (if configured)
-     through the sidebar. Use the controls to fetch market data, trigger
-     forecasts, run backtests and download research summaries.
-
-### Download data
+Start the Streamlit dashboard without the desktop client:
 
 ```bash
-python main.py --mode download-data --ticker TSLA --start-date 2022-01-01 --refresh-data
+python main.py --mode dash --dash-port 8501
 ```
 
-This downloads price data (plus indicators, fundamentals, macro metrics and
-news when available) and stores them in the SQLite database at
-`data/market_data.sqlite`. The `--refresh-data` flag forces a re-download even
-when the requested window already exists in the database.
+The command blocks until the dashboard process exits. Pass additional
+environment variables (e.g. `STOCK_PREDICTOR_UI_API_KEY`) to configure access to
+remote APIs.
 
-### Train a model
+### API service (FastAPI/Uvicorn)
+
+To run only the REST API:
 
 ```bash
-python main.py --mode train --ticker TSLA --start-date 2022-01-01 --news-limit 100
+python main.py --mode api --host 0.0.0.0 --port 8000
 ```
 
-This prepares features, trains a Random Forest model and saves both the model
-(`models/TSLA_random_forest.joblib`) and metrics
-(`models/TSLA_random_forest_metrics.json`).
-
-### Generate a prediction
+The service is served by Uvicorn and exposes OpenAPI docs at `/docs`. Combine
+all services with:
 
 ```bash
-python main.py --mode predict --ticker TSLA
+python main.py --mode full
 ```
 
-The command loads the most recent trained model, refreshes features if needed
-and returns a JSON blob with the predicted closing price for the next trading
-day, the absolute and percentage change relative to the latest observed close
-and metadata about the run.
+This launches the Tkinter UI, the background API thread and the Streamlit
+dashboard. Closing the Tkinter window gracefully terminates the dashboard
+process.
 
-Running `python main.py` without arguments launches the dashboard. Set
-`STOCK_PREDICTOR_DEFAULT_MODE` and `STOCK_PREDICTOR_DEFAULT_TICKER` in your
-environment (or `.env`) to customise the implicit `mode` and `ticker`. When a
-different default mode is configured, the CLI continues to honour it; otherwise
-the dashboard is selected automatically and the ticker defaults to `AAPL`.
-
-### Additional options
-
-- `--no-sentiment` disables sentiment processing even when news is available.
-- `--data-dir` and `--models-dir` allow custom storage locations.
-- `--database-url` overrides the default SQLite connection string. Any
-  SQLAlchemy-compatible URL is accepted, e.g.
-  `sqlite:////tmp/stock_predictor.sqlite` or `postgresql://user:pass@host/db`.
-- `--log-level DEBUG` enables more verbose logging for troubleshooting.
-
-Run `python main.py --help` for the full set of options.
+Run `python main.py --help` for the full list of options and defaults.
 
 ## Database configuration
 
