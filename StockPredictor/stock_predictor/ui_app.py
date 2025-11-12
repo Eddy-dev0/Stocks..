@@ -165,6 +165,9 @@ class StockPredictorDesktopApp:
         self.config = self.application.config
         self.root.title(f"Stock Predictor – {self.config.ticker}")
         self.root.geometry("1280x840")
+        self.root.minsize(1024, 640)
+        self.root.grid_rowconfigure(1, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
 
         self.style = ttk.Style()
         self.default_theme = self.style.theme_use()
@@ -217,7 +220,7 @@ class StockPredictorDesktopApp:
         self.market_holidays: list[pd.Timestamp] = []
 
         self.currency_mode_var = tk.StringVar(value="local")
-        self.currency_button_text = tk.StringVar(value=self._currency_label("local"))
+        self.currency_button_text = tk.StringVar(value=self.currency_symbol)
         self.currency_rate_var = tk.StringVar(value=f"{self._currency_rate('usd'):.4f}")
         self._suspend_rate_updates = False
 
@@ -338,22 +341,15 @@ class StockPredictorDesktopApp:
         return sorted(holidays)
 
     def _build_layout(self, horizons: Iterable[int]) -> None:
-        self._build_toolbar(list(horizons))
+        self.toolbar = self._build_toolbar(list(horizons))
         self._build_notebook()
-        self._build_statusbar()
+        self.statusbar = self._build_statusbar()
         self._on_currency_mode_changed(self.currency_mode_var.get())
 
-    def _build_toolbar(self, _horizons: list[int]) -> None:
+    def _build_toolbar(self, _horizons: list[int]) -> ttk.Frame:
         toolbar = ttk.Frame(self.root, padding=(12, 6))
-        toolbar.pack(fill=tk.X)
+        toolbar.grid(row=0, column=0, sticky="ew")
 
-        self.refresh_button = ttk.Button(toolbar, text="Refresh data", command=self._on_refresh)
-        self.refresh_button.pack(side=tk.LEFT, padx=(0, 6))
-
-        self.predict_button = ttk.Button(toolbar, text="Run prediction", command=self._on_predict)
-        self.predict_button.pack(side=tk.LEFT, padx=(0, 12))
-
-        ttk.Label(toolbar, text="Horizon").pack(side=tk.LEFT)
         self.horizon_var = tk.StringVar(value=self.selected_horizon_label)
         self.horizon_box = ttk.Combobox(
             toolbar,
@@ -362,17 +358,9 @@ class StockPredictorDesktopApp:
             textvariable=self.horizon_var,
             values=self.horizon_labels,
         )
-        self.horizon_box.pack(side=tk.LEFT, padx=(4, 8))
         self.horizon_box.bind("<<ComboboxSelected>>", self._on_horizon_changed)
 
-        self.forecast_label = ttk.Label(toolbar, textvariable=self.forecast_date_var)
-        self.forecast_label.pack(side=tk.LEFT, padx=(4, 12))
-
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-
-        ttk.Label(toolbar, text="Ticker").pack(side=tk.LEFT, padx=(0, 4))
         self.ticker_entry = ttk.Entry(toolbar, width=10, textvariable=self.ticker_var)
-        self.ticker_entry.pack(side=tk.LEFT)
         self.ticker_entry.bind("<Return>", self._on_ticker_submitted)
         self.ticker_entry.bind("<FocusOut>", self._on_ticker_focus_out)
         self.ticker_apply_button = ttk.Button(
@@ -380,16 +368,24 @@ class StockPredictorDesktopApp:
             text="Apply",
             command=self._on_ticker_button,
         )
-        self.ticker_apply_button.pack(side=tk.LEFT, padx=(4, 4))
+        Tooltip(self.ticker_entry, "Use official symbols (e.g., RHM.DE, ^GSPC).")
 
-        self.ticker_help = ttk.Label(toolbar, text="?", width=2, anchor=tk.CENTER, cursor="question_arrow")
-        self.ticker_help.pack(side=tk.LEFT, padx=(0, 12))
-        Tooltip(self.ticker_help, "Use official symbols (e.g., RHM.DE, ^GSPC).")
-
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        self.position_spinbox = ttk.Spinbox(
+            toolbar,
+            from_=1,
+            to=10_000,
+            increment=1,
+            width=8,
+            textvariable=self.position_size_var,
+            command=self._recompute_pnl,
+        )
+        self.position_spinbox.bind("<FocusOut>", lambda _event: self._recompute_pnl())
+        Tooltip(self.position_spinbox, "Number of shares used for P&L estimates.")
 
         self.currency_menu_button = ttk.Menubutton(
-            toolbar, textvariable=self.currency_button_text, direction="below"
+            toolbar,
+            textvariable=self.currency_button_text,
+            direction="below",
         )
         self.currency_menu = tk.Menu(self.currency_menu_button, tearoff=False)
         for code in ("local", "usd", "eur"):
@@ -406,29 +402,51 @@ class StockPredictorDesktopApp:
             command=lambda: self._on_fetch_fx_rate(silent=False),
         )
         self.currency_menu_button.configure(menu=self.currency_menu)
-        self.currency_menu_button.pack(side=tk.LEFT, padx=(0, 6))
+        self.currency_menu_button.configure(width=4)
 
-        self.fx_rate_entry = ttk.Entry(toolbar, width=10, textvariable=self.currency_rate_var, state=tk.DISABLED)
-        self.fx_rate_entry.pack(side=tk.LEFT)
+        self.fx_rate_entry = ttk.Entry(
+            toolbar,
+            width=8,
+            textvariable=self.currency_rate_var,
+            state=tk.DISABLED,
+        )
         self.fx_rate_entry.bind("<Return>", self._on_currency_rate_submit)
 
-        self.fx_rate_button = ttk.Button(
-            toolbar,
-            text="Update rate",
-            command=self._on_currency_rate_button,
-        )
-        self.fx_rate_button.pack(side=tk.LEFT, padx=(4, 12))
+        self.refresh_button = ttk.Button(toolbar, text="Refresh data", command=self._on_refresh)
+        self.predict_button = ttk.Button(toolbar, text="Run prediction", command=self._on_predict)
 
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        self.forecast_label = ttk.Label(toolbar, textvariable=self.forecast_date_var)
 
-        self.progress = ttk.Progressbar(toolbar, mode="indeterminate", length=180)
-        self.progress.pack(side=tk.RIGHT)
+        widgets_in_order: list[tk.Widget] = [
+            self.horizon_box,
+            self.ticker_entry,
+            self.ticker_apply_button,
+            self.position_spinbox,
+            self.currency_menu_button,
+            self.fx_rate_entry,
+            self.refresh_button,
+            self.predict_button,
+        ]
+
+        for column, widget in enumerate(widgets_in_order):
+            widget.grid(row=0, column=column, sticky=tk.W)
+
+        self.forecast_label.grid(row=0, column=len(widgets_in_order), sticky=tk.W)
+
+        for index in range(len(widgets_in_order)):
+            toolbar.grid_columnconfigure(index, weight=0)
+        toolbar.grid_columnconfigure(len(widgets_in_order), weight=1)
+
+        for child in toolbar.winfo_children():
+            child.grid_configure(padx=4, pady=2)
 
         self._update_forecast_label()
 
+        return toolbar
+
     def _build_notebook(self) -> None:
         self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill=tk.BOTH, expand=True)
+        self.notebook.grid(row=1, column=0, sticky="nsew")
 
         self._build_overview_tab()
         self._build_indicators_tab()
@@ -437,9 +455,15 @@ class StockPredictorDesktopApp:
 
     def _build_statusbar(self) -> None:
         status_frame = ttk.Frame(self.root, padding=(12, 4))
-        status_frame.pack(fill=tk.X)
+        status_frame.grid(row=2, column=0, sticky="ew")
+        status_frame.grid_columnconfigure(0, weight=1)
+        status_frame.grid_columnconfigure(1, weight=0)
         self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(status_frame, textvariable=self.status_var, anchor=tk.W).pack(fill=tk.X)
+        self.status_label = ttk.Label(status_frame, textvariable=self.status_var, anchor=tk.W)
+        self.status_label.grid(row=0, column=0, sticky=tk.W)
+        self.progress = ttk.Progressbar(status_frame, mode="indeterminate", length=120)
+        self.progress.grid(row=0, column=1, sticky=tk.E, padx=(8, 0))
+        return status_frame
 
     # ------------------------------------------------------------------
     # Tab builders
@@ -470,23 +494,6 @@ class StockPredictorDesktopApp:
             var = tk.StringVar(value="—")
             ttk.Label(container, textvariable=var).pack(anchor=tk.W)
             self.metric_vars[key] = var
-
-        controls_row = (len(metric_specs) + columns - 1) // columns
-        controls_frame = ttk.Frame(summary_frame, padding=4)
-        controls_frame.grid(row=controls_row, column=0, columnspan=columns, sticky=tk.W)
-        ttk.Label(controls_frame, text="Position size:").grid(row=0, column=0, sticky=tk.W)
-        self.position_spinbox = ttk.Spinbox(
-            controls_frame,
-            from_=1,
-            to=1_000_000,
-            increment=1,
-            width=8,
-            textvariable=self.position_size_var,
-            command=self._recompute_pnl,
-        )
-        self.position_spinbox.grid(row=0, column=1, padx=(6, 6), sticky=tk.W)
-        self.position_spinbox.bind("<FocusOut>", lambda _event: self._recompute_pnl())
-        ttk.Label(controls_frame, text="shares").grid(row=0, column=2, sticky=tk.W)
 
         self.pnl_label = ttk.Label(frame, textvariable=self.pnl_var)
         self._pnl_pack_options = {"anchor": tk.W, "padx": 8, "pady": (0, 12)}
@@ -716,22 +723,19 @@ class StockPredictorDesktopApp:
         changed = mode != previous_mode
         self.currency_mode = mode
         self.currency_symbol = self._currency_symbol(mode)
-        self.currency_button_text.set(self._currency_label(mode))
+        button_display = self.currency_symbol or self._currency_label(mode)
+        self.currency_button_text.set(button_display)
         if hasattr(self, "currency_default_var"):
             display_label = self.currency_display_map.get(mode, "Local")
             if self.currency_default_var.get() != display_label:
                 self.currency_default_var.set(display_label)
         if self._busy:
             entry_state = tk.DISABLED
-            button_state = tk.DISABLED
         elif mode == "local":
             entry_state = tk.DISABLED
-            button_state = tk.DISABLED
         else:
             entry_state = tk.NORMAL
-            button_state = tk.NORMAL
         self.fx_rate_entry.configure(state=entry_state)
-        self.fx_rate_button.configure(state=button_state)
         rate = self._currency_rate(mode)
         if not changed:
             self._set_currency_rate_var(rate)
@@ -750,11 +754,6 @@ class StockPredictorDesktopApp:
 
     def _on_currency_rate_submit(self, _event: Any) -> None:
         self._apply_manual_fx_rate()
-
-    def _on_currency_rate_button(self) -> None:
-        result = self._on_fetch_fx_rate()
-        if result is None:
-            self._set_status("Failed to update FX rate. Using previous value.")
 
     def _apply_manual_fx_rate(self) -> None:
         mode = self.currency_mode_var.get()
@@ -1002,13 +1001,12 @@ class StockPredictorDesktopApp:
             self.horizon_box,
             self.ticker_entry,
             self.ticker_apply_button,
+            self.position_spinbox,
             self.currency_menu_button,
-            self.fx_rate_button,
         ):
             widget.configure(state=state)
         if busy:
             self.fx_rate_entry.configure(state=tk.DISABLED)
-            self.fx_rate_button.configure(state=tk.DISABLED)
         else:
             self._on_currency_mode_changed(self.currency_mode_var.get())
         if busy:
