@@ -148,16 +148,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--ui-api-key",
         help="API key injected into the dashboard session for authenticated API calls.",
     )
+    parser.add_argument(
+        "--no-dashboard",
+        action="store_true",
+        help=(
+            "Disable automatic dashboard launch when --mode is omitted and the default is predict."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
     supplied_argv = sys.argv[1:] if argv is None else list(argv)
     provided_mode = any(arg.startswith("--mode") for arg in supplied_argv)
-    if not provided_mode and args.mode == default_mode == "predict":
-        setattr(args, "_auto_mode", "dashboard")
+    auto_mode: str | None = None
+    if not args.no_dashboard and not provided_mode and args.mode == default_mode == "predict":
+        auto_mode = "dashboard"
         args.mode = "dashboard"
-    else:
-        setattr(args, "_auto_mode", None)
+
+    setattr(args, "_auto_mode", auto_mode)
 
     return args
 
