@@ -76,6 +76,8 @@ class PredictorConfig:
     evaluation_step: int = DEFAULT_BACKTEST_STEP
     direction_confidence_threshold: float = 0.55
     volatility_window: int = DEFAULT_VOLATILITY_WINDOW
+    research_api_keys: tuple[str, ...] = field(default_factory=tuple)
+    research_allow_list: tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         self.ticker = self.ticker.upper()
@@ -113,6 +115,10 @@ class PredictorConfig:
         if int(self.volatility_window) <= 0:
             raise ValueError("volatility_window must be a positive integer.")
         self.volatility_window = int(self.volatility_window)
+        self.research_api_keys = self._normalise_strings(self.research_api_keys)
+        self.research_allow_list = self._normalise_strings(
+            self.research_allow_list, lower=True
+        )
 
     def ensure_directories(self) -> None:
         """Ensure that data and model directories exist."""
@@ -247,6 +253,22 @@ class PredictorConfig:
         clean_target = clean_target.replace(" ", "_")
         return f"{self.ticker}_{self.model_type}_{clean_target}_h{int(horizon)}{suffix}"
 
+    @staticmethod
+    def _normalise_strings(
+        values: Sequence[str] | Iterable[str] | None, *, lower: bool = False
+    ) -> tuple[str, ...]:
+        if values is None:
+            return tuple()
+        cleaned: list[str] = []
+        for raw in values:
+            token = str(raw or "").strip()
+            if not token:
+                continue
+            token = token.lower() if lower else token
+            if token not in cleaned:
+                cleaned.append(token)
+        return tuple(cleaned)
+
 
 def load_environment() -> None:
     """Load configuration from an optional ``.env`` file."""
@@ -277,6 +299,8 @@ def build_config(
     backtest_window: Optional[int] = None,
     backtest_step: Optional[int] = None,
     volatility_window: Optional[int] = None,
+    research_api_keys: Optional[Iterable[str] | str] = None,
+    research_allow_list: Optional[Iterable[str] | str] = None,
 ) -> PredictorConfig:
     """Build a :class:`PredictorConfig` instance from string parameters."""
 
@@ -293,6 +317,13 @@ def build_config(
         database_url
         or os.getenv("STOCK_PREDICTOR_DATABASE_URL")
         or _default_database_url()
+    )
+
+    research_keys_value = research_api_keys or os.getenv(
+        "STOCK_PREDICTOR_RESEARCH_API_KEYS"
+    )
+    research_allow_value = research_allow_list or os.getenv(
+        "STOCK_PREDICTOR_RESEARCH_ALLOW_LIST"
     )
 
     config = PredictorConfig(
@@ -333,6 +364,14 @@ def build_config(
         backtest_step=backtest_step if backtest_step is not None else DEFAULT_BACKTEST_STEP,
         volatility_window=
         volatility_window if volatility_window is not None else DEFAULT_VOLATILITY_WINDOW,
+        research_api_keys=_coerce_iterable(
+            research_keys_value,
+            (),
+        ),
+        research_allow_list=_coerce_iterable(
+            research_allow_value,
+            (),
+        ),
     )
     config.ensure_directories()
     return config
