@@ -170,7 +170,39 @@ class StockPredictorDesktopApp:
         self.root.grid_columnconfigure(0, weight=1)
 
         self.style = ttk.Style()
-        self.default_theme = self.style.theme_use()
+        self.light_theme = "vista"
+        self.dark_theme = "clam"
+        try:
+            self.style.theme_use(self.light_theme)
+        except tk.TclError:
+            self.light_theme = self.dark_theme
+            self.style.theme_use(self.dark_theme)
+        root_bg = self.style.lookup("TFrame", "background")
+        self.root.configure(background=root_bg)
+        self._style_targets = (
+            "TFrame",
+            "TLabelframe",
+            "TLabelframe.Label",
+            "TLabel",
+            "TButton",
+            "TCheckbutton",
+            "TNotebook",
+            "TNotebook.Tab",
+            "Treeview",
+            "Treeview.Heading",
+            "TCombobox",
+            "TEntry",
+            "TMenubutton",
+            "TSpinbox",
+            "TProgressbar",
+        )
+        self._default_style_options = self._capture_style_defaults(self._style_targets)
+        self._default_style_maps = {
+            "Treeview": {key: list(value) for key, value in self.style.map("Treeview").items()},
+            "TCombobox": {
+                key: list(value) for key, value in self.style.map("TCombobox").items()
+            },
+        }
 
         self.ticker_var = tk.StringVar(value=self.config.ticker)
         base_currency = os.environ.get("STOCK_PREDICTOR_UI_BASE_CURRENCY", "Local")
@@ -249,12 +281,24 @@ class StockPredictorDesktopApp:
         self._busy = False
 
         self._build_layout(horizons)
-        self._apply_theme()
+        self.apply_theme(self.dark_mode_var.get())
         self.root.after(200, self._initialise_prediction)
 
     # ------------------------------------------------------------------
     # Layout helpers
     # ------------------------------------------------------------------
+    def _capture_style_defaults(self, names: Iterable[str]) -> dict[str, dict[str, str]]:
+        defaults: dict[str, dict[str, str]] = {}
+        for name in names:
+            options: dict[str, str] = {}
+            for option in ("background", "foreground", "fieldbackground"):
+                value = self.style.lookup(name, option)
+                if value:
+                    options[option] = value
+            if options:
+                defaults[name] = options
+        return defaults
+
     def _resolve_initial_horizon_label(self, horizons: Iterable[int]) -> str:
         for value in horizons:
             try:
@@ -743,8 +787,7 @@ class StockPredictorDesktopApp:
         enabled = bool(self.dark_mode_var.get())
         if enabled == self.dark_mode_enabled:
             return
-        self.dark_mode_enabled = enabled
-        self._apply_theme()
+        self.apply_theme(enabled)
         self._refresh_numeric_views()
 
     def _on_currency_mode_changed(self, mode: str) -> None:
@@ -1658,15 +1701,39 @@ class StockPredictorDesktopApp:
             if self.pnl_label.winfo_manager():
                 self.pnl_label.grid_remove()
 
-    def _apply_theme(self) -> None:
-        enabled = self.dark_mode_enabled
-        mpl_style.use("dark_background" if enabled else "default")
-        if enabled:
+    def _restore_style_defaults(self) -> None:
+        for name in self._style_targets:
+            options = self._default_style_options.get(name)
+            if options:
+                self.style.configure(name, **options)
+        treeview_map = self._default_style_maps.get("Treeview")
+        if treeview_map is not None:
+            self.style.map(
+                "Treeview",
+                **{key: list(value) for key, value in treeview_map.items()},
+            )
+        combobox_map = self._default_style_maps.get("TCombobox")
+        if combobox_map is not None:
+            self.style.map(
+                "TCombobox",
+                **{key: list(value) for key, value in combobox_map.items()},
+            )
+
+    def apply_theme(self, dark: bool) -> None:
+        dark_enabled = bool(dark)
+        theme_name = self.dark_theme if dark_enabled else self.light_theme
+        try:
+            self.style.theme_use(theme_name)
+        except tk.TclError:
+            theme_name = self.dark_theme
+            self.style.theme_use(theme_name)
+        self.dark_mode_enabled = dark_enabled
+        mpl_style.use("dark_background" if dark_enabled else "default")
+        if dark_enabled:
             bg = "#1e1e1e"
             fg = "#f0f0f0"
             field_bg = "#262626"
             accent = "#3a7bd5"
-            self.style.theme_use("clam")
             self.style.configure("TFrame", background=bg)
             self.style.configure("TLabelframe", background=bg, foreground=fg)
             self.style.configure("TLabelframe.Label", background=bg, foreground=fg)
@@ -1683,41 +1750,43 @@ class StockPredictorDesktopApp:
                 bordercolor=field_bg,
             )
             self.style.configure("Treeview.Heading", background=bg, foreground=fg)
-            self.style.map("Treeview", background=[("selected", accent)], foreground=[("selected", fg)])
-            self.style.configure("TCombobox", fieldbackground=field_bg, foreground=fg, background=field_bg)
+            self.style.map(
+                "Treeview",
+                background=[("selected", accent)],
+                foreground=[("selected", fg)],
+            )
+            self.style.configure(
+                "TCombobox",
+                fieldbackground=field_bg,
+                foreground=fg,
+                background=field_bg,
+            )
             self.style.map("TCombobox", fieldbackground=[("readonly", field_bg)])
-            self.style.configure("TEntry", fieldbackground=field_bg, foreground=fg, background=field_bg)
+            self.style.configure(
+                "TEntry",
+                fieldbackground=field_bg,
+                foreground=fg,
+                background=field_bg,
+            )
             self.style.configure("TMenubutton", background=bg, foreground=fg)
             self.style.configure("TSpinbox", background=field_bg, foreground=fg)
             self.style.configure("TProgressbar", background=accent, troughcolor=field_bg)
             root_bg = bg
         else:
-            self.style.theme_use(self.default_theme)
-            for style_name in (
-                "TFrame",
-                "TLabelframe",
-                "TLabelframe.Label",
-                "TLabel",
-                "TButton",
-                "TCheckbutton",
-                "TNotebook",
-                "TNotebook.Tab",
-                "Treeview",
-                "Treeview.Heading",
-                "TCombobox",
-                "TEntry",
-                "TMenubutton",
-                "TSpinbox",
-                "TProgressbar",
-            ):
-                self.style.configure(style_name, background="", foreground="", fieldbackground="")
-            self.style.map("Treeview", background="", foreground="")
-            self.style.map("TCombobox", fieldbackground="")
-            field_bg = self.style.lookup("TEntry", "fieldbackground") or "white"
-            fg = self.style.lookup("TLabel", "foreground") or "black"
-            root_bg = self.style.lookup("TFrame", "background") or "SystemButtonFace"
-        self.root.configure(bg=root_bg)
-        text_bg = field_bg if enabled else "white"
+            self._restore_style_defaults()
+            fg = self.style.lookup("TLabel", "foreground") or "#000000"
+            field_bg = (
+                self.style.lookup("TEntry", "fieldbackground")
+                or self.style.lookup("TEntry", "background")
+                or "white"
+            )
+            root_bg = (
+                self.style.lookup("TFrame", "background")
+                or self.root.cget("background")
+                or "SystemButtonFace"
+            )
+        self.root.configure(background=root_bg)
+        text_bg = field_bg
         text_fg = fg
         for widget in self.text_widgets:
             widget.configure(
