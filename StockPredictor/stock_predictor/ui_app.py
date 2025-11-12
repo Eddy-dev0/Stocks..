@@ -184,6 +184,10 @@ class StockPredictorDesktopApp:
         self.currency_button_text = tk.StringVar(value=self._currency_label("local"))
         self.currency_rate_var = tk.StringVar(value=f"{self._currency_rate('usd'):.4f}")
 
+        self.position_size_var = tk.IntVar(value=1)
+        self.pnl_var = tk.StringVar(value="Expected P&L for 1 share: —")
+        self.position_size_var.trace_add("write", self._on_position_size_changed)
+
         self._busy = False
 
         self._build_layout(horizons)
@@ -323,6 +327,26 @@ class StockPredictorDesktopApp:
             var = tk.StringVar(value="—")
             ttk.Label(container, textvariable=var).pack(anchor=tk.W)
             self.metric_vars[key] = var
+
+        controls_row = (len(metric_specs) + columns - 1) // columns
+        controls_frame = ttk.Frame(summary_frame, padding=4)
+        controls_frame.grid(row=controls_row, column=0, columnspan=columns, sticky=tk.W)
+        ttk.Label(controls_frame, text="Position size:").grid(row=0, column=0, sticky=tk.W)
+        self.position_spinbox = ttk.Spinbox(
+            controls_frame,
+            from_=1,
+            to=1_000_000,
+            increment=1,
+            width=8,
+            textvariable=self.position_size_var,
+            command=self._recompute_pnl,
+        )
+        self.position_spinbox.grid(row=0, column=1, padx=(6, 6), sticky=tk.W)
+        self.position_spinbox.bind("<FocusOut>", lambda _event: self._recompute_pnl())
+        ttk.Label(controls_frame, text="shares").grid(row=0, column=2, sticky=tk.W)
+
+        self.pnl_label = ttk.Label(frame, textvariable=self.pnl_var)
+        self.pnl_label.pack(anchor=tk.W, padx=8, pady=(0, 12))
 
         chart_frame = ttk.LabelFrame(frame, text="Price history", padding=8)
         chart_frame.pack(fill=tk.BOTH, expand=True)
@@ -512,6 +536,9 @@ class StockPredictorDesktopApp:
         self._update_metrics()
         self._update_price_chart()
         self._update_indicator_view()
+
+    def _on_position_size_changed(self, *_args: Any) -> None:
+        self._recompute_pnl()
 
     def _on_ticker_submitted(self, _event: Any) -> None:
         self._apply_ticker_change(self.ticker_var.get())
@@ -827,6 +854,8 @@ class StockPredictorDesktopApp:
             if summary:
                 self._set_status(summary)
 
+        self._recompute_pnl()
+
     def _update_price_chart(self) -> None:
         self.price_ax.clear()
         if isinstance(self.price_history, pd.DataFrame) and not self.price_history.empty:
@@ -1034,6 +1063,45 @@ class StockPredictorDesktopApp:
         if numeric is None:
             return None
         return numeric * self._currency_rate()
+
+    def _recompute_pnl(self) -> None:
+        try:
+            size = int(self.position_size_var.get())
+        except (tk.TclError, ValueError):
+            size = 1
+        min_size, max_size = 1, 1_000_000
+        clamped = max(min_size, min(max_size, size))
+        if clamped != size:
+            self.position_size_var.set(clamped)
+            return
+        size = clamped
+        share_label = "share" if size == 1 else "shares"
+        prefix = f"Expected P&L for {size:,} {share_label}: "
+
+        prediction = self.current_prediction or {}
+        last_raw = _safe_float(prediction.get("last_close"))
+        predicted_raw = _safe_float(prediction.get("predicted_close"))
+        if last_raw is None or predicted_raw is None:
+            self.pnl_var.set(prefix + "—")
+            return
+
+        last_converted = self._convert_currency(last_raw)
+        predicted_converted = self._convert_currency(predicted_raw)
+        if last_converted is None or predicted_converted is None:
+            self.pnl_var.set(prefix + "—")
+            return
+
+        pnl_value = (predicted_converted - last_converted) * size
+        pct_change = _safe_float(prediction.get("expected_change_pct"))
+        if pct_change is None and last_raw != 0:
+            pct_change = (predicted_raw - last_raw) / last_raw
+
+        pnl_display = fmt_ccy(pnl_value, self.currency_symbol)
+        pct_display = fmt_pct(pct_change, show_sign=True)
+        if pct_display == "—":
+            self.pnl_var.set(prefix + pnl_display)
+        else:
+            self.pnl_var.set(f"{prefix}{pnl_display} ({pct_display})")
 
     def _format_price_like_value(self, name: Any, value: Any, *, decimals: int = 4) -> str:
         numeric = _safe_float(value)
