@@ -11,9 +11,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from stock_predictor.ml_preprocessing import PreprocessingBuilder
-from stock_predictor.config import PredictorConfig
-from stock_predictor.model import StockPredictorAI
+from stock_predictor.core import PredictorConfig, StockPredictorAI
+from stock_predictor.core.ml_preprocessing import PreprocessingBuilder
 
 
 def test_preprocessing_pipeline_handles_non_finite_values():

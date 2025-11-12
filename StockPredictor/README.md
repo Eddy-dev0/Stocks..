@@ -2,9 +2,12 @@
 
 The Stock Predictor project provides an end-to-end machine learning pipeline for
 downloading financial market data, engineering features, training a predictive
-model and generating forecasts. All functionality is exposed through a single
-command line interface so the system can be automated or integrated into other
-workflows easily.
+model and generating forecasts. The modernised architecture centres around the
+``StockPredictorApplication`` orchestrator which wires together the analytical
+core, external data providers, research extensions and user interfaces. A
+backwards-compatible (but deprecated) command line entry point remains available
+for automation scenarios while new FastAPI helpers power web or Streamlit
+front-ends.
 
 ## Features
 
@@ -28,16 +31,14 @@ workflows easily.
 
 ```
 StockPredictor/
-├── main.py                # Command line interface
+├── main.py                # Deprecated CLI shim using the new orchestrator
 ├── stock_predictor/
-│   ├── __init__.py
-│   ├── config.py          # Runtime configuration helpers
-│   ├── data_fetcher.py    # Database-backed data loader
-│   ├── database.py        # SQLAlchemy models and helpers
-│   ├── etl.py             # ETL services for populating the database
-│   ├── model.py           # StockPredictorAI implementation
-│   ├── preprocessing.py   # Feature engineering helpers
-│   └── sentiment.py       # Sentiment scoring utilities
+│   ├── app.py             # StockPredictorApplication orchestrator
+│   ├── core/              # Pipelines, modelling and feature engineering
+│   ├── providers/         # External data adapters (database, APIs, sentiment)
+│   ├── research/          # Experimental modules (e.g. Elliott waves)
+│   ├── ui/                # FastAPI entry points and UI integrations
+│   └── docs/              # Helpers pointing to the documentation sources
 ├── data/                  # Cached datasets (created automatically)
 └── models/                # Trained models & metrics (created automatically)
 ```
