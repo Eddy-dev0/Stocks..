@@ -7,9 +7,23 @@ import json
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 from stock_predictor.ui import StockPredictorApplication
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parent
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+_existing_pythonpath = os.environ.get("PYTHONPATH")
+if _existing_pythonpath:
+    pythonpath_parts = _existing_pythonpath.split(os.pathsep)
+    if str(REPOSITORY_ROOT) not in pythonpath_parts:
+        os.environ["PYTHONPATH"] = os.pathsep.join([str(REPOSITORY_ROOT), _existing_pythonpath])
+else:
+    os.environ["PYTHONPATH"] = str(REPOSITORY_ROOT)
 
 
 def _ensure_dashboard_dependencies() -> bool:
