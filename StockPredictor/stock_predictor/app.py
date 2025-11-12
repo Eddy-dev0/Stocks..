@@ -19,6 +19,8 @@ from stock_predictor.core import (
     load_environment,
 )
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -127,12 +129,19 @@ class StockPredictorApplication:
     ) -> int:
         """Launch the dashboard alongside the embedded API service."""
 
-        frontend_path = Path(__file__).resolve().parent.parent / "ui" / "frontend" / "app.py"
+        frontend_path = PROJECT_ROOT / "ui" / "frontend" / "app.py"
         if not frontend_path.exists():
             LOGGER.error("Streamlit dashboard entry point not found at %s", frontend_path)
             return 1
 
         env = os.environ.copy()
+        root_str = str(PROJECT_ROOT)
+        pythonpath = env.get("PYTHONPATH")
+        if pythonpath:
+            if root_str not in pythonpath.split(os.pathsep):
+                env["PYTHONPATH"] = os.pathsep.join([root_str, pythonpath])
+        else:
+            env["PYTHONPATH"] = root_str
         env.setdefault("STOCK_PREDICTOR_DEFAULT_TICKER", self.config.ticker)
         env.setdefault("STOCK_PREDICTOR_API_URL", f"http://{api_host}:{api_port}")
         if ui_api_key:
@@ -169,9 +178,9 @@ class StockPredictorApplication:
         if ui_headless:
             ui_cmd.extend(["--server.headless", "true"])
 
-        api_process = subprocess.Popen(api_cmd, env=env)
+        api_process = subprocess.Popen(api_cmd, env=env, cwd=PROJECT_ROOT)
         try:
-            result = subprocess.run(ui_cmd, env=env, check=False)
+            result = subprocess.run(ui_cmd, env=env, check=False, cwd=PROJECT_ROOT)
             return result.returncode
         except KeyboardInterrupt:
             LOGGER.info("Dashboard interrupted by user.")
