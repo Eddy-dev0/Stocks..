@@ -15,6 +15,7 @@ import matplotlib.dates as mdates
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from pandas.tseries.offsets import BDay
 from matplotlib import style as mpl_style
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
@@ -114,6 +115,14 @@ HORIZON_OPTIONS: tuple[HorizonOption, ...] = (
 )
 
 
+HORIZON_SUMMARY_PHRASES: dict[str, str] = {
+    "Tomorrow": "for tomorrow",
+    "1 Week": "for the next week",
+    "1 Month": "for the next month",
+    "3 Months": "for the next three months",
+}
+
+
 class Tooltip:
     """Lightweight tooltip helper for Tkinter widgets."""
 
@@ -179,10 +188,20 @@ class StockPredictorDesktopApp:
 
         horizons = self.config.prediction_horizons or DEFAULT_PREDICTION_HORIZONS
         self.horizon_options = HORIZON_OPTIONS
-        self.horizon_option_map = {option.label: option for option in self.horizon_options}
-        self.code_to_horizon = {option.code: option for option in self.horizon_options}
-        self.label_to_code = {option.label: option.code for option in self.horizon_options}
-        self.selected_horizon_option = self._resolve_initial_horizon(horizons)
+        self.horizon_labels = [option.label for option in self.horizon_options]
+        self.horizon_map = {
+            option.label: {"code": option.code, "offset": option.business_days}
+            for option in self.horizon_options
+        }
+        self.horizon_code_to_label = {option.code: option.label for option in self.horizon_options}
+        self.horizon_offset_to_label = {
+            option.business_days: option.label for option in self.horizon_options
+        }
+        self.selected_horizon_label: str = ""
+        self.selected_horizon_code: str = ""
+        self.selected_horizon_offset: int = 0
+        initial_label = self._resolve_initial_horizon_label(horizons)
+        self._apply_horizon_selection(initial_label)
         self.current_prediction: dict[str, Any] = {}
         self.price_history: pd.DataFrame | None = None
         self.feature_snapshot: pd.DataFrame | None = None
@@ -194,6 +213,8 @@ class StockPredictorDesktopApp:
         self.indicator_history_converted: pd.DataFrame | None = None
         self.feature_toggle_vars: dict[str, tk.BooleanVar] = {}
         self.forecast_date_var = tk.StringVar(value="Forecast date: —")
+        self.current_forecast_date: pd.Timestamp | None = None
+        self.market_holidays: list[pd.Timestamp] = []
 
         self.currency_mode_var = tk.StringVar(value="local")
         self.currency_button_text = tk.StringVar(value=self._currency_label("local"))
@@ -231,12 +252,90 @@ class StockPredictorDesktopApp:
     # ------------------------------------------------------------------
     # Layout helpers
     # ------------------------------------------------------------------
-    def _resolve_initial_horizon(self, horizons: Iterable[int]) -> HorizonOption:
+    def _resolve_initial_horizon_label(self, horizons: Iterable[int]) -> str:
         for value in horizons:
-            for option in self.horizon_options:
-                if option.business_days == value:
-                    return option
-        return self.horizon_options[0]
+            try:
+                numeric = int(value)
+            except (TypeError, ValueError):
+                continue
+            label = self.horizon_offset_to_label.get(numeric)
+            if label:
+                return label
+        return self.horizon_labels[0]
+
+    def _apply_horizon_selection(self, label: str) -> None:
+        mapping = self.horizon_map.get(label)
+        if mapping is None:
+            return
+        self.selected_horizon_label = label
+        self.selected_horizon_code = str(mapping.get("code") or "")
+        try:
+            self.selected_horizon_offset = int(mapping.get("offset", 0))
+        except (TypeError, ValueError):
+            self.selected_horizon_offset = 0
+
+    def _horizon_summary_phrase(self, label: str | None = None) -> str:
+        key = label or self.selected_horizon_label
+        return HORIZON_SUMMARY_PHRASES.get(key, "").strip()
+
+    def _sync_horizon_from_prediction(self, prediction: Mapping[str, Any] | None) -> None:
+        if not isinstance(prediction, Mapping):
+            return
+        label: str | None = None
+        horizon_value = prediction.get("horizon")
+        if isinstance(horizon_value, str):
+            label = self.horizon_code_to_label.get(horizon_value)
+        else:
+            try:
+                numeric = int(horizon_value)
+            except (TypeError, ValueError):
+                numeric = None
+            if numeric is not None:
+                label = self.horizon_offset_to_label.get(numeric)
+        if label and label in self.horizon_map:
+            self._apply_horizon_selection(label)
+            if hasattr(self, "horizon_var") and self.horizon_var.get() != label:
+                self.horizon_var.set(label)
+
+    def _resolve_market_holidays(
+        self, prediction: Mapping[str, Any] | None = None
+    ) -> list[pd.Timestamp]:
+        holidays: set[pd.Timestamp] = set()
+        sources: list[Any] = []
+        active_prediction: Mapping[str, Any] | None = prediction
+        if active_prediction is None:
+            active_prediction = self.current_prediction if isinstance(self.current_prediction, Mapping) else {}
+        if isinstance(active_prediction, Mapping):
+            for key in ("market_holidays", "trading_holidays", "holidays"):
+                value = active_prediction.get(key)
+                if value:
+                    sources.append(value)
+        metadata = getattr(getattr(self, "application", None), "pipeline", None)
+        metadata_mapping = getattr(metadata, "metadata", None)
+        if isinstance(metadata_mapping, Mapping):
+            for key in ("market_holidays", "trading_holidays", "holidays"):
+                value = metadata_mapping.get(key)
+                if value:
+                    sources.append(value)
+
+        for source in sources:
+            for item in self._iter_holiday_values(source):
+                try:
+                    converted = pd.to_datetime(item, errors="coerce")
+                except Exception:
+                    continue
+                if isinstance(converted, (pd.Series, pd.DatetimeIndex)):
+                    iterable = [val for val in converted.dropna()]
+                elif isinstance(converted, np.ndarray):
+                    iterable = [val for val in converted if pd.notna(val)]
+                else:
+                    iterable = [converted] if pd.notna(converted) else []
+                for val in iterable:
+                    try:
+                        holidays.add(pd.Timestamp(val).normalize())
+                    except Exception:
+                        continue
+        return sorted(holidays)
 
     def _build_layout(self, horizons: Iterable[int]) -> None:
         self._build_toolbar(list(horizons))
@@ -255,13 +354,13 @@ class StockPredictorDesktopApp:
         self.predict_button.pack(side=tk.LEFT, padx=(0, 12))
 
         ttk.Label(toolbar, text="Horizon").pack(side=tk.LEFT)
-        self.horizon_var = tk.StringVar(value=self.selected_horizon_option.label)
+        self.horizon_var = tk.StringVar(value=self.selected_horizon_label)
         self.horizon_box = ttk.Combobox(
             toolbar,
             width=12,
             state="readonly",
             textvariable=self.horizon_var,
-            values=[option.label for option in self.horizon_options],
+            values=self.horizon_labels,
         )
         self.horizon_box.pack(side=tk.LEFT, padx=(4, 8))
         self.horizon_box.bind("<<ComboboxSelected>>", self._on_horizon_changed)
@@ -572,12 +671,11 @@ class StockPredictorDesktopApp:
 
     def _on_horizon_changed(self, _event: Any) -> None:
         label = self.horizon_var.get()
-        option = self.horizon_option_map.get(label)
-        if option is None:
+        if label not in self.horizon_map:
             messagebox.showwarning("Invalid horizon", "Please select a valid horizon value.")
-            self.horizon_var.set(self.selected_horizon_option.label)
+            self.horizon_var.set(self.selected_horizon_label)
             return
-        self.selected_horizon_option = option
+        self._apply_horizon_selection(label)
         self._update_forecast_label()
         self._on_predict()
 
@@ -786,6 +884,9 @@ class StockPredictorDesktopApp:
         self.config = self.application.config
         self.root.title(f"Stock Predictor – {self.config.ticker}")
         self.ticker_var.set(self.config.ticker)
+        self.market_holidays = []
+        self.current_forecast_date = None
+        self.forecast_date_var.set("Forecast date: —")
         self._run_async(self._refresh_and_predict, f"Loading data for {self.config.ticker}…")
 
     # ------------------------------------------------------------------
@@ -802,7 +903,12 @@ class StockPredictorDesktopApp:
         return self._predict_payload()
 
     def _predict_payload(self) -> dict[str, Any]:
-        prediction = self.application.predict(horizon=self.selected_horizon_option.business_days)
+        horizon_arg: Any
+        if self.selected_horizon_code:
+            horizon_arg = self.selected_horizon_code
+        else:
+            horizon_arg = self.selected_horizon_offset
+        prediction = self.application.predict(horizon=horizon_arg)
         metadata = self.application.pipeline.metadata
         snapshot = metadata.get("latest_features") if isinstance(metadata, Mapping) else None
         feature_history: pd.DataFrame | None = None
@@ -873,6 +979,8 @@ class StockPredictorDesktopApp:
         self.feature_history = feature_history if isinstance(feature_history, pd.DataFrame) else None
         self.price_history = price_history if isinstance(price_history, pd.DataFrame) else None
         self.indicator_history = indicator_history if isinstance(indicator_history, pd.DataFrame) else None
+        self._sync_horizon_from_prediction(self.current_prediction)
+        self.market_holidays = self._resolve_market_holidays(self.current_prediction)
         self._apply_currency(self._currency_rate())
         self._update_forecast_label(self.current_prediction.get("target_date"))
         self._update_metrics()
@@ -934,20 +1042,33 @@ class StockPredictorDesktopApp:
 
         return pd.Timestamp.today().normalize()
 
-    def _compute_forecast_date(self, target_date: Any | None = None) -> pd.Timestamp | None:
+    def _compute_forecast_date(
+        self, target_date: Any | None = None, *, offset: int | None = None
+    ) -> pd.Timestamp | None:
         parsed = pd.to_datetime(target_date, errors="coerce") if target_date is not None else None
+        forecast: pd.Timestamp | None = None
         if pd.notna(parsed):
-            return pd.Timestamp(parsed).normalize()
-
-        option = self.selected_horizon_option
-        if option is None:
-            return None
-        base_date = self._forecast_base_date()
-        try:
-            offset = pd.tseries.offsets.BusinessDay(option.business_days)
-            forecast = (base_date + offset).normalize()
-        except Exception:
-            forecast = (base_date + pd.to_timedelta(option.business_days, unit="D")).normalize()
+            forecast = pd.Timestamp(parsed).normalize()
+        else:
+            days = offset if offset is not None else self.selected_horizon_offset
+            try:
+                days_int = int(days)
+            except (TypeError, ValueError):
+                days_int = 0
+            if days_int > 0:
+                base_date = self._forecast_base_date()
+                holidays = self.market_holidays or self._resolve_market_holidays()
+                if not self.market_holidays and holidays:
+                    self.market_holidays = list(holidays)
+                try:
+                    if holidays:
+                        business_offset = BDay(n=days_int, holidays=holidays)
+                    else:
+                        business_offset = BDay(n=days_int)
+                    forecast = (base_date + business_offset).normalize()
+                except Exception:
+                    forecast = (base_date + pd.to_timedelta(days_int, unit="D")).normalize()
+        self.current_forecast_date = forecast
         return forecast
 
     def _update_forecast_label(self, target_date: Any | None = None) -> None:
@@ -980,7 +1101,9 @@ class StockPredictorDesktopApp:
             fmt_ccy(last_close_converted, self.currency_symbol, decimals=decimals)
         )
 
-        forecast = self._compute_forecast_date(self.current_prediction.get("target_date"))
+        forecast = self.current_forecast_date
+        if forecast is None:
+            forecast = self._compute_forecast_date(self.current_prediction.get("target_date"))
         predicted_display = fmt_ccy(predicted_converted, self.currency_symbol, decimals=decimals)
         if forecast is not None:
             forecast_str = forecast.date().isoformat()
@@ -1022,9 +1145,10 @@ class StockPredictorDesktopApp:
     def _update_price_chart(self) -> None:
         self.price_ax.clear()
         prediction = self.current_prediction or {}
-        forecast = self._compute_forecast_date(
-            prediction.get("target_date") or prediction.get("horizon")
-        )
+        forecast = self.current_forecast_date
+        if forecast is None:
+            fallback_target = prediction.get("target_date") or prediction.get("forecast_date")
+            forecast = self._compute_forecast_date(fallback_target)
         title = "Forecast date: —"
         if forecast is not None:
             title = f"Forecast date: {forecast.date().isoformat()}"
@@ -1091,12 +1215,15 @@ class StockPredictorDesktopApp:
                     annotate_x = x_values.iloc[-1]
                 else:
                     annotate_x = x_values[-1]
+                annotation_text = fmt_ccy(
+                    converted_prediction,
+                    self.currency_symbol,
+                    decimals=self.price_decimal_places,
+                )
+                if forecast is not None:
+                    annotation_text = f"{annotation_text} ({forecast.date().isoformat()})"
                 self.price_ax.annotate(
-                    fmt_ccy(
-                        converted_prediction,
-                        self.currency_symbol,
-                        decimals=self.price_decimal_places,
-                    ),
+                    annotation_text,
                     xy=(annotate_x, converted_prediction),
                     xytext=(8, 0),
                     textcoords="offset points",
@@ -1196,7 +1323,17 @@ class StockPredictorDesktopApp:
             self._clear_explanation()
             return
 
-        self._set_text(self.summary_text, explanation.get("summary") or "No explanation available.")
+        summary_raw = explanation.get("summary")
+        summary_text = str(summary_raw).strip() if summary_raw else ""
+        phrase = self._horizon_summary_phrase()
+        if phrase:
+            if summary_text:
+                summary_text = f"Outlook {phrase}: {summary_text}"
+            else:
+                summary_text = f"Outlook {phrase}: No explanation available."
+        elif not summary_text:
+            summary_text = "No explanation available."
+        self._set_text(self.summary_text, summary_text)
         for key, widget in self.reason_lists.items():
             reasons = explanation.get(key)
             if isinstance(reasons, Iterable) and not isinstance(reasons, (str, bytes)):
@@ -1245,7 +1382,11 @@ class StockPredictorDesktopApp:
         self.feature_canvas.draw_idle()
 
     def _clear_explanation(self) -> None:
-        self._set_text(self.summary_text, "Explanation unavailable.")
+        message = "Explanation unavailable."
+        phrase = self._horizon_summary_phrase()
+        if phrase:
+            message = f"Outlook {phrase}: {message}"
+        self._set_text(self.summary_text, message)
         for widget in self.reason_lists.values():
             self._set_text(widget, "No data.")
         for item in self.feature_tree.get_children():
@@ -1255,6 +1396,21 @@ class StockPredictorDesktopApp:
     # ------------------------------------------------------------------
     # Utility helpers
     # ------------------------------------------------------------------
+    def _iter_holiday_values(self, value: Any) -> list[Any]:
+        if value is None:
+            return []
+        if isinstance(value, (str, bytes)):
+            return [value]
+        if isinstance(value, Mapping):
+            return list(value.values())
+        if isinstance(value, pd.Series):
+            return value.dropna().tolist()
+        if isinstance(value, pd.DataFrame):
+            return value.dropna().to_numpy().ravel().tolist()
+        if isinstance(value, Iterable):
+            return list(value)
+        return [value]
+
     def _refresh_numeric_views(self) -> None:
         metrics_updated = False
         if hasattr(self, "metric_vars"):
