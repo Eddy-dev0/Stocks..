@@ -37,6 +37,7 @@ DEFAULT_TEST_SIZE = 0.2
 DEFAULT_BACKTEST_STRATEGY = "rolling"
 DEFAULT_BACKTEST_WINDOW = 252
 DEFAULT_BACKTEST_STEP = 21
+DEFAULT_VOLATILITY_WINDOW = 20
 
 
 @dataclass
@@ -74,6 +75,7 @@ class PredictorConfig:
     evaluation_window: int = DEFAULT_BACKTEST_WINDOW
     evaluation_step: int = DEFAULT_BACKTEST_STEP
     direction_confidence_threshold: float = 0.55
+    volatility_window: int = DEFAULT_VOLATILITY_WINDOW
 
     def __post_init__(self) -> None:
         self.ticker = self.ticker.upper()
@@ -108,6 +110,9 @@ class PredictorConfig:
             raise ValueError("evaluation_step must be positive.")
         if not 0.5 <= float(self.direction_confidence_threshold) < 1:
             raise ValueError("direction_confidence_threshold must be between 0.5 and 1.0.")
+        if int(self.volatility_window) <= 0:
+            raise ValueError("volatility_window must be a positive integer.")
+        self.volatility_window = int(self.volatility_window)
 
     def ensure_directories(self) -> None:
         """Ensure that data and model directories exist."""
@@ -271,6 +276,7 @@ def build_config(
     backtest_strategy: Optional[str] = None,
     backtest_window: Optional[int] = None,
     backtest_step: Optional[int] = None,
+    volatility_window: Optional[int] = None,
 ) -> PredictorConfig:
     """Build a :class:`PredictorConfig` instance from string parameters."""
 
@@ -325,6 +331,8 @@ def build_config(
         if backtest_window is not None
         else DEFAULT_BACKTEST_WINDOW,
         backtest_step=backtest_step if backtest_step is not None else DEFAULT_BACKTEST_STEP,
+        volatility_window=
+        volatility_window if volatility_window is not None else DEFAULT_VOLATILITY_WINDOW,
     )
     config.ensure_directories()
     return config

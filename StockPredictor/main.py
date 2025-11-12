@@ -98,7 +98,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--targets",
-        help="Comma separated list of prediction targets to train/predict/backtest.",
+        help=(
+            "Comma separated list of prediction targets to train/predict/backtest "
+            "(default: close,direction,return,volatility)."
+        ),
     )
     parser.add_argument(
         "--feature-sets",
@@ -110,6 +113,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--model-params",
         help="JSON string describing model hyper-parameters (global/target overrides).",
+    )
+    parser.add_argument(
+        "--volatility-window",
+        type=int,
+        default=20,
+        help="Rolling window (in days) for volatility label generation (default: 20).",
     )
     parser.add_argument(
         "--test-size",
@@ -202,6 +211,8 @@ def main(argv: list[str] | None = None) -> int:
         except json.JSONDecodeError as exc:
             raise SystemExit(f"Failed to parse --model-params: {exc}") from exc
 
+    parsed_targets = parse_csv(args.targets)
+
     config = build_config(
         ticker=args.ticker,
         start_date=args.start_date,
@@ -215,6 +226,9 @@ def main(argv: list[str] | None = None) -> int:
         sentiment=not args.no_sentiment,
         database_url=args.database_url,
         feature_sets=args.feature_sets,
+        prediction_targets=parsed_targets,
+        model_params=model_params,
+        volatility_window=args.volatility_window,
     )
 
     ai = StockPredictorAI(config)
@@ -227,14 +241,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.mode == "train":
             if args.refresh_data:
                 ai.download_data(force=True)
-            metrics = ai.train_model(targets=parse_csv(args.targets))
+            metrics = ai.train_model(targets=parsed_targets)
             print(json.dumps({"status": "ok", "metrics": metrics}, indent=2))
         elif args.mode == "predict":
-            targets = parse_csv(args.targets) if args.targets else ([args.target] if args.target else None)
+            targets = parsed_targets if parsed_targets else ([args.target] if args.target else None)
             prediction = ai.predict(refresh_data=args.refresh_data, targets=targets)
             print(json.dumps({"status": "ok", "prediction": prediction}, indent=2))
         elif args.mode == "backtest":
-            results = ai.run_backtest(targets=parse_csv(args.targets))
+            results = ai.run_backtest(targets=parsed_targets)
             print(json.dumps({"status": "ok", "backtest": results}, indent=2))
         elif args.mode == "importance":
             target = args.target or "close"

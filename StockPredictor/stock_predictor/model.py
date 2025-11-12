@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from numbers import Real
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import joblib
 import numpy as np
@@ -35,6 +36,56 @@ from .models import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+LabelFunction = Callable[[pd.DataFrame, int, int], pd.Series]
+
+
+@dataclass(frozen=True)
+class TargetSpec:
+    """Description of a supported prediction target."""
+
+    name: str
+    task: str
+    default_model_type: Optional[str] = None
+    label_fn: Optional[LabelFunction] = None
+
+
+def make_volatility_label(
+    df: pd.DataFrame, horizon: int, window: int = 20
+) -> pd.Series:
+    """Create a realised volatility label using rolling standard deviation."""
+
+    if window <= 0:
+        raise ValueError("window must be a positive integer")
+
+    working = df.copy()
+    lower_columns = {column.lower(): column for column in working.columns}
+
+    if "return" in working.columns:
+        returns = pd.to_numeric(working["return"], errors="coerce")
+    else:
+        close_column = lower_columns.get("close")
+        if close_column is None:
+            raise KeyError("Input dataframe must contain a 'close' column for volatility labels.")
+        close_series = pd.to_numeric(working[close_column], errors="coerce")
+        returns = close_series.pct_change()
+
+    volatility = returns.rolling(window=window, min_periods=window).std()
+    shift = int(horizon) if horizon and int(horizon) > 0 else 1
+    return volatility.shift(-shift)
+
+
+TARGET_SPECS: dict[str, TargetSpec] = {
+    "close": TargetSpec("close", "regression"),
+    "direction": TargetSpec("direction", "classification"),
+    "return": TargetSpec("return", "regression"),
+    "volatility": TargetSpec(
+        "volatility", "regression", default_model_type="random_forest", label_fn=make_volatility_label
+    ),
+}
+
+SUPPORTED_TARGETS = frozenset(TARGET_SPECS)
 
 
 class ModelNotFoundError(FileNotFoundError):
@@ -106,6 +157,47 @@ class StockPredictorAI:
         metadata["horizons"] = horizons
         metadata["active_horizon"] = self.horizon
 
+        volatility_spec = TARGET_SPECS.get("volatility")
+        if volatility_spec and volatility_spec.label_fn:
+            window = getattr(self.config, "volatility_window", 20)
+            price_history = price_df.copy()
+            if "Date" in price_history.columns:
+                price_history["Date"] = pd.to_datetime(price_history["Date"], errors="coerce")
+                price_history = price_history.dropna(subset=["Date"])
+                price_history = price_history.sort_values("Date").reset_index(drop=True)
+            else:
+                price_history = price_history.sort_index().reset_index(drop=True)
+
+            lower_map = {column.lower(): column for column in price_history.columns}
+            close_column = lower_map.get("close")
+            if close_column is not None:
+                price_history["return"] = pd.to_numeric(
+                    price_history[close_column], errors="coerce"
+                ).pct_change()
+
+            for horizon_value in horizons:
+                try:
+                    label_series = volatility_spec.label_fn(
+                        price_history, int(horizon_value), int(window)
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    LOGGER.debug(
+                        "Failed to compute volatility labels for horizon %s: %s",
+                        horizon_value,
+                        exc,
+                    )
+                    continue
+                if label_series is None:
+                    continue
+                label_series = pd.Series(label_series, name="volatility")
+                if label_series.dropna().empty:
+                    continue
+                label_series = label_series.reset_index(drop=True)
+                label_series.index = feature_result.features.index
+                horizon_targets = feature_result.targets.setdefault(int(horizon_value), {})
+                horizon_targets["volatility"] = label_series
+            metadata["volatility_window"] = int(window)
+
         preprocess_section = self.config.model_params.get("preprocessing", {})
         if isinstance(preprocess_section, dict):
             self.preprocess_options = dict(preprocess_section)
@@ -151,6 +243,11 @@ class StockPredictorAI:
             return self.horizon
         return self.config.resolve_horizon(horizon)
 
+    def _ensure_models_dir(self) -> None:
+        """Ensure that the models directory exists."""
+
+        Path(self.config.models_dir).mkdir(parents=True, exist_ok=True)
+
     def _get_model(self, target: str, horizon: Optional[int] = None) -> Any:
         resolved_horizon = self._resolve_horizon(horizon)
         key = (target, resolved_horizon)
@@ -183,6 +280,7 @@ class StockPredictorAI:
     def load_model(self, target: str = "close", horizon: Optional[int] = None) -> Any:
         resolved_horizon = self._resolve_horizon(horizon)
         path = self.config.model_path_for(target, resolved_horizon)
+        self._ensure_models_dir()
         if not path.exists():
             raise ModelNotFoundError(target, resolved_horizon, path)
         LOGGER.info(
@@ -234,6 +332,7 @@ class StockPredictorAI:
             "target_dates": self.metadata.get("target_dates", {}),
         }
         path = self.config.metrics_path_for(target, horizon)
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, default=str)
         LOGGER.info("Saved metrics for target '%s' (horizon %s) to %s", target, horizon, path)
@@ -255,22 +354,53 @@ class StockPredictorAI:
         raw_feature_columns = self.metadata.get("raw_feature_columns", list(X.columns))
 
         requested_targets = list(targets) if targets else list(self.config.prediction_targets)
+        supported_targets: list[str] = []
+        for target in requested_targets:
+            if target not in SUPPORTED_TARGETS:
+                LOGGER.warning("Skipping unsupported target '%s'.", target)
+                continue
+            if target not in supported_targets:
+                supported_targets.append(target)
+
+        if not supported_targets:
+            LOGGER.error("No supported targets requested for training: %s", requested_targets)
+            return {"horizon": resolved_horizon, "targets": {}}
+
         horizon_targets = targets_by_horizon.get(resolved_horizon)
         if not horizon_targets:
-            raise RuntimeError(
-                f"No targets available for horizon {resolved_horizon}."
-            )
-        available_targets = {
-            name: series for name, series in horizon_targets.items() if name in requested_targets
-        }
+            LOGGER.error("No targets available for horizon %s.", resolved_horizon)
+            return {"horizon": resolved_horizon, "targets": {}}
+
+        available_targets: dict[str, pd.Series] = {}
+        for target in supported_targets:
+            series = horizon_targets.get(target)
+            if series is None:
+                LOGGER.warning(
+                    "Skipping target '%s' at horizon %s: no training data available.",
+                    target,
+                    resolved_horizon,
+                )
+                continue
+            available_targets[target] = series
+
         if not available_targets:
-            raise RuntimeError("No matching targets available for training.")
+            LOGGER.error(
+                "No matching targets available for training after filtering unsupported or missing data."
+            )
+            return {"horizon": resolved_horizon, "targets": {}}
 
         metrics_by_target: dict[str, Dict[str, float]] = {}
         summary_metrics: dict[str, float] = {}
 
+        self._ensure_models_dir()
+
         for target, y in available_targets.items():
-            LOGGER.info("Training target '%s' with model type %s", target, self.config.model_type)
+            spec = TARGET_SPECS.get(target)
+            task = spec.task if spec else ("classification" if target == "direction" else "regression")
+            model_type = (
+                spec.default_model_type if spec and spec.default_model_type else self.config.model_type
+            )
+            LOGGER.info("Training target '%s' with model type %s", target, model_type)
             y_clean = y.dropna()
             if y_clean.empty:
                 LOGGER.warning(
@@ -283,18 +413,17 @@ class StockPredictorAI:
             self._log_target_distribution(target, resolved_horizon, y_clean)
             self._validate_no_nans(target, resolved_horizon, aligned_X, y_clean)
 
-            task = "classification" if target == "direction" else "regression"
             model_params = self.config.model_params.get(target, {})
             global_params = self.config.model_params.get("global", {})
-            factory = ModelFactory(
-                self.config.model_type,
-                {**global_params, **model_params},
-            )
+            factory = ModelFactory(model_type, {**global_params, **model_params})
 
             calibrate_override = model_params.get("calibrate")
             if calibrate_override is None:
                 calibrate_override = global_params.get("calibrate")
-            calibrate_flag = (target == "direction") if calibrate_override is None else bool(calibrate_override)
+            if calibrate_override is None:
+                calibrate_flag = task == "classification" and target == "direction"
+            else:
+                calibrate_flag = bool(calibrate_override)
 
             template = self.preprocessor_templates.get(resolved_horizon)
             evaluation = self._evaluate_model(
@@ -354,13 +483,17 @@ class StockPredictorAI:
 
             self.models[(target, resolved_horizon)] = final_model
             self.preprocessors[(target, resolved_horizon)] = final_pipeline
-            joblib.dump(final_model, self.config.model_path_for(target, resolved_horizon))
-            joblib.dump(final_pipeline, self.config.preprocessor_path_for(target, resolved_horizon))
+            model_path = self.config.model_path_for(target, resolved_horizon)
+            preprocessor_path = self.config.preprocessor_path_for(target, resolved_horizon)
+            model_path.parent.mkdir(parents=True, exist_ok=True)
+            preprocessor_path.parent.mkdir(parents=True, exist_ok=True)
+            joblib.dump(final_model, model_path)
+            joblib.dump(final_pipeline, preprocessor_path)
             self.save_state(target, resolved_horizon, metrics)
             self.tracker.log_run(
                 target=target,
                 run_type="training",
-                parameters={"model_type": self.config.model_type, **model_params},
+                parameters={"model_type": model_type, **model_params},
                 metrics=metrics,
                 context={"feature_columns": feature_names, "horizon": resolved_horizon},
             )
@@ -672,19 +805,41 @@ class StockPredictorAI:
         prediction_warnings: List[str] = []
         training_report: dict[str, Any] = {}
 
+        filtered_targets: list[str] = []
         for target in requested_targets:
-            try:
-                model = self.models.get((target, resolved_horizon)) or self.load_model(
-                    target, resolved_horizon
-                )
-            except ModelNotFoundError:
-                LOGGER.warning("Model for target '%s' missing. Triggering training.", target)
-                report = self.train_model(targets=[target], horizon=resolved_horizon)
-                training_report[target] = {
-                    "horizon": resolved_horizon,
-                    **report.get("targets", {}).get(target, {}),
-                }
-                model = self._get_model(target, resolved_horizon)
+            if target not in SUPPORTED_TARGETS:
+                LOGGER.warning("Skipping target '%s': not supported.", target)
+                continue
+            if target not in filtered_targets:
+                filtered_targets.append(target)
+
+        for target in filtered_targets:
+            model = self.models.get((target, resolved_horizon))
+            if model is None:
+                try:
+                    model = self.load_model(target, resolved_horizon)
+                except ModelNotFoundError:
+                    LOGGER.warning(
+                        "Model for target '%s' missing. Attempting on-demand training.",
+                        target,
+                    )
+                    report = self.train_model(targets=[target], horizon=resolved_horizon)
+                    target_metrics = report.get("targets", {}).get(target)
+                    training_report[target] = {
+                        "horizon": resolved_horizon,
+                        **(target_metrics or {}),
+                    }
+                    model = self.models.get((target, resolved_horizon))
+                    if model is None:
+                        try:
+                            model = self.load_model(target, resolved_horizon)
+                        except ModelNotFoundError:
+                            LOGGER.warning(
+                                "Skipping target '%s' at horizon %s: not supported or training unavailable.",
+                                target,
+                                resolved_horizon,
+                            )
+                            continue
 
             pipeline = self.preprocessors.get((target, resolved_horizon))
             if pipeline is None:
