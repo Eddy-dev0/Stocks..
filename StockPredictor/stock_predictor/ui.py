@@ -137,11 +137,18 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         self.prediction_header_var = tk.StringVar(value="Prediction details will appear here.")
         self.market_data_time_var = tk.StringVar(value="Market data as of: -")
         self.prediction_time_var = tk.StringVar(value="Prediction generated at: -")
+        self.horizon_info_var = tk.StringVar(value="Horizon: -")
+        self.target_date_var = tk.StringVar(value="Target date: -")
+        self.predicted_return_var = tk.StringVar(value="-")
+        self.predicted_volatility_var = tk.StringVar(value="-")
+        self.direction_prob_up_var = tk.StringVar(value="-")
+        self.direction_prob_down_var = tk.StringVar(value="-")
         self.currency_var = tk.StringVar(value="USD")
         self.currency_button_text = tk.StringVar(value="Display in EUR (€)")
         self.metric_vars: dict[str, tk.StringVar] = {
             "mae": tk.StringVar(value="-"),
             "rmse": tk.StringVar(value="-"),
+            "directional_accuracy": tk.StringVar(value="-"),
             "r2": tk.StringVar(value="-"),
             "training_rows": tk.StringVar(value="-"),
             "test_rows": tk.StringVar(value="-"),
@@ -328,22 +335,78 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         )
         self.percent_change_label.grid(column=1, row=6, sticky="w", padx=(40, 0))
 
+        ttk.Label(
+            prediction_tab,
+            textvariable=self.horizon_info_var,
+            font=("Helvetica", 11, "bold"),
+        ).grid(column=0, row=7, sticky="w", pady=(12, 2))
+        ttk.Label(
+            prediction_tab,
+            textvariable=self.target_date_var,
+            font=("Helvetica", 11),
+        ).grid(column=0, row=8, sticky="w", pady=(0, 10))
+
+        ttk.Label(
+            prediction_tab,
+            text="Predicted return over horizon:",
+            font=("Helvetica", 12, "bold"),
+        ).grid(column=0, row=9, sticky="w", pady=(0, 4))
+        ttk.Label(
+            prediction_tab,
+            textvariable=self.predicted_return_var,
+            font=("Helvetica", 14),
+        ).grid(column=1, row=9, sticky="w", padx=(8, 0))
+
+        ttk.Label(
+            prediction_tab,
+            text="Predicted volatility over horizon:",
+            font=("Helvetica", 12, "bold"),
+        ).grid(column=0, row=10, sticky="w", pady=(0, 4))
+        ttk.Label(
+            prediction_tab,
+            textvariable=self.predicted_volatility_var,
+            font=("Helvetica", 14),
+        ).grid(column=1, row=10, sticky="w", padx=(8, 0))
+
+        ttk.Label(
+            prediction_tab,
+            text="Upside probability:",
+            font=("Helvetica", 12, "bold"),
+        ).grid(column=0, row=11, sticky="w", pady=(0, 4))
+        ttk.Label(
+            prediction_tab,
+            textvariable=self.direction_prob_up_var,
+            font=("Helvetica", 14),
+        ).grid(column=1, row=11, sticky="w", padx=(8, 0))
+
+        ttk.Label(
+            prediction_tab,
+            text="Downside probability:",
+            font=("Helvetica", 12, "bold"),
+        ).grid(column=0, row=12, sticky="w", pady=(0, 8))
+        ttk.Label(
+            prediction_tab,
+            textvariable=self.direction_prob_down_var,
+            font=("Helvetica", 14),
+        ).grid(column=1, row=12, sticky="w", padx=(8, 0))
+
         ttk.Separator(prediction_tab, orient="horizontal").grid(
-            column=0, row=7, columnspan=2, sticky="ew", pady=(25, 15)
+            column=0, row=13, columnspan=2, sticky="ew", pady=(20, 15)
         )
 
         ttk.Label(
             prediction_tab,
             text="Training Metrics",
             font=("Helvetica", 13, "bold"),
-        ).grid(column=0, row=8, columnspan=2, sticky="w", pady=(0, 10))
+        ).grid(column=0, row=14, columnspan=2, sticky="w", pady=(0, 10))
 
         metrics_grid = ttk.Frame(prediction_tab)
-        metrics_grid.grid(column=0, row=9, columnspan=2, sticky="w")
+        metrics_grid.grid(column=0, row=15, columnspan=2, sticky="w")
 
         metric_labels = [
             ("MAE", "mae"),
             ("RMSE", "rmse"),
+            ("Directional Accuracy", "directional_accuracy"),
             ("R²", "r2"),
             ("Training Rows", "training_rows"),
             ("Test Rows", "test_rows"),
@@ -697,15 +760,39 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         self.price_ax.scatter(dates[-1], last_close, color=COLOR_NEUTRAL, s=35, zorder=5, label="Last Close")
 
         predicted_value = None
+        target_date_raw: Any = None
+        horizon_days: Optional[int] = None
         if self.latest_prediction:
             predicted_value = self.latest_prediction.get("predicted_close")
+            target_date_raw = self.latest_prediction.get("target_date")
+            try:
+                horizon_days = (
+                    int(self.latest_prediction.get("horizon"))
+                    if self.latest_prediction.get("horizon") is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                horizon_days = None
         if predicted_value is not None:
             try:
                 predicted_value = float(predicted_value)
             except (TypeError, ValueError):
                 predicted_value = None
+        predicted_timestamp: Optional[datetime] = None
+        if target_date_raw:
+            try:
+                parsed = pd.to_datetime(target_date_raw)
+            except Exception:  # pragma: no cover - parsing guard
+                parsed = None
+            if isinstance(parsed, pd.Timestamp):
+                predicted_timestamp = parsed.to_pydatetime()
+            elif isinstance(parsed, datetime):
+                predicted_timestamp = parsed
         if predicted_value is not None and not math.isnan(predicted_value):
-            predicted_date = window_df["Date"].max() + timedelta(days=1)
+            if predicted_timestamp is None:
+                offset_days = horizon_days if horizon_days and horizon_days > 0 else 1
+                predicted_timestamp = window_df["Date"].max() + timedelta(days=offset_days)
+            predicted_date = predicted_timestamp
             predicted_x = mdates.date2num(predicted_date)
             converted_prediction = self._convert_currency_value(predicted_value)
             y_value = converted_prediction if converted_prediction is not None else predicted_value
@@ -831,7 +918,38 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         self.percent_change_label.configure(foreground=color)
 
         ticker = prediction.get("ticker") or (self.current_ticker or "-")
-        self.prediction_header_var.set(f"Prediction for {ticker}")
+        horizon_raw = prediction.get("horizon")
+        try:
+            horizon_value = int(horizon_raw) if horizon_raw is not None else None
+        except (TypeError, ValueError):
+            horizon_value = None
+        if horizon_value and horizon_value > 0:
+            suffix = f" (H{horizon_value})"
+            day_label = "day" if horizon_value == 1 else "days"
+            self.horizon_info_var.set(f"Horizon: {horizon_value} trading {day_label}")
+        else:
+            suffix = ""
+            self.horizon_info_var.set("Horizon: -")
+        self.prediction_header_var.set(f"Prediction for {ticker}{suffix}")
+
+        target_date = prediction.get("target_date")
+        target_display = self._format_timestamp(target_date)
+        if target_display != "-" and " " in target_display:
+            target_display = target_display.split(" ")[0]
+        self.target_date_var.set(
+            f"Target date: {target_display if target_display != '-' else '-'}"
+        )
+
+        self.predicted_return_var.set(self._format_percent(prediction.get("predicted_return")))
+        self.predicted_volatility_var.set(
+            self._format_percent(prediction.get("predicted_volatility"))
+        )
+        self.direction_prob_up_var.set(
+            self._format_percent(prediction.get("direction_probability_up"))
+        )
+        self.direction_prob_down_var.set(
+            self._format_percent(prediction.get("direction_probability_down"))
+        )
 
         market_timestamp = prediction.get("market_data_as_of") or prediction.get("as_of")
         generated_timestamp = prediction.get("generated_at")
@@ -845,6 +963,9 @@ class StockPredictorApp(tk.Tk):  # pragma: no cover - UI side effects dominate
         metrics = metrics or {}
         self.metric_vars["mae"].set(self._format_number(metrics.get("mae")))
         self.metric_vars["rmse"].set(self._format_number(metrics.get("rmse")))
+        self.metric_vars["directional_accuracy"].set(
+            self._format_percent(metrics.get("directional_accuracy"))
+        )
         self.metric_vars["r2"].set(self._format_number(metrics.get("r2")))
         self.metric_vars["training_rows"].set(self._format_int(metrics.get("training_rows")))
         self.metric_vars["test_rows"].set(self._format_int(metrics.get("test_rows")))

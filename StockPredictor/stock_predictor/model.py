@@ -137,6 +137,21 @@ class StockPredictorAI:
                 target_dates = stored.get("target_dates")
                 if isinstance(target_dates, dict):
                     self.metadata.setdefault("target_dates", {}).update(target_dates)
+                metrics_payload = {
+                    key: value
+                    for key, value in stored.items()
+                    if key
+                    not in {
+                        "feature_columns",
+                        "indicator_columns",
+                        "target_dates",
+                        "horizon",
+                    }
+                }
+                if metrics_payload:
+                    metrics_store = self.metadata.setdefault("metrics", {})
+                    horizon_metrics = metrics_store.setdefault(target, {})
+                    horizon_metrics[resolved_horizon] = metrics_payload
         self.metadata["active_horizon"] = resolved_horizon
         return model
 
@@ -243,6 +258,10 @@ class StockPredictorAI:
                 "samples": int(evaluation.get("evaluation_rows", 0)),
             }
             metrics_by_target[target] = metrics
+
+            metrics_store = self.metadata.setdefault("metrics", {})
+            horizon_metrics = metrics_store.setdefault(target, {})
+            horizon_metrics[resolved_horizon] = metrics
 
             self.models[(target, resolved_horizon)] = final_model
             joblib.dump(final_model, self.config.model_path_for(target, resolved_horizon))
@@ -516,6 +535,7 @@ class StockPredictorAI:
         predictions: dict[str, Any] = {}
         confidences: dict[str, float] = {}
         probabilities: dict[str, Dict[str, float]] = {}
+        uncertainties: dict[str, Dict[str, float]] = {}
         prediction_warnings: List[str] = []
         training_report: dict[str, Any] = {}
 
@@ -536,6 +556,10 @@ class StockPredictorAI:
             current_features = latest_features[feature_columns]
             pred_value = model.predict(current_features)[0]
             predictions[target] = float(pred_value)
+
+            uncertainty = self._estimate_prediction_uncertainty(target, model, current_features)
+            if uncertainty:
+                uncertainties[target] = uncertainty
 
             if model_supports_proba(model) and target == "direction":
                 proba = model.predict_proba(current_features)[0]
@@ -591,6 +615,25 @@ class StockPredictorAI:
         if isinstance(target_dates, dict):
             target_date = target_dates.get(resolved_horizon)
 
+        predicted_return = self._safe_float(predictions.get("return"))
+        predicted_volatility = self._safe_float(predictions.get("volatility"))
+        dir_prob = probabilities.get("direction") if isinstance(probabilities, dict) else None
+        direction_probability_up = None
+        direction_probability_down = None
+        if isinstance(dir_prob, dict):
+            direction_probability_up = self._safe_float(dir_prob.get("up"))
+            direction_probability_down = self._safe_float(dir_prob.get("down"))
+
+        uncertainty_clean: dict[str, Dict[str, float]] = {}
+        for tgt, values in uncertainties.items():
+            numeric_values = {
+                key: float(value)
+                for key, value in values.items()
+                if value is not None and np.isfinite(value)
+            }
+            if numeric_values:
+                uncertainty_clean[tgt] = numeric_values
+
         def _to_iso(value: Any) -> Optional[str]:
             if value is None:
                 return None
@@ -615,6 +658,10 @@ class StockPredictorAI:
             "predicted_close": close_prediction,
             "expected_change": expected_change,
             "expected_change_pct": pct_change,
+            "predicted_return": predicted_return,
+            "predicted_volatility": predicted_volatility,
+            "direction_probability_up": direction_probability_up,
+            "direction_probability_down": direction_probability_down,
             "predictions": predictions,
             "horizon": resolved_horizon,
             "target_date": _to_iso(target_date) or "",
@@ -623,6 +670,8 @@ class StockPredictorAI:
             result["confidence"] = confidences
         if probabilities:
             result["probabilities"] = probabilities
+        if uncertainty_clean:
+            result["prediction_uncertainty"] = uncertainty_clean
         if training_report:
             result["training_metrics"] = training_report
         if prediction_warnings:
@@ -631,6 +680,57 @@ class StockPredictorAI:
         if explanation:
             result["explanation"] = explanation
         return result
+
+    def _estimate_prediction_uncertainty(
+        self,
+        target: str,
+        model: Any,
+        features: pd.DataFrame,
+    ) -> Optional[Dict[str, float]]:
+        if not hasattr(model, "named_steps"):
+            return None
+        estimator = model.named_steps.get("estimator")
+        if estimator is None:
+            return None
+
+        transformed = features
+        if hasattr(model, "steps") and len(model.steps) > 1:
+            try:
+                transformed = model[:-1].transform(features)
+            except Exception:  # pragma: no cover - defensive
+                transformed = features
+
+        if isinstance(transformed, pd.DataFrame):
+            transformed = transformed.to_numpy()
+
+        samples: list[float] = []
+
+        if hasattr(estimator, "estimators_"):
+            estimators = getattr(estimator, "estimators_")
+            for member in estimators:
+                try:
+                    if target == "direction" and hasattr(member, "predict_proba"):
+                        proba = member.predict_proba(transformed)[0]
+                        if len(proba) > 1:
+                            samples.append(float(proba[1]))
+                        elif len(proba) == 1:
+                            samples.append(float(proba[0]))
+                    elif hasattr(member, "predict"):
+                        prediction = member.predict(transformed)[0]
+                        samples.append(float(prediction))
+                except Exception:  # pragma: no cover - estimator specific quirks
+                    continue
+
+        if not samples:
+            return None
+
+        values = np.asarray(samples, dtype=float)
+        if values.size == 0 or np.isnan(values).all():
+            return None
+
+        std = float(np.nanstd(values, ddof=1) if values.size > 1 else 0.0)
+        spread = float(np.nanmax(values) - np.nanmin(values))
+        return {"std": std, "range": spread}
 
     # ------------------------------------------------------------------
     # Feature importance
@@ -653,6 +753,12 @@ class StockPredictorAI:
             LOGGER.debug("Latest feature snapshot is unavailable for explanation generation.")
             return None
 
+        raw_horizon = prediction.get("horizon") or self.metadata.get("active_horizon")
+        try:
+            horizon_value: Optional[int] = int(raw_horizon) if raw_horizon is not None else None
+        except (TypeError, ValueError):
+            horizon_value = None
+
         reasons = {
             "technical_reasons": self._technical_reasons(feature_row),
             "fundamental_reasons": self._fundamental_reasons(feature_row),
@@ -660,8 +766,16 @@ class StockPredictorAI:
             "macro_reasons": self._macro_reasons(feature_row),
         }
 
-        summary = self._compose_summary(prediction, reasons)
-        feature_importance = self._collect_feature_importance()
+        feature_importance = self._collect_feature_importance(horizon_value)
+        top_feature_drivers = self._top_feature_drivers(feature_importance)
+        confidence_indicators = self._collect_confidence_indicators(prediction, horizon_value)
+        summary = self._compose_summary(
+            prediction,
+            reasons,
+            top_feature_drivers,
+            confidence_indicators,
+            horizon_value,
+        )
         sources_raw = self.metadata.get("data_sources") or self.fetcher.get_data_sources()
         sources = list(sources_raw) if isinstance(sources_raw, (list, tuple, set)) else []
         if not sources:
@@ -671,6 +785,10 @@ class StockPredictorAI:
             "summary": summary,
             **reasons,
             "feature_importance": feature_importance,
+            "top_feature_drivers": top_feature_drivers,
+            "confidence_indicators": confidence_indicators,
+            "horizon": horizon_value,
+            "target_date": prediction.get("target_date"),
             "sources": sources,
         }
         return explanation
@@ -791,9 +909,19 @@ class StockPredictorAI:
 
         return reasons
 
-    def _compose_summary(self, prediction: Dict[str, Any], reasons: Dict[str, list[str]]) -> str:
+    def _compose_summary(
+        self,
+        prediction: Dict[str, Any],
+        reasons: Dict[str, list[str]],
+        top_feature_drivers: Dict[str, list[str]],
+        confidence_indicators: Dict[str, Any],
+        horizon: Optional[int],
+    ) -> str:
         change = self._safe_float(prediction.get("expected_change"))
         pct_change = self._safe_float(prediction.get("expected_change_pct"))
+        forecast_return = self._safe_float(prediction.get("predicted_return"))
+        volatility = self._safe_float(prediction.get("predicted_volatility"))
+
         if change is None or not np.isfinite(change):
             direction = "Neutral"
         elif change > 0:
@@ -803,31 +931,119 @@ class StockPredictorAI:
         else:
             direction = "Neutral"
 
+        target_date_display = None
+        target_date_raw = prediction.get("target_date")
+        if target_date_raw:
+            try:
+                ts_value = pd.to_datetime(target_date_raw)
+                if not pd.isna(ts_value):
+                    target_date_display = ts_value.strftime("%Y-%m-%d")
+            except Exception:  # pragma: no cover - parsing guard
+                target_date_display = str(target_date_raw)
+
+        if horizon and horizon > 0:
+            horizon_phrase = f"{horizon}-day outlook"
+        else:
+            horizon_phrase = "outlook"
+        target_fragment = f" into {target_date_display}" if target_date_display else ""
+
         highlight = next(
-            (reason for key in ("technical_reasons", "sentiment_reasons", "macro_reasons", "fundamental_reasons") for reason in reasons.get(key, []) if reason),
+            (
+                reason
+                for key in (
+                    "technical_reasons",
+                    "sentiment_reasons",
+                    "macro_reasons",
+                    "fundamental_reasons",
+                )
+                for reason in reasons.get(key, [])
+                if reason
+            ),
             "",
         )
+
         sentences: list[str] = []
-        if highlight and direction != "Neutral":
+        base_sentence = f"{direction} {horizon_phrase}{target_fragment}".strip()
+        if highlight:
             clause = highlight.rstrip(".")
             if clause:
-                sentences.append(f"{direction} outlook driven by {clause}.")
-            else:
-                sentences.append(f"{direction} outlook.")
-        else:
-            sentences.append(f"{direction} outlook.")
-            if highlight:
-                sentences.append(f"Key driver: {highlight}")
+                base_sentence += f" driven by {clause}"
+        sentences.append(base_sentence + ".")
 
         if pct_change is not None and np.isfinite(pct_change) and pct_change != 0:
             sentences.append(f"Expected move of {pct_change * 100:.2f}% versus the last close.")
 
+        if forecast_return is not None and np.isfinite(forecast_return):
+            sentences.append(f"Projected horizon return of {forecast_return * 100:.2f}%.")
+
+        if volatility is not None and np.isfinite(volatility) and volatility > 0:
+            sentences.append(f"Anticipated volatility around {volatility * 100:.2f}%.")
+
+        driver_sections: list[str] = []
+        for category, names in sorted(top_feature_drivers.items()):
+            if not names:
+                continue
+            display_category = category.replace("_", " ").title()
+            joined = ", ".join(names)
+            driver_sections.append(f"{display_category}: {joined}")
+        if driver_sections:
+            sentences.append("Key drivers by category – " + "; ".join(driver_sections) + ".")
+
+        confidence_sections: list[str] = []
+        direction_prob = confidence_indicators.get("direction_probability")
+        if isinstance(direction_prob, dict):
+            up_prob = self._safe_float(direction_prob.get("up"))
+            down_prob = self._safe_float(direction_prob.get("down"))
+            if up_prob is not None and down_prob is not None:
+                confidence_sections.append(
+                    f"Upside probability {up_prob * 100:.1f}% vs. downside {down_prob * 100:.1f}%"
+                )
+            elif up_prob is not None:
+                confidence_sections.append(f"Upside probability {up_prob * 100:.1f}%")
+            elif down_prob is not None:
+                confidence_sections.append(f"Downside probability {down_prob * 100:.1f}%")
+
+        validation_scores = confidence_indicators.get("validation_scores")
+        if isinstance(validation_scores, dict) and validation_scores:
+            metrics_parts: list[str] = []
+            for label, key, formatter in (
+                ("RMSE", "rmse", "{:.3f}"),
+                ("MAE", "mae", "{:.3f}"),
+                ("Directional accuracy", "directional_accuracy", "{:.1%}"),
+                ("R²", "r2", "{:.2f}"),
+            ):
+                value = self._safe_float(validation_scores.get(key))
+                if value is None:
+                    continue
+                try:
+                    formatted = formatter.format(value)
+                except (ValueError, TypeError):
+                    continue
+                metrics_parts.append(f"{label} {formatted}")
+            if metrics_parts:
+                confidence_sections.append("Validation " + ", ".join(metrics_parts))
+
+        uncertainty_scores = confidence_indicators.get("uncertainty")
+        if isinstance(uncertainty_scores, dict) and uncertainty_scores:
+            first_target = next(iter(uncertainty_scores))
+            target_uncertainty = uncertainty_scores.get(first_target) or {}
+            std_value = self._safe_float(target_uncertainty.get("std"))
+            if std_value is not None and std_value > 0:
+                confidence_sections.append(
+                    f"{first_target} prediction std ±{std_value:.3f}"
+                )
+
+        if confidence_sections:
+            sentences.append("Confidence cues: " + "; ".join(confidence_sections) + ".")
+
         summary = " ".join(sentence.strip() for sentence in sentences if sentence)
         return summary.strip()
 
-    def _collect_feature_importance(self, top_n: int = 10) -> list[Dict[str, Any]]:
+    def _collect_feature_importance(
+        self, horizon: Optional[int] = None, top_n: int = 10
+    ) -> list[Dict[str, Any]]:
         try:
-            importance_map = self.feature_importance("close")
+            importance_map = self.feature_importance("close", horizon)
         except Exception as exc:  # pylint: disable=broad-except
             LOGGER.debug("Feature importance unavailable: %s", exc)
             return []
@@ -844,6 +1060,108 @@ class StockPredictorAI:
                 "category": category,
             })
         return results
+
+    @staticmethod
+    def _top_feature_drivers(
+        feature_importance: list[Dict[str, Any]], per_category: int = 2
+    ) -> Dict[str, list[str]]:
+        drivers: dict[str, list[str]] = {}
+        for entry in feature_importance:
+            category = str(entry.get("category") or "other")
+            name = entry.get("name")
+            if not name:
+                continue
+            drivers.setdefault(category, []).append(str(name))
+        return {
+            category: values[:per_category]
+            for category, values in drivers.items()
+            if values
+        }
+
+    def _collect_confidence_indicators(
+        self, prediction: Dict[str, Any], horizon: Optional[int]
+    ) -> Dict[str, Any]:
+        indicators: Dict[str, Any] = {}
+
+        up_prob = self._safe_float(prediction.get("direction_probability_up"))
+        down_prob = self._safe_float(prediction.get("direction_probability_down"))
+        if up_prob is not None or down_prob is not None:
+            probability_block: Dict[str, float] = {}
+            if up_prob is not None:
+                probability_block["up"] = up_prob
+            if down_prob is not None:
+                probability_block["down"] = down_prob
+            indicators["direction_probability"] = probability_block
+
+        uncertainties_raw = prediction.get("prediction_uncertainty")
+        if isinstance(uncertainties_raw, dict):
+            uncertainty_block: Dict[str, Dict[str, float]] = {}
+            for target, values in uncertainties_raw.items():
+                if not isinstance(values, dict):
+                    continue
+                numeric = {
+                    key: float(value)
+                    for key, value in values.items()
+                    if self._safe_float(value) is not None
+                }
+                if numeric:
+                    uncertainty_block[str(target)] = numeric
+            if uncertainty_block:
+                indicators["uncertainty"] = uncertainty_block
+
+        validation_scores = self._validation_metrics("close", horizon)
+        if validation_scores:
+            indicators["validation_scores"] = validation_scores
+
+        return indicators
+
+    def _validation_metrics(
+        self, target: str, horizon: Optional[int]
+    ) -> Dict[str, float]:
+        metrics_store = self.metadata.get("metrics")
+        if not isinstance(metrics_store, dict):
+            return {}
+        target_metrics = metrics_store.get(target)
+        if not isinstance(target_metrics, dict) or not target_metrics:
+            return {}
+
+        entry: Optional[Dict[str, Any]] = None
+        if horizon is not None:
+            entry = target_metrics.get(horizon)
+
+        if entry is None:
+            default_horizon = self.metadata.get("active_horizon")
+            try:
+                default_horizon = int(default_horizon)
+            except (TypeError, ValueError):
+                default_horizon = None
+            if default_horizon is not None:
+                entry = target_metrics.get(default_horizon)
+
+        if entry is None:
+            entry = next(iter(target_metrics.values()), None)
+
+        if not isinstance(entry, dict):
+            return {}
+
+        metrics: Dict[str, float] = {}
+        evaluation = entry.get("evaluation")
+        if isinstance(evaluation, dict):
+            aggregate = evaluation.get("aggregate")
+            if isinstance(aggregate, dict):
+                for key, value in aggregate.items():
+                    numeric = self._safe_float(value)
+                    if numeric is not None:
+                        metrics[key] = numeric
+
+        for key in ("rmse", "mae", "mape", "directional_accuracy", "r2"):
+            if key in metrics:
+                continue
+            numeric = self._safe_float(entry.get(key))
+            if numeric is not None:
+                metrics[key] = numeric
+
+        return metrics
 
     @staticmethod
     def _categorize_feature_name(name: str) -> str:
