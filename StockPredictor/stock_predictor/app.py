@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 import signal
 import subprocess
 import sys
@@ -176,7 +177,14 @@ class StockPredictorApplication:
             LOGGER.info("Dashboard interrupted by user.")
             return 0
         finally:
-            api_process.send_signal(signal.SIGINT)
+            try:
+                if platform.system() == "Windows":
+                    api_process.terminate()
+                else:
+                    api_process.send_signal(signal.SIGINT)
+            except (OSError, ValueError):  # pragma: no cover - best effort cleanup
+                LOGGER.debug("Failed to gracefully stop API server", exc_info=True)
+
             try:
                 api_process.wait(timeout=10)
             except subprocess.TimeoutExpired:
