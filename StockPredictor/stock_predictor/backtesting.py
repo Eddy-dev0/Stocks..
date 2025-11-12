@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 from .models import ModelFactory, classification_metrics, regression_metrics
+from sklearn.base import clone
+from sklearn.pipeline import Pipeline
 
 LOGGER = logging.getLogger(__name__)
 
@@ -37,7 +39,14 @@ class Backtester:
         self.window = max(20, window)
         self.step = max(1, step)
 
-    def run(self, X: pd.DataFrame, y: pd.Series, target: str) -> BacktestResult:
+    def run(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        target: str,
+        *,
+        preprocessor_template: Optional[Pipeline] = None,
+    ) -> BacktestResult:
         task = "classification" if target == "direction" else "regression"
         splits = list(self._generate_splits(len(X)))
         split_metrics: list[Dict[str, float]] = []
@@ -48,16 +57,29 @@ class Backtester:
             if len(y_test) == 0:
                 continue
 
+            pipeline = clone(preprocessor_template) if preprocessor_template is not None else None
+            if pipeline is not None:
+                pipeline.fit(X_train, y_train)
+                X_train_transformed = pipeline.transform(X_train)
+                X_test_transformed = pipeline.transform(X_test)
+            else:
+                X_train_transformed = X_train
+                X_test_transformed = X_test
+
             model = self.model_factory.create(task, calibrate=(target == "direction"))
-            model.fit(X_train, y_train)
-            y_pred = model.predict(X_test)
+            model.fit(X_train_transformed, y_train)
+            y_pred = model.predict(X_test_transformed)
 
             if task == "classification":
                 metrics = classification_metrics(y_test.to_numpy(), y_pred)
                 metrics["directional_accuracy"] = metrics.get("accuracy", 0.0)
             else:
                 metrics = regression_metrics(y_test.to_numpy(), y_pred)
-                baseline = X_test["Close_Current"].to_numpy() if "Close_Current" in X_test else np.zeros_like(y_pred)
+                baseline = (
+                    X_test["Close_Current"].to_numpy()
+                    if "Close_Current" in X_test
+                    else np.zeros_like(y_pred)
+                )
                 predicted_direction = np.sign(y_pred - baseline)
                 actual_direction = np.sign(y_test.to_numpy() - baseline)
                 metrics["directional_accuracy"] = float(
