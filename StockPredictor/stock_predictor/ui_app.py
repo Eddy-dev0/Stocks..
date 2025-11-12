@@ -769,7 +769,7 @@ def run_tkinter_app() -> None:
     try:
         application = StockPredictorApplication.from_environment()
     except Exception as exc:  # pragma: no cover - initialisation guard
-        LOGGER.exception("Failed to initialise application: %%s", exc)
+        LOGGER.exception("Failed to initialise application: %s", exc)
         messagebox.showerror("Initialisation failed", str(exc))
         root.destroy()
         return
@@ -777,7 +777,7 @@ def run_tkinter_app() -> None:
     try:
         StockPredictorDesktopApp(root, application=application)
     except Exception as exc:  # pragma: no cover - defensive UI guard
-        LOGGER.exception("Failed to start desktop UI: %%s", exc)
+        LOGGER.exception("Failed to start desktop UI: %s", exc)
         messagebox.showerror("Startup failed", str(exc))
         root.destroy()
         return

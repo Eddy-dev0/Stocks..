@@ -52,6 +52,9 @@ class StockPredictorApplication:
         """Create an application instance using environment variables and overrides."""
 
         load_environment()
+        overrides.setdefault(
+            "ticker", os.getenv("STOCK_PREDICTOR_DEFAULT_TICKER", "AAPL")
+        )
         config = build_config(**overrides)
         LOGGER.debug("Initialised configuration for ticker %s", config.ticker)
         return cls(config)
