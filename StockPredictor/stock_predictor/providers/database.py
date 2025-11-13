@@ -479,6 +479,38 @@ class Database:
         except (TypeError, json.JSONDecodeError):
             return value
 
+    @staticmethod
+    def _indicator_columns_key(ticker: str, interval: str) -> str:
+        return f"{ticker}:{interval}:indicator_columns"
+
+    def set_indicator_columns(
+        self, ticker: str, interval: str, columns: Iterable[str]
+    ) -> None:
+        cleaned: list[str] = []
+        for column in columns:
+            label = str(column).strip()
+            if not label:
+                continue
+            if label in cleaned:
+                continue
+            cleaned.append(label)
+        key = self._indicator_columns_key(ticker, interval)
+        self.set_meta(key, cleaned)
+
+    def get_indicator_columns(self, ticker: str, interval: str) -> list[str]:
+        key = self._indicator_columns_key(ticker, interval)
+        raw = self.get_meta(key)
+        if isinstance(raw, list):
+            values: list[str] = []
+            for column in raw:
+                label = str(column).strip()
+                if label:
+                    values.append(label)
+            return values
+        if isinstance(raw, str):
+            return [part.strip() for part in raw.split(",") if part.strip()]
+        return []
+
     # ------------------------------------------------------------------
     # Upsert helpers
     # ------------------------------------------------------------------

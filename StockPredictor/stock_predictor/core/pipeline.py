@@ -202,23 +202,50 @@ class MarketDataETL:
 
         LOGGER.info("Computing technical indicators for %s", self.config.ticker)
         enriched = compute_price_features(price_frame)
-        records: list[dict[str, object]] = []
-        for _, row in enriched.iterrows():
-            for indicator in TECHNICAL_INDICATORS:
-                if indicator not in row:
-                    continue
-                records.append(
-                    {
-                        "Date": row["Date"],
-                        "Indicator": indicator,
-                        "Value": row[indicator],
-                        "Category": "technical",
-                    }
-                )
+        indicator_columns_attr = enriched.attrs.get("indicator_columns")
+        indicator_columns: list[str]
+        if isinstance(indicator_columns_attr, (list, tuple, set)):
+            indicator_columns = [str(column) for column in indicator_columns_attr]
+        else:
+            indicator_columns = []
+        fallback = [
+            column
+            for column in TECHNICAL_INDICATORS
+            if column not in indicator_columns and column in enriched.columns
+        ]
+        indicator_columns.extend(fallback)
+        indicator_columns = [
+            column for column in dict.fromkeys(indicator_columns) if column in enriched.columns
+        ]
+        if not indicator_columns:
+            LOGGER.warning("No indicator columns available to persist for %s", self.config.ticker)
+            self.database.set_indicator_columns(
+                self.config.ticker, self.config.interval, indicator_columns
+            )
+            return 0
+
+        indicator_frame = enriched[["Date", *indicator_columns]].copy()
+        indicator_frame = indicator_frame.dropna(subset=["Date"])
+        melted = indicator_frame.melt(
+            id_vars=["Date"], value_vars=indicator_columns, var_name="Indicator", value_name="Value"
+        )
+        melted["Value"] = pd.to_numeric(melted["Value"], errors="coerce")
+        melted = melted.dropna(subset=["Value"])
+        if melted.empty:
+            self.database.set_indicator_columns(
+                self.config.ticker, self.config.interval, indicator_columns
+            )
+            return 0
+
+        melted["Category"] = "technical"
+        records = melted.to_dict("records")
         inserted = self.database.upsert_indicators(
             ticker=self.config.ticker,
             interval=self.config.interval,
             records=records,
+        )
+        self.database.set_indicator_columns(
+            self.config.ticker, self.config.interval, indicator_columns
         )
         if inserted:
             self.database.set_refresh_timestamp(
