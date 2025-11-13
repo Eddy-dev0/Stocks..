@@ -26,6 +26,17 @@ PRICE_EXACT_COLUMNS = {
 }
 
 
+LEGACY_INDICATOR_COLUMNS = [
+    "Return_1d",
+    "LogReturn_1d",
+    "SMA_5",
+    "SMA_10",
+    "EMA_9",
+    "Volatility_5",
+    "Volume_Change",
+]
+
+
 def _identify_price_columns(df: pd.DataFrame) -> list[str]:
     price_columns: list[str] = []
     for column in df.columns:
@@ -90,7 +101,16 @@ def compute_price_features(price_df: pd.DataFrame) -> pd.DataFrame:
     df = pd.concat([df, indicator_result.dataframe], axis=1)
 
     df = df.ffill().bfill()
-    df.attrs["indicator_columns"] = list(indicator_result.columns)
+    indicator_columns = []
+    seen: set[str] = set()
+    for column in [*LEGACY_INDICATOR_COLUMNS, *indicator_result.columns]:
+        if column not in df.columns:
+            continue
+        if column in seen:
+            continue
+        indicator_columns.append(column)
+        seen.add(column)
+    df.attrs["indicator_columns"] = indicator_columns
     df.attrs["price_columns"] = _identify_price_columns(df)
     return df
 

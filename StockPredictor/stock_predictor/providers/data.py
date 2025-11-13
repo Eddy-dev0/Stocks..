@@ -123,6 +123,18 @@ class DataFetcher:
 
         return self._sources.get(category)
 
+    def get_indicator_columns(self) -> list[str]:
+        """Return the list of indicator columns persisted for the active context."""
+
+        try:
+            columns = self.database.get_indicator_columns(
+                self.config.ticker, self.config.interval
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard around persistence
+            LOGGER.debug("Failed to fetch indicator column metadata: %s", exc)
+            return []
+        return columns
+
     def get_last_updated(self, category: str) -> Optional[datetime]:
         """Return the last refresh timestamp recorded for the given category."""
 

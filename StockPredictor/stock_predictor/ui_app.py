@@ -1227,6 +1227,17 @@ class StockPredictorDesktopApp:
 
     def _collect_indicator_names(self) -> list[str]:
         names: set[str] = set()
+        fetcher = getattr(getattr(self.application, "pipeline", None), "fetcher", None)
+        if fetcher is not None and hasattr(fetcher, "get_indicator_columns"):
+            try:
+                stored_columns = fetcher.get_indicator_columns()
+            except Exception as exc:  # pragma: no cover - defensive for optional stack
+                LOGGER.debug("Failed to load stored indicator column metadata: %s", exc)
+                stored_columns = []
+            for item in stored_columns:
+                label = str(item).strip()
+                if label:
+                    names.add(label)
         metadata = getattr(getattr(self.application, "pipeline", None), "metadata", None)
         category_map: Mapping[str, Any] | None = None
         if isinstance(metadata, Mapping):

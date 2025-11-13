@@ -53,13 +53,13 @@ def _not_implemented_group_builder(name: str):
 
 
 def _technical_group_builder(context: FeatureBuildContext) -> FeatureBuildOutput:
-    block = _build_technical_features(
+    block, metadata = _build_technical_features(
         context.price_df,
         indicator_config=context.technical_indicator_config,
     )
     blocks = [block] if block is not None else []
     status = "executed" if blocks else "skipped_no_data"
-    return FeatureBuildOutput(blocks=blocks, status=status)
+    return FeatureBuildOutput(blocks=blocks, metadata=metadata, status=status)
 
 
 def _elliott_group_builder(context: FeatureBuildContext) -> FeatureBuildOutput:
@@ -403,9 +403,10 @@ def _build_technical_features(
     price_df: pd.DataFrame,
     *,
     indicator_config: Mapping[str, Mapping[str, object]] | None,
-) -> FeatureBlock | None:
+) -> tuple[FeatureBlock | None, dict[str, object]]:
+    metadata: dict[str, object] = {}
     if price_df.empty:
-        return None
+        return None, metadata
 
     df = price_df.sort_values("Date").reset_index(drop=True)
     close = pd.to_numeric(df["Close"], errors="coerce")
@@ -415,6 +416,7 @@ def _build_technical_features(
 
     indicator_result = compute_indicators(df, indicator_config)
     indicator_frame = indicator_result.dataframe.reset_index(drop=True)
+    metadata["indicator_columns"] = list(indicator_result.columns)
 
     feature_frame = pd.DataFrame({"Date": df["Date"].reset_index(drop=True)})
     feature_frame["Return_1d"] = close.pct_change()
@@ -454,7 +456,7 @@ def _build_technical_features(
         if column in combined:
             combined[f"Price_to_EMA_{span}"] = _safe_divide(close, combined[column])
 
-    return FeatureBlock(combined, category="technical")
+    return FeatureBlock(combined, category="technical"), metadata
 
 
 def _get_numeric_series(df: pd.DataFrame, column: str, default: float = np.nan) -> pd.Series:
