@@ -87,6 +87,13 @@ def _normalise_currency_code(value: Any) -> str | None:
 def _safe_float(value: Any) -> float | None:
     """Best-effort conversion used for rendering numeric values."""
 
+    if isinstance(value, pd.Series):
+        # Avoid deprecated implicit conversion from a pandas Series by
+        # extracting a representative scalar first.
+        candidate = value.dropna()
+        if candidate.empty:
+            return None
+        value = candidate.iloc[0]
     try:
         numeric = float(value)
     except (TypeError, ValueError):
@@ -287,6 +294,9 @@ class StockPredictorDesktopApp:
         self.feature_history_converted: pd.DataFrame | None = None
         self.indicator_history_converted: pd.DataFrame | None = None
         self._indicator_selection_cache: set[str] = set()
+        self._indicator_names: list[str] = []
+        self._indicator_user_override = False
+        self.indicator_toggle_all_button: ttk.Button | None = None
         self._indicator_selector_updating = False
         self.indicator_secondary_ax: Axes | None = None
         self.feature_toggle_vars: dict[str, tk.BooleanVar] = {}
@@ -664,7 +674,18 @@ class StockPredictorDesktopApp:
         selector_box = ttk.LabelFrame(sidebar, text="Indicator visibility", padding=8)
         selector_box.grid(row=0, column=0, sticky="nsew")
         selector_box.grid_columnconfigure(0, weight=1)
-        selector_box.grid_rowconfigure(0, weight=1)
+        selector_box.grid_rowconfigure(1, weight=1)
+
+        toggle_frame = ttk.Frame(selector_box)
+        toggle_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        toggle_frame.grid_columnconfigure(0, weight=1)
+        self.indicator_toggle_all_button = ttk.Button(
+            toggle_frame,
+            text="Select all indicators",
+            command=self._on_indicator_toggle_all,
+        )
+        self.indicator_toggle_all_button.grid(row=0, column=0, sticky=tk.W)
+        self.indicator_toggle_all_button.configure(state=tk.DISABLED)
 
         self.indicator_listbox = tk.Listbox(
             selector_box,
@@ -672,11 +693,11 @@ class StockPredictorDesktopApp:
             exportselection=False,
             height=12,
         )
-        self.indicator_listbox.grid(row=0, column=0, sticky="nsew")
+        self.indicator_listbox.grid(row=1, column=0, sticky="nsew")
         selector_scrollbar = ttk.Scrollbar(
             selector_box, orient=tk.VERTICAL, command=self.indicator_listbox.yview
         )
-        selector_scrollbar.grid(row=0, column=1, sticky="ns")
+        selector_scrollbar.grid(row=1, column=1, sticky="ns")
         self.indicator_listbox.configure(yscrollcommand=selector_scrollbar.set)
         self.indicator_listbox.bind("<<ListboxSelect>>", self._on_indicator_selection_changed)
 
@@ -938,6 +959,31 @@ class StockPredictorDesktopApp:
             return
         selections = self._current_indicator_selection()
         self._indicator_selection_cache = set(selections)
+        self._indicator_user_override = True
+        self._update_indicator_toggle_button_state(self._indicator_names, self._indicator_selection_cache)
+        self._update_indicator_chart(selections)
+
+    def _on_indicator_toggle_all(self) -> None:
+        if self._indicator_selector_updating or not hasattr(self, "indicator_listbox"):
+            return
+        names = list(self._indicator_names)
+        if not names:
+            return
+        current = set(self._current_indicator_selection())
+        select_all = len(current) != len(names)
+        self._indicator_selector_updating = True
+        try:
+            if select_all:
+                self.indicator_listbox.selection_set(0, tk.END)
+                selections: set[str] = set(names)
+            else:
+                self.indicator_listbox.selection_clear(0, tk.END)
+                selections = set()
+        finally:
+            self._indicator_selector_updating = False
+        self._indicator_selection_cache = selections
+        self._indicator_user_override = True
+        self._update_indicator_toggle_button_state(names, selections)
         self._update_indicator_chart(selections)
 
     def _current_indicator_selection(self) -> list[str]:
@@ -1006,6 +1052,7 @@ class StockPredictorDesktopApp:
     def _populate_indicator_selector(self, names: list[str], selections: set[str]) -> None:
         if not hasattr(self, "indicator_listbox"):
             return
+        self._indicator_names = list(names)
         self._indicator_selector_updating = True
         try:
             self.indicator_listbox.delete(0, tk.END)
@@ -1015,6 +1062,34 @@ class StockPredictorDesktopApp:
                     self.indicator_listbox.selection_set(index)
         finally:
             self._indicator_selector_updating = False
+        self._update_indicator_toggle_button_state(self._indicator_names, selections)
+
+    def _update_indicator_toggle_button_state(
+        self,
+        names: Iterable[str] | None = None,
+        selections: Iterable[str] | None = None,
+    ) -> None:
+        button = getattr(self, "indicator_toggle_all_button", None)
+        if button is None:
+            return
+        if names is not None:
+            self._indicator_names = list(names)
+        available = list(self._indicator_names)
+        if selections is None:
+            selection_set = set(self._indicator_selection_cache)
+        else:
+            selection_set = set(selections)
+        if available:
+            selection_set &= set(available)
+        if not available:
+            button.configure(text="Select all indicators", state=tk.DISABLED)
+            return
+        button.configure(
+            text="Deselect all indicators"
+            if len(selection_set) == len(available)
+            else "Select all indicators",
+            state=tk.NORMAL,
+        )
 
     def _update_indicator_info_panel(self, indicator_names: list[str]) -> None:
         total = len(indicator_names)
@@ -1106,22 +1181,25 @@ class StockPredictorDesktopApp:
                 subset = subset.copy()
                 if date_col:
                     subset[date_col] = pd.to_datetime(subset[date_col], errors="coerce")
-                    subset = subset.dropna(subset=[date_col]).sort_values(date_col)
-                    index = pd.DatetimeIndex(subset[date_col])
-                else:
-                    index = None
                 values = pd.to_numeric(subset[value_col], errors="coerce")
-                values = values.dropna()
                 if values.empty:
                     return None
-                subset = subset.loc[values.index]
-                if isinstance(index, pd.DatetimeIndex):
-                    index = index[values.index]
-                elif index is None:
+                mask = pd.notna(values)
+                if date_col:
+                    mask &= pd.notna(subset[date_col])
+                subset = subset.loc[mask]
+                values = values.loc[mask]
+                if values.empty:
+                    return None
+                if date_col:
+                    subset = subset.sort_values(date_col)
+                    values = values.loc[subset.index]
+                    index = pd.DatetimeIndex(subset[date_col])
+                else:
                     index = pd.RangeIndex(start=0, stop=len(values))
-                series = pd.Series(values.values, index=index)
+                series = pd.Series(values.to_numpy(), index=index)
                 if isinstance(series.index, pd.DatetimeIndex):
-                    series = series.sort_index()
+                    series = series.loc[~series.index.duplicated(keep="last")].sort_index()
                 return series
         return None
 
@@ -1205,6 +1283,16 @@ class StockPredictorDesktopApp:
                 canvas.draw_idle()
             return
 
+        price_index = pd.DatetimeIndex(price_series.index)
+        if price_index.has_duplicates:
+            unique_mask = ~price_index.duplicated(keep="last")
+            price_series = price_series.loc[unique_mask]
+            price_index = pd.DatetimeIndex(price_series.index)
+        price_series = price_series.loc[price_index].sort_index()
+        price_index = pd.DatetimeIndex(price_series.index)
+        price_start = price_index.min()
+        price_end = price_index.max()
+
         if empty_label is not None:
             empty_label.grid_remove()
         if widget is not None:
@@ -1218,23 +1306,87 @@ class StockPredictorDesktopApp:
         ax.set_title(f"{self.config.ticker} price and indicators")
         ax.grid(True, linestyle="--", alpha=0.3)
 
-        selected_names = list(selections) if selections is not None else list(self._indicator_selection_cache)
-        if not selected_names:
-            selected_names = list(self._indicator_selection_cache)
+        if pd.notna(price_start) and pd.notna(price_end):
+            ax.set_xlim(price_start, price_end)
+
+        def align_indicator_series(series: pd.Series) -> pd.Series | None:
+            if not isinstance(series, pd.Series) or series.empty:
+                return None
+            cleaned = pd.to_numeric(series, errors="coerce")
+            cleaned = cleaned.dropna()
+            if cleaned.empty:
+                return None
+            if isinstance(cleaned.index, pd.DatetimeIndex):
+                index = cleaned.index
+                valid_mask = pd.notna(index)
+                if not valid_mask.all():
+                    cleaned = cleaned.loc[valid_mask]
+                    index = index[valid_mask]
+                try:
+                    index = index.tz_localize(None)
+                except (TypeError, AttributeError, ValueError):
+                    try:
+                        index = index.tz_convert(None)
+                    except Exception:
+                        pass
+                cleaned.index = pd.DatetimeIndex(index)
+                if cleaned.empty:
+                    return None
+                dedup_mask = ~cleaned.index.duplicated(keep="last")
+                if not dedup_mask.all():
+                    cleaned = cleaned.loc[dedup_mask]
+                cleaned = cleaned.sort_index()
+                aligned = cleaned.reindex(price_index).dropna()
+                if aligned.empty:
+                    return None
+                return aligned
+            trimmed = cleaned.copy()
+            if len(trimmed) >= len(price_index):
+                trimmed = trimmed.iloc[-len(price_index):]
+                aligned_index = price_index
+            else:
+                aligned_index = price_index[-len(trimmed):]
+            trimmed = trimmed.copy()
+            trimmed.index = aligned_index
+            return trimmed
+
+        if selections is None:
+            selection_set = set(self._indicator_selection_cache)
+        else:
+            selection_set = {str(name) for name in selections}
+        selected_names: list[str] = []
+        if selection_set:
+            ordered = self._indicator_names or list(selection_set)
+            selected_names = [name for name in ordered if name in selection_set]
+            for name in selection_set:
+                if name not in selected_names:
+                    selected_names.append(name)
+
         for name in selected_names:
             series = self._extract_indicator_series(name)
             if series is None or series.empty:
                 continue
+            aligned_series = align_indicator_series(series)
+            if aligned_series is None or aligned_series.empty:
+                continue
+            aligned_series.name = name
             if self.indicator_secondary_ax is None:
                 self.indicator_secondary_ax = ax.twinx()
                 self.indicator_secondary_ax.set_ylabel("Indicator value")
                 self.indicator_secondary_ax.grid(False)
             self.indicator_secondary_ax.plot(
-                series.index,
-                series.values,
+                aligned_series.index,
+                aligned_series.values,
                 label=name,
                 linestyle="--",
             )
+
+        if (
+            self.indicator_secondary_ax is not None
+            and pd.notna(price_start)
+            and pd.notna(price_end)
+        ):
+            self.indicator_secondary_ax.set_xlim(price_start, price_end)
 
         handles, labels = ax.get_legend_handles_labels()
         if self.indicator_secondary_ax is not None:
@@ -1817,10 +1969,12 @@ class StockPredictorDesktopApp:
         selections = set(self._indicator_selection_cache)
         if selections:
             selections &= set(indicator_names)
-        if not selections:
+        if not selections and not self._indicator_user_override:
             selections.update(indicator_names[: min(3, len(indicator_names))])
         self._populate_indicator_selector(indicator_names, selections)
-        self._indicator_selection_cache = selections
+        self._indicator_selection_cache = set(selections)
+        if not indicator_names:
+            self._indicator_user_override = False
         self._update_indicator_info_panel(indicator_names)
         self._update_indicator_chart(selections)
 
@@ -2132,6 +2286,12 @@ class StockPredictorDesktopApp:
             return 1.0
         pair = self._resolve_currency_pair(target_mode)
         if not pair:
+            base_code = self._currency_code("local")
+            target_code = self._currency_code(target_mode)
+            base_norm = base_code.upper() if isinstance(base_code, str) else None
+            target_norm = target_code.upper() if isinstance(target_code, str) else None
+            if base_norm and target_norm and base_norm == target_norm:
+                return 1.0
             fallback_rate = self._currency_rate(target_mode)
             LOGGER.warning(
                 "No FX pair available for mode '%s'; falling back to stored rate %.6f",
@@ -2219,8 +2379,22 @@ class StockPredictorDesktopApp:
                 return None
             converted = frame.copy()
             numeric_columns: list[str] = []
+            excluded_tokens = {
+                "volume",
+                "volumes",
+                "shares",
+                "sharecount",
+                "openinterest",
+                "contract",
+                "contracts",
+            }
             for column in converted.columns:
                 series = converted[column]
+                name_normalised = re.sub(r"[^a-z0-9]+", "", str(column).lower())
+                if name_normalised and any(token in name_normalised for token in excluded_tokens):
+                    continue
+                if pd.api.types.is_datetime64_any_dtype(series) or pd.api.types.is_timedelta64_dtype(series):
+                    continue
                 if pd.api.types.is_numeric_dtype(series):
                     numeric_columns.append(column)
                     continue
