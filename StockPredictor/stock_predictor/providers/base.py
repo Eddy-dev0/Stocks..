@@ -9,7 +9,7 @@ import os
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
+from typing import Any, Awaitable, Dict, List, Mapping, MutableMapping, Optional, Sequence
 
 try:  # Python 3.11+
     from enum import StrEnum as _BaseStrEnum
@@ -343,13 +343,23 @@ class ProviderRegistry:
         *,
         providers: Sequence[str] | None = None,
     ) -> list[ProviderResult]:
-        selected: Iterable[BaseProvider]
         if providers:
-            selected = (self.get(name) for name in providers)
+            selected: list[BaseProvider] = [self.get(name) for name in providers]
         else:
             selected = self.providers_for(request.dataset_type)
 
-        tasks = [provider.fetch(request) for provider in selected]
+        tasks: list[Awaitable[ProviderResult]] = []
+        for provider in selected:
+            if (
+                provider.name in {"csv_loader", "parquet_loader"}
+                and not request.params.get("path")
+            ):
+                LOGGER.info(
+                    "Skipping provider %s: missing required 'path' parameter",
+                    provider.name,
+                )
+                continue
+            tasks.append(provider.fetch(request))
         if not tasks:
             return []
         results = await asyncio.gather(*tasks, return_exceptions=True)
