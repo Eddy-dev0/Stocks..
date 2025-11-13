@@ -32,6 +32,7 @@ from stock_predictor.providers.base import (
     EconomicIndicator,
     NewsArticle,
     PriceBar,
+    ProviderConfigurationError,
     ProviderRequest,
     ProviderResult,
     SentimentSignal,
@@ -75,6 +76,29 @@ MACRO_SYMBOLS: dict[str, str] = {
     "^GSPC": "S&P 500",
     "^VIX": "CBOE Volatility Index",
     "DX-Y.NYB": "US Dollar Index",
+}
+
+
+SOURCE_DESCRIPTION_OVERRIDES: dict[str, str] = {
+    "alpha_vantage": "Alpha Vantage",
+    "csv_loader": "CSV Price Loader",
+    "database": "Local database cache",
+    "finnhub": "Finnhub",
+    "fred": "Federal Reserve Economic Data (FRED)",
+    "gdelt": "GDELT Project",
+    "local": "Local computation",
+    "newsapi": "NewsAPI.org",
+    "placeholder": "Placeholder data",
+    "polygon": "Polygon.io",
+    "parquet_loader": "Parquet Price Loader",
+    "quandl": "Quandl",
+    "reddit": "Reddit",
+    "stooq": "Stooq",
+    "tiingo": "Tiingo",
+    "twitter": "Twitter",
+    "unknown": "Unknown provider",
+    "yahoo_finance": "Yahoo Finance",
+    "yfinance": "Yahoo Finance (yfinance)",
 }
 
 
@@ -1054,16 +1078,58 @@ class MarketDataETL:
                 )
         return records
 
-    def list_sources(self) -> list[str]:
-        providers: set[str] = set()
-        for dataset_providers in self._source_log.values():
-            providers.update(dataset_providers)
-        return sorted(providers)
+    def list_sources(self) -> list[dict[str, object]]:
+        """Return structured metadata describing the data sources consulted."""
+
+        provider_datasets: dict[str, set[str]] = {}
+        for dataset, dataset_providers in self._source_log.items():
+            for provider in dataset_providers:
+                provider_id = provider.strip()
+                if not provider_id:
+                    continue
+                provider_datasets.setdefault(provider_id, set()).add(dataset)
+
+        entries: list[dict[str, object]] = []
+        for provider_id in sorted(provider_datasets):
+            datasets = provider_datasets[provider_id]
+            entry: dict[str, object] = {
+                "id": provider_id,
+                "description": self._describe_source(provider_id),
+            }
+            if datasets:
+                entry["datasets"] = sorted(datasets)
+            entries.append(entry)
+        return entries
 
     def _record_source(self, dataset: str, provider: str) -> None:
         if not provider:
             return
         self._source_log[dataset].add(provider)
+
+    def _describe_source(self, provider_id: str) -> str:
+        override = SOURCE_DESCRIPTION_OVERRIDES.get(provider_id)
+        if override:
+            return override
+        try:
+            provider = self._registry.get(provider_id)
+        except ProviderConfigurationError:
+            provider = None
+        if provider is not None:
+            class_name = provider.__class__.__name__
+            if class_name.endswith("Provider"):
+                class_name = class_name[:-8]
+            return self._humanize_label(class_name)
+        return self._humanize_label(provider_id)
+
+    @staticmethod
+    def _humanize_label(raw: str) -> str:
+        cleaned = (raw or "").replace("_", " ").strip()
+        if not cleaned:
+            return "Unknown source"
+        parts = [part for part in cleaned.split(" ") if part]
+        if not parts:
+            return "Unknown source"
+        return " ".join(part.capitalize() for part in parts)
 
     @staticmethod
     def _normalize_date(value: Any) -> date | None:

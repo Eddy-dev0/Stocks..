@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from numbers import Real
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import joblib
 import numpy as np
@@ -1173,7 +1173,7 @@ class StockPredictorAI:
             horizon_value,
         )
         sources_raw = self.metadata.get("data_sources") or self.fetcher.get_data_sources()
-        sources = list(sources_raw) if isinstance(sources_raw, (list, tuple, set)) else []
+        sources = self._render_source_descriptions(sources_raw)
         if not sources:
             sources = [f"Database cache: price history for {self.config.ticker}."]
 
@@ -1684,6 +1684,51 @@ class StockPredictorAI:
                 metrics[key] = numeric
 
         return metrics
+
+    @staticmethod
+    def _render_source_descriptions(sources: Any) -> list[str]:
+        if sources is None:
+            return []
+        if isinstance(sources, Mapping):
+            iterable = sources.values()
+        elif isinstance(sources, Iterable) and not isinstance(sources, (str, bytes)):
+            iterable = sources
+        else:
+            iterable = [sources]
+
+        descriptions: list[str] = []
+        seen: set[str] = set()
+        for entry in iterable:
+            label: Any = None
+            provider_id: Any = None
+            if isinstance(entry, Mapping):
+                provider_id = entry.get("id") or entry.get("provider") or entry.get("provider_id")
+                label = entry.get("description") or entry.get("label")
+            else:
+                provider_id = getattr(entry, "provider_id", None) or getattr(entry, "id", None)
+                label = getattr(entry, "description", None)
+            if label is None and isinstance(entry, str):
+                label = entry
+            if label is None and provider_id is not None:
+                label = StockPredictorAI._humanize_source_id(provider_id)
+            if label is None and entry is not None:
+                label = str(entry)
+            label_str = str(label).strip() if label is not None else ""
+            if not label_str or label_str in seen:
+                continue
+            seen.add(label_str)
+            descriptions.append(label_str)
+        return descriptions
+
+    @staticmethod
+    def _humanize_source_id(provider_id: Any) -> str:
+        text = str(provider_id or "").replace("_", " ").strip()
+        if not text:
+            return "Unknown source"
+        parts = [part for part in text.split(" ") if part]
+        if not parts:
+            return "Unknown source"
+        return " ".join(part.capitalize() for part in parts)
 
     @staticmethod
     def _categorize_feature_name(name: str) -> str:

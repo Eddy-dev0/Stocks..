@@ -79,6 +79,9 @@ CURRENCY_CODE_TO_SYMBOL: dict[str, str] = {
 }
 
 
+NON_REMOTE_PROVIDER_IDS = {"database", "local", "placeholder", "unknown"}
+
+
 def _normalise_currency_code(value: Any) -> str | None:
     """Return a normalised ISO currency code when possible."""
 
@@ -1320,20 +1323,51 @@ class StockPredictorDesktopApp:
 
         pipeline = getattr(self.application, "pipeline", None)
         metadata = getattr(pipeline, "metadata", None)
-        sources: list[str] = []
+        source_entries: list[Any] = []
         if isinstance(metadata, Mapping):
             raw_sources = metadata.get("data_sources")
-            if isinstance(raw_sources, (list, tuple, set)):
-                sources = [str(item).strip() for item in raw_sources if str(item).strip()]
-        if not sources and getattr(getattr(pipeline, "fetcher", None), "get_data_sources", None):
+            if isinstance(raw_sources, Iterable) and not isinstance(raw_sources, (str, bytes)):
+                source_entries.extend(list(raw_sources))
+        if not source_entries and getattr(getattr(pipeline, "fetcher", None), "get_data_sources", None):
             try:
                 fetched = pipeline.fetcher.get_data_sources()
             except Exception:  # pragma: no cover - defensive network call
                 fetched = []
-            if isinstance(fetched, (list, tuple, set)):
-                sources = [str(item).strip() for item in fetched if str(item).strip()]
-        unique_sources = sorted({source for source in sources if source})
-        self.indicator_info_vars["data_sources"].set(str(len(unique_sources)))
+            if isinstance(fetched, Iterable) and not isinstance(fetched, (str, bytes)):
+                source_entries.extend(list(fetched))
+
+        provider_ids: set[str] = set()
+        for entry in source_entries:
+            candidate: Any = None
+            if isinstance(entry, Mapping):
+                candidate = (
+                    entry.get("id")
+                    or entry.get("provider")
+                    or entry.get("provider_id")
+                )
+            else:
+                candidate = getattr(entry, "provider_id", None) or getattr(entry, "id", None)
+            if candidate is None and isinstance(entry, str):
+                candidate = entry
+            if candidate is None and entry is not None and not isinstance(entry, (str, bytes)):
+                candidate = str(entry)
+            if candidate is None:
+                continue
+            normalized = str(candidate).strip().lower()
+            if normalized and normalized not in NON_REMOTE_PROVIDER_IDS:
+                provider_ids.add(normalized)
+
+        if not provider_ids and source_entries:
+            fallback = {
+                value
+                for entry in source_entries
+                if isinstance(entry, str)
+                and (value := str(entry).strip().lower())
+                and value not in NON_REMOTE_PROVIDER_IDS
+            }
+            provider_ids.update(fallback)
+
+        self.indicator_info_vars["data_sources"].set(str(len(provider_ids)))
 
         confidence_display = self._compute_confidence_metric()
         self.indicator_info_vars["confidence"].set(confidence_display)
