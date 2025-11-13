@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import tkinter as tk
+from collections import defaultdict
 from dataclasses import dataclass
 from tkinter import messagebox, ttk
 from typing import Any, Callable, Iterable, Mapping
@@ -15,6 +16,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from pandas.tseries.offsets import BDay
+from matplotlib import colors as mcolors
 from matplotlib import style as mpl_style
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
@@ -307,6 +309,8 @@ class StockPredictorDesktopApp:
         self.indicator_toggle_all_button: ttk.Button | None = None
         self._indicator_selector_updating = False
         self.indicator_secondary_ax: Axes | None = None
+        self._indicator_extra_axes: list[Axes] = []
+        self._indicator_family_colors: dict[str, str] = {}
         self.feature_toggle_vars: dict[str, tk.BooleanVar] = {}
         self.forecast_date_var = tk.StringVar(value="Forecast date: —")
         self.current_forecast_date: pd.Timestamp | None = None
@@ -1460,6 +1464,24 @@ class StockPredictorDesktopApp:
                 return series
         return None
 
+    def _indicator_family_color(self, family: str) -> str:
+        palette = (
+            "tab:orange",
+            "tab:green",
+            "tab:red",
+            "tab:purple",
+            "tab:brown",
+            "tab:pink",
+            "tab:olive",
+            "tab:cyan",
+            "tab:gray",
+            "tab:blue",
+        )
+        if family not in self._indicator_family_colors:
+            index = len(self._indicator_family_colors) % len(palette)
+            self._indicator_family_colors[family] = palette[index]
+        return self._indicator_family_colors[family]
+
     def _update_indicator_chart(self, selections: Iterable[str] | None = None) -> None:
         if not hasattr(self, "indicator_price_ax"):
             return
@@ -1481,6 +1503,13 @@ class StockPredictorDesktopApp:
             except Exception:  # pragma: no cover - defensive cleanup
                 pass
             self.indicator_secondary_ax = None
+        if getattr(self, "_indicator_extra_axes", None):
+            for extra_ax in list(self._indicator_extra_axes):
+                try:
+                    extra_ax.remove()
+                except Exception:  # pragma: no cover - defensive cleanup
+                    pass
+            self._indicator_extra_axes = []
 
         price_frame = (
             self.price_history_converted
@@ -1555,7 +1584,9 @@ class StockPredictorDesktopApp:
         if widget is not None:
             widget.grid()
 
-        ax.plot(price_series.index, price_series.values, label="Price", color="tab:blue")
+        (price_line,) = ax.plot(
+            price_series.index, price_series.values, label="Price", color="tab:blue"
+        )
         ylabel = "Price"
         if self.currency_symbol:
             ylabel = f"Price ({self.currency_symbol})"
@@ -1619,39 +1650,350 @@ class StockPredictorDesktopApp:
                 if name not in selected_names:
                     selected_names.append(name)
 
+        legend_entries: dict[str, Any] = {}
+        legend_order: list[str] = []
+
+        def register_legend(name: str, artist: Any | None) -> None:
+            if artist is None:
+                return
+            if name not in legend_entries:
+                legend_entries[name] = artist
+                legend_order.append(name)
+
+        register_legend("Price", price_line)
+
+        pipeline = getattr(self.application, "pipeline", None)
+        metadata = getattr(pipeline, "metadata", None)
+        normalized_categories: dict[str, str] = {}
+        if isinstance(metadata, Mapping):
+            raw_categories = metadata.get("feature_categories")
+            if isinstance(raw_categories, Mapping):
+                normalized_categories = {
+                    str(key).strip().lower(): str(value).strip()
+                    for key, value in raw_categories.items()
+                }
+
+        @dataclass(slots=True)
+        class IndicatorRenderItem:
+            name: str
+            family: str
+            role: str
+            style: str
+            axis_role: str
+            series: pd.Series
+            color: str
+
+        oscillator_keywords = (
+            "rsi",
+            "stoch",
+            "momentum",
+            "osc",
+            "adx",
+            "di",
+            "obv",
+            "roc",
+            "ppo",
+            "mfi",
+            "cci",
+        )
+
+        def classify_indicator(name: str, category_label: str) -> tuple[str, str, str, str]:
+            lower = name.lower()
+            category_lower = category_label.lower()
+
+            if "macd" in lower:
+                period_match = re.search(r"(\d+)", lower)
+                family = f"macd_{period_match.group(1)}" if period_match else "macd"
+                if "hist" in lower or "histogram" in lower:
+                    return family, "histogram", "histogram", "oscillator"
+                return family, "macd_line", "line", "oscillator"
+
+            if "bollinger" in lower or lower.startswith("bb_") or "bb " in lower:
+                period_match = re.search(r"(\d+)", lower)
+                family = (
+                    f"bollinger_{period_match.group(1)}"
+                    if period_match
+                    else "bollinger"
+                )
+                if "bandwidth" in lower or "percent" in lower:
+                    return family, "derived", "line", "oscillator"
+                if any(token in lower for token in ("upper", "high", "top")):
+                    return family, "upper", "band", "price"
+                if any(token in lower for token in ("lower", "low", "bottom")):
+                    return family, "lower", "band", "price"
+                if any(token in lower for token in ("middle", "mid")):
+                    return family, "middle", "line", "price"
+                return family, "bollinger", "line", "price"
+
+            if "supertrend" in lower:
+                period_match = re.search(r"(\d+)", lower)
+                family = (
+                    f"supertrend_{period_match.group(1)}"
+                    if period_match
+                    else "supertrend"
+                )
+                if "direction" in lower:
+                    return family, "direction", "zone", "price"
+                return family, "trend", "zone", "price"
+
+            if "volume" in lower:
+                return name, "volume", "line", "indicator"
+
+            if any(
+                token in lower
+                for token in ("ema", "sma", "hma", "wma", "vwma", "moving_average")
+            ) or lower.endswith("_ma"):
+                return name, "average", "line", "price"
+
+            if (
+                "oscillator" in category_lower
+                or any(token in lower for token in oscillator_keywords)
+            ):
+                return name, "oscillator", "line", "oscillator"
+
+            if "atr" in lower or "volatility" in category_lower:
+                return name, "volatility", "line", "indicator"
+
+            return name, "value", "line", "indicator"
+
+        families: dict[str, list[IndicatorRenderItem]] = defaultdict(list)
+        missing_names: set[str] = set()
+
         for name in selected_names:
             series = self._extract_indicator_series(name)
             if series is None or series.empty:
+                missing_names.add(name)
                 continue
             aligned_series = align_indicator_series(series)
             if aligned_series is None or aligned_series.empty:
+                missing_names.add(name)
                 continue
             aligned_series.name = name
-            if self.indicator_secondary_ax is None:
-                self.indicator_secondary_ax = ax.twinx()
-                self.indicator_secondary_ax.set_ylabel("Indicator value")
-                self.indicator_secondary_ax.grid(False)
-            self.indicator_secondary_ax.plot(
-                aligned_series.index,
-                aligned_series.values,
-                label=name,
-                linestyle="--",
+            category_label = normalized_categories.get(name.lower(), "")
+            family, role, style, axis_role = classify_indicator(name, category_label)
+            color = self._indicator_family_color(family)
+            families[family].append(
+                IndicatorRenderItem(
+                    name=name,
+                    family=family,
+                    role=role,
+                    style=style,
+                    axis_role=axis_role,
+                    series=aligned_series,
+                    color=color,
+                )
             )
 
-        if (
-            self.indicator_secondary_ax is not None
-            and pd.notna(price_start)
-            and pd.notna(price_end)
-        ):
-            self.indicator_secondary_ax.set_xlim(price_start, price_end)
+        axes_by_role: dict[str, Axes] = {"price": ax}
+        oscillator_zero_added = False
 
-        handles, labels = ax.get_legend_handles_labels()
-        if self.indicator_secondary_ax is not None:
-            sec_handles, sec_labels = self.indicator_secondary_ax.get_legend_handles_labels()
-            handles += sec_handles
-            labels += sec_labels
-        if handles:
-            ax.legend(handles, labels, loc="best")
+        def blend_color(base: str, target: str, weight: float, *, alpha: float | None = None) -> tuple[float, float, float, float]:
+            weight = min(max(weight, 0.0), 1.0)
+            base_rgb = np.array(mcolors.to_rgb(base))
+            target_rgb = np.array(mcolors.to_rgb(target))
+            mixed = (1 - weight) * base_rgb + weight * target_rgb
+            rgba = (*mixed, 1.0)
+            if alpha is not None:
+                rgba = (rgba[0], rgba[1], rgba[2], alpha)
+            return rgba
+
+        def get_axis(role: str) -> Axes:
+            nonlocal oscillator_zero_added
+            if role == "price":
+                return ax
+            if role == "indicator":
+                indicator_ax = axes_by_role.get("indicator")
+                if indicator_ax is None:
+                    indicator_ax = ax.twinx()
+                    indicator_ax.set_ylabel("Indicator value")
+                    indicator_ax.grid(False)
+                    axes_by_role["indicator"] = indicator_ax
+                    self._indicator_extra_axes.append(indicator_ax)
+                    self.indicator_secondary_ax = indicator_ax
+                    if "oscillator" in axes_by_role:
+                        axes_by_role["oscillator"].spines["right"].set_position(("axes", 1.1))
+                return indicator_ax
+            if role == "oscillator":
+                oscillator_ax = axes_by_role.get("oscillator")
+                if oscillator_ax is None:
+                    oscillator_ax = ax.twinx()
+                    oscillator_ax.set_ylabel("Oscillator value")
+                    oscillator_ax.grid(False)
+                    axes_by_role["oscillator"] = oscillator_ax
+                    self._indicator_extra_axes.append(oscillator_ax)
+                    if "indicator" in axes_by_role:
+                        oscillator_ax.spines["right"].set_position(("axes", 1.1))
+                    else:
+                        oscillator_ax.spines["right"].set_position(("axes", 1.0))
+                if not oscillator_zero_added:
+                    oscillator_ax.axhline(0, color="#808080", linestyle=":", linewidth=0.8, alpha=0.6)
+                    oscillator_zero_added = True
+                return oscillator_ax
+            return get_axis("indicator")
+
+        for family, items in families.items():
+            plotted: set[str] = set()
+
+            band_members = [item for item in items if item.style == "band"]
+            if band_members:
+                upper = next((item for item in band_members if item.role == "upper"), None)
+                lower = next((item for item in band_members if item.role == "lower"), None)
+                axis = get_axis("price")
+                if upper is not None and lower is not None:
+                    aligned_upper, aligned_lower = upper.series.align(lower.series, join="inner")
+                    aligned_upper = aligned_upper.dropna()
+                    aligned_lower = aligned_lower.dropna()
+                    common_index = aligned_upper.index.intersection(aligned_lower.index)
+                    if not common_index.empty:
+                        axis.fill_between(
+                            common_index,
+                            aligned_upper.reindex(common_index),
+                            aligned_lower.reindex(common_index),
+                            color=blend_color(upper.color, "white", 0.5, alpha=0.15),
+                            label="_nolegend_",
+                        )
+                    for member in (upper, lower):
+                        line, = axis.plot(
+                            member.series.index,
+                            member.series.values,
+                            color=member.color,
+                            linestyle="--",
+                            label=member.name,
+                        )
+                        register_legend(member.name, line)
+                        plotted.add(member.name)
+                else:
+                    for member in band_members:
+                        line, = axis.plot(
+                            member.series.index,
+                            member.series.values,
+                            color=member.color,
+                            linestyle="--",
+                            label=member.name,
+                        )
+                        register_legend(member.name, line)
+                        plotted.add(member.name)
+
+            trend_member = next((item for item in items if item.role == "trend"), None)
+            direction_member = next((item for item in items if item.role == "direction"), None)
+            if trend_member is not None:
+                axis = get_axis("price")
+                line, = axis.plot(
+                    trend_member.series.index,
+                    trend_member.series.values,
+                    color=trend_member.color,
+                    linestyle="--",
+                    label=trend_member.name,
+                )
+                register_legend(trend_member.name, line)
+                plotted.add(trend_member.name)
+                if direction_member is not None:
+                    direction_series = direction_member.series.reindex(trend_member.series.index)
+                    price_aligned = price_series.reindex(trend_member.series.index)
+                    zone_frame = pd.DataFrame(
+                        {
+                            "trend": trend_member.series,
+                            "direction": direction_series,
+                            "price": price_aligned,
+                        }
+                    ).dropna()
+                    if not zone_frame.empty:
+                        bullish_mask = zone_frame["direction"] >= 0
+                        bearish_mask = zone_frame["direction"] < 0
+                        bullish_fill = axis.fill_between(
+                            zone_frame.index,
+                            zone_frame["price"],
+                            zone_frame["trend"],
+                            where=bullish_mask,
+                            color=blend_color(direction_member.color, "white", 0.4, alpha=0.18),
+                            interpolate=True,
+                            label=direction_member.name,
+                        )
+                        axis.fill_between(
+                            zone_frame.index,
+                            zone_frame["price"],
+                            zone_frame["trend"],
+                            where=bearish_mask,
+                            color=blend_color(direction_member.color, "black", 0.25, alpha=0.18),
+                            interpolate=True,
+                            label="_nolegend_",
+                        )
+                        register_legend(direction_member.name, bullish_fill)
+                        plotted.add(direction_member.name)
+
+            for item in items:
+                if item.name in plotted:
+                    continue
+                axis = get_axis(item.axis_role)
+                if item.style == "histogram":
+                    x_values = item.series.index
+                    if len(x_values) > 1:
+                        numeric_index = date2num(x_values.to_pydatetime())
+                        width = float(np.diff(numeric_index).mean()) * 0.8
+                    else:
+                        width = 0.6
+                    positive = item.series[item.series >= 0]
+                    negative = item.series[item.series < 0]
+                    if not positive.empty:
+                        axis.bar(
+                            positive.index,
+                            positive.values,
+                            width=width,
+                            color=blend_color(item.color, "white", 0.25, alpha=0.65),
+                            align="center",
+                        )
+                    if not negative.empty:
+                        axis.bar(
+                            negative.index,
+                            negative.values,
+                            width=width,
+                            color=blend_color(item.color, "black", 0.3, alpha=0.65),
+                            align="center",
+                        )
+                    legend_patch = Rectangle(
+                        (0, 0),
+                        1,
+                        1,
+                        facecolor=blend_color(item.color, "white", 0.25, alpha=0.8),
+                        edgecolor="none",
+                    )
+                    register_legend(item.name, legend_patch)
+                else:
+                    linestyle = "--" if item.axis_role != "price" else "-"
+                    line, = axis.plot(
+                        item.series.index,
+                        item.series.values,
+                        color=item.color,
+                        linestyle=linestyle,
+                        label=item.name,
+                    )
+                    register_legend(item.name, line)
+
+        if pd.notna(price_start) and pd.notna(price_end):
+            for axis_obj in axes_by_role.values():
+                axis_obj.set_xlim(price_start, price_end)
+
+        if "indicator" not in axes_by_role and "oscillator" in axes_by_role:
+            self.indicator_secondary_ax = axes_by_role["oscillator"]
+
+        if legend_order:
+            handles = [legend_entries[label] for label in legend_order]
+            ax.legend(handles, legend_order, loc="best")
+
+        if missing_names:
+            self._indicator_selection_cache.difference_update(missing_names)
+            if hasattr(self, "indicator_listbox"):
+                self._indicator_selector_updating = True
+                try:
+                    values = self.indicator_listbox.get(0, tk.END)
+                    for index, value in enumerate(values):
+                        if value in missing_names:
+                            self.indicator_listbox.selection_clear(index)
+                finally:
+                    self._indicator_selector_updating = False
+            self._update_indicator_toggle_button_state(
+                self._indicator_names, self._indicator_selection_cache
+            )
 
         ax.set_xlabel("Date")
         ax.xaxis.set_major_formatter(DateFormatter("%b-%Y"))
