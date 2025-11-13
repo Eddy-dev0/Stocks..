@@ -66,6 +66,21 @@ CURRENCY_SYMBOL_TO_CODE: dict[str, str] = {
 }
 
 
+CURRENCY_CODE_TO_SYMBOL: dict[str, str] = {
+    code: symbol for symbol, code in CURRENCY_SYMBOL_TO_CODE.items()
+}
+
+
+def _normalise_currency_code(value: Any) -> str | None:
+    """Return a normalised ISO currency code when possible."""
+
+    if isinstance(value, str):
+        candidate = value.strip().upper()
+        if re.fullmatch(r"[A-Z]{3}", candidate):
+            return candidate
+    return None
+
+
 def _safe_float(value: Any) -> float | None:
     """Best-effort conversion used for rendering numeric values."""
 
@@ -230,14 +245,16 @@ class StockPredictorDesktopApp:
         base_symbol = _detect_currency_symbol(base_currency, fallback="$")
         self.currency_profiles: dict[str, dict[str, str]] = {
             "local": {"label": base_currency, "symbol": base_symbol.strip()},
-            "usd": {"label": "USD $", "symbol": "$"},
-            "eur": {"label": "EUR €", "symbol": "€"},
+            "usd": {"label": "USD $", "symbol": "$", "code": "USD"},
+            "eur": {"label": "EUR €", "symbol": "€", "code": "EUR"},
         }
         self.currency_rates: dict[str, float] = {
             "local": 1.0,
             "usd": usd_rate,
             "eur": 1.0,
         }
+        self._suspend_rate_updates = False
+        self._initialise_currency_profile()
         self.currency_mode: str = "local"
         self.currency_symbol: str = self._currency_symbol("local")
 
@@ -274,7 +291,6 @@ class StockPredictorDesktopApp:
         self.currency_mode_var = tk.StringVar(value="local")
         self.currency_button_text = tk.StringVar(value=self.currency_symbol)
         self.currency_rate_var = tk.StringVar(value=f"{self._currency_rate('usd'):.4f}")
-        self._suspend_rate_updates = False
 
         self.currency_choice_map = {"Local": "local", "USD": "usd", "EUR": "eur"}
         self.currency_display_map = {value: key for key, value in self.currency_choice_map.items()}
@@ -1028,9 +1044,10 @@ class StockPredictorDesktopApp:
         self.feature_history = feature_history if isinstance(feature_history, pd.DataFrame) else None
         self.price_history = price_history if isinstance(price_history, pd.DataFrame) else None
         self.indicator_history = indicator_history if isinstance(indicator_history, pd.DataFrame) else None
+        self._update_local_currency_profile(self.price_history)
         self._sync_horizon_from_prediction(self.current_prediction)
         self.market_holidays = self._resolve_market_holidays(self.current_prediction)
-        self._apply_currency(self._currency_rate())
+        self._apply_currency(mode=self.currency_mode)
         self._update_forecast_label(self.current_prediction.get("target_date"))
         self._update_metrics()
         self._update_price_chart()
@@ -1512,6 +1529,140 @@ class StockPredictorDesktopApp:
         if not overview_refreshed and hasattr(self, "pnl_label"):
             self._recompute_pnl()
 
+    def _initialise_currency_profile(self) -> None:
+        detected_code = self._detect_local_currency_code()
+        if not detected_code:
+            detected_code = self._extract_currency_code(
+                self.currency_profiles.get("local"), mode="local"
+            )
+        if detected_code:
+            self._set_local_currency_code(detected_code)
+
+    def _detect_local_currency_code(self) -> str | None:
+        explicit = _normalise_currency_code(
+            os.environ.get("STOCK_PREDICTOR_UI_BASE_CURRENCY_CODE")
+        )
+        if explicit:
+            return explicit
+
+        pipeline = getattr(self.application, "pipeline", None)
+        metadata = getattr(pipeline, "metadata", None)
+        if isinstance(metadata, Mapping):
+            for key in ("price_currency", "currency", "financial_currency", "quote_currency"):
+                candidate = _normalise_currency_code(metadata.get(key))
+                if candidate:
+                    return candidate
+
+        code = self._infer_currency_from_frame(getattr(self, "price_history", None))
+        if code:
+            return code
+
+        fetcher = getattr(pipeline, "fetcher", None)
+        if fetcher and hasattr(fetcher, "fetch_price_data"):
+            try:
+                cached_prices = fetcher.fetch_price_data(force=False)
+            except Exception as exc:  # pragma: no cover - cached data optional
+                LOGGER.debug(
+                    "Unable to retrieve cached price data for currency detection: %s",
+                    exc,
+                )
+            else:
+                code = self._infer_currency_from_frame(cached_prices)
+                if code:
+                    return code
+
+        try:
+            ticker = yf.Ticker(self.config.ticker)
+            fast_info = getattr(ticker, "fast_info", None)
+            if fast_info:
+                if isinstance(fast_info, Mapping):
+                    code = _normalise_currency_code(
+                        fast_info.get("currency") or fast_info.get("quote_currency")
+                    )
+                else:
+                    code = _normalise_currency_code(getattr(fast_info, "currency", None))
+                if code:
+                    return code
+            info = getattr(ticker, "info", None)
+            if isinstance(info, Mapping):
+                for key in ("currency", "financialCurrency", "quoteCurrency"):
+                    code = _normalise_currency_code(info.get(key))
+                    if code:
+                        return code
+        except Exception as exc:  # pragma: no cover - yfinance metadata optional
+            LOGGER.debug("Failed to resolve ticker currency via yfinance: %s", exc)
+
+        return None
+
+    @staticmethod
+    def _infer_currency_from_frame(frame: pd.DataFrame | None) -> str | None:
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            return None
+        if hasattr(frame, "attrs"):
+            for key in ("currency", "Currency"):
+                code = _normalise_currency_code(frame.attrs.get(key))
+                if code:
+                    return code
+        for column in ("Currency", "currency", "CURRENCY"):
+            if column in frame.columns:
+                series = frame[column].dropna()
+                if not series.empty:
+                    code = _normalise_currency_code(series.iloc[0])
+                    if code:
+                        return code
+        return None
+
+    def _set_local_currency_code(self, code: str) -> None:
+        normalised = _normalise_currency_code(code)
+        if not normalised:
+            return
+        profile = self.currency_profiles.setdefault("local", {})
+        previous = _normalise_currency_code(profile.get("code"))
+        if previous == normalised:
+            return
+        profile["code"] = normalised
+        label = str(profile.get("label") or "")
+        if not label.strip() or label.strip().lower() == "local":
+            profile["label"] = normalised
+        symbol = str(profile.get("symbol") or "").strip()
+        if not symbol:
+            profile["symbol"] = CURRENCY_CODE_TO_SYMBOL.get(normalised, symbol)
+        LOGGER.info("Detected local currency code: %s", normalised)
+        if getattr(self, "currency_mode", "local") == "local":
+            self.currency_symbol = self._currency_symbol("local")
+            if hasattr(self, "currency_button_text"):
+                display = self.currency_symbol or self._currency_label("local")
+                self.currency_button_text.set(display)
+
+    def _update_local_currency_profile(self, price_history: pd.DataFrame | None) -> None:
+        code = self._infer_currency_from_frame(price_history)
+        if code:
+            self._set_local_currency_code(code)
+
+    def _extract_currency_code(
+        self, profile: Mapping[str, Any] | None, *, mode: str | None = None
+    ) -> str | None:
+        if not isinstance(profile, Mapping):
+            return None
+        code = _normalise_currency_code(profile.get("code"))
+        if code:
+            return code
+        label = str(profile.get("label") or "")
+        match = re.search(r"\b([A-Z]{3})\b", label.upper())
+        if match:
+            return match.group(1)
+        symbol = str(profile.get("symbol") or "").strip()
+        if not symbol:
+            symbol = _detect_currency_symbol(label, fallback="")
+        if symbol:
+            mapped = CURRENCY_SYMBOL_TO_CODE.get(symbol)
+            if mapped:
+                return mapped
+        fallback_map = {"usd": "USD", "eur": "EUR"}
+        if mode:
+            return fallback_map.get(mode.lower())
+        return None
+
     def _currency_label(self, mode: str | None = None) -> str:
         profile = self.currency_profiles.get(mode or self.currency_mode, {})
         return str(profile.get("label") or "")
@@ -1545,19 +1696,15 @@ class StockPredictorDesktopApp:
 
     def _currency_code(self, mode: str) -> str | None:
         profile = self.currency_profiles.get(mode, {})
-        label = str(profile.get("label") or "")
-        match = re.search(r"\b([A-Z]{3})\b", label.upper())
-        if match:
-            return match.group(1)
-        symbol = str(profile.get("symbol") or "").strip()
-        if not symbol:
-            symbol = _detect_currency_symbol(label, fallback="")
-        if symbol:
-            code = CURRENCY_SYMBOL_TO_CODE.get(symbol)
-            if code:
-                return code
-        fallback_map = {"usd": "USD", "eur": "EUR"}
-        return fallback_map.get(mode)
+        code = self._extract_currency_code(profile, mode=mode)
+        if code:
+            return code
+        if mode == "local":
+            detected = self._detect_local_currency_code()
+            if detected:
+                self._set_local_currency_code(detected)
+                return detected
+        return None
 
     def _resolve_currency_pair(self, target_mode: str) -> str | None:
         if target_mode == "local":
@@ -1652,7 +1799,12 @@ class StockPredictorDesktopApp:
             self._set_status(f"FX rate automatically updated to {rate:.4f}.")
         return rate
 
-    def _apply_currency(self, rate: float) -> None:
+    def _apply_currency(self, rate: float | None = None, *, mode: str | None = None) -> None:
+        target_mode = mode or self.currency_mode
+        resolved_rate = float(rate) if rate is not None else self._currency_rate(target_mode)
+        if resolved_rate <= 0:
+            resolved_rate = 1.0
+
         def _convert_frame(frame: pd.DataFrame | None) -> pd.DataFrame | None:
             if not isinstance(frame, pd.DataFrame) or frame.empty:
                 return None
@@ -1673,7 +1825,7 @@ class StockPredictorDesktopApp:
                 numeric_columns.append(column)
             if numeric_columns:
                 converted.loc[:, numeric_columns] = (
-                    converted.loc[:, numeric_columns].astype(float) * float(rate)
+                    converted.loc[:, numeric_columns].astype(float) * float(resolved_rate)
                 )
             return converted
 
@@ -1683,18 +1835,19 @@ class StockPredictorDesktopApp:
         self.indicator_history_converted = _convert_frame(self.indicator_history)
 
     def _on_currency_changed(self, mode: str, rate: float) -> None:
-        self._apply_currency(rate)
+        self._apply_currency(rate, mode=mode)
         self._refresh_numeric_views()
 
     def _on_fx_rate_changed(self, mode: str, rate: float) -> None:
-        self._apply_currency(rate)
+        self._apply_currency(rate, mode=mode)
         self._refresh_numeric_views()
 
-    def _convert_currency(self, value: Any) -> float | None:
+    def _convert_currency(self, value: Any, mode: str | None = None) -> float | None:
         numeric = _safe_float(value)
         if numeric is None:
             return None
-        return numeric * self._currency_rate()
+        rate = self._currency_rate(mode)
+        return numeric * rate
 
     def _update_pnl_visibility(self) -> None:
         if not hasattr(self, "pnl_label"):
