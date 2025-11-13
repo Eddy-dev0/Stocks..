@@ -10,6 +10,11 @@ from stock_predictor.core.config import (
 )
 from stock_predictor.core.data_pipeline import AsyncDataPipeline
 from stock_predictor.core.modeling import StockPredictorAI, TargetSpec, make_volatility_label
+from stock_predictor.core.trend_finder import (
+    DEFAULT_TREND_UNIVERSE,
+    TrendFinder,
+    TrendInsight,
+)
 
 __all__ = [
     "AsyncDataPipeline",
@@ -20,6 +25,9 @@ __all__ = [
     "make_volatility_label",
     "DEFAULT_PREDICTION_TARGETS",
     "DEFAULT_PREDICTION_HORIZONS",
+    "DEFAULT_TREND_UNIVERSE",
     "build_config",
     "load_environment",
+    "TrendFinder",
+    "TrendInsight",
 ]

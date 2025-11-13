@@ -24,7 +24,12 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 
 from stock_predictor.app import StockPredictorApplication
-from stock_predictor.core import DEFAULT_PREDICTION_HORIZONS, StockPredictorAI
+from stock_predictor.core import (
+    DEFAULT_PREDICTION_HORIZONS,
+    StockPredictorAI,
+    TrendFinder,
+    TrendInsight,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -318,6 +323,18 @@ class StockPredictorDesktopApp:
             "3 decimals": 3,
             "4 decimals": 4,
         }
+
+        self.trend_finder: TrendFinder | None = None
+        self.trend_results: list[TrendInsight] = []
+        self.trend_horizon_var = tk.StringVar(value=self.selected_horizon_label)
+        self.trend_status_var = tk.StringVar(
+            value="Select a horizon and click “Find Opportunities”."
+        )
+        self._trend_busy = False
+        self.trend_tree: ttk.Treeview | None = None
+        self.trend_placeholder: ttk.Label | None = None
+        self.trend_progress: ttk.Progressbar | None = None
+        self._trend_placeholder_default = "Run a scan to discover new opportunities."
         self.decimal_display_map = {value: label for label, value in self.decimal_option_map.items()}
         self.currency_default_var = tk.StringVar(
             value=self.currency_display_map.get(self.currency_mode, "Local")
@@ -374,6 +391,8 @@ class StockPredictorDesktopApp:
             self.selected_horizon_offset = int(mapping.get("offset", 0))
         except (TypeError, ValueError):
             self.selected_horizon_offset = 0
+        if hasattr(self, "trend_horizon_var") and self.trend_horizon_var.get() != label:
+            self.trend_horizon_var.set(label)
 
     def _horizon_summary_phrase(self, label: str | None = None) -> str:
         key = label or self.selected_horizon_label
@@ -549,6 +568,7 @@ class StockPredictorDesktopApp:
         self.notebook.grid(row=1, column=0, sticky="nsew")
 
         self._build_overview_tab()
+        self._build_trend_finder_tab()
         self._build_indicators_tab()
         self._build_explanation_tab()
         self._build_settings_tab()
@@ -636,6 +656,82 @@ class StockPredictorDesktopApp:
         self.price_chart_message = ttk.Label(
             chart_frame, text="No data loaded yet", anchor=tk.CENTER, justify=tk.CENTER
         )
+
+    def _build_trend_finder_tab(self) -> None:
+        frame = ttk.Frame(self.notebook, padding=12)
+        self.notebook.add(frame, text="Trend Finder")
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(2, weight=1)
+
+        controls = ttk.Frame(frame)
+        controls.grid(row=0, column=0, sticky="ew")
+        controls.grid_columnconfigure(2, weight=1)
+
+        caption = ttk.Label(controls, text="Horizon:")
+        caption.grid(row=0, column=0, sticky=tk.W, padx=(0, 6))
+
+        self.trend_horizon_box = ttk.Combobox(
+            controls,
+            width=12,
+            state="readonly",
+            values=self.horizon_labels,
+            textvariable=self.trend_horizon_var,
+        )
+        self.trend_horizon_box.grid(row=0, column=1, sticky=tk.W)
+
+        self.trend_scan_button = ttk.Button(
+            controls, text="Find Opportunities", command=self._on_trend_scan
+        )
+        self.trend_scan_button.grid(row=0, column=2, sticky=tk.W, padx=(12, 0))
+
+        self.trend_progress = ttk.Progressbar(controls, mode="indeterminate", length=120)
+        self.trend_progress.grid(row=0, column=3, sticky=tk.W, padx=(12, 0))
+        self.trend_progress.grid_remove()
+
+        status = ttk.Label(frame, textvariable=self.trend_status_var, anchor=tk.W)
+        status.grid(row=1, column=0, sticky="ew", pady=(8, 4))
+
+        table_frame = ttk.Frame(frame)
+        table_frame.grid(row=2, column=0, sticky="nsew")
+        table_frame.grid_columnconfigure(0, weight=1)
+        table_frame.grid_rowconfigure(0, weight=1)
+
+        columns = ("ticker", "score", "technical", "fundamental", "sentiment")
+        self.trend_tree = ttk.Treeview(
+            table_frame,
+            columns=columns,
+            show="headings",
+            height=12,
+            selectmode="browse",
+        )
+        headings = {
+            "ticker": "Ticker",
+            "score": "Composite",
+            "technical": "Technical",
+            "fundamental": "Fundamental",
+            "sentiment": "Sentiment",
+        }
+        for column, title in headings.items():
+            self.trend_tree.heading(column, text=title)
+            anchor = tk.CENTER if column == "ticker" else tk.E
+            width = 90 if column == "ticker" else 120
+            self.trend_tree.column(column, anchor=anchor, width=width, stretch=True)
+
+        trend_scrollbar = ttk.Scrollbar(
+            table_frame, orient=tk.VERTICAL, command=self.trend_tree.yview
+        )
+        trend_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.trend_tree.configure(yscrollcommand=trend_scrollbar.set)
+        self.trend_tree.grid(row=0, column=0, sticky="nsew")
+
+        self.trend_placeholder = ttk.Label(
+            table_frame,
+            text=self._trend_placeholder_default,
+            anchor=tk.CENTER,
+            justify=tk.CENTER,
+        )
+        self.trend_placeholder.grid(row=0, column=0, sticky="nsew")
+        self.trend_tree.grid_remove()
 
     def _build_indicators_tab(self) -> None:
         frame = ttk.Frame(self.notebook, padding=12)
@@ -873,6 +969,133 @@ class StockPredictorDesktopApp:
         self._update_forecast_label()
         self._refresh_overview()
         self._on_predict()
+
+    def _on_trend_scan(self) -> None:
+        if self._trend_busy:
+            return
+        label = self.trend_horizon_var.get() or self.selected_horizon_label
+        mapping = self.horizon_map.get(label)
+        if mapping is None:
+            messagebox.showwarning(
+                "Invalid horizon", "Please select a valid horizon value for the scan."
+            )
+            self.trend_horizon_var.set(self.selected_horizon_label)
+            return
+        try:
+            horizon_value = int(mapping.get("offset", 0))
+        except (TypeError, ValueError):
+            horizon_value = 0
+        if horizon_value <= 0:
+            messagebox.showwarning(
+                "Unsupported horizon",
+                "The selected horizon is not supported for trend scanning.",
+            )
+            return
+        summary = self._horizon_summary_phrase(label)
+        if summary:
+            status = f"Scanning universe {summary}…"
+        else:
+            status = "Scanning universe…"
+        self._set_trend_busy(True, status)
+        finder = self._get_trend_finder()
+
+        def worker() -> None:
+            try:
+                results = finder.scan(horizon=horizon_value, limit=5)
+            except Exception as exc:  # pragma: no cover - optional providers may fail
+                LOGGER.exception("Trend scan failed: %s", exc)
+                self.root.after(0, lambda err=exc: self._on_trend_scan_failure(err))
+            else:
+                self.root.after(
+                    0,
+                    lambda payload=(label, results): self._on_trend_scan_success(
+                        payload[0], payload[1]
+                    ),
+                )
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+    def _on_trend_scan_success(self, label: str, results: list[TrendInsight]) -> None:
+        self.trend_results = list(results)
+        if results:
+            summary = self._horizon_summary_phrase(label)
+            if summary:
+                message = f"Top {len(results)} opportunities {summary} ready."
+            else:
+                message = f"Top {len(results)} opportunities ready."
+        else:
+            message = "No opportunities found for the selected horizon."
+        self._refresh_trend_table(
+            "No opportunities were identified during the latest scan." if not results else None
+        )
+        self._set_trend_busy(False, message)
+
+    def _on_trend_scan_failure(self, exc: Exception) -> None:
+        self._set_trend_busy(False, "Trend scan failed.")
+        messagebox.showerror("Trend scan failed", str(exc))
+
+    def _set_trend_busy(self, busy: bool, status: str | None = None) -> None:
+        self._trend_busy = busy
+        if status:
+            self.trend_status_var.set(status)
+        if hasattr(self, "trend_scan_button") and self.trend_scan_button:
+            state = tk.DISABLED if busy else tk.NORMAL
+            self.trend_scan_button.configure(state=state)
+        if hasattr(self, "trend_horizon_box") and self.trend_horizon_box:
+            if busy:
+                self.trend_horizon_box.configure(state="disabled")
+            else:
+                self.trend_horizon_box.configure(state="readonly")
+        if self.trend_progress is not None:
+            if busy:
+                self.trend_progress.grid()
+                self.trend_progress.start(10)
+            else:
+                self.trend_progress.stop()
+                self.trend_progress.grid_remove()
+
+    def _refresh_trend_table(self, empty_message: str | None = None) -> None:
+        if self.trend_tree is None:
+            return
+        for item in self.trend_tree.get_children():
+            self.trend_tree.delete(item)
+        if not self.trend_results:
+            if self.trend_placeholder is not None:
+                if empty_message:
+                    self.trend_placeholder.configure(text=empty_message)
+                else:
+                    self.trend_placeholder.configure(text=self._trend_placeholder_default)
+                self.trend_placeholder.grid()
+            self.trend_tree.grid_remove()
+            return
+        if self.trend_placeholder is not None:
+            self.trend_placeholder.grid_remove()
+        self.trend_tree.grid(row=0, column=0, sticky="nsew")
+        for insight in self.trend_results:
+            values = (
+                insight.ticker,
+                self._format_trend_score(insight.composite_score),
+                self._format_trend_score(insight.technical_score),
+                self._format_trend_score(insight.fundamental_score),
+                self._format_trend_score(insight.sentiment_score),
+            )
+            self.trend_tree.insert("", tk.END, values=values)
+
+    def _format_trend_score(self, value: float | None) -> str:
+        numeric = _safe_float(value)
+        if numeric is None:
+            return "—"
+        scaled = max(-1.0, min(1.0, float(numeric)))
+        percentile = (scaled + 1.0) / 2.0 * 100.0
+        return f"{percentile:0.1f}%"
+
+    def _get_trend_finder(self) -> TrendFinder:
+        if self.trend_finder is None:
+            self.trend_finder = TrendFinder(self.config)
+        else:
+            self.trend_finder.update_base_config(self.config)
+        return self.trend_finder
 
     def _on_currency_default_changed(self, _event: Any | None = None) -> None:
         label = self.currency_default_var.get()
@@ -1440,6 +1663,9 @@ class StockPredictorDesktopApp:
         self.market_holidays = []
         self.current_forecast_date = None
         self.forecast_date_var.set("Forecast date: —")
+        self.trend_results = []
+        self.trend_status_var.set("Select a horizon and click “Find Opportunities”.")
+        self._refresh_trend_table()
         self._refresh_overview()
         self._run_async(self._refresh_and_predict, f"Loading data for {self.config.ticker}…")
 
