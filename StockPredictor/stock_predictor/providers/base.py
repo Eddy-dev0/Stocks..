@@ -11,6 +11,16 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
 
+try:  # Python 3.11+
+    from enum import StrEnum as _BaseStrEnum
+except ImportError:  # pragma: no cover - fallback for older interpreters
+    from enum import Enum as _Enum
+
+    class _BaseStrEnum(str, _Enum):
+        """Fallback StrEnum implementation for Python < 3.11."""
+
+        pass
+
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -29,7 +39,7 @@ class ProviderConfigurationError(ProviderError):
     """Raised when the caller supplies unsupported parameters."""
 
 
-class DatasetType(str):
+class DatasetType(_BaseStrEnum):
     """Enumeration of supported dataset categories."""
 
     PRICES = "prices"
