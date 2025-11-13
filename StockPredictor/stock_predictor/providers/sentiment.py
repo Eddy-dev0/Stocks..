@@ -6,6 +6,7 @@ import logging
 from typing import Iterable
 
 import pandas as pd
+from pandas.api.types import is_string_dtype
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 LOGGER = logging.getLogger(__name__)
@@ -38,19 +39,40 @@ def attach_sentiment(news_df: pd.DataFrame) -> pd.DataFrame:
     if news_df.empty:
         return news_df
 
-    text_source = None
-    for candidate in ("text", "content", "description", "title"):
-        if candidate in news_df.columns:
-            text_source = candidate
+    normalized_columns = {col.lower(): col for col in news_df.columns}
+    text_series: pd.Series | None = None
+
+    for candidate in ("summary", "content", "description", "text", "title"):
+        source_column = normalized_columns.get(candidate)
+        if source_column is not None:
+            text_series = news_df[source_column].fillna("").astype(str)
             break
 
-    if text_source is None:
+    if text_series is None:
+        string_columns = [
+            column
+            for column in news_df.columns
+            if is_string_dtype(news_df[column])
+        ]
+
+        if string_columns:
+            combined = news_df[string_columns].apply(
+                lambda row: " ".join(
+                    value.strip()
+                    for value in row
+                    if isinstance(value, str) and value.strip()
+                ),
+                axis=1,
+            )
+            text_series = combined.str.replace(r"\s+", " ", regex=True).str.strip()
+
+    if text_series is None:
         LOGGER.warning("No textual column found for sentiment analysis.")
         news_df["sentiment"] = 0.0
         return news_df
 
     news_df = news_df.copy()
-    news_df["sentiment"] = score_sentiment(news_df[text_source].fillna(""))
+    news_df["sentiment"] = score_sentiment(text_series.fillna(""))
     return news_df
 
 
