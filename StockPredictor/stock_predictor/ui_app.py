@@ -468,14 +468,6 @@ class StockPredictorDesktopApp:
         self.currency_menu_button.configure(menu=self.currency_menu)
         self.currency_menu_button.configure(width=4)
 
-        self.fx_rate_entry = ttk.Entry(
-            toolbar,
-            width=8,
-            textvariable=self.currency_rate_var,
-            state=tk.DISABLED,
-        )
-        self.fx_rate_entry.bind("<Return>", self._on_currency_rate_submit)
-
         self.refresh_button = ttk.Button(toolbar, text="Refresh data", command=self._on_refresh)
         self.predict_button = ttk.Button(toolbar, text="Run prediction", command=self._on_predict)
 
@@ -487,7 +479,6 @@ class StockPredictorDesktopApp:
             self.ticker_apply_button,
             self.position_spinbox,
             self.currency_menu_button,
-            self.fx_rate_entry,
             self.refresh_button,
             self.predict_button,
         ]
@@ -824,13 +815,6 @@ class StockPredictorDesktopApp:
             display_label = self.currency_display_map.get(mode, "Local")
             if self.currency_default_var.get() != display_label:
                 self.currency_default_var.set(display_label)
-        if self._busy:
-            entry_state = tk.DISABLED
-        elif mode == "local":
-            entry_state = tk.DISABLED
-        else:
-            entry_state = tk.NORMAL
-        self.fx_rate_entry.configure(state=entry_state)
         rate = self._currency_rate(mode)
         if not changed:
             self._set_currency_rate_var(rate)
@@ -846,36 +830,6 @@ class StockPredictorDesktopApp:
             self._on_currency_changed(mode, rate)
         else:
             self._on_currency_changed(mode, updated_rate)
-
-    def _on_currency_rate_submit(self, _event: Any) -> None:
-        self._apply_manual_fx_rate()
-
-    def _apply_manual_fx_rate(self) -> None:
-        mode = self.currency_mode_var.get()
-        if mode == "local":
-            messagebox.showinfo(
-                "Local currency",
-                "Local currency does not require a conversion rate.",
-            )
-            self._set_currency_rate_var(self._currency_rate(mode))
-            return
-        raw = self.currency_rate_var.get()
-        try:
-            rate = float(raw)
-        except (TypeError, ValueError):
-            messagebox.showwarning(
-                "Invalid FX rate", "Please provide a numeric FX conversion rate."
-            )
-            self._set_currency_rate_var(self._currency_rate(mode))
-            return
-        if rate <= 0:
-            messagebox.showwarning("Invalid FX rate", "FX conversion rate must be positive.")
-            self._set_currency_rate_var(self._currency_rate(mode))
-            return
-        self._set_currency_rate(mode, rate)
-        self._set_currency_rate_var(self._currency_rate(mode))
-        self._on_fx_rate_changed(mode, rate)
-        self._set_status(f"FX rate updated to {rate:.4f}.")
 
     def _on_position_size_changed(self, *_args: Any) -> None:
         self._refresh_overview()
@@ -1101,9 +1055,7 @@ class StockPredictorDesktopApp:
             self.currency_menu_button,
         ):
             widget.configure(state=state)
-        if busy:
-            self.fx_rate_entry.configure(state=tk.DISABLED)
-        else:
+        if not busy:
             self._on_currency_mode_changed(self.currency_mode_var.get())
         if busy:
             self.progress.start(12)
@@ -1697,7 +1649,7 @@ class StockPredictorDesktopApp:
         if apply:
             self._on_fx_rate_changed(target_mode, rate)
         if not silent:
-            self._set_status(f"FX rate updated to {rate:.4f}.")
+            self._set_status(f"FX rate automatically updated to {rate:.4f}.")
         return rate
 
     def _apply_currency(self, rate: float) -> None:
