@@ -46,6 +46,26 @@ KNOWN_CURRENCY_SYMBOLS = (
 )
 
 
+CURRENCY_SYMBOL_TO_CODE: dict[str, str] = {
+    "$": "USD",
+    "€": "EUR",
+    "£": "GBP",
+    "¥": "JPY",
+    "₹": "INR",
+    "₩": "KRW",
+    "₽": "RUB",
+    "₪": "ILS",
+    "₫": "VND",
+    "₱": "PHP",
+    "฿": "THB",
+    "₦": "NGN",
+    "₴": "UAH",
+    "₭": "LAK",
+    "₲": "PYG",
+    "₵": "GHS",
+}
+
+
 def _safe_float(value: Any) -> float | None:
     """Best-effort conversion used for rendering numeric values."""
 
@@ -1577,6 +1597,13 @@ class StockPredictorDesktopApp:
         match = re.search(r"([A-Z]{3})", label.upper())
         if match:
             return match.group(1)
+        symbol = str(profile.get("symbol") or "").strip()
+        if not symbol:
+            symbol = _detect_currency_symbol(label, fallback="")
+        if symbol:
+            code = CURRENCY_SYMBOL_TO_CODE.get(symbol)
+            if code:
+                return code
         fallback_map = {"usd": "USD", "eur": "EUR"}
         return fallback_map.get(mode)
 
