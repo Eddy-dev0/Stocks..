@@ -1594,7 +1594,7 @@ class StockPredictorDesktopApp:
     def _currency_code(self, mode: str) -> str | None:
         profile = self.currency_profiles.get(mode, {})
         label = str(profile.get("label") or "")
-        match = re.search(r"([A-Z]{3})", label.upper())
+        match = re.search(r"\b([A-Z]{3})\b", label.upper())
         if match:
             return match.group(1)
         symbol = str(profile.get("symbol") or "").strip()
@@ -1610,8 +1610,10 @@ class StockPredictorDesktopApp:
     def _resolve_currency_pair(self, target_mode: str) -> str | None:
         if target_mode == "local":
             return None
-        base_code = self._currency_code("local")
-        target_code = self._currency_code(target_mode)
+        base_code_raw = self._currency_code("local")
+        target_code_raw = self._currency_code(target_mode)
+        base_code = base_code_raw.upper() if isinstance(base_code_raw, str) else None
+        target_code = target_code_raw.upper() if isinstance(target_code_raw, str) else None
         if not base_code or not target_code or base_code == target_code:
             return None
         return f"{base_code}{target_code}=X"
@@ -1622,21 +1624,40 @@ class StockPredictorDesktopApp:
             return 1.0
         pair = self._resolve_currency_pair(target_mode)
         if not pair:
-            LOGGER.warning("No FX pair available for mode '%s'", target_mode)
-            return None
+            fallback_rate = self._currency_rate(target_mode)
+            LOGGER.warning(
+                "No FX pair available for mode '%s'; falling back to stored rate %.6f",
+                target_mode,
+                fallback_rate,
+            )
+            return fallback_rate
+        previous_rate = self._currency_rate(target_mode)
         try:
             data = yf.download(pair, period="5d", auto_adjust=True, progress=False)
         except Exception as exc:  # pragma: no cover - network errors
-            LOGGER.warning("Failed to download FX rate for %s: %s", pair, exc)
-            return None
+            LOGGER.warning(
+                "Failed to download FX rate for %s: %s; using stored rate %.6f",
+                pair,
+                exc,
+                previous_rate,
+            )
+            return previous_rate
         if data.empty:
-            LOGGER.warning("Empty FX dataset returned for %s", pair)
-            return None
+            LOGGER.warning(
+                "Empty FX dataset returned for %s; using stored rate %.6f",
+                pair,
+                previous_rate,
+            )
+            return previous_rate
         try:
             last_row = data.iloc[-1]
         except IndexError:  # pragma: no cover - defensive guard
-            LOGGER.warning("FX dataset for %s did not contain rows", pair)
-            return None
+            LOGGER.warning(
+                "FX dataset for %s did not contain rows; using stored rate %.6f",
+                pair,
+                previous_rate,
+            )
+            return previous_rate
         rate: float | None = None
         for column in ("Adj Close", "Close", "close"):
             if column in last_row:
@@ -1646,8 +1667,13 @@ class StockPredictorDesktopApp:
         if rate is None:
             rate = _safe_float(last_row.squeeze())
         if rate is None or rate <= 0:
-            LOGGER.warning("Invalid FX rate %s returned for %s", rate, pair)
-            return None
+            LOGGER.warning(
+                "Invalid FX rate %s returned for %s; using stored rate %.6f",
+                rate,
+                pair,
+                previous_rate,
+            )
+            return previous_rate
         return rate
 
     def _on_fetch_fx_rate(
