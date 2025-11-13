@@ -131,8 +131,8 @@ class DataFetcher:
             self.config.ticker, interval, category
         )
 
-    def get_data_sources(self) -> list[str]:
-        """Return a human-readable list of data sources touched during the ETL run."""
+    def get_data_sources(self) -> list[dict[str, object]]:
+        """Return metadata describing the data sources touched during the ETL run."""
 
         return self.etl.list_sources()
 
