@@ -18,7 +18,9 @@ from pandas.tseries.offsets import BDay
 from matplotlib import style as mpl_style
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
-from matplotlib.dates import DateFormatter
+from matplotlib.dates import DateFormatter, date2num
+from matplotlib.lines import Line2D
+from matplotlib.patches import Rectangle
 
 from stock_predictor.app import StockPredictorApplication
 from stock_predictor.core import DEFAULT_PREDICTION_HORIZONS, StockPredictorAI
@@ -294,6 +296,8 @@ class StockPredictorDesktopApp:
 
         self.currency_choice_map = {"Local": "local", "USD": "usd", "EUR": "eur"}
         self.currency_display_map = {value: key for key, value in self.currency_choice_map.items()}
+        self.chart_type_options: tuple[str, ...] = ("Line", "Candlestick")
+        self.chart_type_var = tk.StringVar(value=self.chart_type_options[0])
         self.price_decimal_places = 2
         self.decimal_option_map = {
             "2 decimals": 2,
@@ -484,6 +488,16 @@ class StockPredictorDesktopApp:
         self.currency_menu_button.configure(menu=self.currency_menu)
         self.currency_menu_button.configure(width=4)
 
+        self.chart_type_box = ttk.Combobox(
+            toolbar,
+            width=14,
+            state="readonly",
+            textvariable=self.chart_type_var,
+            values=self.chart_type_options,
+        )
+        self.chart_type_box.bind("<<ComboboxSelected>>", self._on_chart_type_changed)
+        Tooltip(self.chart_type_box, "Choose the price chart style.")
+
         self.refresh_button = ttk.Button(toolbar, text="Refresh data", command=self._on_refresh)
         self.predict_button = ttk.Button(toolbar, text="Run prediction", command=self._on_predict)
 
@@ -495,6 +509,7 @@ class StockPredictorDesktopApp:
             self.ticker_apply_button,
             self.position_spinbox,
             self.currency_menu_button,
+            self.chart_type_box,
             self.refresh_button,
             self.predict_button,
         ]
@@ -806,6 +821,12 @@ class StockPredictorDesktopApp:
         if display_label and display_label != label:
             self.number_format_var.set(display_label)
         self._refresh_numeric_views()
+
+    def _on_chart_type_changed(self, _event: Any | None = None) -> None:
+        value = self.chart_type_var.get()
+        if value not in self.chart_type_options:
+            self.chart_type_var.set(self.chart_type_options[0])
+        self._update_price_chart()
 
     def _on_pnl_toggle(self) -> None:
         self._update_pnl_visibility()
@@ -1228,6 +1249,13 @@ class StockPredictorDesktopApp:
             title = f"Forecast date: {forecast.date().isoformat()}"
         ax.set_title(title)
 
+        try:
+            chart_type_value = str(self.chart_type_var.get())
+        except Exception:
+            chart_type_value = "Line"
+        chart_type = chart_type_value.strip().lower()
+        use_candlestick = chart_type == "candlestick"
+
         frame_source: pd.DataFrame | None = None
         if isinstance(self.price_history_converted, pd.DataFrame) and not self.price_history_converted.empty:
             frame_source = self.price_history_converted
@@ -1242,21 +1270,47 @@ class StockPredictorDesktopApp:
 
         frame = frame_source.copy()
         lower_map = {str(column).lower(): column for column in frame.columns}
-        if "date" in lower_map:
-            frame[lower_map["date"]] = pd.to_datetime(frame[lower_map["date"]], errors="coerce")
-            frame = frame.dropna(subset=[lower_map["date"]])
-            frame = frame.sort_values(lower_map["date"])
-            x_values = frame[lower_map["date"]]
+        normalised_map = {
+            re.sub(r"[^a-z]", "", str(column).lower()): column for column in frame.columns
+        }
+
+        def resolve_column(*candidates: str) -> str | None:
+            for candidate in candidates:
+                key = str(candidate).lower()
+                column = lower_map.get(key)
+                if column is not None:
+                    return column
+                normalised = re.sub(r"[^a-z]", "", key)
+                column = normalised_map.get(normalised)
+                if column is not None:
+                    return column
+            return None
+
+        date_column = resolve_column("date")
+        if date_column is not None:
+            frame[date_column] = pd.to_datetime(frame[date_column], errors="coerce")
+            frame = frame.dropna(subset=[date_column])
+            frame = frame.sort_values(date_column)
+            x_index = pd.DatetimeIndex(frame[date_column])
         else:
             frame.index = pd.to_datetime(frame.index, errors="coerce")
-            frame = frame.dropna(subset=[frame.columns[0]])
-            x_values = frame.index
+            valid_mask = pd.notna(frame.index)
+            frame = frame.loc[valid_mask]
+            frame = frame.sort_index()
+            x_index = pd.DatetimeIndex(frame.index)
 
-        close_column = None
-        for candidate in ("close", "adjclose", "adj_close"):
-            if candidate in lower_map:
-                close_column = lower_map[candidate]
-                break
+        if x_index.empty:
+            show_empty_state()
+            self._style_figure(self.price_figure)
+            canvas.draw_idle()
+            return
+
+        frame = frame.copy()
+        frame.index = x_index
+        frame = frame.loc[~frame.index.duplicated(keep="last")]
+        x_index = pd.DatetimeIndex(frame.index)
+
+        close_column = resolve_column("close", "adjclose", "adj_close")
         if close_column is None:
             numeric_columns = frame.select_dtypes(include=[np.number]).columns
             if not len(numeric_columns):
@@ -1267,34 +1321,115 @@ class StockPredictorDesktopApp:
             close_column = numeric_columns[0]
 
         series = pd.to_numeric(frame[close_column], errors="coerce")
-        plotted_series = pd.Series(series.to_numpy(), index=pd.Index(x_values)).dropna()
+        plotted_series = series.dropna()
+
         if plotted_series.empty:
             show_empty_state()
             self._style_figure(self.price_figure)
             canvas.draw_idle()
             return
 
+        legend_handles: list[Any] = []
+        candlestick_frame: pd.DataFrame | None = None
+        if use_candlestick:
+            ohlc_columns = {
+                "open": resolve_column("open", "open_price", "o"),
+                "high": resolve_column("high", "high_price", "h"),
+                "low": resolve_column("low", "low_price", "l"),
+                "close": close_column,
+            }
+            if all(ohlc_columns.values()):
+                candlestick_frame = pd.DataFrame(
+                    {
+                        key: pd.to_numeric(frame[column], errors="coerce")
+                        for key, column in ohlc_columns.items()
+                    },
+                    index=frame.index,
+                )
+                candlestick_frame = candlestick_frame.dropna().sort_index()
+                if candlestick_frame.empty:
+                    candlestick_frame = None
+                else:
+                    plotted_series = candlestick_frame["close"]
+            else:
+                candlestick_frame = None
+            if candlestick_frame is None:
+                use_candlestick = False
+
         if empty_label is not None:
             empty_label.grid_remove()
         if canvas_widget is not None:
             canvas_widget.grid()
 
-        close_label = "Close (price)" if not self.currency_symbol else f"Close ({self.currency_symbol})"
-        ax.plot(plotted_series.index, plotted_series.values, label=close_label, color="tab:blue")
-
         last_x = plotted_series.index[-1]
-        last_y = plotted_series.iloc[-1]
+        last_y = float(plotted_series.iloc[-1])
         last_display = fmt_ccy(last_y, self.currency_symbol, decimals=self.price_decimal_places)
-        ax.scatter([last_x], [last_y], color="tab:blue", zorder=5)
-        ax.annotate(
-            f"Last: {last_display}",
-            xy=(last_x, last_y),
-            xytext=(8, 0),
-            textcoords="offset points",
-            va="center",
-            ha="left",
-            color="tab:blue",
-        )
+
+        if use_candlestick and candlestick_frame is not None:
+            date_numbers = date2num(candlestick_frame.index.to_pydatetime())
+            if len(date_numbers) > 1:
+                unique_steps = np.diff(np.unique(date_numbers))
+                base_width = float(unique_steps.min()) if len(unique_steps) else 1.0
+            else:
+                base_width = 1.0
+            candle_width = max(min(base_width * 0.6, 0.8), 0.15)
+            for date_num, (open_, high_, low_, close_) in zip(
+                date_numbers, candlestick_frame.itertuples(index=False, name=None)
+            ):
+                color = "tab:green" if close_ >= open_ else "tab:red"
+                ax.vlines(date_num, low_, high_, color=color, linewidth=1)
+                body_bottom = min(open_, close_)
+                body_height = max(abs(close_ - open_), 1e-9)
+                rect = Rectangle(
+                    (date_num - candle_width / 2, body_bottom),
+                    candle_width,
+                    body_height,
+                    facecolor=color,
+                    edgecolor=color,
+                    alpha=0.9,
+                )
+                ax.add_patch(rect)
+            ax.scatter([date_numbers[-1]], [last_y], color="tab:blue", zorder=5)
+            ax.annotate(
+                f"Last: {last_display}",
+                xy=(date_numbers[-1], last_y),
+                xytext=(8, 0),
+                textcoords="offset points",
+                va="center",
+                ha="left",
+                color="tab:blue",
+            )
+            legend_handles.extend(
+                [
+                    Line2D([0], [0], color="tab:green", linewidth=3, label="Up day"),
+                    Line2D([0], [0], color="tab:red", linewidth=3, label="Down day"),
+                ]
+            )
+            last_x_value = date_numbers[-1]
+        else:
+            close_label = (
+                "Close (price)"
+                if not self.currency_symbol
+                else f"Close ({self.currency_symbol})"
+            )
+            (line_handle,) = ax.plot(
+                plotted_series.index,
+                plotted_series.values,
+                label=close_label,
+                color="tab:blue",
+            )
+            legend_handles.append(line_handle)
+            ax.scatter([last_x], [last_y], color="tab:blue", zorder=5)
+            ax.annotate(
+                f"Last: {last_display}",
+                xy=(last_x, last_y),
+                xytext=(8, 0),
+                textcoords="offset points",
+                va="center",
+                ha="left",
+                color="tab:blue",
+            )
+            last_x_value = last_x
 
         predicted_close = _safe_float(prediction.get("predicted_close"))
         converted_prediction = self._convert_currency(predicted_close) if predicted_close is not None else None
@@ -1308,13 +1443,28 @@ class StockPredictorDesktopApp:
                 line_end = forecast
             else:
                 line_end = pd.to_datetime(last_x) + pd.Timedelta(days=1)
-            ax.plot(
-                [last_x, line_end],
-                [converted_prediction, converted_prediction],
-                color="tab:orange",
-                linestyle="--",
-                label=predicted_label,
-            )
+            if use_candlestick and candlestick_frame is not None:
+                last_x_num = float(last_x_value)
+                line_end_num = float(date2num(pd.to_datetime(line_end)))
+                (predicted_handle,) = ax.plot(
+                    [last_x_num, line_end_num],
+                    [converted_prediction, converted_prediction],
+                    color="tab:orange",
+                    linestyle="--",
+                    label=predicted_label,
+                )
+                legend_handles.append(predicted_handle)
+                annotation_xy = (line_end_num, converted_prediction)
+            else:
+                (predicted_handle,) = ax.plot(
+                    [last_x, line_end],
+                    [converted_prediction, converted_prediction],
+                    color="tab:orange",
+                    linestyle="--",
+                    label=predicted_label,
+                )
+                legend_handles.append(predicted_handle)
+                annotation_xy = (pd.to_datetime(line_end), converted_prediction)
             annotation_text = fmt_ccy(
                 converted_prediction,
                 self.currency_symbol,
@@ -1324,7 +1474,7 @@ class StockPredictorDesktopApp:
                 annotation_text = f"{annotation_text} ({forecast.date().isoformat()})"
             ax.annotate(
                 annotation_text,
-                xy=(pd.to_datetime(line_end), converted_prediction),
+                xy=annotation_xy,
                 xytext=(8, 0),
                 textcoords="offset points",
                 va="center",
@@ -1337,7 +1487,10 @@ class StockPredictorDesktopApp:
             ylabel = f"Price ({self.currency_symbol})"
         ax.set_ylabel(ylabel)
         ax.grid(True, linestyle="--", alpha=0.3)
-        ax.legend(loc="best")
+        if legend_handles:
+            ax.legend(handles=legend_handles, loc="best")
+        if use_candlestick and candlestick_frame is not None:
+            ax.xaxis_date()
         ax.xaxis.set_major_formatter(DateFormatter("%b-%Y"))
 
         self._style_figure(self.price_figure)
