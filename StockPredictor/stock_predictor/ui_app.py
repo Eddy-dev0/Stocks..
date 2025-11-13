@@ -18,6 +18,7 @@ from pandas.tseries.offsets import BDay
 from matplotlib import style as mpl_style
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+from matplotlib.axes import Axes
 from matplotlib.dates import DateFormatter, date2num
 from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
@@ -285,6 +286,9 @@ class StockPredictorDesktopApp:
         self.feature_snapshot_converted: pd.DataFrame | None = None
         self.feature_history_converted: pd.DataFrame | None = None
         self.indicator_history_converted: pd.DataFrame | None = None
+        self._indicator_selection_cache: set[str] = set()
+        self._indicator_selector_updating = False
+        self.indicator_secondary_ax: Axes | None = None
         self.feature_toggle_vars: dict[str, tk.BooleanVar] = {}
         self.forecast_date_var = tk.StringVar(value="Forecast date: —")
         self.current_forecast_date: pd.Timestamp | None = None
@@ -626,30 +630,75 @@ class StockPredictorDesktopApp:
     def _build_indicators_tab(self) -> None:
         frame = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(frame, text="Indicators")
+        frame.grid_rowconfigure(0, weight=1)
+        frame.grid_columnconfigure(0, weight=3)
+        frame.grid_columnconfigure(1, weight=1)
 
-        tree_frame = ttk.Frame(frame)
-        tree_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        chart_frame = ttk.LabelFrame(frame, text="Price & indicators", padding=8)
+        chart_frame.grid(row=0, column=0, sticky="nsew")
+        chart_frame.grid_rowconfigure(0, weight=1)
+        chart_frame.grid_columnconfigure(0, weight=1)
 
-        columns = ("indicator", "value", "category")
-        self.indicator_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=20)
-        self.indicator_tree.heading("indicator", text="Indicator")
-        self.indicator_tree.heading("value", text="Latest value")
-        self.indicator_tree.heading("category", text="Category")
-        self.indicator_tree.column("indicator", width=220, anchor=tk.W)
-        self.indicator_tree.column("value", width=120, anchor=tk.E)
-        self.indicator_tree.column("category", width=140, anchor=tk.W)
-        self.indicator_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.indicator_tree.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.indicator_tree.configure(yscrollcommand=scrollbar.set)
-        self.indicator_tree.bind("<<TreeviewSelect>>", self._on_indicator_selected)
+        self.indicator_price_figure = Figure(figsize=(7.5, 4.5), dpi=100, constrained_layout=True)
+        self.indicator_price_figure.patch.set_facecolor("white")
+        self.indicator_price_ax = self.indicator_price_figure.add_subplot(111)
+        self.indicator_price_ax.set_facecolor("white")
+        self.indicator_price_canvas = FigureCanvasTkAgg(self.indicator_price_figure, master=chart_frame)
+        self.indicator_price_canvas_widget = self.indicator_price_canvas.get_tk_widget()
+        self.indicator_price_canvas_widget.grid(row=0, column=0, sticky="nsew")
 
-        chart_frame = ttk.LabelFrame(frame, text="Indicator snapshot", padding=8)
-        chart_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(12, 0))
-        self.indicator_figure = Figure(figsize=(5, 4), dpi=100)
-        self.indicator_ax = self.indicator_figure.add_subplot(111)
-        self.indicator_canvas = FigureCanvasTkAgg(self.indicator_figure, master=chart_frame)
-        self.indicator_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.indicator_chart_message = ttk.Label(
+            chart_frame,
+            text="No indicators loaded yet",
+            anchor=tk.CENTER,
+            justify=tk.CENTER,
+        )
+        self.indicator_chart_message.grid(row=0, column=0, sticky="nsew")
+        self.indicator_price_canvas_widget.grid_remove()
+
+        sidebar = ttk.Frame(frame, padding=(12, 0, 0, 0))
+        sidebar.grid(row=0, column=1, sticky="nsew")
+        sidebar.grid_rowconfigure(1, weight=1)
+        sidebar.grid_columnconfigure(0, weight=1)
+
+        selector_box = ttk.LabelFrame(sidebar, text="Indicator visibility", padding=8)
+        selector_box.grid(row=0, column=0, sticky="nsew")
+        selector_box.grid_columnconfigure(0, weight=1)
+        selector_box.grid_rowconfigure(0, weight=1)
+
+        self.indicator_listbox = tk.Listbox(
+            selector_box,
+            selectmode=tk.MULTIPLE,
+            exportselection=False,
+            height=12,
+        )
+        self.indicator_listbox.grid(row=0, column=0, sticky="nsew")
+        selector_scrollbar = ttk.Scrollbar(
+            selector_box, orient=tk.VERTICAL, command=self.indicator_listbox.yview
+        )
+        selector_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.indicator_listbox.configure(yscrollcommand=selector_scrollbar.set)
+        self.indicator_listbox.bind("<<ListboxSelect>>", self._on_indicator_selection_changed)
+
+        info_box = ttk.LabelFrame(sidebar, text="Insights", padding=8)
+        info_box.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        info_box.grid_columnconfigure(1, weight=1)
+
+        self.indicator_info_vars = {
+            "total_indicators": tk.StringVar(value="0"),
+            "data_sources": tk.StringVar(value="0"),
+            "confidence": tk.StringVar(value="—"),
+        }
+        info_specs = (
+            ("total_indicators", "Indicators tracked"),
+            ("data_sources", "Online sources"),
+            ("confidence", "Confidence"),
+        )
+        for row, (key, label) in enumerate(info_specs):
+            caption = ttk.Label(info_box, text=f"{label}:")
+            caption.grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
+            value = ttk.Label(info_box, textvariable=self.indicator_info_vars[key], anchor=tk.E)
+            value.grid(row=row, column=1, sticky=tk.EW, pady=2)
 
     def _build_explanation_tab(self) -> None:
         frame = ttk.Frame(self.notebook, padding=12)
@@ -884,56 +933,323 @@ class StockPredictorDesktopApp:
     def _on_ticker_button(self) -> None:
         self._apply_ticker_change(self.ticker_var.get())
 
-    def _on_indicator_selected(self, _event: Any) -> None:
-        selection = self.indicator_tree.selection()
-        if not selection:
+    def _on_indicator_selection_changed(self, _event: Any | None = None) -> None:
+        if self._indicator_selector_updating:
             return
-        indicator = selection[0]
-        series = None
+        selections = self._current_indicator_selection()
+        self._indicator_selection_cache = set(selections)
+        self._update_indicator_chart(selections)
+
+    def _current_indicator_selection(self) -> list[str]:
+        if not hasattr(self, "indicator_listbox"):
+            return []
+        try:
+            indices = self.indicator_listbox.curselection()
+        except Exception:
+            return []
+        return [self.indicator_listbox.get(idx) for idx in indices]
+
+    def _collect_indicator_names(self) -> list[str]:
+        names: set[str] = set()
+        metadata = getattr(getattr(self.application, "pipeline", None), "metadata", None)
+        category_map: Mapping[str, Any] | None = None
+        if isinstance(metadata, Mapping):
+            raw_names = metadata.get("indicator_columns")
+            if isinstance(raw_names, (list, tuple, set)):
+                for item in raw_names:
+                    label = str(item).strip()
+                    if label:
+                        names.add(label)
+            category_map = metadata.get("feature_categories") if metadata else None
+            if isinstance(category_map, Mapping):
+                for column, category in category_map.items():
+                    category_label = str(category).lower()
+                    if "indicator" in category_label or "oscillator" in category_label:
+                        label = str(column).strip()
+                        if label:
+                            names.add(label)
+
         feature_history = (
             self.feature_history_converted
             if isinstance(self.feature_history_converted, pd.DataFrame)
             else self.feature_history
         )
+        if not names and isinstance(feature_history, pd.DataFrame):
+            excluded_tokens = {"open", "high", "low", "close", "volume", "adjclose", "adj_close"}
+            for column in feature_history.columns:
+                label = str(column).strip()
+                if not label:
+                    continue
+                if label.lower() in excluded_tokens:
+                    continue
+                value = feature_history[column].iloc[-1] if len(feature_history) else None
+                if _safe_float(value) is None:
+                    continue
+                names.add(label)
+
         indicator_history = (
             self.indicator_history_converted
             if isinstance(self.indicator_history_converted, pd.DataFrame)
             else self.indicator_history
         )
+        if isinstance(indicator_history, pd.DataFrame):
+            column_map = {str(col).lower(): col for col in indicator_history.columns}
+            indicator_col = column_map.get("indicator")
+            if indicator_col:
+                for value in indicator_history[indicator_col].dropna().unique():
+                    label = str(value).strip()
+                    if label:
+                        names.add(label)
+
+        return sorted(names, key=str.lower)
+
+    def _populate_indicator_selector(self, names: list[str], selections: set[str]) -> None:
+        if not hasattr(self, "indicator_listbox"):
+            return
+        self._indicator_selector_updating = True
+        try:
+            self.indicator_listbox.delete(0, tk.END)
+            for index, name in enumerate(names):
+                self.indicator_listbox.insert(tk.END, name)
+                if name in selections:
+                    self.indicator_listbox.selection_set(index)
+        finally:
+            self._indicator_selector_updating = False
+
+    def _update_indicator_info_panel(self, indicator_names: list[str]) -> None:
+        total = len(indicator_names)
+        self.indicator_info_vars["total_indicators"].set(str(total))
+
+        pipeline = getattr(self.application, "pipeline", None)
+        metadata = getattr(pipeline, "metadata", None)
+        sources: list[str] = []
+        if isinstance(metadata, Mapping):
+            raw_sources = metadata.get("data_sources")
+            if isinstance(raw_sources, (list, tuple, set)):
+                sources = [str(item).strip() for item in raw_sources if str(item).strip()]
+        if not sources and getattr(getattr(pipeline, "fetcher", None), "get_data_sources", None):
+            try:
+                fetched = pipeline.fetcher.get_data_sources()
+            except Exception:  # pragma: no cover - defensive network call
+                fetched = []
+            if isinstance(fetched, (list, tuple, set)):
+                sources = [str(item).strip() for item in fetched if str(item).strip()]
+        unique_sources = sorted({source for source in sources if source})
+        self.indicator_info_vars["data_sources"].set(str(len(unique_sources)))
+
+        confidence_display = self._compute_confidence_metric()
+        self.indicator_info_vars["confidence"].set(confidence_display)
+
+    def _compute_confidence_metric(self) -> str:
+        prediction = self.current_prediction if isinstance(self.current_prediction, Mapping) else {}
+        confidence = None
+        confidence_block = prediction.get("confidence") if isinstance(prediction, Mapping) else None
+        if isinstance(confidence_block, Mapping):
+            numeric_values = [
+                _safe_float(value)
+                for value in confidence_block.values()
+                if _safe_float(value) is not None
+            ]
+            if numeric_values:
+                confidence = max(numeric_values)
+
+        if confidence is None:
+            up = _safe_float(prediction.get("direction_probability_up"))
+            down = _safe_float(prediction.get("direction_probability_down"))
+            candidates = [value for value in (up, down) if value is not None]
+            if candidates:
+                confidence = max(candidates)
+
+        if confidence is None:
+            return "—"
+        return fmt_pct(confidence, decimals=1)
+
+    def _extract_indicator_series(self, indicator: str) -> pd.Series | None:
+        feature_history = (
+            self.feature_history_converted
+            if isinstance(self.feature_history_converted, pd.DataFrame)
+            else self.feature_history
+        )
         if isinstance(feature_history, pd.DataFrame) and indicator in feature_history.columns:
-            series = pd.to_numeric(feature_history[indicator], errors="coerce").dropna()
-        elif isinstance(indicator_history, pd.DataFrame):
+            frame = feature_history.copy()
+            columns = {str(col).lower(): col for col in frame.columns}
+            date_col = columns.get("date")
+            if date_col is not None:
+                frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
+                frame = frame.dropna(subset=[date_col]).sort_values(date_col)
+                index = pd.DatetimeIndex(frame[date_col])
+            else:
+                index = pd.to_datetime(frame.index, errors="coerce")
+                valid_mask = pd.notna(index)
+                frame = frame.loc[valid_mask]
+                index = pd.DatetimeIndex(index[valid_mask])
+            series = pd.to_numeric(frame[indicator], errors="coerce")
+            series = pd.Series(series.values, index=index)
+            series = series.dropna()
+            if not series.empty:
+                return series
+
+        indicator_history = (
+            self.indicator_history_converted
+            if isinstance(self.indicator_history_converted, pd.DataFrame)
+            else self.indicator_history
+        )
+        if isinstance(indicator_history, pd.DataFrame) and not indicator_history.empty:
             columns = {str(column).lower(): column for column in indicator_history.columns}
             indicator_col = columns.get("indicator")
             value_col = columns.get("value")
             date_col = columns.get("date")
             if indicator_col and value_col:
                 subset = indicator_history[indicator_history[indicator_col] == indicator]
+                if subset.empty:
+                    return None
+                subset = subset.copy()
                 if date_col:
-                    subset = subset.copy()
                     subset[date_col] = pd.to_datetime(subset[date_col], errors="coerce")
-                    subset = subset.dropna(subset=[date_col])
-                    subset = subset.sort_values(date_col)
-                    x_values = subset[date_col]
+                    subset = subset.dropna(subset=[date_col]).sort_values(date_col)
+                    index = pd.DatetimeIndex(subset[date_col])
                 else:
-                    subset = subset.copy()
-                    subset.index = pd.RangeIndex(start=0, stop=len(subset))
-                    x_values = subset.index
+                    index = None
                 values = pd.to_numeric(subset[value_col], errors="coerce")
-                series = pd.Series(values.values, index=x_values)
-        if series is None or series.empty:
+                values = values.dropna()
+                if values.empty:
+                    return None
+                subset = subset.loc[values.index]
+                if isinstance(index, pd.DatetimeIndex):
+                    index = index[values.index]
+                elif index is None:
+                    index = pd.RangeIndex(start=0, stop=len(values))
+                series = pd.Series(values.values, index=index)
+                if isinstance(series.index, pd.DatetimeIndex):
+                    series = series.sort_index()
+                return series
+        return None
+
+    def _update_indicator_chart(self, selections: Iterable[str] | None = None) -> None:
+        if not hasattr(self, "indicator_price_ax"):
+            return
+        ax = self.indicator_price_ax
+        canvas = getattr(self, "indicator_price_canvas", None)
+        widget = getattr(self, "indicator_price_canvas_widget", None)
+        empty_label = getattr(self, "indicator_chart_message", None)
+
+        def show_empty_state() -> None:
+            if widget is not None:
+                widget.grid_remove()
+            if empty_label is not None:
+                empty_label.grid(row=0, column=0, sticky="nsew")
+
+        ax.clear()
+        if self.indicator_secondary_ax is not None:
+            try:
+                self.indicator_secondary_ax.remove()
+            except Exception:  # pragma: no cover - defensive cleanup
+                pass
+            self.indicator_secondary_ax = None
+
+        price_frame = (
+            self.price_history_converted
+            if isinstance(self.price_history_converted, pd.DataFrame)
+            else self.price_history
+        )
+        if not isinstance(price_frame, pd.DataFrame) or price_frame.empty:
+            show_empty_state()
+            if canvas is not None:
+                self._style_figure(self.indicator_price_figure)
+                canvas.draw_idle()
             return
 
-        self.indicator_ax.clear()
-        self.indicator_ax.plot(series.index, series.values, label=indicator)
-        self.indicator_ax.set_title(indicator)
-        self.indicator_ax.set_xlabel("Date")
-        self.indicator_ax.set_ylabel("Value")
-        self.indicator_ax.grid(True, linestyle="--", alpha=0.3)
-        self.indicator_ax.legend(loc="best")
-        self.indicator_figure.tight_layout()
-        self._style_figure(self.indicator_figure)
-        self.indicator_canvas.draw_idle()
+        frame = price_frame.copy()
+        columns = {str(col).lower(): col for col in frame.columns}
+        date_col = columns.get("date")
+        if date_col:
+            frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
+            frame = frame.dropna(subset=[date_col]).sort_values(date_col)
+            index = pd.DatetimeIndex(frame[date_col])
+        else:
+            index = pd.to_datetime(frame.index, errors="coerce")
+            valid_mask = pd.notna(index)
+            frame = frame.loc[valid_mask]
+            index = pd.DatetimeIndex(index[valid_mask])
+
+        if index.empty:
+            show_empty_state()
+            if canvas is not None:
+                self._style_figure(self.indicator_price_figure)
+                canvas.draw_idle()
+            return
+
+        close_col = None
+        for candidate in ("close", "adjclose", "adj_close"):
+            close_col = columns.get(candidate)
+            if close_col:
+                break
+        if close_col is None:
+            numeric_cols = frame.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols):
+                close_col = numeric_cols[0]
+        if close_col is None:
+            show_empty_state()
+            if canvas is not None:
+                self._style_figure(self.indicator_price_figure)
+                canvas.draw_idle()
+            return
+
+        price_series = pd.to_numeric(frame[close_col], errors="coerce")
+        price_series.index = index
+        price_series = price_series.dropna()
+        if price_series.empty:
+            show_empty_state()
+            if canvas is not None:
+                self._style_figure(self.indicator_price_figure)
+                canvas.draw_idle()
+            return
+
+        if empty_label is not None:
+            empty_label.grid_remove()
+        if widget is not None:
+            widget.grid()
+
+        ax.plot(price_series.index, price_series.values, label="Price", color="tab:blue")
+        ylabel = "Price"
+        if self.currency_symbol:
+            ylabel = f"Price ({self.currency_symbol})"
+        ax.set_ylabel(ylabel)
+        ax.set_title(f"{self.config.ticker} price and indicators")
+        ax.grid(True, linestyle="--", alpha=0.3)
+
+        selected_names = list(selections) if selections is not None else list(self._indicator_selection_cache)
+        if not selected_names:
+            selected_names = list(self._indicator_selection_cache)
+        for name in selected_names:
+            series = self._extract_indicator_series(name)
+            if series is None or series.empty:
+                continue
+            if self.indicator_secondary_ax is None:
+                self.indicator_secondary_ax = ax.twinx()
+                self.indicator_secondary_ax.set_ylabel("Indicator value")
+                self.indicator_secondary_ax.grid(False)
+            self.indicator_secondary_ax.plot(
+                series.index,
+                series.values,
+                label=name,
+                linestyle="--",
+            )
+
+        handles, labels = ax.get_legend_handles_labels()
+        if self.indicator_secondary_ax is not None:
+            sec_handles, sec_labels = self.indicator_secondary_ax.get_legend_handles_labels()
+            handles += sec_handles
+            labels += sec_labels
+        if handles:
+            ax.legend(handles, labels, loc="best")
+
+        ax.set_xlabel("Date")
+        ax.xaxis.set_major_formatter(DateFormatter("%b-%Y"))
+
+        if canvas is not None:
+            self._style_figure(self.indicator_price_figure)
+            canvas.draw_idle()
 
     def _on_feature_toggle_changed(self) -> None:
         if self._busy:
@@ -1497,76 +1813,16 @@ class StockPredictorDesktopApp:
         canvas.draw_idle()
 
     def _update_indicator_view(self) -> None:
-        for item in self.indicator_tree.get_children():
-            self.indicator_tree.delete(item)
-        snapshot_frame = (
-            self.feature_snapshot_converted
-            if isinstance(self.feature_snapshot_converted, pd.DataFrame)
-            else self.feature_snapshot
-        )
-        if snapshot_frame is not None and not snapshot_frame.empty:
-            row = snapshot_frame.iloc[0]
-            metadata = self.application.pipeline.metadata
-            categories = {}
-            if isinstance(metadata, Mapping):
-                categories = metadata.get("feature_categories", {}) or {}
-            for column, value in row.items():
-                numeric = _safe_float(value)
-                if numeric is None:
-                    continue
-                category = categories.get(column, "feature")
-                display_value = self._format_price_like_value(column, numeric)
-                self.indicator_tree.insert(
-                    "",
-                    tk.END,
-                    iid=str(column),
-                    values=(str(column), display_value, str(category)),
-                )
-        if not self.indicator_tree.get_children():
-            indicator_frame = (
-                self.indicator_history_converted
-                if isinstance(self.indicator_history_converted, pd.DataFrame)
-                else self.indicator_history
-            )
-        else:
-            indicator_frame = None
-        if not self.indicator_tree.get_children() and isinstance(indicator_frame, pd.DataFrame):
-            frame = indicator_frame
-            columns = {str(column).lower(): column for column in frame.columns}
-            indicator_col = columns.get("indicator")
-            value_col = columns.get("value")
-            date_col = columns.get("date")
-            if indicator_col and value_col:
-                latest = frame.copy()
-                if date_col:
-                    latest[date_col] = pd.to_datetime(latest[date_col], errors="coerce")
-                    latest = latest.dropna(subset=[date_col])
-                    latest = latest.sort_values(date_col)
-                    latest = latest.groupby(indicator_col).tail(1)
-                else:
-                    latest = latest.groupby(indicator_col).tail(1)
-                for _, row in latest.iterrows():
-                    name = str(row.get(indicator_col))
-                    numeric = _safe_float(row.get(value_col))
-                    if numeric is None:
-                        continue
-                    display_value = self._format_price_like_value(name, numeric)
-                    self.indicator_tree.insert(
-                        "",
-                        tk.END,
-                        iid=name,
-                        values=(name, display_value, "indicator"),
-                    )
-        if isinstance(self.feature_history, pd.DataFrame):
-            cleaned_history = self.feature_history.copy()
-            for column in cleaned_history.columns:
-                try:
-                    numeric = pd.to_numeric(cleaned_history[column], errors="coerce")
-                except Exception:  # pragma: no cover - defensive conversion
-                    continue
-                if not numeric.isna().all():
-                    cleaned_history[column] = numeric
-            self.feature_history = cleaned_history
+        indicator_names = self._collect_indicator_names()
+        selections = set(self._indicator_selection_cache)
+        if selections:
+            selections &= set(indicator_names)
+        if not selections:
+            selections.update(indicator_names[: min(3, len(indicator_names))])
+        self._populate_indicator_selector(indicator_names, selections)
+        self._indicator_selection_cache = selections
+        self._update_indicator_info_panel(indicator_names)
+        self._update_indicator_chart(selections)
 
     def _update_explanation(self) -> None:
         prediction = self.current_prediction or {}
@@ -1677,7 +1933,7 @@ class StockPredictorDesktopApp:
         overview_refreshed = self._refresh_overview()
         if hasattr(self, "price_ax"):
             self._update_price_chart()
-        if hasattr(self, "indicator_tree"):
+        if hasattr(self, "indicator_price_ax"):
             self._update_indicator_view()
         if not overview_refreshed and hasattr(self, "pnl_label"):
             self._recompute_pnl()
@@ -2109,13 +2365,13 @@ class StockPredictorDesktopApp:
             )
         for figure in (
             getattr(self, "price_figure", None),
-            getattr(self, "indicator_figure", None),
+            getattr(self, "indicator_price_figure", None),
             getattr(self, "feature_figure", None),
         ):
             self._style_figure(figure)
         for canvas in (
             getattr(self, "price_canvas", None),
-            getattr(self, "indicator_canvas", None),
+            getattr(self, "indicator_price_canvas", None),
             getattr(self, "feature_canvas", None),
         ):
             if canvas is not None:
