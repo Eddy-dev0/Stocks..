@@ -2,34 +2,45 @@
 
 from __future__ import annotations
 
-import json
+import asyncio
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Any, Callable, DefaultDict, Dict, Iterable, Tuple
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    DefaultDict,
+    Dict,
+    Iterable,
+    Mapping,
+    Sequence,
+    Tuple,
+    TypeVar,
+)
 
 import pandas as pd
-import requests
 import yfinance as yf
-from urllib.error import HTTPError
 
 from .config import PredictorConfig
 from .database import Database
 from .preprocessing import compute_price_features
 from .sentiment import aggregate_daily_sentiment, attach_sentiment
+from stock_predictor.providers.base import (
+    DatasetType,
+    EconomicIndicator,
+    NewsArticle,
+    PriceBar,
+    ProviderRequest,
+    ProviderResult,
+    SentimentSignal,
+    build_default_registry,
+)
 
 LOGGER = logging.getLogger(__name__)
 
-YF_PRICES_MISSING_ERROR = getattr(yf, "YFPricesMissingError", None)
-YF_TZ_MISSING_ERROR = getattr(yf, "YFTzMissingError", None)
-
-YFINANCE_DOWNLOAD_ERRORS: tuple[type[Exception], ...] = tuple(
-    exc
-    for exc in (YF_PRICES_MISSING_ERROR, YF_TZ_MISSING_ERROR)
-    if isinstance(exc, type) and issubclass(exc, Exception)
-)
-
+T = TypeVar("T")
 
 class NoPriceDataError(RuntimeError):
     """Raised when a ticker fails to yield any price observations."""
@@ -78,12 +89,11 @@ class RefreshResult:
 class MarketDataETL:
     """Services that orchestrate downloading, normalising and storing data."""
 
-    NEWS_ENDPOINT = "https://financialmodelingprep.com/api/v3/stock_news"
-
     def __init__(self, config: PredictorConfig, database: Database | None = None) -> None:
         self.config = config
         self.database = database or Database(config.database_url)
         self._source_log: DefaultDict[str, set[str]] = defaultdict(set)
+        self._registry = build_default_registry()
 
     # ------------------------------------------------------------------
     # Public refresh API
@@ -102,10 +112,7 @@ class MarketDataETL:
             )
         if not force and self._covers_requested_range(existing):
             LOGGER.debug("Price data already present for %s", self.config.ticker)
-            self._record_source(
-                "database",
-                f"Cached price history for {self.config.ticker} ({self.config.interval} interval)",
-            )
+            self._record_source("prices", "database")
             return RefreshResult(existing, downloaded=False)
 
         LOGGER.info(
@@ -114,40 +121,34 @@ class MarketDataETL:
             self.config.start_date,
             self.config.end_date or "today",
         )
-        try:
-            downloaded = self._download_price_data()
-        except HTTPError as exc:
-            LOGGER.error("HTTP error while downloading prices for %s: %s", self.config.ticker, exc)
-            raise NoPriceDataError(
-                self.config.ticker,
-                self._compose_error_message(str(exc)),
-            ) from exc
-        except Exception as exc:  # pylint: disable=broad-except
-            if YFINANCE_DOWNLOAD_ERRORS and isinstance(exc, YFINANCE_DOWNLOAD_ERRORS):  # type: ignore[arg-type]
-                LOGGER.error("Failed to download prices for %s: %s", self.config.ticker, exc)
-                raise NoPriceDataError(
-                    self.config.ticker,
-                    self._compose_error_message(str(exc)),
-                ) from exc
-            raise
+        params: Dict[str, Any] = {"interval": self.config.interval}
+        if self.config.start_date:
+            params["start"] = self.config.start_date.isoformat()
+        if self.config.end_date:
+            params["end"] = self.config.end_date.isoformat()
 
-        if downloaded.empty:
+        results = self._fetch_dataset(DatasetType.PRICES, params)
+        providers = self._collect_providers(results)
+        downloaded = self._coalesce_price_results(results)
+
+        if downloaded is None or downloaded.empty:
             LOGGER.error(
                 "No price data returned for ticker %s in requested range",
                 self.config.ticker,
             )
             raise NoPriceDataError(
                 self.config.ticker,
-                self._compose_error_message("Empty dataframe from data provider."),
+                self._compose_error_message("Empty dataframe from data providers."),
             )
         self.database.upsert_prices(self.config.ticker, self.config.interval, downloaded)
         self.database.set_refresh_timestamp(
             self.config.ticker, self.config.interval, "prices"
         )
-        self._record_source(
-            "yfinance",
-            f"Price history for {self.config.ticker} ({self.config.interval} interval)",
-        )
+        if providers:
+            for provider in providers:
+                self._record_source("prices", provider)
+        else:
+            self._record_source("prices", "unknown")
         refreshed = self.database.get_prices(
             ticker=self.config.ticker,
             interval=self.config.interval,
@@ -199,7 +200,7 @@ class MarketDataETL:
             self.database.set_refresh_timestamp(
                 self.config.ticker, self.config.interval, "indicators"
             )
-            self._record_source("local", "Derived technical indicators from price history")
+            self._record_source("indicators", "local")
         return inserted
 
     def refresh_fundamentals(self, force: bool = False) -> int:
@@ -208,9 +209,14 @@ class MarketDataETL:
             return 0
 
         LOGGER.info("Downloading fundamentals for %s", self.config.ticker)
-        ticker = yf.Ticker(self.config.ticker)
 
         records: list[dict[str, object]] = []
+        provider_results = self._fetch_dataset(DatasetType.FUNDAMENTALS)
+        provider_names = self._collect_providers(provider_results)
+        records.extend(self._coalesce_fundamental_results(provider_results))
+
+        ticker = yf.Ticker(self.config.ticker)
+
         statement_sources: Dict[str, Tuple[str, pd.DataFrame | None]] = {
             "income_statement_annual": ("annual", getattr(ticker, "financials", None)),
             "income_statement_quarterly": (
@@ -229,9 +235,13 @@ class MarketDataETL:
             ),
         }
 
+        used_yfinance = False
+
         for statement_name, (period, frame) in statement_sources.items():
             normalized = self._normalize_statement(frame, statement_name, period)
             records.extend(normalized)
+            if normalized:
+                used_yfinance = True
 
         info = getattr(ticker, "info", {}) or {}
         if info:
@@ -247,13 +257,20 @@ class MarketDataETL:
                     "Raw": value if not isinstance(value, (int, float)) else None,
                 }
                 records.append(record)
+            used_yfinance = True
 
         inserted = self.database.upsert_fundamentals(records)
         if inserted:
             self.database.set_refresh_timestamp(
                 self.config.ticker, "global", "fundamentals"
             )
-            self._record_source("yfinance", f"Fundamental statements for {self.config.ticker}")
+            if provider_names:
+                for provider in provider_names:
+                    self._record_source("fundamentals", provider)
+            if used_yfinance:
+                self._record_source("fundamentals", "yfinance")
+            if not provider_names and not used_yfinance:
+                self._record_source("fundamentals", "unknown")
         return inserted
 
     def refresh_macro(self, force: bool = False) -> int:
@@ -314,86 +331,47 @@ class MarketDataETL:
             self.database.set_refresh_timestamp(
                 self.config.ticker, self.config.interval, "macro"
             )
-            self._record_source(
-                "yfinance",
-                "Macro indicators: "
-                + ", ".join(f"{symbol} ({name})" for symbol, name in MACRO_SYMBOLS.items()),
-            )
+            self._record_source("macro", "yfinance")
         return inserted
 
     def refresh_news(self, force: bool = False) -> RefreshResult:
         existing = self.database.get_news(self.config.ticker)
         if not force and not existing.empty:
+            self._record_source("news", "database")
             return RefreshResult(existing, downloaded=False)
 
-        if not self.config.news_api_key:
-            LOGGER.info(
-                "No news API key configured; returning cached database entries only."
-            )
-            return RefreshResult(existing, downloaded=False)
-
-        params = {
-            "tickers": self.config.ticker,
-            "limit": self.config.news_limit,
-            "apikey": self.config.news_api_key,
-        }
         LOGGER.info(
             "Downloading up to %s news articles for %s",
             self.config.news_limit,
             self.config.ticker,
         )
-        try:
-            response = requests.get(self.NEWS_ENDPOINT, params=params, timeout=30)
-            response.raise_for_status()
-            articles = response.json()
-        except requests.RequestException as exc:
-            LOGGER.error("Failed to download news data: %s", exc)
-            return RefreshResult(existing, downloaded=False)
-        except ValueError as exc:  # json decoding error
-            LOGGER.error("Failed to parse news response: %s", exc)
-            return RefreshResult(existing, downloaded=False)
 
-        if not isinstance(articles, list):
-            LOGGER.error("Unexpected response for news data: %s", json.dumps(articles)[:200])
-            return RefreshResult(existing, downloaded=False)
-        if not articles:
+        params = {"query": self.config.ticker, "limit": self.config.news_limit or 50}
+        results = self._fetch_dataset(DatasetType.NEWS, params)
+        providers = self._collect_providers(results)
+        frame = self._coalesce_news_results(results)
+
+        if frame is None or frame.empty:
             LOGGER.warning("No news articles returned for %s", self.config.ticker)
-            return RefreshResult(existing, downloaded=True)
+            for provider in providers:
+                self._record_source("news", provider)
+            return RefreshResult(existing, downloaded=bool(providers))
 
-        frame = pd.DataFrame(articles)
-        if "publishedDate" in frame.columns:
-            frame["publishedDate"] = pd.to_datetime(
-                frame["publishedDate"], errors="coerce"
-            )
-            frame = frame.dropna(subset=["publishedDate"])
-        records = []
-        for row in frame.itertuples(index=False):
-            records.append(
-                {
-                    "Ticker": self.config.ticker,
-                    "PublishedAt": getattr(row, "publishedDate", None),
-                    "Title": getattr(row, "title", None),
-                    "Summary": getattr(row, "text", getattr(row, "summary", None)),
-                    "Url": getattr(row, "url", None),
-                    "Source": getattr(row, "site", getattr(row, "source", None)),
-                }
-            )
-
+        records = frame.to_dict("records")
         inserted = self.database.upsert_news(records)
         if inserted:
             self.database.set_refresh_timestamp(
                 self.config.ticker, "global", "news"
             )
-            self._record_source("news_api", f"News and sentiment articles for {self.config.ticker}")
+            for provider in providers:
+                self._record_source("news", provider)
         refreshed = self.database.get_news(self.config.ticker)
         return RefreshResult(refreshed, downloaded=True)
 
     def refresh_corporate_events(self, force: bool = False) -> RefreshResult:
         existing = self.database.get_corporate_events(self.config.ticker)
         if not force and not existing.empty:
-            self._record_source(
-                "database", f"Cached corporate events for {self.config.ticker}"
-            )
+            self._record_source("corporate_events", "database")
             return RefreshResult(existing, downloaded=False)
 
         LOGGER.info("Refreshing corporate action history for %s", self.config.ticker)
@@ -489,18 +467,14 @@ class MarketDataETL:
                 self.config.ticker, "global", "corporate_events"
             )
             provider = "yfinance" if downloaded else "placeholder"
-            self._record_source(
-                provider, f"Corporate events for {self.config.ticker}"
-            )
+            self._record_source("corporate_events", provider)
         refreshed = self.database.get_corporate_events(self.config.ticker)
         return RefreshResult(refreshed, downloaded=downloaded)
 
     def refresh_options_surface(self, force: bool = False) -> RefreshResult:
         existing = self.database.get_option_surface(self.config.ticker)
         if not force and not existing.empty:
-            self._record_source(
-                "database", f"Cached option surface for {self.config.ticker}"
-            )
+            self._record_source("options_surface", "database")
             return RefreshResult(existing, downloaded=False)
 
         LOGGER.info("Refreshing option surface snapshot for %s", self.config.ticker)
@@ -598,38 +572,48 @@ class MarketDataETL:
                 self.config.ticker, "global", "options"
             )
             provider = "yfinance" if downloaded else "placeholder"
-            self._record_source(provider, f"Option surface snapshot for {self.config.ticker}")
+            self._record_source("options_surface", provider)
         refreshed = self.database.get_option_surface(self.config.ticker)
         return RefreshResult(refreshed, downloaded=downloaded)
 
     def refresh_sentiment_signals(self, force: bool = False) -> RefreshResult:
         existing = self.database.get_sentiment_signals(self.config.ticker)
         if not force and not existing.empty:
-            self._record_source(
-                "database", f"Cached sentiment signals for {self.config.ticker}"
-            )
+            self._record_source("sentiment", "database")
             return RefreshResult(existing, downloaded=False)
+
+        params = {"query": self.config.ticker, "limit": 200}
+        provider_results = self._fetch_dataset(DatasetType.SENTIMENT, params)
+        providers = self._collect_providers(provider_results)
+
+        sentiment_records: list[dict[str, Any]] = []
+        for result in provider_results:
+            for record in result.records:
+                if isinstance(record, SentimentSignal):
+                    payload = record.as_record()
+                    if payload.get("Ticker"):
+                        sentiment_records.append(payload)
 
         news = self.database.get_news(self.config.ticker)
         if news.empty and self.config.sentiment:
             news_result = self.refresh_news(force=False)
             news = news_result.data
 
-        records: list[dict[str, Any]] = []
-        downloaded = False
         if not news.empty:
             working = news.copy()
-            if "publishedDate" in working.columns:
-                working["publishedDate"] = pd.to_datetime(
-                    working["publishedDate"], errors="coerce"
-                )
-            elif "PublishedAt" in working.columns:
-                working["publishedDate"] = pd.to_datetime(
-                    working["PublishedAt"], errors="coerce"
+            published_col = None
+            for candidate in ("publishedDate", "PublishedAt"):
+                if candidate in working.columns:
+                    published_col = candidate
+                    break
+            if published_col:
+                working[published_col] = pd.to_datetime(
+                    working[published_col], errors="coerce"
                 )
             else:
                 working["publishedDate"] = pd.NaT
-            working = working.dropna(subset=["publishedDate"])
+                published_col = "publishedDate"
+            working = working.dropna(subset=[published_col])
             if "Summary" in working.columns:
                 working["text"] = working["Summary"].fillna("")
             elif "summary" in working.columns:
@@ -643,8 +627,8 @@ class MarketDataETL:
             scored = attach_sentiment(working)
             aggregated = aggregate_daily_sentiment(scored)
             counts_series = (
-                scored.groupby(scored["publishedDate"].dt.date)["publishedDate"].count()
-                if "publishedDate" in scored.columns
+                scored.groupby(scored[published_col].dt.date)[published_col].count()
+                if published_col in scored.columns
                 else pd.Series(dtype=int)
             )
             counts = counts_series.to_dict()
@@ -653,7 +637,7 @@ class MarketDataETL:
                 if pd.isna(row_date):
                     continue
                 count = int(counts.get(row_date.date(), 0))
-                records.append(
+                sentiment_records.append(
                     {
                         "Ticker": self.config.ticker,
                         "AsOf": row_date,
@@ -664,10 +648,11 @@ class MarketDataETL:
                         "Payload": {"articles": count},
                     }
                 )
-            downloaded = bool(records)
+            if aggregated.shape[0]:
+                providers.add("vader")
 
-        if not records:
-            records.append(
+        if not sentiment_records:
+            sentiment_records.append(
                 {
                     "Ticker": self.config.ticker,
                     "AsOf": datetime.utcnow(),
@@ -676,29 +661,36 @@ class MarketDataETL:
                     "Score": 0.0,
                     "Magnitude": None,
                     "Payload": {
-                        "note": "Placeholder sentiment score generated because no news data was available."
+                        "note": "Placeholder sentiment score generated because no sentiment providers returned data."
                     },
                 }
             )
+            providers.add("placeholder")
 
+        frame = pd.DataFrame(sentiment_records)
+        if not frame.empty and "AsOf" in frame.columns:
+            frame["AsOf"] = pd.to_datetime(frame["AsOf"], errors="coerce")
+            frame = frame.dropna(subset=["AsOf"])
+            frame = frame.sort_values("AsOf").drop_duplicates(
+                subset=["Provider", "SignalType", "AsOf"], keep="last"
+            )
+
+        records = frame.to_dict("records") if not frame.empty else []
         inserted = self.database.upsert_sentiment_signals(records)
         if inserted:
             self.database.set_refresh_timestamp(
                 self.config.ticker, "global", "sentiment"
             )
-            provider = "analytics" if downloaded else "placeholder"
-            self._record_source(
-                provider, f"Sentiment signals for {self.config.ticker}"
-            )
+            for provider in providers:
+                self._record_source("sentiment", provider)
         refreshed = self.database.get_sentiment_signals(self.config.ticker)
+        downloaded = bool(records) and providers != {"placeholder"}
         return RefreshResult(refreshed, downloaded=downloaded)
 
     def refresh_esg_metrics(self, force: bool = False) -> RefreshResult:
         existing = self.database.get_esg_metrics(self.config.ticker)
         if not force and not existing.empty:
-            self._record_source(
-                "database", f"Cached ESG metrics for {self.config.ticker}"
-            )
+            self._record_source("esg_metrics", "database")
             return RefreshResult(existing, downloaded=False)
 
         LOGGER.info("Refreshing ESG metrics for %s", self.config.ticker)
@@ -748,16 +740,14 @@ class MarketDataETL:
                 self.config.ticker, "global", "esg"
             )
             provider = "yfinance" if downloaded else "placeholder"
-            self._record_source(provider, f"ESG metrics for {self.config.ticker}")
+            self._record_source("esg_metrics", provider)
         refreshed = self.database.get_esg_metrics(self.config.ticker)
         return RefreshResult(refreshed, downloaded=downloaded)
 
     def refresh_ownership_flows(self, force: bool = False) -> RefreshResult:
         existing = self.database.get_ownership_flows(self.config.ticker)
         if not force and not existing.empty:
-            self._record_source(
-                "database", f"Cached ownership data for {self.config.ticker}"
-            )
+            self._record_source("ownership_flows", "database")
             return RefreshResult(existing, downloaded=False)
 
         LOGGER.info("Refreshing ownership and flow data for %s", self.config.ticker)
@@ -859,7 +849,7 @@ class MarketDataETL:
                 self.config.ticker, "global", "ownership"
             )
             provider = "yfinance" if downloaded else "placeholder"
-            self._record_source(provider, f"Ownership and flow data for {self.config.ticker}")
+            self._record_source("ownership_flows", provider)
         refreshed = self.database.get_ownership_flows(self.config.ticker)
         return RefreshResult(refreshed, downloaded=downloaded)
 
@@ -903,39 +893,177 @@ class MarketDataETL:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-    def _download_price_data(self) -> pd.DataFrame:
-        df = yf.download(
-            tickers=self.config.ticker,
-            start=self.config.start_date.isoformat() if self.config.start_date else None,
-            end=self.config.end_date.isoformat() if self.config.end_date else None,
-            interval=self.config.interval,
-            progress=False,
-            auto_adjust=False,
+    def _run_async(self, coroutine_factory: Callable[[], Awaitable[T]]) -> T:
+        try:
+            return asyncio.run(coroutine_factory())
+        except RuntimeError as exc:  # pragma: no cover - defensive fallback
+            message = str(exc).lower()
+            if "event loop" not in message:
+                raise
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(coroutine_factory())
+            finally:
+                loop.close()
+
+    def _fetch_dataset(
+        self, dataset: DatasetType, params: Mapping[str, Any] | None = None
+    ) -> list[ProviderResult]:
+        request = ProviderRequest(
+            dataset_type=dataset,
+            symbol=self.config.ticker,
+            params=dict(params or {}),
         )
-        if df.empty:
-            return pd.DataFrame()
-        df = df.reset_index()
-        if isinstance(df.columns, pd.MultiIndex):
-            # Flatten multi-level columns returned by yfinance when requesting a
-            # single ticker so downstream code can access fields using the
-            # expected names (e.g. "Open", "Close"). We only keep the price
-            # field component as the ticker level is redundant once flattened.
-            df.columns = df.columns.get_level_values(0)
-        # Ensure the first column is always normalised to "Date" even when
-        # yfinance labels it differently (e.g. "Datetime").
-        df = df.rename(columns={df.columns[0]: "Date"})
-        df.columns = [col.title() if isinstance(col, str) else col for col in df.columns]
-        return df
+
+        async def _runner() -> list[ProviderResult]:
+            return await self._registry.fetch_all(request)
+
+        return self._run_async(_runner)
+
+    @staticmethod
+    def _collect_providers(results: Sequence[ProviderResult]) -> set[str]:
+        return {result.source for result in results if result.source}
+
+    @staticmethod
+    def _coalesce_price_results(
+        results: Sequence[ProviderResult],
+    ) -> pd.DataFrame | None:
+        bars: list[dict[str, Any]] = []
+        for result in results:
+            for record in result.records:
+                if isinstance(record, PriceBar):
+                    bars.append(record.as_frame_row())
+        if not bars:
+            return None
+        frame = pd.DataFrame(bars)
+        if frame.empty:
+            return None
+        frame = frame.dropna(how="all")
+        if frame.empty:
+            return None
+        frame = frame.sort_values("Date").drop_duplicates(subset=["Date"], keep="last")
+        return frame.reset_index(drop=True)
+
+    @staticmethod
+    def _coalesce_news_results(
+        results: Sequence[ProviderResult],
+    ) -> pd.DataFrame | None:
+        articles: list[dict[str, Any]] = []
+        for result in results:
+            for record in result.records:
+                if isinstance(record, NewsArticle):
+                    articles.append(record.as_record())
+        if not articles:
+            return None
+        frame = pd.DataFrame(articles)
+        if frame.empty:
+            return None
+        if "PublishedAt" in frame.columns:
+            frame["PublishedAt"] = pd.to_datetime(frame["PublishedAt"], errors="coerce")
+            frame = frame.dropna(subset=["PublishedAt"])
+        frame = frame.sort_values("PublishedAt").drop_duplicates(
+            subset=["Url", "Title"], keep="last"
+        )
+        return frame.reset_index(drop=True)
+
+    def _coalesce_fundamental_results(
+        self, results: Sequence[ProviderResult]
+    ) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        for result in results:
+            for record in result.records:
+                raw: Mapping[str, Any]
+                if hasattr(record, "model_dump"):
+                    raw = record.model_dump()  # type: ignore[assignment]
+                elif isinstance(record, Mapping):
+                    raw = dict(record)
+                else:
+                    raw = {
+                        key: value
+                        for key, value in vars(record).items()
+                        if not key.startswith("_")
+                    }
+                if not isinstance(raw, Mapping):
+                    continue
+                metrics_payload = raw.get("metrics")
+                if isinstance(metrics_payload, Mapping):
+                    as_of = self._normalize_date(
+                        raw.get("AsOf")
+                        or raw.get("as_of")
+                        or raw.get("date")
+                        or raw.get("Date")
+                    ) or datetime.utcnow().date()
+                    statement = (
+                        raw.get("Statement")
+                        or raw.get("statement")
+                        or result.metadata.get("statement")
+                        or "provider"
+                    )
+                    period = raw.get("Period") or raw.get("period") or "latest"
+                    for metric_name, metric_value in metrics_payload.items():
+                        records.append(
+                            {
+                                "Ticker": raw.get("Ticker")
+                                or raw.get("ticker")
+                                or self.config.ticker,
+                                "Statement": statement,
+                                "Period": period,
+                                "AsOf": as_of,
+                                "Metric": metric_name,
+                                "Value": self._safe_float(metric_value),
+                                "Raw": raw,
+                            }
+                        )
+                    continue
+                metric = (
+                    raw.get("Metric")
+                    or raw.get("metric")
+                    or raw.get("name")
+                    or raw.get("field")
+                )
+                if metric is None:
+                    continue
+                as_of_value = (
+                    raw.get("AsOf")
+                    or raw.get("as_of")
+                    or raw.get("date")
+                    or raw.get("Date")
+                )
+                as_of = self._normalize_date(as_of_value) or datetime.utcnow().date()
+                value = raw.get("Value")
+                if value is None and "value" in raw:
+                    value = raw.get("value")
+                records.append(
+                    {
+                        "Ticker": raw.get("Ticker")
+                        or raw.get("ticker")
+                        or self.config.ticker,
+                        "Statement": raw.get("Statement")
+                        or raw.get("statement")
+                        or result.metadata.get("statement")
+                        or "provider",
+                        "Period": raw.get("Period")
+                        or raw.get("period")
+                        or result.metadata.get("period")
+                        or "latest",
+                        "AsOf": as_of,
+                        "Metric": metric,
+                        "Value": self._safe_float(value),
+                        "Raw": raw,
+                    }
+                )
+        return records
 
     def list_sources(self) -> list[str]:
-        entries: list[str] = []
-        for provider, descriptions in self._source_log.items():
-            for description in sorted(descriptions):
-                entries.append(f"{provider}: {description}")
-        return entries
+        providers: set[str] = set()
+        for dataset_providers in self._source_log.values():
+            providers.update(dataset_providers)
+        return sorted(providers)
 
-    def _record_source(self, provider: str, description: str) -> None:
-        self._source_log[provider].add(description)
+    def _record_source(self, dataset: str, provider: str) -> None:
+        if not provider:
+            return
+        self._source_log[dataset].add(provider)
 
     @staticmethod
     def _normalize_date(value: Any) -> date | None:
