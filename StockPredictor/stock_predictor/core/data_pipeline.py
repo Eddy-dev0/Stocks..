@@ -51,7 +51,12 @@ class PipelineResult:
 
 
 class AsyncDataPipeline:
-    """Pipeline coordinating asynchronous provider fetches."""
+    """Pipeline coordinating asynchronous provider fetches.
+
+    Configure :attr:`PredictorConfig.csv_price_loader_path` or
+    :attr:`PredictorConfig.parquet_price_loader_path` to enable local
+    file-based price providers.
+    """
 
     def __init__(
         self,
@@ -61,7 +66,10 @@ class AsyncDataPipeline:
         database: Database | None = None,
     ) -> None:
         self.config = config
-        self.registry = registry or build_default_registry()
+        self.registry = registry or build_default_registry(
+            csv_loader_path=self.config.csv_price_loader_path,
+            parquet_loader_path=self.config.parquet_price_loader_path,
+        )
         self.database = database or Database(config.database_url)
         self._closed = False
 
@@ -111,6 +119,9 @@ class AsyncDataPipeline:
                 params["start"] = self.config.start_date.isoformat()
             if self.config.end_date:
                 params["end"] = self.config.end_date.isoformat()
+            loader_path = self._price_loader_path()
+            if loader_path:
+                params.setdefault("path", loader_path)
             return params
         if dataset == DatasetType.NEWS:
             return {"query": self.config.ticker, "limit": 50}
@@ -148,6 +159,17 @@ class AsyncDataPipeline:
             return frame, persisted, source_counts
         LOGGER.info("No persistence strategy for dataset %s", dataset)
         return None, 0, source_counts
+
+    def _price_loader_path(self) -> str | None:
+        """Return the configured path for local price loaders, if any."""
+
+        for path in (
+            self.config.csv_price_loader_path,
+            self.config.parquet_price_loader_path,
+        ):
+            if path:
+                return str(path)
+        return None
 
     def _dedupe_prices(self, records: Iterable[object]) -> pd.DataFrame | None:
         bars = [record for record in records if isinstance(record, PriceBar)]

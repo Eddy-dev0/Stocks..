@@ -103,6 +103,10 @@ class PredictorConfig:
     risk_free_rate: float = 0.0
     research_api_keys: tuple[str, ...] = field(default_factory=tuple)
     research_allow_list: tuple[str, ...] = field(default_factory=tuple)
+    # Provide a local CSV file path to enable the CSVPriceLoader provider.
+    csv_price_loader_path: Path | None = None
+    # Provide a local Parquet file path to enable the ParquetPriceLoader provider.
+    parquet_price_loader_path: Path | None = None
 
     def __post_init__(self) -> None:
         self.ticker = self.ticker.upper()
@@ -150,6 +154,12 @@ class PredictorConfig:
         self.research_allow_list = self._normalise_strings(
             self.research_allow_list, lower=True
         )
+        if self.csv_price_loader_path is not None:
+            self.csv_price_loader_path = Path(self.csv_price_loader_path).expanduser()
+        if self.parquet_price_loader_path is not None:
+            self.parquet_price_loader_path = Path(
+                self.parquet_price_loader_path
+            ).expanduser()
 
     def ensure_directories(self) -> None:
         """Ensure that data and model directories exist."""

@@ -113,13 +113,21 @@ class RefreshResult:
 
 
 class MarketDataETL:
-    """Services that orchestrate downloading, normalising and storing data."""
+    """Services that orchestrate downloading, normalising and storing data.
+
+    To enable local file-based price loaders configure
+    :attr:`PredictorConfig.csv_price_loader_path` or
+    :attr:`PredictorConfig.parquet_price_loader_path`.
+    """
 
     def __init__(self, config: PredictorConfig, database: Database | None = None) -> None:
         self.config = config
         self.database = database or Database(config.database_url)
         self._source_log: DefaultDict[str, set[str]] = defaultdict(set)
-        self._registry = build_default_registry()
+        self._registry = build_default_registry(
+            csv_loader_path=self.config.csv_price_loader_path,
+            parquet_loader_path=self.config.parquet_price_loader_path,
+        )
 
     # ------------------------------------------------------------------
     # Public refresh API
@@ -989,10 +997,15 @@ class MarketDataETL:
     def _fetch_dataset(
         self, dataset: DatasetType, params: Mapping[str, Any] | None = None
     ) -> ProviderFetchSummary:
+        request_params = dict(params or {})
+        if dataset == DatasetType.PRICES:
+            loader_path = self._price_loader_path()
+            if loader_path and "path" not in request_params:
+                request_params["path"] = loader_path
         request = ProviderRequest(
             dataset_type=dataset,
             symbol=self.config.ticker,
-            params=dict(params or {}),
+            params=request_params,
         )
 
         async def _runner() -> ProviderFetchSummary:
@@ -1003,6 +1016,17 @@ class MarketDataETL:
     @staticmethod
     def _collect_providers(results: Sequence[ProviderResult]) -> set[str]:
         return {result.source for result in results if result.source}
+
+    def _price_loader_path(self) -> str | None:
+        """Return the configured path for local price loaders, if any."""
+
+        for path in (
+            self.config.csv_price_loader_path,
+            self.config.parquet_price_loader_path,
+        ):
+            if path:
+                return str(path)
+        return None
 
     def _log_provider_failures(
         self, dataset: str, failures: Sequence[ProviderFailure]
