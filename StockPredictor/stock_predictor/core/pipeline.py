@@ -6,7 +6,7 @@ import asyncio
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time
 from typing import (
     Any,
     Awaitable,
@@ -22,6 +22,10 @@ from typing import (
 
 import pandas as pd
 import yfinance as yf
+
+from pandas.tseries.holiday import USFederalHolidayCalendar
+from pandas.tseries.offsets import CustomBusinessDay
+from zoneinfo import ZoneInfo
 
 from .config import PredictorConfig
 from .database import Database
@@ -44,6 +48,10 @@ from stock_predictor.providers.base import (
 LOGGER = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+US_MARKET_TIMEZONE = ZoneInfo("America/New_York")
+US_MARKET_CLOSE = time(16, 0)
+US_MARKET_BUSINESS_DAY = CustomBusinessDay(calendar=USFederalHolidayCalendar())
 
 class NoPriceDataError(RuntimeError):
     """Raised when a ticker fails to yield any price observations."""
@@ -157,8 +165,9 @@ class MarketDataETL:
                 )
         if not force and self._covers_requested_range(existing):
             LOGGER.debug("Price data already present for %s", self.config.ticker)
+            prepared = self._apply_provider_timestamps(existing, None)
             self._record_source("prices", "database")
-            return RefreshResult(existing, downloaded=False)
+            return RefreshResult(prepared, downloaded=False)
 
         LOGGER.info(
             "Downloading price data for %s (%s - %s)",
@@ -187,8 +196,9 @@ class MarketDataETL:
                     "Providers returned no new price rows for %s; reusing cached data.",
                     self.config.ticker,
                 )
+                prepared = self._apply_provider_timestamps(existing, None)
                 self._record_source("prices", "database")
-                return RefreshResult(existing, downloaded=False)
+                return RefreshResult(prepared, downloaded=False)
 
             message = self._compose_error_message(
                 self._compose_failure_summary(summary.failures)
@@ -216,7 +226,8 @@ class MarketDataETL:
                 self.config.ticker,
                 self._compose_error_message("Cached dataset is empty after refresh."),
             )
-        return RefreshResult(refreshed, downloaded=True)
+        prepared = self._apply_provider_timestamps(refreshed, downloaded)
+        return RefreshResult(prepared, downloaded=True)
 
     def refresh_indicators(
         self, price_frame: pd.DataFrame | None = None, force: bool = False
@@ -1287,23 +1298,109 @@ class MarketDataETL:
         ticker_upper = (self.config.ticker or "").upper()
         return TICKER_HINTS.get(ticker_upper, "")
 
+    @staticmethod
+    def _normalize_to_market_tz(timestamp: datetime | pd.Timestamp) -> pd.Timestamp:
+        ts = pd.Timestamp(timestamp)
+        if ts.tzinfo is None:
+            return ts.tz_localize(US_MARKET_TIMEZONE)
+        return ts.tz_convert(US_MARKET_TIMEZONE)
+
+    @staticmethod
+    def _is_trading_day(timestamp: datetime | pd.Timestamp) -> bool:
+        ts = MarketDataETL._normalize_to_market_tz(pd.Timestamp(timestamp)).normalize()
+        naive = ts.tz_localize(None)
+        return US_MARKET_BUSINESS_DAY.is_on_offset(naive)
+
+    @staticmethod
+    def _previous_trading_day(timestamp: datetime | pd.Timestamp) -> pd.Timestamp:
+        candidate = MarketDataETL._normalize_to_market_tz(pd.Timestamp(timestamp)).normalize()
+        for _ in range(10):
+            candidate = (candidate - US_MARKET_BUSINESS_DAY).normalize()
+            if MarketDataETL._is_trading_day(candidate):
+                return candidate
+        return candidate
+
+    @staticmethod
+    def _latest_trading_session(reference: datetime | pd.Timestamp | None = None) -> date:
+        current = MarketDataETL._normalize_to_market_tz(
+            pd.Timestamp.utcnow() if reference is None else reference
+        )
+        session = current.normalize()
+        if not MarketDataETL._is_trading_day(session):
+            session = MarketDataETL._previous_trading_day(session)
+        else:
+            if (current.hour, current.minute, current.second) < (
+                US_MARKET_CLOSE.hour,
+                US_MARKET_CLOSE.minute,
+                US_MARKET_CLOSE.second,
+            ):
+                session = MarketDataETL._previous_trading_day(session)
+        return session.tz_localize(None).date()
+
+    def _apply_provider_timestamps(
+        self, persisted: pd.DataFrame, downloaded: pd.DataFrame | None
+    ) -> pd.DataFrame:
+        if persisted.empty or "Date" not in persisted.columns:
+            return persisted
+        frame = persisted.copy()
+        try:
+            persisted_dates = pd.to_datetime(frame["Date"], errors="coerce")
+        except Exception:  # pragma: no cover - defensive
+            return frame
+        if persisted_dates.isna().all():
+            return frame
+        if getattr(persisted_dates.dt, "tz", None) is None:
+            localized = persisted_dates.dt.tz_localize(US_MARKET_TIMEZONE)
+        else:
+            localized = persisted_dates.dt.tz_convert(US_MARKET_TIMEZONE)
+        frame["Date"] = localized
+        if downloaded is None or downloaded.empty or "Date" not in downloaded.columns:
+            return frame
+        try:
+            provider_dates = pd.to_datetime(downloaded["Date"], errors="coerce").dropna()
+        except Exception:  # pragma: no cover - defensive
+            return frame
+        if provider_dates.empty:
+            return frame
+        if getattr(provider_dates.dt, "tz", None) is None:
+            provider_dates = provider_dates.dt.tz_localize(US_MARKET_TIMEZONE)
+        else:
+            provider_dates = provider_dates.dt.tz_convert(US_MARKET_TIMEZONE)
+        provider_map: dict[date, pd.Timestamp] = {}
+        for ts in provider_dates:
+            provider_map[ts.date()] = ts
+        if not provider_map:
+            return frame
+        for trade_date, ts in provider_map.items():
+            mask = frame["Date"].dt.date == trade_date
+            if mask.any():
+                frame.loc[mask, "Date"] = ts
+        return frame
+
     def _covers_requested_range(self, frame: pd.DataFrame) -> bool:
         if frame.empty:
             return False
         start = self.config.start_date
         end = self.config.end_date
-        frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
-        if frame["Date"].isna().all():
+        try:
+            date_values = pd.to_datetime(frame["Date"], errors="coerce").dropna()
+        except Exception:  # pragma: no cover - defensive
             return False
-        min_date = frame["Date"].min().date()
-        max_date = frame["Date"].max().date()
+        if date_values.empty:
+            return False
+        if getattr(date_values.dt, "tz", None) is None:
+            market_dates = date_values.dt.tz_localize(US_MARKET_TIMEZONE)
+        else:
+            market_dates = date_values.dt.tz_convert(US_MARKET_TIMEZONE)
+        min_date = market_dates.min().date()
+        max_date = market_dates.max().date()
         if start and min_date > start:
             return False
         if end and max_date < end:
             return False
         if not end:
-            today = datetime.utcnow().date()
-            if (today - max_date).days > 2:
+            latest_session = self._latest_trading_session()
+            if max_date < latest_session:
                 return False
         return True
 
