@@ -1302,7 +1302,9 @@ class MarketDataETL:
     def _normalize_to_market_tz(timestamp: datetime | pd.Timestamp) -> pd.Timestamp:
         ts = pd.Timestamp(timestamp)
         if ts.tzinfo is None:
-            return ts.tz_localize(US_MARKET_TIMEZONE)
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
         return ts.tz_convert(US_MARKET_TIMEZONE)
 
     @staticmethod
