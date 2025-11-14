@@ -1031,10 +1031,13 @@ class StockPredictorAI:
                 self.metadata["feature_columns"] = list(transformed_features.columns)
             self.metadata["latest_transformed_features"] = transformed_features
 
-            pred_value = model.predict(transformed_features)[0]
+            model_input = self._prepare_features_for_model(model, transformed_features)
+            pred_value = model.predict(model_input)[0]
             predictions[target] = float(pred_value)
 
-            uncertainty = self._estimate_prediction_uncertainty(target, model, transformed_features)
+            uncertainty = self._estimate_prediction_uncertainty(
+                target, model, transformed_features
+            )
             if uncertainty:
                 metrics_block = uncertainty.get("metrics") if isinstance(uncertainty, dict) else None
                 quantiles_block = uncertainty.get("quantiles") if isinstance(uncertainty, dict) else None
@@ -1055,7 +1058,7 @@ class StockPredictorAI:
                     }
 
             if model_supports_proba(model) and target == "direction":
-                proba = model.predict_proba(transformed_features)[0]
+                proba = model.predict_proba(model_input)[0]
                 estimator = model.named_steps.get("estimator")
                 classes = getattr(estimator, "classes_", None)
                 class_prob_map: Dict[Any, float] = {}
@@ -1092,7 +1095,7 @@ class StockPredictorAI:
 
             event_threshold = self._event_threshold(target)
             event_prob = self._estimate_event_probability(
-                model, transformed_features, threshold=event_threshold
+                model, model_input, threshold=event_threshold
             )
             if event_prob is not None:
                 if target == "return":
@@ -1196,6 +1199,26 @@ class StockPredictorAI:
         if recommendation:
             result["recommendation"] = recommendation
         return result
+
+    def _prepare_features_for_model(
+        self, model: Any, features: pd.DataFrame | np.ndarray
+    ) -> pd.DataFrame | np.ndarray:
+        """Return feature matrix in a format compatible with *model*."""
+
+        if not isinstance(features, pd.DataFrame):
+            return features
+
+        def _expects_named_features(candidate: Any) -> bool:
+            return bool(candidate is not None and hasattr(candidate, "feature_names_in_"))
+
+        estimator = None
+        if hasattr(model, "named_steps") and isinstance(model.named_steps, Mapping):
+            estimator = model.named_steps.get("estimator")
+
+        if _expects_named_features(model) or _expects_named_features(estimator):
+            return features
+
+        return features.to_numpy()
 
     def _estimate_prediction_uncertainty(
         self,
@@ -1310,7 +1333,7 @@ class StockPredictorAI:
     def _estimate_event_probability(
         self,
         model: Pipeline,
-        features: pd.DataFrame,
+        features: pd.DataFrame | np.ndarray,
         *,
         threshold: float,
     ) -> float | None:
