@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from numbers import Real
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
@@ -14,8 +14,9 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.base import clone
-from sklearn.metrics import r2_score
-from sklearn.model_selection import TimeSeriesSplit, train_test_split
+from sklearn.calibration import calibration_curve
+from sklearn.metrics import brier_score_loss, r2_score
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 
 from ..backtesting import Backtester
@@ -347,6 +348,8 @@ class StockPredictorAI:
         self,
         targets: Optional[Iterable[str]] = None,
         horizon: Optional[int] = None,
+        *,
+        force: bool = False,
     ) -> Dict[str, Any]:
         resolved_horizon = self._resolve_horizon(horizon)
         self.horizon = resolved_horizon
@@ -389,12 +392,32 @@ class StockPredictorAI:
             )
             return {"horizon": resolved_horizon, "targets": {}}
 
-        metrics_by_target: dict[str, Dict[str, float]] = {}
+        seed = int(self.config.model_params.get("global", {}).get("random_state", 42))
+        np.random.seed(seed)
+
+        metrics_by_target: dict[str, Dict[str, Any]] = {}
         summary_metrics: dict[str, float] = {}
 
         self._ensure_models_dir()
 
         for target, y in available_targets.items():
+            if not self._should_retrain(target, resolved_horizon, force=force):
+                LOGGER.info(
+                    "Skipping training for target '%s' horizon %s; existing model is up-to-date.",
+                    target,
+                    resolved_horizon,
+                )
+                try:
+                    self.load_model(target, resolved_horizon)
+                except ModelNotFoundError:
+                    LOGGER.debug(
+                        "Cached model for %s horizon %s missing despite retrain guard; forcing rebuild.",
+                        target,
+                        resolved_horizon,
+                    )
+                else:
+                    continue
+
             spec = TARGET_SPECS.get(target)
             task = spec.task if spec else ("classification" if target == "direction" else "regression")
             model_type = (
@@ -466,7 +489,7 @@ class StockPredictorAI:
                 target, final_model, transformed_X
             )
 
-            metrics = dict(evaluation["aggregate"])
+            metrics: Dict[str, Any] = dict(evaluation["aggregate"])
             metrics["training_rows"] = int(len(transformed_X))
             metrics["test_rows"] = int(evaluation.get("evaluation_rows", 0))
             metrics["horizon"] = resolved_horizon
@@ -478,11 +501,31 @@ class StockPredictorAI:
                 "parameters": evaluation.get("parameters", {}),
                 "samples": int(evaluation.get("evaluation_rows", 0)),
             }
-            if isinstance(distribution_summary, dict) and distribution_summary:
+            if distribution_summary:
                 metrics["forecast_distribution"] = distribution_summary
                 self.metadata.setdefault("forecast_distribution", {})[
                     (target, resolved_horizon)
                 ] = distribution_summary
+
+            in_sample_proba = None
+            estimator = final_model.named_steps.get("estimator")
+            if task == "classification" and model_supports_proba(final_model):
+                try:
+                    in_sample_proba = final_model.predict_proba(transformed_X)
+                except Exception as exc:  # pragma: no cover - defensive
+                    LOGGER.debug("Failed to compute in-sample probabilities: %s", exc)
+            in_sample_pred = final_model.predict(transformed_X)
+            metrics["in_sample"] = self._compute_evaluation_metrics(
+                task,
+                y_clean,
+                in_sample_pred,
+                transformed_X,
+                aligned_X,
+                in_sample_proba,
+                getattr(estimator, "classes_", None),
+            )
+            metrics["out_of_sample"] = evaluation["aggregate"]
+
             metrics_by_target[target] = metrics
 
             metrics_store = self.metadata.setdefault("metrics", {})
@@ -520,6 +563,40 @@ class StockPredictorAI:
         )
         self.metadata["active_horizon"] = resolved_horizon
         return {"horizon": resolved_horizon, "targets": metrics_by_target, **summary_metrics}
+
+    def _should_retrain(self, target: str, horizon: int, *, force: bool) -> bool:
+        if force:
+            return True
+        model_path = self.config.model_path_for(target, horizon)
+        if not model_path.exists():
+            return True
+        metrics_path = self.config.metrics_path_for(target, horizon)
+        if not metrics_path.exists():
+            return True
+
+        try:
+            data_timestamp = self.fetcher.get_last_updated("prices")
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.debug("Unable to determine last data refresh: %s", exc)
+            return False
+
+        cooldown_hours = float(getattr(self.config, "retrain_cooldown_hours", 0) or 0)
+        model_mtime = datetime.fromtimestamp(model_path.stat().st_mtime)
+
+        if cooldown_hours > 0:
+            if datetime.utcnow() - model_mtime < timedelta(hours=cooldown_hours):
+                return False
+
+        if data_timestamp is None:
+            return False
+
+        if isinstance(data_timestamp, datetime):
+            data_moment = data_timestamp
+        else:
+            data_moment = datetime.combine(data_timestamp, datetime.min.time())
+        data_moment = data_moment.replace(tzinfo=None)
+
+        return data_moment > model_mtime
 
     def _log_target_distribution(
         self,
@@ -605,13 +682,12 @@ class StockPredictorAI:
         splits: List[Dict[str, Any]] = []
 
         if strategy == "holdout":
-            X_train, X_test, y_train, y_test = train_test_split(
-                features,
-                target_series,
-                test_size=self.config.test_size,
-                shuffle=self.config.shuffle_training,
-                random_state=42,
+            split_idx = max(
+                1, int(len(features) * (1 - self.config.test_size))
             )
+            split_idx = min(split_idx, len(features) - 1)
+            X_train, X_test = features.iloc[:split_idx], features.iloc[split_idx:]
+            y_train, y_test = target_series.iloc[:split_idx], target_series.iloc[split_idx:]
             pipeline = clone(preprocessor) if preprocessor is not None else None
             if pipeline is not None:
                 pipeline.fit(X_train, y_train)
@@ -623,12 +699,21 @@ class StockPredictorAI:
             model = factory.create(task, calibrate=calibrate_flag)
             model.fit(X_train_transformed, y_train)
             y_pred = model.predict(X_test_transformed)
+            proba = None
+            estimator = model.named_steps.get("estimator")
+            if task == "classification" and model_supports_proba(model):
+                try:
+                    proba = model.predict_proba(X_test_transformed)
+                except Exception as exc:  # pragma: no cover - defensive
+                    LOGGER.debug("Failed to compute holdout probabilities: %s", exc)
             metrics = self._compute_evaluation_metrics(
                 task,
                 y_test,
                 y_pred,
                 X_test_transformed,
                 X_test,
+                proba,
+                getattr(estimator, "classes_", None),
             )
             metrics.update(
                 {
@@ -646,7 +731,7 @@ class StockPredictorAI:
             evaluation_rows = int(len(X_test))
             parameters = {
                 "test_size": float(self.config.test_size),
-                "shuffle": bool(self.config.shuffle_training),
+                "shuffle": False,
             }
         elif strategy == "time_series":
             splitter = TimeSeriesSplit(n_splits=self.config.evaluation_folds)
@@ -666,12 +751,21 @@ class StockPredictorAI:
                 model = factory.create(task, calibrate=calibrate_flag)
                 model.fit(X_train_transformed, y_train)
                 y_pred = model.predict(X_test_transformed)
+                proba = None
+                estimator = model.named_steps.get("estimator")
+                if task == "classification" and model_supports_proba(model):
+                    try:
+                        proba = model.predict_proba(X_test_transformed)
+                    except Exception as exc:  # pragma: no cover - defensive
+                        LOGGER.debug("Failed to compute CV probabilities: %s", exc)
                 metrics = self._compute_evaluation_metrics(
                     task,
                     y_test,
                     y_pred,
                     X_test_transformed,
                     X_test,
+                    proba,
+                    getattr(estimator, "classes_", None),
                 )
                 metrics.update(
                     {
@@ -727,10 +821,18 @@ class StockPredictorAI:
         y_pred: np.ndarray,
         X_test: pd.DataFrame,
         raw_X_test: pd.DataFrame,
-    ) -> Dict[str, float]:
+        proba: np.ndarray | None = None,
+        classes: Sequence[Any] | None = None,
+    ) -> Dict[str, Any]:
         if task == "classification":
-            metrics = classification_metrics(y_true.to_numpy(), y_pred)
+            metrics: Dict[str, Any] = classification_metrics(y_true.to_numpy(), y_pred)
             metrics["directional_accuracy"] = metrics.get("accuracy", 0.0)
+            if proba is not None:
+                calibration_metrics = self._calibration_report(
+                    y_true.to_numpy(), proba, classes
+                )
+                if calibration_metrics:
+                    metrics.update(calibration_metrics)
             return metrics
 
         metrics = regression_metrics(y_true.to_numpy(), y_pred)
@@ -753,6 +855,64 @@ class StockPredictorAI:
             metrics["directional_accuracy"] = 0.0
         metrics["signed_error"] = float(np.mean(y_pred - y_true.to_numpy()))
         return metrics
+
+    def _calibration_report(
+        self,
+        y_true: np.ndarray,
+        proba: np.ndarray,
+        classes: Sequence[Any] | None,
+    ) -> Dict[str, Any]:
+        try:
+            if classes is not None:
+                classes_array = np.asarray(classes)
+                positive_index = None
+                for idx, cls in enumerate(classes_array):
+                    if cls in {1, True, "1", "up"}:
+                        positive_index = idx
+                        break
+                if positive_index is None:
+                    positive_index = int(np.argmax(classes_array))
+            else:
+                positive_index = 1 if proba.shape[1] > 1 else 0
+
+            if proba.ndim == 1:
+                positive_proba = proba
+            else:
+                positive_proba = proba[:, positive_index]
+
+            if classes is not None:
+                mapping = {cls: idx for idx, cls in enumerate(classes)}
+                y_binary = np.array(
+                    [
+                        1
+                        if mapping.get(value, value)
+                        == mapping.get(classes[positive_index], positive_index)
+                        else 0
+                    ]
+                    for value in y_true
+                )
+            else:
+                y_binary = np.array([1 if value in {1, True, "1"} else 0 for value in y_true])
+
+            brier = brier_score_loss(y_binary, positive_proba)
+            frac_pos, mean_pred = calibration_curve(
+                y_binary, positive_proba, n_bins=10, strategy="uniform"
+            )
+            ece = float(np.abs(frac_pos - mean_pred).mean())
+            mce = float(np.abs(frac_pos - mean_pred).max())
+
+            return {
+                "brier_score": float(brier),
+                "expected_calibration_error": ece,
+                "max_calibration_error": mce,
+                "calibration_curve": {
+                    "fraction_positives": [float(x) for x in frac_pos],
+                    "mean_predicted_value": [float(x) for x in mean_pred],
+                },
+            }
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.debug("Failed to compute calibration metrics: %s", exc)
+            return {}
 
     def _aggregate_evaluation_metrics(
         self, splits: List[Dict[str, Any]]
@@ -814,6 +974,7 @@ class StockPredictorAI:
         prediction_intervals: dict[str, Dict[str, float]] = {}
         prediction_warnings: List[str] = []
         training_report: dict[str, Any] = {}
+        event_probabilities: dict[str, Dict[str, float]] = {}
 
         filtered_targets: list[str] = []
         for target in requested_targets:
@@ -833,7 +994,9 @@ class StockPredictorAI:
                         "Model for target '%s' missing. Attempting on-demand training.",
                         target,
                     )
-                    report = self.train_model(targets=[target], horizon=resolved_horizon)
+                    report = self.train_model(
+                        targets=[target], horizon=resolved_horizon, force=True
+                    )
                     target_metrics = report.get("targets", {}).get(target)
                     training_report[target] = {
                         "horizon": resolved_horizon,
@@ -921,10 +1084,24 @@ class StockPredictorAI:
                 threshold = float(self.config.direction_confidence_threshold)
                 if confidence_value < threshold:
                     warning_msg = (
-                        f"Direction model confidence {confidence_value:.3f} below threshold {threshold:.2f}."
+                        f"Direction model confidence {confidence_value:.3f} below threshold "
+                        f"{threshold:.2f}. Consider tuning 'direction_confidence_threshold'."
                     )
                     LOGGER.warning(warning_msg)
                     prediction_warnings.append(warning_msg)
+
+            event_threshold = self._event_threshold(target)
+            event_prob = self._estimate_event_probability(
+                model, transformed_features, threshold=event_threshold
+            )
+            if event_prob is not None:
+                if target == "return":
+                    label = f"return>{event_threshold:+.2%}"
+                elif target == "volatility":
+                    label = f"volatility>{event_threshold:.4f}"
+                else:
+                    label = f"{target}>{event_threshold}"
+                event_probabilities.setdefault(target, {})[label] = float(event_prob)
 
         close_prediction = predictions.get("close")
         latest_close = float(self.metadata.get("latest_close", np.nan))
@@ -1000,6 +1177,8 @@ class StockPredictorAI:
             result["confidence"] = confidences
         if probabilities:
             result["probabilities"] = probabilities
+        if event_probabilities:
+            result["event_probabilities"] = event_probabilities
         if uncertainty_clean:
             result["prediction_uncertainty"] = uncertainty_clean
         if quantile_forecasts:
@@ -1127,6 +1306,48 @@ class StockPredictorAI:
         if interval_payload:
             result["interval"] = interval_payload
         return result or None
+
+    def _estimate_event_probability(
+        self,
+        model: Pipeline,
+        features: pd.DataFrame,
+        *,
+        threshold: float,
+    ) -> float | None:
+        estimator = model.named_steps.get("estimator")
+        if estimator is None:
+            return None
+        try:
+            if hasattr(estimator, "estimators_"):
+                member_preds = np.vstack(
+                    [tree.predict(features) for tree in estimator.estimators_]
+                )
+                if member_preds.size == 0:
+                    return None
+                return float(np.mean(member_preds[:, 0] > threshold))
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.debug("Failed to estimate event probability: %s", exc)
+            return None
+        return None
+
+    def _event_threshold(self, target: str) -> float:
+        params = self.config.model_params.get(target, {})
+        if isinstance(params, Mapping) and "event_threshold" in params:
+            try:
+                return float(params["event_threshold"])
+            except (TypeError, ValueError):
+                LOGGER.debug(
+                    "Ignoring invalid event_threshold for %s: %s",
+                    target,
+                    params.get("event_threshold"),
+                )
+        if target == "return":
+            return 0.0
+        if target == "volatility":
+            latest_vol = self.metadata.get("latest_realised_volatility")
+            if latest_vol is not None:
+                return float(latest_vol)
+        return 0.0
 
     # ------------------------------------------------------------------
     # Feature importance

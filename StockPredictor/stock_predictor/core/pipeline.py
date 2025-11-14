@@ -33,6 +33,8 @@ from stock_predictor.providers.base import (
     NewsArticle,
     PriceBar,
     ProviderConfigurationError,
+    ProviderFailure,
+    ProviderFetchSummary,
     ProviderRequest,
     ProviderResult,
     SentimentSignal,
@@ -130,10 +132,20 @@ class MarketDataETL:
             end=self.config.end_date,
         )
         if existing.empty:
-            LOGGER.info(
-                "No cached price data found for %s; attempting to download fresh data.",
-                self.config.ticker,
-            )
+            cached = self._load_local_price_cache()
+            if cached is not None and not cached.empty:
+                LOGGER.info(
+                    "Loaded %s cached price rows for %s from local cache.",
+                    cached.shape[0],
+                    self.config.ticker,
+                )
+                existing = cached
+                self._record_source("prices", "local")
+            else:
+                LOGGER.info(
+                    "No cached price data found for %s; attempting to download fresh data.",
+                    self.config.ticker,
+                )
         if not force and self._covers_requested_range(existing):
             LOGGER.debug("Price data already present for %s", self.config.ticker)
             self._record_source("prices", "database")
@@ -151,23 +163,32 @@ class MarketDataETL:
         if self.config.end_date:
             params["end"] = self.config.end_date.isoformat()
 
-        results = self._fetch_dataset(DatasetType.PRICES, params)
-        providers = self._collect_providers(results)
-        downloaded = self._coalesce_price_results(results)
+        summary = self._fetch_dataset(DatasetType.PRICES, params)
+        if summary.failures:
+            self._log_provider_failures("prices", summary.failures)
+
+        providers = self._collect_providers(summary.results)
+        downloaded = self._coalesce_price_results(summary.results)
 
         if downloaded is None or downloaded.empty:
-            LOGGER.error(
-                "No price data returned for ticker %s in requested range",
-                self.config.ticker,
+            if not existing.empty:
+                LOGGER.warning(
+                    "Providers returned no new price rows for %s; reusing cached data.",
+                    self.config.ticker,
+                )
+                self._record_source("prices", "database")
+                return RefreshResult(existing, downloaded=False)
+
+            message = self._compose_error_message(
+                self._compose_failure_summary(summary.failures)
+                or "Empty dataframe from data providers."
             )
-            raise NoPriceDataError(
-                self.config.ticker,
-                self._compose_error_message("Empty dataframe from data providers."),
-            )
+            raise NoPriceDataError(self.config.ticker, message)
         self.database.upsert_prices(self.config.ticker, self.config.interval, downloaded)
         self.database.set_refresh_timestamp(
             self.config.ticker, self.config.interval, "prices"
         )
+        self._write_price_cache(downloaded)
         if providers:
             for provider in providers:
                 self._record_source("prices", provider)
@@ -262,7 +283,10 @@ class MarketDataETL:
         LOGGER.info("Downloading fundamentals for %s", self.config.ticker)
 
         records: list[dict[str, object]] = []
-        provider_results = self._fetch_dataset(DatasetType.FUNDAMENTALS)
+        summary = self._fetch_dataset(DatasetType.FUNDAMENTALS)
+        if summary.failures:
+            self._log_provider_failures("fundamentals", summary.failures)
+        provider_results = summary.results
         provider_names = self._collect_providers(provider_results)
         records.extend(self._coalesce_fundamental_results(provider_results))
 
@@ -398,9 +422,11 @@ class MarketDataETL:
         )
 
         params = {"query": self.config.ticker, "limit": self.config.news_limit or 50}
-        results = self._fetch_dataset(DatasetType.NEWS, params)
-        providers = self._collect_providers(results)
-        frame = self._coalesce_news_results(results)
+        summary = self._fetch_dataset(DatasetType.NEWS, params)
+        if summary.failures:
+            self._log_provider_failures("news", summary.failures)
+        providers = self._collect_providers(summary.results)
+        frame = self._coalesce_news_results(summary.results)
 
         if frame is None or frame.empty:
             LOGGER.warning("No news articles returned for %s", self.config.ticker)
@@ -634,7 +660,10 @@ class MarketDataETL:
             return RefreshResult(existing, downloaded=False)
 
         params = {"query": self.config.ticker, "limit": 200}
-        provider_results = self._fetch_dataset(DatasetType.SENTIMENT, params)
+        summary = self._fetch_dataset(DatasetType.SENTIMENT, params)
+        if summary.failures:
+            self._log_provider_failures("sentiment", summary.failures)
+        provider_results = summary.results
         providers = self._collect_providers(provider_results)
 
         sentiment_records: list[dict[str, Any]] = []
@@ -959,14 +988,14 @@ class MarketDataETL:
 
     def _fetch_dataset(
         self, dataset: DatasetType, params: Mapping[str, Any] | None = None
-    ) -> list[ProviderResult]:
+    ) -> ProviderFetchSummary:
         request = ProviderRequest(
             dataset_type=dataset,
             symbol=self.config.ticker,
             params=dict(params or {}),
         )
 
-        async def _runner() -> list[ProviderResult]:
+        async def _runner() -> ProviderFetchSummary:
             return await self._registry.fetch_all(request)
 
         return self._run_async(_runner)
@@ -974,6 +1003,49 @@ class MarketDataETL:
     @staticmethod
     def _collect_providers(results: Sequence[ProviderResult]) -> set[str]:
         return {result.source for result in results if result.source}
+
+    def _log_provider_failures(
+        self, dataset: str, failures: Sequence[ProviderFailure]
+    ) -> None:
+        if not failures:
+            return
+        LOGGER.warning(
+            "Partial %s refresh for %s: %s",
+            dataset,
+            self.config.ticker,
+            self._compose_failure_summary(failures),
+        )
+
+    @staticmethod
+    def _compose_failure_summary(failures: Sequence[ProviderFailure]) -> str:
+        parts: list[str] = []
+        for failure in failures:
+            detail = failure.error
+            if failure.status_code:
+                detail = f"{detail} (status={failure.status_code})"
+            if failure.retry_after:
+                detail = f"{detail}; retry_in={int(failure.retry_after)}s"
+            parts.append(f"{failure.provider}: {detail}")
+        return "; ".join(parts)
+
+    def _load_local_price_cache(self) -> pd.DataFrame | None:
+        path = self.config.price_cache_path
+        if not path.exists():
+            return None
+        try:
+            frame = pd.read_csv(path, parse_dates=["Date"])
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.debug("Failed to load local price cache %s: %s", path, exc)
+            return None
+        return frame
+
+    def _write_price_cache(self, frame: pd.DataFrame) -> None:
+        path = self.config.price_cache_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            frame.to_csv(path, index=False)
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.debug("Unable to persist price cache to %s: %s", path, exc)
 
     @staticmethod
     def _coalesce_price_results(
