@@ -29,6 +29,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 LOGGER = logging.getLogger(__name__)
 
+# Tracks whether we've already informed the caller that file-based loaders are
+# disabled. This avoids repeating the same informational log on every
+# registry creation.
+_FILE_LOADER_LOGGED = False
+
 
 class ProviderError(RuntimeError):
     """Base class for provider related failures."""
@@ -610,8 +615,22 @@ class ProviderRegistry:
         )
 
 
-def build_default_registry() -> ProviderRegistry:
-    """Construct a registry with the default provider set."""
+def build_default_registry(
+    *,
+    csv_loader_path: str | os.PathLike[str] | None = None,
+    parquet_loader_path: str | os.PathLike[str] | None = None,
+) -> ProviderRegistry:
+    """Construct a registry with the default provider set.
+
+    Parameters
+    ----------
+    csv_loader_path:
+        Optional filesystem path enabling the :class:`CSVPriceLoader`.
+        When ``None`` the loader is not registered.
+    parquet_loader_path:
+        Optional filesystem path enabling the :class:`ParquetPriceLoader`.
+        When ``None`` the loader is not registered.
+    """
 
     from .adapters import (  # local import to avoid circular dependencies
         AlphaVantageProvider,
@@ -632,6 +651,18 @@ def build_default_registry() -> ProviderRegistry:
 
     registry = ProviderRegistry()
 
+    has_csv_loader = csv_loader_path is not None
+    has_parquet_loader = parquet_loader_path is not None
+
+    global _FILE_LOADER_LOGGED
+    if not has_csv_loader and not has_parquet_loader and not _FILE_LOADER_LOGGED:
+        LOGGER.info(
+            "Local price file loaders are disabled. Set "
+            "'csv_price_loader_path' or 'parquet_price_loader_path' in the "
+            "PredictorConfig to enable them."
+        )
+        _FILE_LOADER_LOGGED = True
+
     def _try_register(factory: type[BaseProvider]) -> None:
         try:
             registry.register(factory())
@@ -650,8 +681,10 @@ def build_default_registry() -> ProviderRegistry:
     registry.register(RedditProvider())
     _try_register(TwitterProvider)
     _try_register(QuandlProvider)
-    registry.register(CSVPriceLoader())
-    registry.register(ParquetPriceLoader())
+    if has_csv_loader:
+        registry.register(CSVPriceLoader())
+    if has_parquet_loader:
+        registry.register(ParquetPriceLoader())
     return registry
 
 
