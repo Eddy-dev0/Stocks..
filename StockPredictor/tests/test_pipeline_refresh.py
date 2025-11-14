@@ -93,3 +93,13 @@ def test_refresh_prices_downloads_when_cache_is_stale(monkeypatch, tmp_path) -> 
     refreshed_ts = database.get_refresh_timestamp("AAPL", "1d", "prices")
     assert refreshed_ts is not None
     assert refreshed_ts > old_refresh
+
+
+def test_latest_trading_session_with_midday_utc_reference_returns_previous_day() -> None:
+    """Midday UTC references should map to the prior completed U.S. session."""
+
+    reference = pd.Timestamp("2024-03-27 12:00:00", tz="UTC")
+
+    session = MarketDataETL._latest_trading_session(reference=reference)
+
+    assert session == date(2024, 3, 26)
