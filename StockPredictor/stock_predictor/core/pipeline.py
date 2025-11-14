@@ -127,6 +127,7 @@ class MarketDataETL:
         self._registry = build_default_registry(
             csv_loader_path=self.config.csv_price_loader_path,
             parquet_loader_path=self.config.parquet_price_loader_path,
+            config=self.config,
         )
 
     # ------------------------------------------------------------------
@@ -173,7 +174,9 @@ class MarketDataETL:
 
         summary = self._fetch_dataset(DatasetType.PRICES, params)
         if summary.failures:
-            self._log_provider_failures("prices", summary.failures)
+            self._log_provider_failures(
+                "prices", summary.failures, bool(summary.results)
+            )
 
         providers = self._collect_providers(summary.results)
         downloaded = self._coalesce_price_results(summary.results)
@@ -293,7 +296,9 @@ class MarketDataETL:
         records: list[dict[str, object]] = []
         summary = self._fetch_dataset(DatasetType.FUNDAMENTALS)
         if summary.failures:
-            self._log_provider_failures("fundamentals", summary.failures)
+            self._log_provider_failures(
+                "fundamentals", summary.failures, bool(summary.results)
+            )
         provider_results = summary.results
         provider_names = self._collect_providers(provider_results)
         records.extend(self._coalesce_fundamental_results(provider_results))
@@ -432,7 +437,7 @@ class MarketDataETL:
         params = {"query": self.config.ticker, "limit": self.config.news_limit or 50}
         summary = self._fetch_dataset(DatasetType.NEWS, params)
         if summary.failures:
-            self._log_provider_failures("news", summary.failures)
+            self._log_provider_failures("news", summary.failures, bool(summary.results))
         providers = self._collect_providers(summary.results)
         frame = self._coalesce_news_results(summary.results)
 
@@ -670,7 +675,9 @@ class MarketDataETL:
         params = {"query": self.config.ticker, "limit": 200}
         summary = self._fetch_dataset(DatasetType.SENTIMENT, params)
         if summary.failures:
-            self._log_provider_failures("sentiment", summary.failures)
+            self._log_provider_failures(
+                "sentiment", summary.failures, bool(summary.results)
+            )
         provider_results = summary.results
         providers = self._collect_providers(provider_results)
 
@@ -1029,11 +1036,15 @@ class MarketDataETL:
         return None
 
     def _log_provider_failures(
-        self, dataset: str, failures: Sequence[ProviderFailure]
+        self,
+        dataset: str,
+        failures: Sequence[ProviderFailure],
+        had_success: bool = False,
     ) -> None:
         if not failures:
             return
-        LOGGER.warning(
+        log = LOGGER.info if had_success else LOGGER.warning
+        log(
             "Partial %s refresh for %s: %s",
             dataset,
             self.config.ticker,

@@ -40,6 +40,20 @@ class YahooFinanceProvider(BaseProvider):
     name = "yahoo_finance"
     supported_datasets = (DatasetType.PRICES,)
 
+    def __init__(
+        self,
+        *,
+        rate_limit_per_sec: float | None = None,
+        cooldown_seconds: float | None = None,
+        **base_kwargs: Any,
+    ) -> None:
+        settings: dict[str, Any] = dict(base_kwargs)
+        if rate_limit_per_sec is not None:
+            settings["rate_limit_per_sec"] = rate_limit_per_sec
+        if cooldown_seconds is not None:
+            settings["cooldown_seconds"] = cooldown_seconds
+        super().__init__(**settings)
+
     async def _fetch(self, request: ProviderRequest) -> ProviderResult:
         params = {
             "range": request.params.get("range", "1y"),

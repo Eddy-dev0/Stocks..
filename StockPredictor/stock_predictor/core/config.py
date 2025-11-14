@@ -107,6 +107,9 @@ class PredictorConfig:
     csv_price_loader_path: Path | None = None
     # Provide a local Parquet file path to enable the ParquetPriceLoader provider.
     parquet_price_loader_path: Path | None = None
+    yahoo_rate_limit_per_second: float | None = None
+    yahoo_rate_limit_per_minute: float | None = None
+    yahoo_cooldown_seconds: float | None = None
 
     def __post_init__(self) -> None:
         self.ticker = self.ticker.upper()
@@ -160,6 +163,18 @@ class PredictorConfig:
             self.parquet_price_loader_path = Path(
                 self.parquet_price_loader_path
             ).expanduser()
+        if self.yahoo_rate_limit_per_second is not None:
+            self.yahoo_rate_limit_per_second = max(
+                0.0, float(self.yahoo_rate_limit_per_second)
+            )
+        if self.yahoo_rate_limit_per_minute is not None:
+            self.yahoo_rate_limit_per_minute = max(
+                0.0, float(self.yahoo_rate_limit_per_minute)
+            )
+        if self.yahoo_cooldown_seconds is not None:
+            self.yahoo_cooldown_seconds = max(
+                0.0, float(self.yahoo_cooldown_seconds)
+            )
 
     def ensure_directories(self) -> None:
         """Ensure that data and model directories exist."""
