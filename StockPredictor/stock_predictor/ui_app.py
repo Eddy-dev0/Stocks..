@@ -16,8 +16,8 @@ from typing import Any, Callable, Iterable, Mapping
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from pandas.tseries.offsets import BDay
 from dateutil.relativedelta import relativedelta
+from pandas.tseries.offsets import BDay, CustomBusinessDay
 from matplotlib import colors as mcolors
 from matplotlib import style as mpl_style
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -191,9 +191,11 @@ def _calendar_delta_for_horizon(
 ) -> Any:
     """Return an appropriate calendar delta for the selected horizon."""
 
-    if label and "trading" in label.lower():
+    normalized_label = (label or "").strip().lower()
+    preset_labels = {option.label.lower() for option in DEFAULT_HORIZON_PRESETS}
+    if normalized_label in preset_labels or "trading" in normalized_label:
         if holidays:
-            return BDay(n=days, holidays=holidays)
+            return CustomBusinessDay(n=days, holidays=holidays)
         return BDay(n=days)
 
     match = _HORIZON_CODE_PATTERN.match(code.strip()) if code else None
@@ -208,6 +210,57 @@ def _calendar_delta_for_horizon(
             return timedelta(days=count)
 
     return timedelta(days=days)
+
+
+def _ensure_future_trading_day(
+    base_date: Any, candidate: Any, *, context: str | None = None
+) -> pd.Timestamp:
+    """Normalise and validate that ``candidate`` is an acceptable forecast date."""
+
+    try:
+        base = pd.Timestamp(base_date).normalize()
+        forecast = pd.Timestamp(candidate).normalize()
+    except Exception as exc:  # pragma: no cover - defensive
+        raise ValueError("Unable to interpret forecast dates") from exc
+
+    if forecast < base:
+        message = "Forecast date precedes the market snapshot"
+        if context:
+            message = f"{message} for {context}"
+        raise ValueError(message)
+
+    if forecast.weekday() >= 5:
+        message = "Forecast date falls on a weekend"
+        if context:
+            message = f"{message} for {context}"
+        raise ValueError(message)
+
+    return forecast
+
+
+def _trading_day_for_horizon(
+    base_date: Any,
+    *,
+    business_days: int,
+    holidays: Iterable[pd.Timestamp] | None = None,
+    context: str | None = None,
+) -> pd.Timestamp:
+    """Return the trading-day forecast for the given horizon."""
+
+    if business_days <= 0:
+        raise ValueError("Horizon must be a positive number of business days")
+
+    try:
+        base = pd.Timestamp(base_date).normalize()
+    except Exception as exc:  # pragma: no cover - defensive
+        raise ValueError("Unable to interpret base forecast date") from exc
+
+    if holidays:
+        offset = CustomBusinessDay(n=business_days, holidays=holidays)
+    else:
+        offset = BDay(n=business_days)
+    candidate = (base + offset).normalize()
+    return _ensure_future_trading_day(base, candidate, context=context)
 
 
 def _pluralise(value: int, singular: str, plural: str | None = None) -> str:
@@ -2438,10 +2491,23 @@ class StockPredictorDesktopApp:
     def _compute_forecast_date(
         self, target_date: Any | None = None, *, offset: int | None = None
     ) -> pd.Timestamp | None:
+        base_date = self._forecast_base_date()
         parsed = pd.to_datetime(target_date, errors="coerce") if target_date is not None else None
+        holidays = self.market_holidays or self._resolve_market_holidays()
+        if not self.market_holidays and holidays:
+            self.market_holidays = list(holidays)
+
         forecast: pd.Timestamp | None = None
         if pd.notna(parsed):
-            forecast = pd.Timestamp(parsed).normalize()
+            try:
+                forecast = _ensure_future_trading_day(
+                    base_date,
+                    pd.Timestamp(parsed).normalize(),
+                    context=str(target_date),
+                )
+            except ValueError as exc:
+                LOGGER.warning("Discarding invalid forecast date %s: %s", target_date, exc)
+                forecast = None
         else:
             days = offset if offset is not None else self.selected_horizon_offset
             try:
@@ -2449,22 +2515,22 @@ class StockPredictorDesktopApp:
             except (TypeError, ValueError):
                 days_int = 0
             if days_int > 0:
-                base_date = self._forecast_base_date()
-                holidays = self.market_holidays or self._resolve_market_holidays()
-                if not self.market_holidays and holidays:
-                    self.market_holidays = list(holidays)
-                delta = _calendar_delta_for_horizon(
-                    days=days_int,
-                    code=self.selected_horizon_code,
-                    label=self.selected_horizon_label,
-                    holidays=holidays,
-                )
-                # Historically we always used BDay here, which skipped weekends
-                # and caused the "1 Week" option to land two calendar days early.
                 try:
-                    forecast = (base_date + delta).normalize()
-                except Exception:
-                    forecast = (base_date + pd.to_timedelta(days_int, unit="D")).normalize()
+                    forecast = _trading_day_for_horizon(
+                        base_date,
+                        business_days=days_int,
+                        holidays=holidays,
+                        context=self.selected_horizon_label or self.selected_horizon_code,
+                    )
+                except ValueError as exc:
+                    LOGGER.warning(
+                        "Unable to compute forecast date for %s business days from %s: %s",
+                        days_int,
+                        base_date.date().isoformat(),
+                        exc,
+                    )
+                    forecast = None
+
         self.current_forecast_date = forecast
         return forecast
 

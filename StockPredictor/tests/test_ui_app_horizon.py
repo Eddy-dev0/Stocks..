@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -29,8 +30,39 @@ def _build_app() -> StockPredictorDesktopApp:
     return app
 
 
-def test_week_horizon_uses_calendar_week() -> None:
+def test_week_horizon_uses_trading_week() -> None:
     app = _build_app()
     forecast = app._compute_forecast_date()
     assert forecast is not None
     assert forecast.date() == date(2025, 11, 21)
+
+
+def test_tomorrow_rolls_over_weekend() -> None:
+    app = _build_app()
+    app.selected_horizon_code = "1d"
+    app.selected_horizon_label = "Tomorrow"
+    app.selected_horizon_offset = 1
+
+    forecast = app._compute_forecast_date()
+    assert forecast is not None
+    assert forecast.date() == date(2025, 11, 17)
+
+
+def test_rejects_weekend_target_date(caplog: pytest.LogCaptureFixture) -> None:
+    app = _build_app()
+
+    with caplog.at_level("WARNING"):
+        forecast = app._compute_forecast_date(date(2025, 11, 15))
+
+    assert forecast is None
+    assert "weekend" in caplog.text.lower()
+
+
+def test_rejects_past_target_date(caplog: pytest.LogCaptureFixture) -> None:
+    app = _build_app()
+
+    with caplog.at_level("WARNING"):
+        forecast = app._compute_forecast_date(date(2025, 11, 13))
+
+    assert forecast is None
+    assert "precedes" in caplog.text.lower()
