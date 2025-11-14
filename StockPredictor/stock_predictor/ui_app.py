@@ -161,22 +161,52 @@ class HorizonOption:
     label: str
     code: str
     business_days: int
+    summary: str = ""
 
 
-HORIZON_OPTIONS: tuple[HorizonOption, ...] = (
-    HorizonOption("Tomorrow", "1d", 1),
-    HorizonOption("1 Week", "1w", 5),
-    HorizonOption("1 Month", "1m", 21),
-    HorizonOption("3 Months", "3m", 63),
+DEFAULT_HORIZON_PRESETS: tuple[HorizonOption, ...] = (
+    HorizonOption("Tomorrow", "1d", 1, "for tomorrow"),
+    HorizonOption("1 Week", "1w", 5, "for the next week"),
+    HorizonOption("1 Month", "1m", 21, "for the next month"),
+    HorizonOption("3 Months", "3m", 63, "for the next three months"),
 )
 
 
-HORIZON_SUMMARY_PHRASES: dict[str, str] = {
-    "Tomorrow": "for tomorrow",
-    "1 Week": "for the next week",
-    "1 Month": "for the next month",
-    "3 Months": "for the next three months",
+DEFAULT_HORIZON_PRESETS_BY_DAYS: dict[int, HorizonOption] = {
+    option.business_days: option for option in DEFAULT_HORIZON_PRESETS
 }
+
+
+def _pluralise(value: int, singular: str, plural: str | None = None) -> str:
+    if value == 1:
+        return singular
+    return plural or f"{singular}s"
+
+
+def _create_horizon_option(days: int) -> HorizonOption:
+    preset = DEFAULT_HORIZON_PRESETS_BY_DAYS.get(days)
+    if preset is not None:
+        return HorizonOption(preset.label, preset.code, preset.business_days, preset.summary)
+
+    if days <= 0:
+        raise ValueError("Horizon must be a positive number of business days.")
+
+    if days % 21 == 0:
+        months = days // 21
+        label = f"{months} {_pluralise(months, 'Month')}"
+        code = f"{months}m"
+        summary = f"for the next {months} {_pluralise(months, 'month')}"
+    elif days % 5 == 0:
+        weeks = days // 5
+        label = f"{weeks} {_pluralise(weeks, 'Week')}"
+        code = f"{weeks}w"
+        summary = f"for the next {weeks} {_pluralise(weeks, 'week')}"
+    else:
+        label = f"{days} {_pluralise(days, 'Day')}"
+        code = f"{days}d"
+        summary = f"over the next {days} trading {_pluralise(days, 'day')}"
+
+    return HorizonOption(label, code, days, summary)
 
 
 class Tooltip:
@@ -279,22 +309,20 @@ class StockPredictorDesktopApp:
         self.currency_mode: str = "local"
         self.currency_symbol: str = self._currency_symbol("local")
 
-        horizons = self.config.prediction_horizons or DEFAULT_PREDICTION_HORIZONS
-        self.horizon_options = HORIZON_OPTIONS
-        self.horizon_labels = [option.label for option in self.horizon_options]
-        self.horizon_map = {
-            option.label: {"code": option.code, "offset": option.business_days}
-            for option in self.horizon_options
-        }
-        self.horizon_code_to_label = {option.code: option.label for option in self.horizon_options}
-        self.horizon_offset_to_label = {
-            option.business_days: option.label for option in self.horizon_options
-        }
+        horizon_values = self.config.prediction_horizons or DEFAULT_PREDICTION_HORIZONS
+        self.horizon_notice_var = tk.StringVar(value="")
+        self.horizon_notice_label: ttk.Label | None = None
+        self._hidden_horizon_labels: list[str] = []
+        self.horizon_options: tuple[HorizonOption, ...] = tuple()
+        self.horizon_labels: list[str] = []
+        self.horizon_map: dict[str, dict[str, Any]] = {}
+        self.horizon_code_to_label: dict[str, str] = {}
+        self.horizon_offset_to_label: dict[int, str] = {}
+        self.horizon_summary_phrases: dict[str, str] = {}
         self.selected_horizon_label: str = ""
         self.selected_horizon_code: str = ""
         self.selected_horizon_offset: int = 0
-        initial_label = self._resolve_initial_horizon_label(horizons)
-        self._apply_horizon_selection(initial_label)
+        self._configure_horizons(horizon_values)
         self.current_prediction: dict[str, Any] = {}
         self.price_history: pd.DataFrame | None = None
         self.feature_snapshot: pd.DataFrame | None = None
@@ -359,7 +387,7 @@ class StockPredictorDesktopApp:
 
         self._busy = False
 
-        self._build_layout(horizons)
+        self._build_layout(horizon_values)
         self.apply_theme(self.dark_mode_var.get())
         self.root.after(200, self._initialise_prediction)
 
@@ -378,7 +406,126 @@ class StockPredictorDesktopApp:
                 defaults[name] = options
         return defaults
 
+    @staticmethod
+    def _normalise_horizon_values(horizons: Iterable[Any] | None) -> list[int]:
+        values: list[int] = []
+        if horizons is None:
+            return values
+        for raw in horizons:
+            if raw is None:
+                continue
+            try:
+                numeric = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if numeric <= 0:
+                continue
+            if numeric not in values:
+                values.append(numeric)
+        values.sort()
+        return values
+
+    def _summary_for_option(self, option: HorizonOption) -> str:
+        summary = (option.summary or "").strip()
+        if summary:
+            return summary
+        days = option.business_days
+        if days <= 0:
+            return ""
+        return f"over the next {days} trading {_pluralise(days, 'day')}"
+
+    def _update_horizon_notice(self) -> None:
+        hidden = [label for label in self._hidden_horizon_labels if label]
+        if hidden:
+            hidden_text = ", ".join(hidden)
+            message = f"Hiding horizons without trained models: {hidden_text}."
+        else:
+            message = ""
+        self.horizon_notice_var.set(message)
+        if self.horizon_notice_label is not None:
+            if message:
+                self.horizon_notice_label.grid()
+            else:
+                self.horizon_notice_label.grid_remove()
+
+    def _configure_horizons(self, horizons: Iterable[Any] | None) -> None:
+        resolved = self._normalise_horizon_values(horizons)
+        if not resolved:
+            resolved = list(DEFAULT_PREDICTION_HORIZONS)
+
+        options: list[HorizonOption] = []
+        for days in resolved:
+            try:
+                option = _create_horizon_option(days)
+            except ValueError:
+                continue
+            options.append(option)
+
+        if not options:
+            fallback = DEFAULT_HORIZON_PRESETS[0]
+            options = [
+                HorizonOption(
+                    fallback.label,
+                    fallback.code,
+                    fallback.business_days,
+                    fallback.summary,
+                )
+            ]
+            resolved = [options[0].business_days]
+
+        self.horizon_options = tuple(options)
+        self.horizon_labels = [option.label for option in options]
+        self.horizon_map = {
+            option.label: {"code": option.code, "offset": option.business_days}
+            for option in options
+        }
+        self.horizon_code_to_label = {
+            option.code: option.label for option in options if option.code
+        }
+        self.horizon_offset_to_label = {
+            option.business_days: option.label for option in options
+        }
+        self.horizon_summary_phrases = {
+            option.label: self._summary_for_option(option) for option in options
+        }
+
+        resolved_tuple = tuple(resolved)
+        if resolved_tuple and resolved_tuple != self.config.prediction_horizons:
+            try:
+                self.config.prediction_horizons = resolved_tuple
+            except Exception:
+                LOGGER.debug("Unable to update configured horizons to %s", resolved_tuple)
+
+        self._hidden_horizon_labels = [
+            preset.label
+            for preset in DEFAULT_HORIZON_PRESETS
+            if preset.business_days not in resolved
+        ]
+        self._update_horizon_notice()
+
+        preferred = self.selected_horizon_label
+        if preferred not in self.horizon_map:
+            if self.selected_horizon_offset in self.horizon_offset_to_label:
+                preferred = self.horizon_offset_to_label[self.selected_horizon_offset]
+            else:
+                preferred = self._resolve_initial_horizon_label(resolved)
+        if preferred:
+            self._apply_horizon_selection(preferred)
+        elif self.horizon_labels:
+            self._apply_horizon_selection(self.horizon_labels[0])
+
+        if hasattr(self, "horizon_box") and self.horizon_box is not None:
+            self.horizon_box.configure(values=self.horizon_labels)
+        if hasattr(self, "horizon_var") and self.horizon_var.get() != self.selected_horizon_label:
+            self.horizon_var.set(self.selected_horizon_label)
+        if hasattr(self, "trend_horizon_box") and self.trend_horizon_box is not None:
+            self.trend_horizon_box.configure(values=self.horizon_labels)
+        if hasattr(self, "trend_horizon_var") and self.trend_horizon_var.get() != self.selected_horizon_label:
+            self.trend_horizon_var.set(self.selected_horizon_label)
+
     def _resolve_initial_horizon_label(self, horizons: Iterable[int]) -> str:
+        if not self.horizon_labels:
+            return ""
         for value in horizons:
             try:
                 numeric = int(value)
@@ -404,7 +551,19 @@ class StockPredictorDesktopApp:
 
     def _horizon_summary_phrase(self, label: str | None = None) -> str:
         key = label or self.selected_horizon_label
-        return HORIZON_SUMMARY_PHRASES.get(key, "").strip()
+        summary = self.horizon_summary_phrases.get(key, "").strip()
+        if summary:
+            return summary
+        mapping = self.horizon_map.get(key)
+        if mapping is None:
+            return ""
+        try:
+            offset = int(mapping.get("offset", 0))
+        except (TypeError, ValueError):
+            offset = 0
+        if offset <= 0:
+            return ""
+        return f"over the next {offset} trading {_pluralise(offset, 'day')}"
 
     def _sync_horizon_from_prediction(self, prediction: Mapping[str, Any] | None) -> None:
         if not isinstance(prediction, Mapping):
@@ -566,6 +725,23 @@ class StockPredictorDesktopApp:
 
         for child in toolbar.winfo_children():
             child.grid_configure(padx=4, pady=2)
+
+        total_columns = len(widgets_in_order) + 1
+        self.horizon_notice_label = ttk.Label(
+            toolbar,
+            textvariable=self.horizon_notice_var,
+            wraplength=520,
+            justify=tk.LEFT,
+        )
+        self.horizon_notice_label.grid(
+            row=1,
+            column=0,
+            columnspan=total_columns,
+            sticky=tk.W,
+            padx=4,
+            pady=(0, 2),
+        )
+        self._update_horizon_notice()
 
         self._update_forecast_label()
 
@@ -2048,6 +2224,7 @@ class StockPredictorDesktopApp:
         self.config = self.application.config
         self.root.title(f"Stock Predictor – {self.config.ticker}")
         self.ticker_var.set(self.config.ticker)
+        self._configure_horizons(self.config.prediction_horizons)
         self.market_holidays = []
         self.current_forecast_date = None
         self.forecast_date_var.set("Forecast date: —")
@@ -2079,6 +2256,9 @@ class StockPredictorDesktopApp:
         prediction = self.application.predict(horizon=horizon_arg)
         metadata = self.application.pipeline.metadata
         snapshot = metadata.get("latest_features") if isinstance(metadata, Mapping) else None
+        horizon_values: Iterable[Any] | None = None
+        if isinstance(metadata, Mapping):
+            horizon_values = metadata.get("horizons")
         feature_history: pd.DataFrame | None = None
         if isinstance(snapshot, pd.DataFrame) and not snapshot.empty:
             try:
@@ -2108,6 +2288,7 @@ class StockPredictorDesktopApp:
             "feature_history": feature_history,
             "price_history": price_history if isinstance(price_history, pd.DataFrame) else None,
             "indicator_history": indicators if isinstance(indicators, pd.DataFrame) else None,
+            "horizons": horizon_values if horizon_values is not None else self.config.prediction_horizons,
         }
 
     # ------------------------------------------------------------------
@@ -2136,6 +2317,10 @@ class StockPredictorDesktopApp:
     def _on_async_success(self, payload: Mapping[str, Any] | Any) -> None:
         if not isinstance(payload, Mapping):
             payload = {}
+
+        horizons_payload = payload.get("horizons")
+        if horizons_payload is not None:
+            self._configure_horizons(horizons_payload)
 
         prediction = payload.get("prediction", {})
         snapshot = payload.get("snapshot")
