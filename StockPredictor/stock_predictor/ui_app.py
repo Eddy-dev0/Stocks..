@@ -9,6 +9,7 @@ import threading
 import tkinter as tk
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import timedelta
 from tkinter import messagebox, ttk
 from typing import Any, Callable, Iterable, Mapping
 
@@ -16,6 +17,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from pandas.tseries.offsets import BDay
+from dateutil.relativedelta import relativedelta
 from matplotlib import colors as mcolors
 from matplotlib import style as mpl_style
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -175,6 +177,37 @@ DEFAULT_HORIZON_PRESETS: tuple[HorizonOption, ...] = (
 DEFAULT_HORIZON_PRESETS_BY_DAYS: dict[int, HorizonOption] = {
     option.business_days: option for option in DEFAULT_HORIZON_PRESETS
 }
+
+
+_HORIZON_CODE_PATTERN = re.compile(r"^(?P<count>\d+)\s*(?P<unit>[a-zA-Z]+)$")
+
+
+def _calendar_delta_for_horizon(
+    *,
+    days: int,
+    code: str,
+    label: str,
+    holidays: Iterable[pd.Timestamp] | None = None,
+) -> Any:
+    """Return an appropriate calendar delta for the selected horizon."""
+
+    if label and "trading" in label.lower():
+        if holidays:
+            return BDay(n=days, holidays=holidays)
+        return BDay(n=days)
+
+    match = _HORIZON_CODE_PATTERN.match(code.strip()) if code else None
+    if match:
+        count = int(match.group("count"))
+        unit = match.group("unit").lower()
+        if unit.endswith("w"):
+            return timedelta(weeks=count)
+        if unit.endswith("m"):
+            return relativedelta(months=count)
+        if unit.endswith("d"):
+            return timedelta(days=count)
+
+    return timedelta(days=days)
 
 
 def _pluralise(value: int, singular: str, plural: str | None = None) -> str:
@@ -2420,12 +2453,16 @@ class StockPredictorDesktopApp:
                 holidays = self.market_holidays or self._resolve_market_holidays()
                 if not self.market_holidays and holidays:
                     self.market_holidays = list(holidays)
+                delta = _calendar_delta_for_horizon(
+                    days=days_int,
+                    code=self.selected_horizon_code,
+                    label=self.selected_horizon_label,
+                    holidays=holidays,
+                )
+                # Historically we always used BDay here, which skipped weekends
+                # and caused the "1 Week" option to land two calendar days early.
                 try:
-                    if holidays:
-                        business_offset = BDay(n=days_int, holidays=holidays)
-                    else:
-                        business_offset = BDay(n=days_int)
-                    forecast = (base_date + business_offset).normalize()
+                    forecast = (base_date + delta).normalize()
                 except Exception:
                     forecast = (base_date + pd.to_timedelta(days_int, unit="D")).normalize()
         self.current_forecast_date = forecast
