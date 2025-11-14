@@ -24,6 +24,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 LOGGER = logging.getLogger(__name__)
@@ -555,33 +556,65 @@ class Database:
         interval: str,
         records: Iterable[dict[str, Any]],
     ) -> int:
-        payload = []
-        for record in records:
-            payload.append(
-                {
-                    "ticker": ticker,
-                    "interval": interval,
-                    "date": self._coerce_date(record.get("Date")),
-                    "name": record.get("Indicator") or record.get("name"),
-                    "category": record.get("Category", "technical"),
-                    "value": self._coerce_float(record.get("Value")),
-                    "extra": json.dumps(record.get("Extra")) if record.get("Extra") is not None else None,
-                }
-            )
-        if not payload:
-            return 0
-        stmt = insert(Indicator).values(payload)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=[Indicator.ticker, Indicator.interval, Indicator.date, Indicator.name],
-            set_={
-                "category": stmt.excluded.category,
-                "value": stmt.excluded.value,
-                "extra": stmt.excluded.extra,
-            },
-        )
+        batch_size = 200
+        total_processed = 0
+        batch: list[dict[str, Any]] = []
+
         with self.session() as session:
-            session.execute(stmt)
-        return len(payload)
+
+            def execute_batch(chunk: list[dict[str, Any]]) -> int:
+                if not chunk:
+                    return 0
+                stmt = insert(Indicator).values(chunk)
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[
+                        Indicator.ticker,
+                        Indicator.interval,
+                        Indicator.date,
+                        Indicator.name,
+                    ],
+                    set_={
+                        "category": stmt.excluded.category,
+                        "value": stmt.excluded.value,
+                        "extra": stmt.excluded.extra,
+                    },
+                )
+                try:
+                    with session.begin():
+                        session.execute(stmt)
+                except SQLAlchemyError as exc:  # pragma: no cover - defensive logging
+                    LOGGER.error(
+                        "Failed to upsert %d indicator rows for %s %s: %s",
+                        len(chunk),
+                        ticker,
+                        interval,
+                        exc,
+                    )
+                    return 0
+                return len(chunk)
+
+            for record in records:
+                batch.append(
+                    {
+                        "ticker": ticker,
+                        "interval": interval,
+                        "date": self._coerce_date(record.get("Date")),
+                        "name": record.get("Indicator") or record.get("name"),
+                        "category": record.get("Category", "technical"),
+                        "value": self._coerce_float(record.get("Value")),
+                        "extra": json.dumps(record.get("Extra"))
+                        if record.get("Extra") is not None
+                        else None,
+                    }
+                )
+                if len(batch) >= batch_size:
+                    total_processed += execute_batch(batch)
+                    batch = []
+
+            if batch:
+                total_processed += execute_batch(batch)
+
+        return total_processed
 
     def upsert_fundamentals(self, records: Iterable[dict[str, Any]]) -> int:
         payload = []
