@@ -32,6 +32,7 @@ from stock_predictor.core import (
     TrendFinder,
     TrendInsight,
 )
+from stock_predictor.core.pipeline import NoPriceDataError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -2120,6 +2121,9 @@ class StockPredictorDesktopApp:
         def worker() -> None:
             try:
                 result = func()
+            except NoPriceDataError as exc:
+                LOGGER.warning("No price data available for %s: %s", exc.ticker, exc)
+                self.root.after(0, lambda err=exc: self._on_no_price_data_error(err))
             except Exception as exc:  # pragma: no cover - defensive wrapper around worker
                 LOGGER.exception("Desktop worker failed: %s", exc)
                 self.root.after(0, lambda err=exc: self._on_async_failure(err))
@@ -2160,6 +2164,12 @@ class StockPredictorDesktopApp:
     def _on_async_failure(self, exc: Exception) -> None:
         self._set_busy(False, "An error occurred.")
         messagebox.showerror("Prediction failed", str(exc))
+
+    def _on_no_price_data_error(self, exc: NoPriceDataError) -> None:
+        ticker = getattr(exc, "ticker", self.config.ticker)
+        status = f"No data available for {ticker}."
+        self._set_busy(False, status)
+        messagebox.showwarning("No price data", str(exc))
 
     def _set_busy(self, busy: bool, status: str | None = None) -> None:
         self._busy = busy
