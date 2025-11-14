@@ -471,6 +471,9 @@ class StockPredictorAI:
             else:
                 builder = PreprocessingBuilder(**self.preprocess_options)
                 final_pipeline = builder.create_pipeline()
+            # Intentionally fit with a named DataFrame so downstream estimators retain
+            # feature metadata, preventing scikit-learn from emitting feature name
+            # mismatch warnings when predicting.
             final_pipeline.fit(aligned_X, y_clean)
             transformed_X = final_pipeline.transform(aligned_X)
             feature_names = get_feature_names_from_pipeline(final_pipeline)
@@ -1342,8 +1345,12 @@ class StockPredictorAI:
             return None
         try:
             if hasattr(estimator, "estimators_"):
+                if isinstance(features, pd.DataFrame):
+                    feature_matrix = features.to_numpy()
+                else:
+                    feature_matrix = np.asarray(features)
                 member_preds = np.vstack(
-                    [tree.predict(features) for tree in estimator.estimators_]
+                    [tree.predict(feature_matrix) for tree in estimator.estimators_]
                 )
                 if member_preds.size == 0:
                     return None
