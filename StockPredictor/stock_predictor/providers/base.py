@@ -12,7 +12,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Awaitable, Dict, List, Mapping, MutableMapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Awaitable, Dict, List, Mapping, MutableMapping, Optional, Sequence
 
 try:  # Python 3.11+
     from enum import StrEnum as _BaseStrEnum
@@ -26,6 +26,9 @@ except ImportError:  # pragma: no cover - fallback for older interpreters
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ..core.config import PredictorConfig
 
 LOGGER = logging.getLogger(__name__)
 
@@ -312,6 +315,7 @@ class BaseProvider(abc.ABC):
         self._jitter = float(max(0.0, jitter))
         self._cooldowns: MutableMapping[str, float] = {}
         self._cooldown_lock = asyncio.Lock()
+        self._global_cooldown_until: float = 0.0
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -323,6 +327,19 @@ class BaseProvider(abc.ABC):
         if request.dataset_type not in self.supported_datasets:
             raise ProviderConfigurationError(
                 f"Provider {self.name} does not support dataset {request.dataset_type}."
+            )
+
+        in_global_cooldown, global_remaining = await self._global_cooldown_remaining()
+        if in_global_cooldown:
+            raise ProviderCooldownError(
+                self.name,
+                request.symbol,
+                global_remaining,
+                attempts=0,
+                message=(
+                    f"Provider {self.name} is cooling down globally. "
+                    f"Retry after {int(global_remaining)}s."
+                ),
             )
 
         in_cooldown, remaining = await self._cooldown_remaining(request)
@@ -362,6 +379,7 @@ class BaseProvider(abc.ABC):
                 if status == 429 and attempt >= self._retries:
                     retry_after = max(self._cooldown_seconds, wait)
                     await self._schedule_cooldown(request, retry_after)
+                    await self._schedule_global_cooldown(retry_after)
                     LOGGER.warning(
                         "Provider %s hit rate limits for %s after %s attempts; "
                         "cooling down for %.0fs.",
@@ -457,6 +475,28 @@ class BaseProvider(abc.ABC):
         async with self._cooldown_lock:
             self._cooldowns.pop(self._cooldown_key(request), None)
 
+    async def _global_cooldown_remaining(self) -> tuple[bool, float]:
+        async with self._cooldown_lock:
+            expires = self._global_cooldown_until
+            if expires <= 0:
+                return False, 0.0
+            remaining = expires - time.monotonic()
+            if remaining <= 0:
+                self._global_cooldown_until = 0.0
+                return False, 0.0
+            return True, remaining
+
+    async def _schedule_global_cooldown(self, seconds: float) -> None:
+        if seconds <= 0:
+            return
+        async with self._cooldown_lock:
+            self._global_cooldown_until = time.monotonic() + seconds
+
+    async def global_cooldown_remaining(self) -> tuple[bool, float]:
+        """Return whether the provider is in a global cooldown window."""
+
+        return await self._global_cooldown_remaining()
+
     def _retry_delay(self, attempt: int, exc: Exception) -> float:
         base_delay = self._backoff_factor * (2 ** (attempt - 1))
         if isinstance(exc, httpx.HTTPStatusError):
@@ -524,6 +564,7 @@ class ProviderRegistry:
             selected = self.providers_for(request.dataset_type)
 
         tasks: list[tuple[BaseProvider, Awaitable[ProviderResult]]] = []
+        skipped_failures: list[ProviderFailure] = []
         for provider in selected:
             if (
                 provider.name in {"csv_loader", "parquet_loader"}
@@ -536,16 +577,38 @@ class ProviderRegistry:
                     )
                     self._config_warnings.add(provider.name)
                 continue
+            in_global_cooldown, remaining = await provider.global_cooldown_remaining()
+            if in_global_cooldown:
+                skipped_failures.append(
+                    ProviderFailure(
+                        provider=provider.name,
+                        error=(
+                            f"Provider {provider.name} is cooling down globally."
+                        ),
+                        status_code=429,
+                        retry_after=remaining,
+                        is_rate_limited=True,
+                    )
+                )
+                continue
             tasks.append((provider, provider.fetch(request)))
 
         if not tasks:
+            if skipped_failures:
+                self._log_failures(
+                    request.symbol,
+                    request.dataset_type,
+                    skipped_failures,
+                    had_success=False,
+                )
+                return ProviderFetchSummary([], skipped_failures)
             return ProviderFetchSummary.empty()
 
         raw_results = await asyncio.gather(
             *(task for _, task in tasks), return_exceptions=True
         )
         successes: list[ProviderResult] = []
-        failures: list[ProviderFailure] = []
+        failures: list[ProviderFailure] = list(skipped_failures)
 
         for (provider, _), outcome in zip(tasks, raw_results):
             if isinstance(outcome, ProviderResult):
@@ -554,7 +617,12 @@ class ProviderRegistry:
             failures.append(self._convert_exception(provider, outcome))
 
         if failures:
-            self._log_failures(request.symbol, request.dataset_type, failures)
+            self._log_failures(
+                request.symbol,
+                request.dataset_type,
+                failures,
+                had_success=bool(successes),
+            )
 
         return ProviderFetchSummary(successes, failures)
 
@@ -598,6 +666,8 @@ class ProviderRegistry:
         symbol: str,
         dataset: DatasetType,
         failures: Sequence[ProviderFailure],
+        *,
+        had_success: bool,
     ) -> None:
         parts: list[str] = []
         for failure in failures:
@@ -607,7 +677,8 @@ class ProviderRegistry:
             if failure.retry_after:
                 detail = f"{detail}; retry_in={int(failure.retry_after)}s"
             parts.append(f"{failure.provider}: {detail}")
-        LOGGER.warning(
+        log = LOGGER.info if had_success else LOGGER.warning
+        log(
             "Provider failures for %s/%s: %s",
             symbol,
             dataset,
@@ -619,6 +690,7 @@ def build_default_registry(
     *,
     csv_loader_path: str | os.PathLike[str] | None = None,
     parquet_loader_path: str | os.PathLike[str] | None = None,
+    config: "PredictorConfig" | None = None,
 ) -> ProviderRegistry:
     """Construct a registry with the default provider set.
 
@@ -630,6 +702,9 @@ def build_default_registry(
     parquet_loader_path:
         Optional filesystem path enabling the :class:`ParquetPriceLoader`.
         When ``None`` the loader is not registered.
+    config:
+        Optional :class:`~stock_predictor.core.config.PredictorConfig` supplying
+        provider tuning parameters.
     """
 
     from .adapters import (  # local import to avoid circular dependencies
@@ -651,6 +726,58 @@ def build_default_registry(
 
     registry = ProviderRegistry()
 
+    def _coerce_positive(value: object | None) -> float | None:
+        try:
+            numeric = float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        return max(0.0, numeric)
+
+    def _resolve_yahoo_rate(limit_config: "PredictorConfig" | None) -> float | None:
+        rate: float | None = None
+        if limit_config is not None:
+            per_second = getattr(limit_config, "yahoo_rate_limit_per_second", None)
+            if per_second is not None:
+                coerced = _coerce_positive(per_second)
+                if coerced is not None:
+                    rate = coerced
+            if rate is None:
+                per_minute = getattr(limit_config, "yahoo_rate_limit_per_minute", None)
+                if per_minute is not None:
+                    coerced = _coerce_positive(per_minute)
+                    if coerced is not None:
+                        rate = coerced / 60.0
+        if rate is None:
+            for env_key in ("YAHOO_RATE_LIMIT_PER_SECOND", "YAHOO_RATE_LIMIT_PER_SEC"):
+                env_rate = os.environ.get(env_key)
+                if env_rate:
+                    coerced = _coerce_positive(env_rate)
+                    if coerced is not None:
+                        rate = coerced
+                        break
+        if rate is None:
+            env_rate = os.environ.get("YAHOO_RATE_LIMIT_PER_MINUTE")
+            if env_rate:
+                coerced = _coerce_positive(env_rate)
+                if coerced is not None:
+                    rate = coerced / 60.0
+        return rate
+
+    def _resolve_yahoo_cooldown(limit_config: "PredictorConfig" | None) -> float | None:
+        cooldown: float | None = None
+        if limit_config is not None:
+            config_value = getattr(limit_config, "yahoo_cooldown_seconds", None)
+            if config_value is not None:
+                cooldown = _coerce_positive(config_value)
+        if cooldown is None:
+            env_value = os.environ.get("YAHOO_COOLDOWN_SECONDS")
+            if env_value:
+                cooldown = _coerce_positive(env_value)
+        return cooldown
+
+    yahoo_rate_limit = _resolve_yahoo_rate(config)
+    yahoo_cooldown = _resolve_yahoo_cooldown(config)
+
     has_csv_loader = csv_loader_path is not None
     has_parquet_loader = parquet_loader_path is not None
 
@@ -669,7 +796,12 @@ def build_default_registry(
         except ProviderAuthenticationError as exc:
             LOGGER.debug("Skipping provider %s: %s", factory.__name__, exc)
 
-    registry.register(YahooFinanceProvider())
+    yahoo_kwargs: dict[str, float] = {}
+    if yahoo_rate_limit is not None:
+        yahoo_kwargs["rate_limit_per_sec"] = yahoo_rate_limit
+    if yahoo_cooldown is not None:
+        yahoo_kwargs["cooldown_seconds"] = yahoo_cooldown
+    registry.register(YahooFinanceProvider(**yahoo_kwargs))
     _try_register(AlphaVantageProvider)
     _try_register(FinnhubProvider)
     _try_register(PolygonProvider)

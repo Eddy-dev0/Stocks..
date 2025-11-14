@@ -69,6 +69,7 @@ class AsyncDataPipeline:
         self.registry = registry or build_default_registry(
             csv_loader_path=self.config.csv_price_loader_path,
             parquet_loader_path=self.config.parquet_price_loader_path,
+            config=self.config,
         )
         self.database = database or Database(config.database_url)
         self._closed = False
