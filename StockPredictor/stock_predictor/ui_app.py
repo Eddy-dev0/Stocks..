@@ -2328,18 +2328,18 @@ class StockPredictorDesktopApp:
 
     def _refresh_and_predict(self) -> dict[str, Any]:
         self.application.refresh_data(force=True)
-        return self._predict_payload()
+        return self._predict_payload(refresh=True)
 
     def _predict_only(self) -> dict[str, Any]:
         return self._predict_payload()
 
-    def _predict_payload(self) -> dict[str, Any]:
+    def _predict_payload(self, *, refresh: bool = False) -> dict[str, Any]:
         horizon_arg: Any
         if self.selected_horizon_code:
             horizon_arg = self.selected_horizon_code
         else:
             horizon_arg = self.selected_horizon_offset
-        prediction = self.application.predict(horizon=horizon_arg)
+        prediction = self.application.predict(horizon=horizon_arg, refresh=refresh)
         metadata = self.application.pipeline.metadata
         snapshot = metadata.get("latest_features") if isinstance(metadata, Mapping) else None
         horizon_values: Iterable[Any] | None = None

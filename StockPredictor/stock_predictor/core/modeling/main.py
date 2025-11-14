@@ -955,9 +955,47 @@ class StockPredictorAI:
             LOGGER.info("Refreshing data prior to prediction.")
             self.download_data(force=True)
 
-        if not self.metadata or refresh_data:
+        needs_feature_refresh = refresh_data or not self.metadata
+        price_df: Optional[pd.DataFrame] = None
+        latest_price_timestamp: Optional[pd.Timestamp] = None
+
+        try:
+            price_df = self.fetcher.fetch_price_data()
+        except Exception as exc:  # pragma: no cover - provider level failures are optional
+            LOGGER.debug("Unable to fetch price data for staleness check: %s", exc)
+        else:
+            if not price_df.empty and "Date" in price_df.columns:
+                candidate_dates = pd.to_datetime(price_df["Date"], errors="coerce").dropna()
+                if not candidate_dates.empty:
+                    latest_price_timestamp = candidate_dates.iloc[-1]
+
+        metadata_latest_timestamp: Optional[pd.Timestamp] = None
+        if self.metadata:
+            raw_latest = self.metadata.get("latest_date")
+            if raw_latest is not None:
+                try:
+                    metadata_latest_timestamp = pd.to_datetime(raw_latest)
+                except (TypeError, ValueError):
+                    metadata_latest_timestamp = None
+                else:
+                    if pd.isna(metadata_latest_timestamp):
+                        metadata_latest_timestamp = None
+
+        if latest_price_timestamp is not None:
+            if metadata_latest_timestamp is None or latest_price_timestamp > metadata_latest_timestamp:
+                if not needs_feature_refresh:
+                    LOGGER.info(
+                        "Detected new market data available through %s; rebuilding features.",
+                        latest_price_timestamp,
+                    )
+                needs_feature_refresh = True
+
+        if needs_feature_refresh:
             LOGGER.info("Preparing features before prediction.")
-            self.prepare_features()
+            if price_df is not None:
+                self.prepare_features(price_df=price_df)
+            else:
+                self.prepare_features()
 
         latest_features = self.metadata.get("latest_features")
         if latest_features is None:
@@ -1127,6 +1165,38 @@ class StockPredictorAI:
         target_date = None
         if isinstance(target_dates, dict):
             target_date = target_dates.get(resolved_horizon)
+
+        latest_timestamp: Optional[pd.Timestamp] = None
+        if latest_date is not None:
+            try:
+                latest_timestamp = pd.to_datetime(latest_date)
+            except (TypeError, ValueError):
+                latest_timestamp = None
+            else:
+                if pd.isna(latest_timestamp):
+                    latest_timestamp = None
+
+        target_timestamp: Optional[pd.Timestamp] = None
+        if target_date is not None:
+            try:
+                target_timestamp = pd.to_datetime(target_date)
+            except (TypeError, ValueError):
+                target_timestamp = None
+            else:
+                if pd.isna(target_timestamp):
+                    target_timestamp = None
+
+        if latest_timestamp is not None:
+            if target_timestamp is None or target_timestamp <= latest_timestamp:
+                try:
+                    offset = pd.tseries.offsets.BDay(int(resolved_horizon))
+                except Exception:  # pragma: no cover - guard invalid horizon types
+                    offset = pd.Timedelta(days=int(resolved_horizon))
+                target_timestamp = latest_timestamp + offset
+                self.metadata.setdefault("target_dates", {})[resolved_horizon] = target_timestamp
+            target_date = target_timestamp
+        else:
+            target_date = target_timestamp
 
         predicted_return = self._safe_float(predictions.get("return"))
         predicted_volatility = self._safe_float(predictions.get("volatility"))
