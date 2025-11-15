@@ -7,6 +7,8 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
+import re
+import unicodedata
 from typing import (
     Any,
     Awaitable,
@@ -54,6 +56,53 @@ US_MARKET_CLOSE = time(16, 0)
 US_MARKET_BUSINESS_DAY = CustomBusinessDay(calendar=USFederalHolidayCalendar())
 CACHE_MAX_AGE = timedelta(hours=24)
 
+_TZ_ALIAS_MAP: dict[str, str] = {
+    # Central European variants (German)
+    "cet": "Europe/Paris",
+    "cest": "Europe/Paris",
+    "central european time": "Europe/Paris",
+    "central european standard time": "Europe/Paris",
+    "central european summer time": "Europe/Paris",
+    "mez": "Europe/Berlin",
+    "mesz": "Europe/Berlin",
+    "mitteleuropaeische zeit": "Europe/Berlin",
+    "mitteleuropaeische sommerzeit": "Europe/Berlin",
+    "mitteleuropaische zeit": "Europe/Berlin",
+    "mitteleuropaische sommerzeit": "Europe/Berlin",
+    "mitteleuropaeische standardzeit": "Europe/Berlin",
+    "mitteleuropaeische winterzeit": "Europe/Berlin",
+    "mitteleuropaeischer zeit": "Europe/Berlin",
+    "mitteleuropaeischer sommerzeit": "Europe/Berlin",
+    "mitteleuropaeische normalzeit": "Europe/Berlin",
+    "mitteleuropaeische standard time": "Europe/Berlin",
+    "mitteleuropaeische daylight time": "Europe/Berlin",
+    "mitteleuropaeische sommernzeit": "Europe/Berlin",
+    "mitteleuropaeische winterzeit": "Europe/Berlin",
+    "mitteleuropäische zeit": "Europe/Berlin",
+    "mitteleuropäische sommerzeit": "Europe/Berlin",
+    "mitteleuropäische standardzeit": "Europe/Berlin",
+    "mitteleuropäische winterzeit": "Europe/Berlin",
+    "mitteleuropäischer zeit": "Europe/Berlin",
+    "mitteleuropäischer sommerzeit": "Europe/Berlin",
+    "mitteleuropäische normalzeit": "Europe/Berlin",
+    "mitteleuropäische standard time": "Europe/Berlin",
+    "mitteleuropäische daylight time": "Europe/Berlin",
+    "hec": "Europe/Paris",
+    "haec": "Europe/Paris",
+    "heure d'europe centrale": "Europe/Paris",
+    "heure d’europe centrale": "Europe/Paris",
+    "heure deurope centrale": "Europe/Paris",
+    "heure d'ete d'europe centrale": "Europe/Paris",
+    "heure d’été d’europe centrale": "Europe/Paris",
+    "heure dete deurope centrale": "Europe/Paris",
+    "heure normale d'europe centrale": "Europe/Paris",
+    "heure normale d’europe centrale": "Europe/Paris",
+    "heure normale deurope centrale": "Europe/Paris",
+    "heure d'hiver d'europe centrale": "Europe/Paris",
+    "heure d’hiver d’europe centrale": "Europe/Paris",
+    "heure dhiver deurope centrale": "Europe/Paris",
+}
+
 
 def resolve_market_timezone(config: PredictorConfig | None = None) -> ZoneInfo:
     """Return the market timezone configured for the application context."""
@@ -77,6 +126,17 @@ def resolve_market_timezone(config: PredictorConfig | None = None) -> ZoneInfo:
     return DEFAULT_MARKET_TIMEZONE
 
 
+def _normalise_timezone_key(value: str) -> str:
+    normalised = unicodedata.normalize("NFKD", value)
+    normalised = normalised.replace("’", "'").replace("`", "'")
+    normalised = "".join(ch for ch in normalised if not unicodedata.combining(ch))
+    normalised = normalised.casefold()
+    normalised = re.sub(r"[\s\-_]+", " ", normalised)
+    normalised = re.sub(r"[^a-z0-9/+' ]+", " ", normalised)
+    normalised = re.sub(r"\s+", " ", normalised)
+    return normalised.strip()
+
+
 def _coerce_zoneinfo(value: str | None) -> ZoneInfo | None:
     if not value:
         return None
@@ -86,8 +146,19 @@ def _coerce_zoneinfo(value: str | None) -> ZoneInfo | None:
     try:
         return ZoneInfo(candidate)
     except ZoneInfoNotFoundError:
-        LOGGER.warning("Unknown timezone '%s'; ignoring configured value.", candidate)
-        return None
+        pass
+
+    alias = _TZ_ALIAS_MAP.get(_normalise_timezone_key(candidate))
+    if alias:
+        try:
+            timezone = ZoneInfo(alias)
+            LOGGER.debug("Translated timezone alias '%s' to '%s'.", candidate, alias)
+            return timezone
+        except ZoneInfoNotFoundError:  # pragma: no cover - defensive guard
+            LOGGER.warning("Unable to resolve timezone alias '%s' -> '%s'.", candidate, alias)
+
+    LOGGER.warning("Unknown timezone '%s'; ignoring configured value.", candidate)
+    return None
 
 
 def _tz_name(tz: tzinfo | None) -> str | None:
