@@ -405,11 +405,17 @@ class StooqProvider(BaseProvider):
     supported_datasets = (DatasetType.PRICES,)
 
     async def _fetch(self, request: ProviderRequest) -> ProviderResult:
-        symbol = request.symbol.lower()
-        url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+        raw_symbol = request.symbol.strip()
+        normalized_symbol = raw_symbol.lower()
+        if "." not in raw_symbol:
+            normalized_symbol = f"{normalized_symbol}.us"
+
+        url = f"https://stooq.com/q/d/l/?s={normalized_symbol}&i=d"
         response = await self.client.get(url)
         response.raise_for_status()
         frame = pd.read_csv(StringIO(response.text)) if response.text else pd.DataFrame()
+        if not frame.empty:
+            frame = frame.dropna(how="any")
         bars: list[PriceBar] = []
         for _, row in frame.iterrows():
             timestamp = pd.Timestamp(row["Date"]).to_pydatetime().replace(tzinfo=timezone.utc)
