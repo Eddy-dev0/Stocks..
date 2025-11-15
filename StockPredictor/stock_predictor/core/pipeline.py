@@ -7,7 +7,7 @@ import logging
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone, tzinfo
+from datetime import date, datetime, time as dt_time, timedelta, timezone, tzinfo
 import re
 import unicodedata
 from typing import (
@@ -54,7 +54,7 @@ LOGGER = logging.getLogger(__name__)
 T = TypeVar("T")
 
 DEFAULT_MARKET_TIMEZONE = ZoneInfo("America/New_York")
-US_MARKET_CLOSE = time(16, 0)
+US_MARKET_CLOSE = dt_time(16, 0)
 US_MARKET_BUSINESS_DAY = CustomBusinessDay(calendar=USFederalHolidayCalendar())
 CACHE_MAX_AGE = timedelta(hours=24)
 
