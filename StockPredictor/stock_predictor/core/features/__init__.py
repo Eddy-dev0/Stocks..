@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Dict, Iterable, Iterator, Mapping, Optional, Sequence
 
 import numpy as np
@@ -19,6 +20,9 @@ from .feature_registry import (
     build_feature_registry,
     default_feature_toggles,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -199,7 +203,14 @@ class FeatureAssembler:
         for spec in execution_plan:
             summary = group_metadata[spec.name]
             if not spec.implemented:
-                raise FeatureNotImplementedError(spec.name)
+                message = (
+                    f"Feature group '{spec.name}' is declared but not implemented. Skipping."
+                )
+                logger.warning(message)
+                summary["status"] = "unimplemented"
+                summary["executed"] = False
+                metadata.setdefault("warnings", []).append(message)
+                continue
 
             if spec.name == "sentiment" and not sentiment_enabled:
                 output = FeatureBuildOutput(
