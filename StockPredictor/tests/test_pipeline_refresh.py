@@ -79,7 +79,7 @@ def test_refresh_prices_downloads_when_cache_is_stale(monkeypatch, tmp_path) -> 
         failures=[],
     )
 
-    def fake_fetch(self, dataset, params=None):
+    def fake_fetch(self, dataset, params=None, *, providers=None):
         assert dataset == DatasetType.PRICES
         return summary
 
@@ -123,7 +123,7 @@ def test_refresh_prices_raises_when_database_cache_expired(monkeypatch, tmp_path
 
     summary = ProviderFetchSummary(results=[], failures=[])
 
-    def fake_fetch(self, dataset, params=None):  # pragma: no cover - deterministic stub
+    def fake_fetch(self, dataset, params=None, *, providers=None):  # pragma: no cover - deterministic stub
         assert dataset == DatasetType.PRICES
         return summary
 
@@ -163,7 +163,7 @@ def test_refresh_prices_raises_when_local_cache_expired(monkeypatch, tmp_path) -
 
     summary = ProviderFetchSummary(results=[], failures=[])
 
-    def fake_fetch(self, dataset, params=None):  # pragma: no cover - deterministic stub
+    def fake_fetch(self, dataset, params=None, *, providers=None):  # pragma: no cover - deterministic stub
         assert dataset == DatasetType.PRICES
         return summary
 

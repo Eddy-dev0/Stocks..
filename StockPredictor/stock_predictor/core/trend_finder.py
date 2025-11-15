@@ -11,6 +11,7 @@ import pandas as pd
 
 from .config import PredictorConfig
 from .modeling import StockPredictorAI
+from .pipeline import MarketDataETL
 
 LOGGER = logging.getLogger(__name__)
 
@@ -147,6 +148,8 @@ class TrendFinder:
         if not tickers:
             return []
 
+        self._prefetch_universe(tickers)
+
         try:
             resolved_horizon = self.base_config.resolve_horizon(
                 None if horizon is None else horizon
@@ -276,6 +279,16 @@ class TrendFinder:
                 continue
             seen[label] = None
         return tuple(seen.keys())
+
+    def _prefetch_universe(self, tickers: Sequence[str]) -> None:
+        alt_providers = ("alpha_vantage", "stooq")
+        for ticker in tickers:
+            config = replace(self.base_config, ticker=ticker)
+            etl = MarketDataETL(config)
+            try:
+                etl.refresh_prices(force=False, providers=alt_providers)
+            except Exception as exc:  # pragma: no cover - defensive guard
+                LOGGER.debug("Trend prefetch for %s failed: %s", ticker, exc)
 
     @staticmethod
     def _aggregate_score(

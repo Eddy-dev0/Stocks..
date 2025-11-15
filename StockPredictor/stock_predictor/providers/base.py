@@ -362,7 +362,7 @@ class BaseProvider(abc.ABC):
         cache_key = self._cache_key(request)
         cached = await self._cache.get(cache_key)
         if cached:
-            return cached.copy(update={"from_cache": True})
+            return cached.model_copy(update={"from_cache": True})
 
         attempt_errors: list[str] = []
         last_error: Exception | None = None
@@ -382,22 +382,21 @@ class BaseProvider(abc.ABC):
                 retry_after_hint = self._retry_after_header(exc.response)
                 wait = self._retry_delay(attempt, exc, retry_after=retry_after_hint)
                 if status == 429 and attempt >= self._retries:
-                    cooldown_delay = retry_after_hint if retry_after_hint is not None else wait
-                    retry_after = max(self._cooldown_seconds, cooldown_delay)
-                    await self._schedule_cooldown(request, retry_after)
-                    await self._schedule_global_cooldown(retry_after)
+                    cooldown_delay = self._cooldown_delay(wait, retry_after_hint)
+                    await self._schedule_cooldown(request, cooldown_delay)
+                    await self._schedule_global_cooldown(cooldown_delay)
                     LOGGER.warning(
                         "Provider %s hit rate limits for %s after %s attempts; "
                         "cooling down for %.0fs.",
                         self.name,
                         request.symbol,
                         attempt,
-                        retry_after,
+                        cooldown_delay,
                     )
                     raise ProviderCooldownError(
                         self.name,
                         request.symbol,
-                        retry_after,
+                        cooldown_delay,
                         attempt,
                         str(exc),
                     ) from exc
@@ -433,6 +432,23 @@ class BaseProvider(abc.ABC):
         raise ProviderError(
             f"{self.name} failed for {request.symbol} without raising an exception."
         )
+
+    def _cooldown_delay(self, wait: float, retry_after_hint: float | None) -> float:
+        """Return a cooldown delay derived from retry hints and jitter."""
+
+        if retry_after_hint is not None:
+            jitter_base = max(retry_after_hint, 1.0) * self._jitter
+            jitter = random.uniform(0.0, jitter_base) if jitter_base > 0 else 0.0
+            return max(0.0, retry_after_hint + jitter)
+
+        if wait > 0:
+            return wait
+
+        fallback = max(self._backoff_factor, 0.0)
+        if fallback <= 0:
+            return 0.0
+        jitter = random.uniform(0.0, fallback * self._jitter) if self._jitter > 0 else 0.0
+        return fallback + jitter
 
     async def _fetch(self, request: ProviderRequest) -> ProviderResult:
         raise NotImplementedError

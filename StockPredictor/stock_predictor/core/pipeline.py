@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
@@ -20,6 +21,7 @@ from typing import (
     Sequence,
     Tuple,
     TypeVar,
+    ClassVar,
 )
 
 import pandas as pd
@@ -252,6 +254,9 @@ class MarketDataETL:
     :attr:`PredictorConfig.parquet_price_loader_path`.
     """
 
+    _memory_cache: ClassVar[dict[tuple[str, str, DatasetType], tuple[float, ProviderFetchSummary]]] = {}
+    _memory_cache_ttl: ClassVar[float] = 300.0
+
     def __init__(self, config: PredictorConfig, database: Database | None = None) -> None:
         self.config = config
         self.database = database or Database(config.database_url)
@@ -267,7 +272,12 @@ class MarketDataETL:
     # ------------------------------------------------------------------
     # Public refresh API
     # ------------------------------------------------------------------
-    def refresh_prices(self, force: bool = False) -> RefreshResult:
+    def refresh_prices(
+        self,
+        force: bool = False,
+        *,
+        providers: Sequence[str] | None = None,
+    ) -> RefreshResult:
         stale_notes: list[str] = []
         price_source: str | None = None
         existing = self.database.get_prices(
@@ -360,7 +370,7 @@ class MarketDataETL:
         if self.config.end_date:
             params["end"] = self.config.end_date.isoformat()
 
-        summary = self._fetch_dataset(DatasetType.PRICES, params)
+        summary = self._fetch_dataset(DatasetType.PRICES, params, providers=providers)
         if summary.failures:
             self._log_provider_failures(
                 "prices", summary.failures, bool(summary.results)
@@ -1196,7 +1206,11 @@ class MarketDataETL:
                 loop.close()
 
     def _fetch_dataset(
-        self, dataset: DatasetType, params: Mapping[str, Any] | None = None
+        self,
+        dataset: DatasetType,
+        params: Mapping[str, Any] | None = None,
+        *,
+        providers: Sequence[str] | None = None,
     ) -> ProviderFetchSummary:
         request_params = dict(params or {})
         if dataset == DatasetType.PRICES:
@@ -1210,9 +1224,76 @@ class MarketDataETL:
         )
 
         async def _runner() -> ProviderFetchSummary:
-            return await self._registry.fetch_all(request)
+            return await self._registry.fetch_all(request, providers=providers)
 
-        return self._run_async(_runner)
+        summary = self._run_async(_runner)
+        return self._apply_memory_cache(dataset, summary)
+
+    def _apply_memory_cache(
+        self, dataset: DatasetType, summary: ProviderFetchSummary
+    ) -> ProviderFetchSummary:
+        key = self._memory_cache_key(dataset)
+        if summary.results:
+            self._store_memory_cache(key, summary)
+            return summary
+
+        cached = self._get_memory_cache(key)
+        if not cached:
+            return summary
+
+        if not summary.failures:
+            return cached
+
+        if not all(self._is_rate_limited_failure(failure) for failure in summary.failures):
+            return summary
+
+        LOGGER.info(
+            "Using cached %s data for %s because providers are rate limited.",
+            dataset.value,
+            self.config.ticker,
+        )
+        return cached
+
+    def _memory_cache_key(self, dataset: DatasetType) -> tuple[str, str, DatasetType]:
+        return (self.config.ticker, self.config.interval, dataset)
+
+    def _get_memory_cache(
+        self, key: tuple[str, str, DatasetType]
+    ) -> ProviderFetchSummary | None:
+        entry = self._memory_cache.get(key)
+        if not entry:
+            return None
+        expires_at, cached_summary = entry
+        if time.monotonic() > expires_at:
+            self._memory_cache.pop(key, None)
+            return None
+        return self._clone_summary(cached_summary, mark_cached=True)
+
+    def _store_memory_cache(
+        self, key: tuple[str, str, DatasetType], summary: ProviderFetchSummary
+    ) -> None:
+        self._memory_cache[key] = (
+            time.monotonic() + self._memory_cache_ttl,
+            self._clone_summary(summary, mark_cached=False),
+        )
+
+    @staticmethod
+    def _is_rate_limited_failure(failure: ProviderFailure) -> bool:
+        if failure.is_rate_limited:
+            return True
+        return failure.status_code == 429
+
+    @staticmethod
+    def _clone_summary(
+        summary: ProviderFetchSummary, *, mark_cached: bool
+    ) -> ProviderFetchSummary:
+        cloned_results: list[ProviderResult] = []
+        for result in summary.results:
+            copy = result.model_copy(deep=True)
+            if mark_cached:
+                copy.from_cache = True
+            cloned_results.append(copy)
+        return ProviderFetchSummary(cloned_results, list(summary.failures))
 
     @staticmethod
     def _collect_providers(results: Sequence[ProviderResult]) -> set[str]:
