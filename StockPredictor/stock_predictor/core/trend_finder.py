@@ -295,12 +295,28 @@ class TrendFinder:
         return tuple(seen.keys())
 
     def _prefetch_universe(self, tickers: Sequence[str]) -> None:
-        alt_providers = ("alpha_vantage", "stooq")
         for ticker in tickers:
             config = replace(self.base_config, ticker=ticker)
             etl = MarketDataETL(config)
             try:
-                etl.refresh_prices(force=False, providers=alt_providers)
+                provider_sequence = [
+                    name
+                    for name in etl.preferred_price_providers()
+                    if name != "yahoo_finance"
+                ]
+                fallback_candidates = list(provider_sequence)
+                for preferred in ("alpha_vantage", "stooq"):
+                    if preferred not in fallback_candidates:
+                        if preferred == "alpha_vantage":
+                            fallback_candidates.insert(0, preferred)
+                        else:
+                            fallback_candidates.append(preferred)
+                deduped: list[str] = []
+                for name in fallback_candidates:
+                    if name not in deduped:
+                        deduped.append(name)
+                fallback = tuple(deduped[:3]) if deduped else None
+                etl.refresh_prices(force=False, providers=fallback)
             except Exception as exc:  # pragma: no cover - defensive guard
                 LOGGER.debug("Trend prefetch for %s failed: %s", ticker, exc)
 

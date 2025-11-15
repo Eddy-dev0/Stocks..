@@ -1361,12 +1361,21 @@ class StockPredictorDesktopApp:
                 self.trend_progress.grid_remove()
 
     def _update_trend_progress(self, current: int, total: int, status: str) -> None:
+        maximum = max(int(total), 1)
+        value = max(0, min(int(current), maximum))
         if self.trend_progress is not None:
-            maximum = max(int(total), 1)
-            value = max(0, min(int(current), maximum))
             self.trend_progress.configure(maximum=maximum, value=value)
         if status:
-            self.trend_status_var.set(status)
+            percent = 0
+            try:
+                percent = int(round((value / maximum) * 100)) if maximum else 0
+            except Exception:  # pragma: no cover - defensive guard
+                percent = 0
+            if maximum > 0:
+                display = f"{status} – {percent}% complete"
+            else:
+                display = status
+            self.trend_status_var.set(display)
 
     def _refresh_trend_table(self, empty_message: str | None = None) -> None:
         if self.trend_tree is None:

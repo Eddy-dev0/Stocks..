@@ -254,8 +254,10 @@ class MarketDataETL:
     :attr:`PredictorConfig.parquet_price_loader_path`.
     """
 
-    _memory_cache: ClassVar[dict[tuple[str, str, DatasetType], tuple[float, ProviderFetchSummary]]] = {}
-    _memory_cache_ttl: ClassVar[float] = 300.0
+    _memory_cache: ClassVar[
+        dict[tuple[str, str, DatasetType], tuple[float, ProviderFetchSummary]]
+    ] = {}
+    _memory_cache_default_ttl: ClassVar[float] = 900.0
 
     def __init__(self, config: PredictorConfig, database: Database | None = None) -> None:
         self.config = config
@@ -268,6 +270,10 @@ class MarketDataETL:
         )
         self.market_timezone = resolve_market_timezone(self.config)
         self._last_price_cache_warning: str | None = None
+        ttl = getattr(self.config, "memory_cache_seconds", None)
+        if ttl is None:
+            ttl = self._memory_cache_default_ttl
+        self._memory_cache_ttl = max(60.0, float(ttl))
 
     # ------------------------------------------------------------------
     # Public refresh API
@@ -1222,18 +1228,115 @@ class MarketDataETL:
             symbol=self.config.ticker,
             params=request_params,
         )
+        provider_sequence = self._resolve_provider_sequence(dataset, providers)
 
-        async def _runner() -> ProviderFetchSummary:
-            return await self._registry.fetch_all(request, providers=providers)
+        if dataset == DatasetType.PRICES:
+            summary = self._fetch_with_rotation(request, provider_sequence)
+        else:
 
-        summary = self._run_async(_runner)
+            async def _runner() -> ProviderFetchSummary:
+                provider_arg: Sequence[str] | None = provider_sequence or None
+                return await self._registry.fetch_all(request, providers=provider_arg)
+
+            summary = self._run_async(_runner)
+
         return self._apply_memory_cache(dataset, summary)
+
+    def preferred_price_providers(self) -> list[str]:
+        """Return the resolved provider order for price downloads."""
+
+        return self._resolve_provider_sequence(DatasetType.PRICES, None)
+
+    def _resolve_provider_sequence(
+        self, dataset: DatasetType, providers: Sequence[str] | None
+    ) -> list[str]:
+        """Determine the provider order honouring config priorities."""
+
+        available = [
+            provider.name for provider in self._registry.providers_for(dataset)
+        ]
+        disabled = set(getattr(self.config, "disabled_providers", ()) or ())
+
+        def _normalise(values: Sequence[str] | None) -> list[str]:
+            normalised: list[str] = []
+            if not values:
+                return normalised
+            for raw in values:
+                token = str(raw or "").strip().lower()
+                if not token or token in normalised:
+                    continue
+                normalised.append(token)
+            return normalised
+
+        if providers:
+            sequence = [p for p in _normalise(list(providers)) if p in available]
+        elif dataset == DatasetType.PRICES:
+            priority = _normalise(getattr(self.config, "price_provider_priority", ()))
+            sequence = [name for name in priority if name in available]
+            remaining = [name for name in available if name not in sequence]
+            if "yahoo_finance" in remaining:
+                remaining = [name for name in remaining if name != "yahoo_finance"] + [
+                    name for name in remaining if name == "yahoo_finance"
+                ]
+            sequence.extend(remaining)
+        else:
+            sequence = list(available)
+
+        filtered = [name for name in sequence if name not in disabled]
+        return filtered
+
+    def _fetch_with_rotation(
+        self, request: ProviderRequest, providers: Sequence[str]
+    ) -> ProviderFetchSummary:
+        if not providers:
+            return ProviderFetchSummary.empty()
+
+        aggregate_results: list[ProviderResult] = []
+        aggregate_failures: list[ProviderFailure] = []
+        provider_cycle = list(providers)
+        max_cycles = 3
+
+        for cycle in range(max_cycles):
+            cycle_failures: list[ProviderFailure] = []
+            for provider_name in provider_cycle:
+
+                async def _runner(name: str = provider_name) -> ProviderFetchSummary:
+                    return await self._registry.fetch_all(request, providers=[name])
+
+                summary = self._run_async(_runner)
+                aggregate_results.extend(summary.results)
+                aggregate_failures.extend(summary.failures)
+                cycle_failures.extend(summary.failures)
+                if summary.results:
+                    return ProviderFetchSummary(aggregate_results, aggregate_failures)
+
+            if not cycle_failures:
+                break
+
+            if not all(self._is_rate_limited_failure(failure) for failure in cycle_failures):
+                break
+
+            retry_delay = self._minimum_retry_after(cycle_failures)
+            if retry_delay is None or retry_delay <= 0:
+                break
+
+            LOGGER.info(
+                "All %s providers for %s are rate limited; retrying in %.0fs (attempt %s/%s).",
+                request.dataset_type.value,
+                request.symbol,
+                retry_delay,
+                cycle + 1,
+                max_cycles,
+            )
+            time.sleep(retry_delay)
+
+        return ProviderFetchSummary(aggregate_results, aggregate_failures)
 
     def _apply_memory_cache(
         self, dataset: DatasetType, summary: ProviderFetchSummary
     ) -> ProviderFetchSummary:
         key = self._memory_cache_key(dataset)
-        if summary.results:
+        if summary.results or not summary.failures:
             self._store_memory_cache(key, summary)
             return summary
 
@@ -1276,6 +1379,19 @@ class MarketDataETL:
             time.monotonic() + self._memory_cache_ttl,
             self._clone_summary(summary, mark_cached=False),
         )
+
+    @staticmethod
+    def _minimum_retry_after(
+        failures: Sequence[ProviderFailure],
+    ) -> float | None:
+        delays = [
+            float(failure.retry_after)
+            for failure in failures
+            if failure.retry_after and failure.retry_after > 0
+        ]
+        if not delays:
+            return None
+        return max(0.0, min(delays))
 
     @staticmethod
     def _is_rate_limited_failure(failure: ProviderFailure) -> bool:
