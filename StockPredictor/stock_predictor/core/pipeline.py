@@ -6,7 +6,7 @@ import asyncio
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime, time, tzinfo
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from typing import (
     Any,
     Awaitable,
@@ -52,6 +52,7 @@ T = TypeVar("T")
 DEFAULT_MARKET_TIMEZONE = ZoneInfo("America/New_York")
 US_MARKET_CLOSE = time(16, 0)
 US_MARKET_BUSINESS_DAY = CustomBusinessDay(calendar=USFederalHolidayCalendar())
+CACHE_MAX_AGE = timedelta(hours=24)
 
 
 def resolve_market_timezone(config: PredictorConfig | None = None) -> ZoneInfo:
@@ -190,36 +191,90 @@ class MarketDataETL:
             config=self.config,
         )
         self.market_timezone = resolve_market_timezone(self.config)
+        self._last_price_cache_warning: str | None = None
 
     # ------------------------------------------------------------------
     # Public refresh API
     # ------------------------------------------------------------------
     def refresh_prices(self, force: bool = False) -> RefreshResult:
+        stale_notes: list[str] = []
+        price_source: str | None = None
         existing = self.database.get_prices(
             ticker=self.config.ticker,
             interval=self.config.interval,
             start=self.config.start_date,
             end=self.config.end_date,
         )
-        if existing.empty:
-            cached = self._load_local_price_cache()
-            if cached is not None and not cached.empty:
-                LOGGER.info(
-                    "Loaded %s cached price rows for %s from local cache.",
-                    cached.shape[0],
-                    self.config.ticker,
+        existing_ts = self.database.get_refresh_timestamp(
+            self.config.ticker, self.config.interval, "prices"
+        )
+        existing_is_fresh = bool(
+            existing_ts and self._is_cache_timestamp_fresh(existing_ts)
+        )
+        if not existing.empty and not existing_is_fresh:
+            if existing_ts is None:
+                stale_notes.append("Database price cache is missing a refresh timestamp.")
+            else:
+                if existing_ts.tzinfo is None:
+                    display_ts = existing_ts.replace(tzinfo=timezone.utc)
+                else:
+                    display_ts = existing_ts
+                stale_notes.append(
+                    f"Database price cache expired (last refreshed {display_ts.isoformat()})."
                 )
-                existing = cached
-                self._record_source("prices", "local")
+            existing = existing.iloc[0:0]
+            existing_is_fresh = False
+        elif not existing.empty and existing_is_fresh:
+            price_source = "database"
+
+        cache_path = self.config.price_cache_path
+        cache_payload = None
+        if existing.empty:
+            cache_exists = cache_path.exists()
+            cache_payload = self._load_local_price_cache()
+            if cache_payload is not None:
+                cached_frame, cache_timestamp = cache_payload
+                if not cached_frame.empty:
+                    LOGGER.info(
+                        "Loaded %s cached price rows for %s from local cache (as of %s).",
+                        cached_frame.shape[0],
+                        self.config.ticker,
+                        cache_timestamp.isoformat(),
+                    )
+                    existing = cached_frame
+                    existing_ts = cache_timestamp
+                    existing_is_fresh = True
+                    price_source = "local"
+                else:
+                    stale_notes.append("Local price cache contains no data.")
+                    existing_is_fresh = False
+            elif cache_exists and self._last_price_cache_warning:
+                stale_notes.append(self._last_price_cache_warning)
+        if not existing.empty and price_source is None:
+            price_source = "database"
+
+        if existing.empty:
+            if stale_notes:
+                LOGGER.info(
+                    "Cached price data for %s is unavailable: %s",
+                    self.config.ticker,
+                    "; ".join(stale_notes),
+                )
             else:
                 LOGGER.info(
                     "No cached price data found for %s; attempting to download fresh data.",
                     self.config.ticker,
                 )
-        if not force and self._covers_requested_range(existing):
+
+        if (
+            not force
+            and existing_is_fresh
+            and self._covers_requested_range(existing)
+        ):
             LOGGER.debug("Price data already present for %s", self.config.ticker)
             prepared = self._apply_provider_timestamps(existing, None)
-            self._record_source("prices", "database")
+            if price_source:
+                self._record_source("prices", price_source)
             return RefreshResult(prepared, downloaded=False)
 
         LOGGER.info(
@@ -244,19 +299,23 @@ class MarketDataETL:
         downloaded = self._coalesce_price_results(summary.results)
 
         if downloaded is None or downloaded.empty:
-            if not existing.empty:
+            if not existing.empty and existing_is_fresh:
                 LOGGER.warning(
                     "Providers returned no new price rows for %s; reusing cached data.",
                     self.config.ticker,
                 )
                 prepared = self._apply_provider_timestamps(existing, None)
-                self._record_source("prices", "database")
+                if price_source:
+                    self._record_source("prices", price_source)
                 return RefreshResult(prepared, downloaded=False)
 
-            message = self._compose_error_message(
+            detail = (
                 self._compose_failure_summary(summary.failures)
                 or "Empty dataframe from data providers."
             )
+            if stale_notes:
+                detail = f"{detail} Cached data unavailable: {'; '.join(stale_notes)}"
+            message = self._compose_error_message(detail)
             raise NoPriceDataError(self.config.ticker, message)
         self.database.upsert_prices(self.config.ticker, self.config.interval, downloaded)
         self.database.set_refresh_timestamp(
@@ -1127,22 +1186,72 @@ class MarketDataETL:
             parts.append(f"{failure.provider}: {detail}")
         return "; ".join(parts)
 
-    def _load_local_price_cache(self) -> pd.DataFrame | None:
+    def _is_cache_timestamp_fresh(
+        self, timestamp: datetime | pd.Timestamp | None
+    ) -> bool:
+        if timestamp is None:
+            return False
+        if isinstance(timestamp, pd.Timestamp):
+            timestamp = timestamp.to_pydatetime()
+        reference = datetime.now(timezone.utc)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        else:
+            timestamp = timestamp.astimezone(timezone.utc)
+        return reference - timestamp <= CACHE_MAX_AGE
+
+    def _load_local_price_cache(self) -> tuple[pd.DataFrame, datetime] | None:
         path = self.config.price_cache_path
+        self._last_price_cache_warning = None
         if not path.exists():
             return None
         try:
-            frame = pd.read_csv(path, parse_dates=["Date"])
+            frame = pd.read_csv(path)
         except Exception as exc:  # pragma: no cover - defensive
             LOGGER.debug("Failed to load local price cache %s: %s", path, exc)
+            self._last_price_cache_warning = "Local price cache could not be read."
             return None
-        return frame
+        timestamp: datetime | None = None
+        if "CacheTimestamp" in frame.columns:
+            ts_series = pd.to_datetime(frame["CacheTimestamp"], errors="coerce").dropna()
+            if not ts_series.empty:
+                timestamp = ts_series.iloc[0].to_pydatetime()
+            frame = frame.drop(columns=["CacheTimestamp"])
+        if "Date" in frame.columns:
+            frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+        if timestamp is None:
+            try:
+                stat = path.stat()
+            except OSError as exc:  # pragma: no cover - defensive
+                LOGGER.debug("Unable to stat price cache %s: %s", path, exc)
+            else:
+                timestamp = datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+        if timestamp is None:
+            self._last_price_cache_warning = "Local price cache is missing timestamp metadata."
+            return None
+        if not self._is_cache_timestamp_fresh(timestamp):
+            self._last_price_cache_warning = (
+                f"Local price cache expired (last updated {timestamp.isoformat()})."
+            )
+            LOGGER.info(
+                "Ignoring local price cache %s with timestamp %s older than %s.",
+                path,
+                timestamp.isoformat(),
+                CACHE_MAX_AGE,
+            )
+            return None
+        frame.attrs["cache_timestamp"] = timestamp
+        return frame, timestamp
 
     def _write_price_cache(self, frame: pd.DataFrame) -> None:
         path = self.config.price_cache_path
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            frame.to_csv(path, index=False)
+            timestamp = datetime.now(timezone.utc)
+            payload = frame.copy()
+            payload["CacheTimestamp"] = timestamp.isoformat()
+            payload.to_csv(path, index=False)
+            frame.attrs["cache_timestamp"] = timestamp
         except Exception as exc:  # pragma: no cover - defensive
             LOGGER.debug("Unable to persist price cache to %s: %s", path, exc)
 

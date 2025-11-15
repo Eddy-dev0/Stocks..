@@ -2441,9 +2441,10 @@ class StockPredictorDesktopApp:
 
     def _on_no_price_data_error(self, exc: NoPriceDataError) -> None:
         ticker = getattr(exc, "ticker", self.config.ticker)
-        status = f"No data available for {ticker}."
+        detail = str(exc)
+        status = detail if detail else f"No data available for {ticker}."
         self._set_busy(False, status)
-        messagebox.showwarning("No price data", str(exc))
+        messagebox.showwarning("No price data", detail)
 
     def _set_busy(self, busy: bool, status: str | None = None) -> None:
         self._busy = busy
