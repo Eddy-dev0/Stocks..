@@ -6,7 +6,7 @@ import asyncio
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, tzinfo
 from typing import (
     Any,
     Awaitable,
@@ -25,7 +25,7 @@ import yfinance as yf
 
 from pandas.tseries.holiday import USFederalHolidayCalendar
 from pandas.tseries.offsets import CustomBusinessDay
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import PredictorConfig
 from .database import Database
@@ -49,9 +49,61 @@ LOGGER = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-US_MARKET_TIMEZONE = ZoneInfo("America/New_York")
+DEFAULT_MARKET_TIMEZONE = ZoneInfo("America/New_York")
 US_MARKET_CLOSE = time(16, 0)
 US_MARKET_BUSINESS_DAY = CustomBusinessDay(calendar=USFederalHolidayCalendar())
+
+
+def resolve_market_timezone(config: PredictorConfig | None = None) -> ZoneInfo:
+    """Return the market timezone configured for the application context."""
+
+    tz_key = getattr(config, "market_timezone", None)
+    timezone = _coerce_zoneinfo(tz_key)
+    if timezone is not None:
+        return timezone
+
+    local_timezone = datetime.now().astimezone().tzinfo
+    timezone = _coerce_zoneinfo(_tz_name(local_timezone))
+    if timezone is not None:
+        return timezone
+
+    if isinstance(local_timezone, ZoneInfo):
+        return local_timezone
+
+    LOGGER.debug(
+        "Falling back to default market timezone %s", DEFAULT_MARKET_TIMEZONE.key
+    )
+    return DEFAULT_MARKET_TIMEZONE
+
+
+def _coerce_zoneinfo(value: str | None) -> ZoneInfo | None:
+    if not value:
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    try:
+        return ZoneInfo(candidate)
+    except ZoneInfoNotFoundError:
+        LOGGER.warning("Unknown timezone '%s'; ignoring configured value.", candidate)
+        return None
+
+
+def _tz_name(tz: tzinfo | None) -> str | None:
+    if tz is None:
+        return None
+    for attr in ("key", "zone"):
+        name = getattr(tz, attr, None)
+        if isinstance(name, str) and name:
+            return name
+    try:
+        now = datetime.now(tz)
+    except Exception:  # pragma: no cover - defensive guard
+        now = datetime.now()
+    name = tz.tzname(now)
+    if isinstance(name, str) and name:
+        return name
+    return None
 
 class NoPriceDataError(RuntimeError):
     """Raised when a ticker fails to yield any price observations."""
@@ -137,6 +189,7 @@ class MarketDataETL:
             parquet_loader_path=self.config.parquet_price_loader_path,
             config=self.config,
         )
+        self.market_timezone = resolve_market_timezone(self.config)
 
     # ------------------------------------------------------------------
     # Public refresh API
@@ -1298,45 +1351,45 @@ class MarketDataETL:
         ticker_upper = (self.config.ticker or "").upper()
         return TICKER_HINTS.get(ticker_upper, "")
 
-    @staticmethod
-    def _normalize_to_market_tz(timestamp: datetime | pd.Timestamp) -> pd.Timestamp:
+    def _normalize_to_market_tz(self, timestamp: datetime | pd.Timestamp) -> pd.Timestamp:
         ts = pd.Timestamp(timestamp)
         if ts.tzinfo is None:
-            ts = ts.tz_localize("UTC")
+            try:
+                ts = ts.tz_localize("UTC")
+            except Exception:
+                ts = ts.tz_localize(self.market_timezone)
         else:
             ts = ts.tz_convert("UTC")
-        return ts.tz_convert(US_MARKET_TIMEZONE)
+        return ts.tz_convert(self.market_timezone)
 
-    @staticmethod
-    def _is_trading_day(timestamp: datetime | pd.Timestamp) -> bool:
-        ts = MarketDataETL._normalize_to_market_tz(pd.Timestamp(timestamp)).normalize()
+    def _is_trading_day(self, timestamp: datetime | pd.Timestamp) -> bool:
+        ts = self._normalize_to_market_tz(pd.Timestamp(timestamp)).normalize()
         naive = ts.tz_localize(None)
         return US_MARKET_BUSINESS_DAY.is_on_offset(naive)
 
-    @staticmethod
-    def _previous_trading_day(timestamp: datetime | pd.Timestamp) -> pd.Timestamp:
-        candidate = MarketDataETL._normalize_to_market_tz(pd.Timestamp(timestamp)).normalize()
+    def _previous_trading_day(self, timestamp: datetime | pd.Timestamp) -> pd.Timestamp:
+        candidate = self._normalize_to_market_tz(pd.Timestamp(timestamp)).normalize()
         for _ in range(10):
             candidate = (candidate - US_MARKET_BUSINESS_DAY).normalize()
-            if MarketDataETL._is_trading_day(candidate):
+            if self._is_trading_day(candidate):
                 return candidate
         return candidate
 
-    @staticmethod
-    def _latest_trading_session(reference: datetime | pd.Timestamp | None = None) -> date:
-        current = MarketDataETL._normalize_to_market_tz(
-            pd.Timestamp.utcnow() if reference is None else reference
-        )
+    def _latest_trading_session(
+        self, reference: datetime | pd.Timestamp | None = None
+    ) -> date:
+        basis = pd.Timestamp.utcnow() if reference is None else reference
+        current = self._normalize_to_market_tz(basis)
         session = current.normalize()
-        if not MarketDataETL._is_trading_day(session):
-            session = MarketDataETL._previous_trading_day(session)
+        if not self._is_trading_day(session):
+            session = self._previous_trading_day(session)
         else:
             if (current.hour, current.minute, current.second) < (
                 US_MARKET_CLOSE.hour,
                 US_MARKET_CLOSE.minute,
                 US_MARKET_CLOSE.second,
             ):
-                session = MarketDataETL._previous_trading_day(session)
+                session = self._previous_trading_day(session)
         return session.tz_localize(None).date()
 
     def _apply_provider_timestamps(
@@ -1352,9 +1405,9 @@ class MarketDataETL:
         if persisted_dates.isna().all():
             return frame
         if getattr(persisted_dates.dt, "tz", None) is None:
-            localized = persisted_dates.dt.tz_localize(US_MARKET_TIMEZONE)
+            localized = persisted_dates.dt.tz_localize(self.market_timezone)
         else:
-            localized = persisted_dates.dt.tz_convert(US_MARKET_TIMEZONE)
+            localized = persisted_dates.dt.tz_convert(self.market_timezone)
         frame["Date"] = localized
         if downloaded is None or downloaded.empty or "Date" not in downloaded.columns:
             return frame
@@ -1365,9 +1418,9 @@ class MarketDataETL:
         if provider_dates.empty:
             return frame
         if getattr(provider_dates.dt, "tz", None) is None:
-            provider_dates = provider_dates.dt.tz_localize(US_MARKET_TIMEZONE)
+            provider_dates = provider_dates.dt.tz_localize(self.market_timezone)
         else:
-            provider_dates = provider_dates.dt.tz_convert(US_MARKET_TIMEZONE)
+            provider_dates = provider_dates.dt.tz_convert(self.market_timezone)
         provider_map: dict[date, pd.Timestamp] = {}
         for ts in provider_dates:
             provider_map[ts.date()] = ts
@@ -1391,9 +1444,9 @@ class MarketDataETL:
         if date_values.empty:
             return False
         if getattr(date_values.dt, "tz", None) is None:
-            market_dates = date_values.dt.tz_localize(US_MARKET_TIMEZONE)
+            market_dates = date_values.dt.tz_localize(self.market_timezone)
         else:
-            market_dates = date_values.dt.tz_convert(US_MARKET_TIMEZONE)
+            market_dates = date_values.dt.tz_convert(self.market_timezone)
         min_date = market_dates.min().date()
         max_date = market_dates.max().date()
         if start and min_date > start:
@@ -1455,5 +1508,10 @@ class MarketDataETL:
             return None
 
 
-__all__ = ["MarketDataETL", "RefreshResult", "NoPriceDataError"]
+__all__ = [
+    "MarketDataETL",
+    "RefreshResult",
+    "NoPriceDataError",
+    "resolve_market_timezone",
+]
 

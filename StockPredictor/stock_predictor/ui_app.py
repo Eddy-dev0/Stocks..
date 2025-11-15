@@ -10,6 +10,7 @@ import tkinter as tk
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import timedelta
+from zoneinfo import ZoneInfo
 from tkinter import messagebox, ttk
 from typing import Any, Callable, Iterable, Mapping
 
@@ -34,7 +35,7 @@ from stock_predictor.core import (
     TrendFinder,
     TrendInsight,
 )
-from stock_predictor.core.pipeline import NoPriceDataError
+from stock_predictor.core.pipeline import NoPriceDataError, resolve_market_timezone
 
 LOGGER = logging.getLogger(__name__)
 
@@ -335,6 +336,7 @@ class StockPredictorDesktopApp:
         self.root = root
         self.application = application or StockPredictorApplication.from_environment()
         self.config = self.application.config
+        self.market_timezone: ZoneInfo = resolve_market_timezone(self.config)
         self.root.title(f"Stock Predictor – {self.config.ticker}")
         self.root.geometry("1280x840")
         self.root.minsize(1024, 640)
@@ -2308,6 +2310,7 @@ class StockPredictorDesktopApp:
             return
 
         self.config = self.application.config
+        self.market_timezone = resolve_market_timezone(self.config)
         self.root.title(f"Stock Predictor – {self.config.ticker}")
         self.ticker_var.set(self.config.ticker)
         self._configure_horizons(self.config.prediction_horizons)
@@ -2467,12 +2470,39 @@ class StockPredictorDesktopApp:
     def _set_status(self, message: str) -> None:
         self.status_var.set(message)
 
+    def _now(self) -> pd.Timestamp:
+        return pd.Timestamp.now(tz=self.market_timezone)
+
+    def _today(self) -> pd.Timestamp:
+        return self._now().normalize()
+
+    def _localize_market_timestamp(self, value: Any) -> pd.Timestamp | None:
+        if value is None:
+            return None
+        try:
+            parsed = pd.to_datetime(value, errors="coerce")
+        except Exception:  # pragma: no cover - defensive
+            return None
+        if pd.isna(parsed):
+            return None
+        ts = pd.Timestamp(parsed)
+        tz = self.market_timezone
+        if ts.tzinfo is None:
+            try:
+                return ts.tz_localize(tz)
+            except Exception:  # pragma: no cover - defensive fallback
+                return ts.tz_localize("UTC").tz_convert(tz)
+        try:
+            return ts.tz_convert(tz)
+        except Exception:  # pragma: no cover - defensive fallback
+            return ts.tz_localize(tz)
+
     def _forecast_base_date(self) -> pd.Timestamp:
         prediction = self.current_prediction or {}
         as_of = prediction.get("market_data_as_of") if isinstance(prediction, Mapping) else None
-        timestamp = pd.to_datetime(as_of, errors="coerce") if as_of is not None else None
-        if pd.notna(timestamp):
-            return pd.Timestamp(timestamp).normalize()
+        timestamp = self._localize_market_timestamp(as_of)
+        if timestamp is not None:
+            return timestamp.normalize()
 
         if isinstance(self.price_history, pd.DataFrame) and not self.price_history.empty:
             frame = self.price_history.copy()
@@ -2480,29 +2510,37 @@ class StockPredictorDesktopApp:
             if "date" in lower_map:
                 dates = pd.to_datetime(frame[lower_map["date"]], errors="coerce").dropna()
                 if not dates.empty:
-                    return pd.Timestamp(dates.iloc[-1]).normalize()
+                    localized = self._localize_market_timestamp(dates.iloc[-1])
+                    if localized is not None:
+                        return localized.normalize()
             index_dates = pd.to_datetime(frame.index, errors="coerce")
             index_series = pd.Series(index_dates).dropna()
             if not index_series.empty:
-                return pd.Timestamp(index_series.iloc[-1]).normalize()
+                localized = self._localize_market_timestamp(index_series.iloc[-1])
+                if localized is not None:
+                    return localized.normalize()
 
-        return pd.Timestamp.today().normalize()
+        return self._today()
 
     def _compute_forecast_date(
         self, target_date: Any | None = None, *, offset: int | None = None
     ) -> pd.Timestamp | None:
         base_date = self._forecast_base_date()
-        parsed = pd.to_datetime(target_date, errors="coerce") if target_date is not None else None
+        parsed = (
+            self._localize_market_timestamp(target_date)
+            if target_date is not None
+            else None
+        )
         holidays = self.market_holidays or self._resolve_market_holidays()
         if not self.market_holidays and holidays:
             self.market_holidays = list(holidays)
 
         forecast: pd.Timestamp | None = None
-        if pd.notna(parsed):
+        if parsed is not None:
             try:
                 forecast = _ensure_future_trading_day(
                     base_date,
-                    pd.Timestamp(parsed).normalize(),
+                    parsed.normalize(),
                     context=str(target_date),
                 )
             except ValueError as exc:
@@ -2538,7 +2576,12 @@ class StockPredictorDesktopApp:
         display = "Forecast date: —"
         forecast = self._compute_forecast_date(target_date)
         if forecast is not None:
-            display = f"Forecast date: {forecast.date().isoformat()}"
+            local_forecast = (
+                forecast.tz_convert(self.market_timezone)
+                if forecast.tzinfo
+                else forecast.tz_localize(self.market_timezone)
+            )
+            display = f"Forecast date: {local_forecast.date().isoformat()}"
         self.forecast_date_var.set(display)
 
     # ------------------------------------------------------------------
@@ -2548,7 +2591,13 @@ class StockPredictorDesktopApp:
         prediction = self.current_prediction or {}
         explanation = prediction.get("explanation") if isinstance(prediction, Mapping) else None
         self.metric_vars["ticker"].set(str(prediction.get("ticker") or self.config.ticker))
-        self.metric_vars["as_of"].set(str(prediction.get("market_data_as_of") or "—"))
+        as_of_raw = prediction.get("market_data_as_of") if isinstance(prediction, Mapping) else None
+        localized_as_of = self._localize_market_timestamp(as_of_raw)
+        if localized_as_of is not None:
+            as_of_display = localized_as_of.strftime("%Y-%m-%d %H:%M %Z")
+        else:
+            as_of_display = "—"
+        self.metric_vars["as_of"].set(as_of_display)
 
         last_close = prediction.get("last_close")
         predicted_close = prediction.get("predicted_close")
@@ -2569,7 +2618,8 @@ class StockPredictorDesktopApp:
             forecast = self._compute_forecast_date(self.current_prediction.get("target_date"))
         predicted_display = fmt_ccy(predicted_converted, self.currency_symbol, decimals=decimals)
         if forecast is not None:
-            forecast_str = forecast.date().isoformat()
+            local_forecast = forecast.tz_convert(self.market_timezone) if forecast.tzinfo else forecast.tz_localize(self.market_timezone)
+            forecast_str = local_forecast.date().isoformat()
             if predicted_display == "—":
                 predicted_display = f"— ({forecast_str})"
             else:
