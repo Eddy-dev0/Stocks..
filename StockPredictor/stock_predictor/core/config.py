@@ -14,7 +14,7 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from dotenv import load_dotenv
 
-from .features import default_feature_toggles
+from .features import FEATURE_REGISTRY, default_feature_toggles
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
@@ -481,6 +481,12 @@ def _coerce_feature_toggles(
                 toggles[name] = True
 
     defaults.update(toggles)
+
+    implemented = {name for name, spec in FEATURE_REGISTRY.items() if spec.implemented}
+    for name in list(defaults):
+        if name not in implemented:
+            defaults[name] = False
+
     return defaults
 
 

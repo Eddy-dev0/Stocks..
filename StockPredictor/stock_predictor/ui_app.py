@@ -36,6 +36,7 @@ from stock_predictor.core import (
     TrendInsight,
 )
 from stock_predictor.core.pipeline import NoPriceDataError, resolve_market_timezone
+from stock_predictor.core.features import FEATURE_REGISTRY
 
 LOGGER = logging.getLogger(__name__)
 
@@ -86,6 +87,11 @@ CURRENCY_CODE_TO_SYMBOL: dict[str, str] = {
 
 
 NON_REMOTE_PROVIDER_IDS = {"database", "local", "placeholder", "unknown"}
+
+
+IMPLEMENTED_FEATURE_GROUPS: set[str] = {
+    name for name, spec in FEATURE_REGISTRY.items() if spec.implemented
+}
 
 
 def _normalise_currency_code(value: Any) -> str | None:
@@ -1209,7 +1215,14 @@ class StockPredictorDesktopApp:
         toggles_box = ttk.LabelFrame(frame, text="Feature toggles", padding=8)
         toggles_box.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
 
-        for idx, (name, enabled) in enumerate(sorted(self.config.feature_toggles.items())):
+        self.feature_toggle_vars.clear()
+        toggle_names = [
+            name
+            for name in sorted(self.config.feature_toggles)
+            if name in IMPLEMENTED_FEATURE_GROUPS
+        ]
+        for idx, name in enumerate(toggle_names):
+            enabled = bool(self.config.feature_toggles.get(name, False))
             var = tk.BooleanVar(value=enabled)
             self.feature_toggle_vars[name] = var
             check = ttk.Checkbutton(
@@ -2281,8 +2294,13 @@ class StockPredictorDesktopApp:
     def _on_feature_toggle_changed(self) -> None:
         if self._busy:
             return
-        new_toggles = {name: bool(var.get()) for name, var in self.feature_toggle_vars.items()}
-        self.config.feature_toggles.update(new_toggles)
+        toggles: dict[str, bool] = {}
+        for name in sorted(IMPLEMENTED_FEATURE_GROUPS):
+            if name in self.feature_toggle_vars:
+                toggles[name] = bool(self.feature_toggle_vars[name].get())
+            else:
+                toggles[name] = bool(self.config.feature_toggles.get(name, False))
+        self.config.feature_toggles = toggles
         self.application.pipeline = StockPredictorAI(self.config)
         self._set_status("Feature toggles updated. Re-run prediction to apply changes.")
 
@@ -2487,7 +2505,9 @@ class StockPredictorDesktopApp:
         if pd.isna(parsed):
             return None
         ts = pd.Timestamp(parsed)
-        tz = self.market_timezone
+        tz = getattr(self, "market_timezone", None)
+        if tz is None:
+            return ts
         if ts.tzinfo is None:
             try:
                 return ts.tz_localize(tz)
