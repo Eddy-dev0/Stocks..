@@ -110,6 +110,7 @@ class PredictorConfig:
     yahoo_rate_limit_per_second: float | None = None
     yahoo_rate_limit_per_minute: float | None = None
     yahoo_cooldown_seconds: float | None = None
+    market_timezone: str | None = None
 
     def __post_init__(self) -> None:
         self.ticker = self.ticker.upper()
@@ -175,6 +176,9 @@ class PredictorConfig:
             self.yahoo_cooldown_seconds = max(
                 0.0, float(self.yahoo_cooldown_seconds)
             )
+        if self.market_timezone is not None:
+            tz_str = str(self.market_timezone).strip()
+            self.market_timezone = tz_str or None
 
     def ensure_directories(self) -> None:
         """Ensure that data and model directories exist."""

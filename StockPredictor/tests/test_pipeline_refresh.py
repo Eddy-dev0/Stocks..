@@ -13,7 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from stock_predictor.core.config import PredictorConfig
-from stock_predictor.core.pipeline import MarketDataETL, US_MARKET_TIMEZONE
+from stock_predictor.core.pipeline import MarketDataETL
 from stock_predictor.providers.base import (
     DatasetType,
     PriceBar,
@@ -52,10 +52,11 @@ def test_refresh_prices_downloads_when_cache_is_stale(monkeypatch, tmp_path) -> 
     monkeypatch.setattr(
         MarketDataETL,
         "_latest_trading_session",
-        staticmethod(lambda reference=None: expected_session),
+        lambda self, reference=None: expected_session,
     )
 
-    new_timestamp = pd.Timestamp("2024-03-27 16:00:00", tz=US_MARKET_TIMEZONE)
+    market_tz = etl.market_timezone
+    new_timestamp = pd.Timestamp("2024-03-27 16:00:00", tz=market_tz)
     price_bar = PriceBar(
         symbol="AAPL",
         timestamp=new_timestamp.to_pydatetime(),
@@ -87,7 +88,7 @@ def test_refresh_prices_downloads_when_cache_is_stale(monkeypatch, tmp_path) -> 
 
     assert result.downloaded is True
     assert len(result.data) == len(cached_dates) + 1
-    assert result.data["Date"].dt.tz is US_MARKET_TIMEZONE
+    assert getattr(result.data["Date"].dt.tz, "key", None) == getattr(market_tz, "key", None)
     assert result.data.iloc[-1]["Date"] == new_timestamp
 
     refreshed_ts = database.get_refresh_timestamp("AAPL", "1d", "prices")
@@ -100,6 +101,8 @@ def test_latest_trading_session_with_midday_utc_reference_returns_previous_day()
 
     reference = pd.Timestamp("2024-03-27 12:00:00", tz="UTC")
 
-    session = MarketDataETL._latest_trading_session(reference=reference)
+    config = PredictorConfig(ticker="AAPL")
+    etl = MarketDataETL(config)
+    session = etl._latest_trading_session(reference=reference)
 
     assert session == date(2024, 3, 26)
