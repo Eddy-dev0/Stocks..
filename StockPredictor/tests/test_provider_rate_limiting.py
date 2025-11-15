@@ -59,7 +59,7 @@ def test_yahoo_global_cooldown_short_circuits(monkeypatch: pytest.MonkeyPatch) -
     """A 429 response should trigger a provider-wide cooldown."""
 
     async def _runner() -> None:
-        provider = YahooFinanceProvider(cooldown_seconds=3, retries=1)
+        provider = YahooFinanceProvider(cooldown_seconds=3, retries=1, jitter=0.0)
         request = ProviderRequest(dataset_type=DatasetType.PRICES, symbol="AAPL", params={})
 
         call_count = 0
@@ -90,6 +90,45 @@ def test_yahoo_global_cooldown_short_circuits(monkeypatch: pytest.MonkeyPatch) -
         in_cooldown, remaining = await provider.global_cooldown_remaining()
         assert in_cooldown
         assert remaining > 0
+
+        await provider.aclose()
+
+    asyncio.run(_runner())
+
+
+def test_429_retry_hint_overrides_default_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry-After hints should set the cooldown instead of the default window."""
+
+    async def _runner() -> None:
+        provider = YahooFinanceProvider(
+            cooldown_seconds=900,
+            retries=1,
+            backoff_factor=1.0,
+            jitter=0.0,
+        )
+        request = ProviderRequest(dataset_type=DatasetType.PRICES, symbol="IBM", params={})
+
+        async def _always_rate_limit(
+            self: YahooFinanceProvider, _: ProviderRequest
+        ) -> ProviderResult:
+            request_obj = httpx.Request("GET", "https://example.com")
+            response = httpx.Response(
+                429, request=request_obj, headers={"Retry-After": "30"}
+            )
+            raise httpx.HTTPStatusError(
+                "Too Many Requests", request=request_obj, response=response
+            )
+
+        monkeypatch.setattr(
+            YahooFinanceProvider, "_fetch", _always_rate_limit, raising=False
+        )
+
+        with pytest.raises(ProviderCooldownError) as excinfo:
+            await provider.fetch(request)
+
+        assert excinfo.value.retry_after == pytest.approx(30.0)
 
         await provider.aclose()
 
