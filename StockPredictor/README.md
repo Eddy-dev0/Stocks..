@@ -139,6 +139,22 @@ single placeholder row that documents the missing feed. These placeholders make
 it easy to distinguish “no data yet” from “not refreshed” states and allow the
 schema bootstrap to remain idempotent.
 
+## Yahoo Finance rate limiting
+
+The default provider registry now throttles Yahoo Finance requests to a
+conservative pace of roughly one request every 40 seconds. This keeps automated
+refresh jobs within the unofficial limits enforced by Yahoo and prevents long
+cooldown periods triggered by HTTP 429 responses.
+
+Override the default throttle by providing
+`PredictorConfig.yahoo_rate_limit_per_second` or
+`PredictorConfig.yahoo_rate_limit_per_minute` before constructing the
+application/registry. The same values can be supplied via environment variables
+(`YAHOO_RATE_LIMIT_PER_SECOND`, `YAHOO_RATE_LIMIT_PER_SEC`, or
+`YAHOO_RATE_LIMIT_PER_MINUTE`). Cooldown behaviour can also be tuned through
+`PredictorConfig.yahoo_cooldown_seconds` or the `YAHOO_COOLDOWN_SECONDS`
+environment variable.
+
 ## Requirements
 
 See [`requirements.txt`](requirements.txt) for the complete dependency list.

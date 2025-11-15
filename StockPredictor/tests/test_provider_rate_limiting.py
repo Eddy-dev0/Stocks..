@@ -17,13 +17,42 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from stock_predictor.providers.adapters import StooqProvider, YahooFinanceProvider
 from stock_predictor.providers.base import (
+    DEFAULT_YAHOO_RATE_LIMIT_PER_SEC,
     DatasetType,
     PriceBar,
     ProviderCooldownError,
     ProviderRegistry,
     ProviderRequest,
     ProviderResult,
+    build_default_registry,
 )
+
+
+def test_default_registry_uses_conservative_yahoo_rate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Yahoo provider defaults to a slow, safe rate when unspecified."""
+
+    for key in (
+        "YAHOO_RATE_LIMIT_PER_SECOND",
+        "YAHOO_RATE_LIMIT_PER_SEC",
+        "YAHOO_RATE_LIMIT_PER_MINUTE",
+        "YAHOO_COOLDOWN_SECONDS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    registry = build_default_registry()
+    yahoo = registry.get("yahoo_finance")
+
+    interval = yahoo._rate_limiter._interval  # type: ignore[attr-defined]
+    if interval > 0:
+        assert 1.0 / interval == pytest.approx(
+            DEFAULT_YAHOO_RATE_LIMIT_PER_SEC, rel=1e-3
+        )
+    else:
+        assert DEFAULT_YAHOO_RATE_LIMIT_PER_SEC == 0.0
+
+    asyncio.run(registry.aclose())
 
 
 def test_yahoo_global_cooldown_short_circuits(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -32,6 +32,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 LOGGER = logging.getLogger(__name__)
 
+# Default Yahoo Finance request rate used when the caller does not explicitly
+# configure a throttle. Roughly equates to one request every 40 seconds.
+DEFAULT_YAHOO_RATE_LIMIT_PER_SEC = 1.0 / 40.0
+
 # Tracks whether we've already informed the caller that file-based loaders are
 # disabled. This avoids repeating the same informational log on every
 # registry creation.
@@ -705,6 +709,15 @@ def build_default_registry(
     config:
         Optional :class:`~stock_predictor.core.config.PredictorConfig` supplying
         provider tuning parameters.
+
+    Notes
+    -----
+    When no Yahoo-specific rate limit is supplied via ``config`` or environment
+    variables the registry applies a conservative default of roughly one
+    request every 40 seconds. Override this behaviour by setting
+    ``PredictorConfig.yahoo_rate_limit_per_second`` (or the corresponding
+    ``YAHOO_RATE_LIMIT_PER_SECOND``/``YAHOO_RATE_LIMIT_PER_MINUTE`` environment
+    variables) before building the registry.
     """
 
     from .adapters import (  # local import to avoid circular dependencies
@@ -776,6 +789,8 @@ def build_default_registry(
         return cooldown
 
     yahoo_rate_limit = _resolve_yahoo_rate(config)
+    if yahoo_rate_limit is None:
+        yahoo_rate_limit = DEFAULT_YAHOO_RATE_LIMIT_PER_SEC
     yahoo_cooldown = _resolve_yahoo_cooldown(config)
 
     has_csv_loader = csv_loader_path is not None
@@ -836,5 +851,6 @@ __all__ = [
     "ProviderRequest",
     "ProviderResult",
     "SentimentSignal",
+    "DEFAULT_YAHOO_RATE_LIMIT_PER_SEC",
     "build_default_registry",
 ]
