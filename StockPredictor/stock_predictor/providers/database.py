@@ -538,15 +538,18 @@ class Database:
             return 0
 
         processed = 0
-        columns_per_row = len(records[0])
+        columns_per_row = len(records[0]) if records else 0
 
         with self.session() as session:
             bind = session.get_bind()
-            max_parameters = getattr(getattr(bind, "dialect", None), "max_parameters", None)
-            if max_parameters and columns_per_row:
-                batch_size = max(1, max_parameters // columns_per_row)
+            dialect = getattr(bind, "dialect", None)
+            max_parameters = getattr(dialect, "max_parameters", None)
+
+            if columns_per_row:
+                effective_max_parameters = max_parameters if max_parameters is not None else 900
+                batch_size = max(1, effective_max_parameters // columns_per_row)
             else:
-                batch_size = len(records)
+                batch_size = len(records) or 1
 
             for start in range(0, len(records), batch_size):
                 batch = records[start : start + batch_size]
