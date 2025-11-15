@@ -541,21 +541,45 @@ class BaseProvider(abc.ABC):
     @staticmethod
     def _retry_after_header(response: httpx.Response) -> float | None:
         header = response.headers.get("Retry-After")
-        if not header:
-            return None
-        try:
-            return float(header)
-        except ValueError:
+        if header:
             try:
-                retry_time = parsedate_to_datetime(header)
-            except (TypeError, ValueError):
-                return None
-            if retry_time is None:
-                return None
-            return max(
-                0.0,
-                (retry_time - datetime.now(timezone.utc)).total_seconds(),
-            )
+                return float(header)
+            except ValueError:
+                try:
+                    retry_time = parsedate_to_datetime(header)
+                except (TypeError, ValueError):
+                    retry_time = None
+                if retry_time is not None:
+                    return max(
+                        0.0,
+                        (retry_time - datetime.now(timezone.utc)).total_seconds(),
+                    )
+
+        reset_headers = (
+            "X-RateLimit-Reset",
+            "X-RateLimit-Reset-Second",
+            "X-RateLimit-Reset-Minute",
+            "X-Finnhub-RateLimit-Reset",
+        )
+        now_ts = datetime.now(timezone.utc).timestamp()
+        for header_name in reset_headers:
+            raw_value = response.headers.get(header_name)
+            if not raw_value:
+                continue
+            try:
+                reset_value = float(raw_value)
+            except ValueError:
+                continue
+
+            if reset_value > now_ts + 1:
+                delay = reset_value - now_ts
+            else:
+                delay = reset_value
+
+            if delay > 0:
+                return delay
+
+        return None
 
 
 class ProviderRegistry:

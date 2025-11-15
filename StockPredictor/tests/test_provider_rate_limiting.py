@@ -199,6 +199,31 @@ def test_retry_uses_full_retry_after_delay(monkeypatch: pytest.MonkeyPatch) -> N
     asyncio.run(_runner())
 
 
+def test_retry_after_header_supports_vendor_specific_hints() -> None:
+    """Custom rate limit headers should provide retry hints when available."""
+
+    request = httpx.Request("GET", "https://example.com")
+
+    absolute_reset = datetime.now(timezone.utc).timestamp() + 42
+    absolute_response = httpx.Response(
+        429,
+        request=request,
+        headers={"X-RateLimit-Reset": str(absolute_reset)},
+    )
+
+    relative_response = httpx.Response(
+        429,
+        request=request,
+        headers={"X-RateLimit-Reset-Second": "17"},
+    )
+
+    absolute_delay = YahooFinanceProvider._retry_after_header(absolute_response)
+    relative_delay = YahooFinanceProvider._retry_after_header(relative_response)
+
+    assert absolute_delay is not None and absolute_delay == pytest.approx(42, rel=0.05)
+    assert relative_delay == pytest.approx(17.0)
+
+
 def test_registry_respects_global_cooldown(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
