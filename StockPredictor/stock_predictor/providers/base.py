@@ -379,9 +379,11 @@ class BaseProvider(abc.ABC):
                 last_error = exc
                 status = exc.response.status_code
                 attempt_errors.append(f"HTTP {status}")
-                wait = self._retry_delay(attempt, exc)
+                retry_after_hint = self._retry_after_header(exc.response)
+                wait = self._retry_delay(attempt, exc, retry_after=retry_after_hint)
                 if status == 429 and attempt >= self._retries:
-                    retry_after = max(self._cooldown_seconds, wait)
+                    cooldown_delay = retry_after_hint if retry_after_hint is not None else wait
+                    retry_after = max(self._cooldown_seconds, cooldown_delay)
                     await self._schedule_cooldown(request, retry_after)
                     await self._schedule_global_cooldown(retry_after)
                     LOGGER.warning(
@@ -501,14 +503,24 @@ class BaseProvider(abc.ABC):
 
         return await self._global_cooldown_remaining()
 
-    def _retry_delay(self, attempt: int, exc: Exception) -> float:
+    def _retry_delay(
+        self,
+        attempt: int,
+        exc: Exception,
+        *,
+        retry_after: float | None = None,
+    ) -> float:
         base_delay = self._backoff_factor * (2 ** (attempt - 1))
-        if isinstance(exc, httpx.HTTPStatusError):
+        header_delay = retry_after
+        if header_delay is None and isinstance(exc, httpx.HTTPStatusError):
             header_delay = self._retry_after_header(exc.response)
-            if header_delay is not None:
-                base_delay = max(base_delay, header_delay)
+        if header_delay is not None:
+            base_delay = max(base_delay, header_delay)
         jitter = random.uniform(0.0, self._jitter * max(base_delay, 1.0))
-        return min(self._max_retry_wait, base_delay + jitter)
+        total_delay = base_delay + jitter
+        if header_delay is not None:
+            return total_delay
+        return min(self._max_retry_wait, total_delay)
 
     @staticmethod
     def _retry_after_header(response: httpx.Response) -> float | None:

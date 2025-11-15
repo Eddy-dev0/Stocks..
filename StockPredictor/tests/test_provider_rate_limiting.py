@@ -68,7 +68,7 @@ def test_yahoo_global_cooldown_short_circuits(monkeypatch: pytest.MonkeyPatch) -
             nonlocal call_count
             call_count += 1
             request_obj = httpx.Request("GET", "https://example.com")
-            response = httpx.Response(429, request=request_obj, headers={"Retry-After": "2"})
+            response = httpx.Response(429, request=request_obj, headers={"Retry-After": "120"})
             raise httpx.HTTPStatusError("Too Many Requests", request=request_obj, response=response)
 
         monkeypatch.setattr(YahooFinanceProvider, "_fetch", _failing_fetch, raising=False)
@@ -77,7 +77,7 @@ def test_yahoo_global_cooldown_short_circuits(monkeypatch: pytest.MonkeyPatch) -
             await provider.fetch(request)
 
         assert call_count == 1
-        assert excinfo.value.retry_after >= 3
+        assert excinfo.value.retry_after == pytest.approx(120.0)
         assert excinfo.value.attempts == 1
 
         with pytest.raises(ProviderCooldownError) as cooldown_exc:
@@ -90,6 +90,70 @@ def test_yahoo_global_cooldown_short_circuits(monkeypatch: pytest.MonkeyPatch) -
         in_cooldown, remaining = await provider.global_cooldown_remaining()
         assert in_cooldown
         assert remaining > 0
+
+        await provider.aclose()
+
+    asyncio.run(_runner())
+
+
+def test_retry_uses_full_retry_after_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Providers should respect long Retry-After hints when retrying."""
+
+    async def _runner() -> None:
+        provider = YahooFinanceProvider(
+            cooldown_seconds=3,
+            retries=2,
+            backoff_factor=1.0,
+            max_retry_wait=10.0,
+            jitter=0.0,
+            rate_limit_per_sec=0.0,
+        )
+        request = ProviderRequest(dataset_type=DatasetType.PRICES, symbol="MSFT", params={})
+
+        call_count = 0
+
+        async def _fetch(self: YahooFinanceProvider, _: ProviderRequest) -> ProviderResult:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                request_obj = httpx.Request("GET", "https://example.com")
+                response = httpx.Response(
+                    429,
+                    request=request_obj,
+                    headers={"Retry-After": "120"},
+                )
+                raise httpx.HTTPStatusError(
+                    "Too Many Requests", request=request_obj, response=response
+                )
+            bar = PriceBar(
+                symbol="MSFT",
+                timestamp=datetime.now(timezone.utc),
+                open=1.0,
+                high=1.1,
+                low=0.9,
+                close=1.05,
+                volume=5,
+            )
+            return ProviderResult(
+                dataset_type=DatasetType.PRICES,
+                source=self.name,
+                records=[bar],
+                metadata={"symbol": "MSFT"},
+            )
+
+        sleep_calls: list[float] = []
+
+        async def _fake_sleep(delay: float, result: object | None = None) -> object | None:
+            sleep_calls.append(delay)
+            return result
+
+        monkeypatch.setattr(YahooFinanceProvider, "_fetch", _fetch, raising=False)
+        monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+
+        await provider.fetch(request)
+
+        assert sleep_calls
+        assert sleep_calls[0] == pytest.approx(120.0)
 
         await provider.aclose()
 
