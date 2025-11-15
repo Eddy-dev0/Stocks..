@@ -534,21 +534,40 @@ class Database:
                     "volume": self._coerce_float(getattr(row, "Volume", None)),
                 }
             )
-        stmt = insert(Price).values(records)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=[Price.ticker, Price.interval, Price.date],
-            set_={
-                "open": stmt.excluded.open,
-                "high": stmt.excluded.high,
-                "low": stmt.excluded.low,
-                "close": stmt.excluded.close,
-                "adj_close": stmt.excluded.adj_close,
-                "volume": stmt.excluded.volume,
-            },
-        )
+        if not records:
+            return 0
+
+        processed = 0
+        columns_per_row = len(records[0])
+
         with self.session() as session:
-            session.execute(stmt)
-        return len(records)
+            bind = session.get_bind()
+            max_parameters = getattr(getattr(bind, "dialect", None), "max_parameters", None)
+            if max_parameters and columns_per_row:
+                batch_size = max(1, max_parameters // columns_per_row)
+            else:
+                batch_size = len(records)
+
+            for start in range(0, len(records), batch_size):
+                batch = records[start : start + batch_size]
+                if not batch:
+                    continue
+                stmt = insert(Price).values(batch)
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[Price.ticker, Price.interval, Price.date],
+                    set_={
+                        "open": stmt.excluded.open,
+                        "high": stmt.excluded.high,
+                        "low": stmt.excluded.low,
+                        "close": stmt.excluded.close,
+                        "adj_close": stmt.excluded.adj_close,
+                        "volume": stmt.excluded.volume,
+                    },
+                )
+                session.execute(stmt)
+                processed += len(batch)
+
+        return processed
 
     def upsert_indicators(
         self,
