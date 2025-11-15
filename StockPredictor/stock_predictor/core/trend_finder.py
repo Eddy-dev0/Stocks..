@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field, replace
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -138,6 +138,7 @@ class TrendFinder:
         horizon: int | str | None = None,
         universe: Sequence[str] | None = None,
         limit: int = 5,
+        progress_callback: Callable[[int, int, str], None] | None = None,
     ) -> list[TrendInsight]:
         """Return the strongest opportunities for ``horizon``."""
 
@@ -159,110 +160,123 @@ class TrendFinder:
             resolved_horizon = self.base_config.prediction_horizons[0]
 
         insights: list[TrendInsight] = []
-        for ticker in tickers:
-            config = replace(self.base_config, ticker=ticker)
+        total = len(tickers)
+        for index, ticker in enumerate(tickers):
+            progress_status = f"Scanning {ticker} ({index + 1}/{total})"
             try:
-                ai = self.ai_factory(config, horizon=resolved_horizon)
-            except Exception as exc:  # pragma: no cover - optional deps
-                LOGGER.debug("Unable to create StockPredictorAI for %s: %s", ticker, exc)
-                continue
-
-            try:
-                features, _, _ = ai.prepare_features()
-            except Exception as exc:  # pragma: no cover - optional deps
-                LOGGER.debug("Unable to prepare features for %s: %s", ticker, exc)
-                continue
-
-            ai_metadata = getattr(ai, "metadata", {}) or {}
-            latest_features = ai_metadata.get("latest_features")
-            if isinstance(latest_features, pd.DataFrame) and not latest_features.empty:
-                latest_row = latest_features.iloc[0]
-            elif isinstance(features, pd.DataFrame) and not features.empty:
-                latest_row = features.iloc[-1]
-            else:
-                continue
-
-            category_map: Mapping[str, Any] = ai_metadata.get("feature_categories", {})
-            technical_score = self._aggregate_score(latest_row, category_map, _TECHNICAL_TOKENS)
-            fundamental_score = self._aggregate_score(
-                latest_row, category_map, _FUNDAMENTAL_TOKENS
-            )
-            sentiment_score = self._aggregate_score(
-                latest_row, category_map, _SENTIMENT_TOKENS
-            )
-
-            try:
-                prediction_payload: Mapping[str, Any] | None = ai.predict(
-                    horizon=resolved_horizon
-                )
-            except Exception as exc:  # pragma: no cover - optional deps
-                LOGGER.debug(
-                    "Unable to generate predictions for %s at horizon %s: %s",
-                    ticker,
-                    resolved_horizon,
-                    exc,
-                )
-                prediction_payload = None
-
-            prediction_score = self._prediction_score_from_payload(prediction_payload)
-            weights = self._resolve_horizon_weights(resolved_horizon)
-            composite: float | None = None
-
-            if prediction_score is not None:
-                weighted_components: dict[str, float] = {"prediction": prediction_score}
-                if fundamental_score is not None:
-                    weighted_components["fundamental"] = fundamental_score
-                if sentiment_score is not None:
-                    weighted_components["sentiment"] = sentiment_score
-                composite = self._weighted_composite(weighted_components, weights)
-            else:
-                components = [
-                    value
-                    for value in (technical_score, fundamental_score, sentiment_score)
-                    if value is not None
-                ]
-                if not components:
+                config = replace(self.base_config, ticker=ticker)
+                try:
+                    ai = self.ai_factory(config, horizon=resolved_horizon)
+                except Exception as exc:  # pragma: no cover - optional deps
+                    LOGGER.debug("Unable to create StockPredictorAI for %s: %s", ticker, exc)
                     continue
-                composite = float(np.mean(components))
 
-            if composite is None:
-                continue
+                try:
+                    features, _, _ = ai.prepare_features()
+                except Exception as exc:  # pragma: no cover - optional deps
+                    LOGGER.debug("Unable to prepare features for %s: %s", ticker, exc)
+                    continue
 
-            if isinstance(ai_metadata, Mapping):
-                insight_metadata: dict[str, Any] = dict(ai_metadata)
-            else:
-                insight_metadata = {}
-            previous_component_scores = insight_metadata.get("component_scores")
-            if isinstance(previous_component_scores, Mapping):
-                component_scores = dict(previous_component_scores)
-            else:
-                component_scores = {}
-            component_scores.update(
-                {
-                    "prediction": prediction_score,
-                    "technical": technical_score,
-                    "fundamental": fundamental_score,
-                    "sentiment": sentiment_score,
-                }
-            )
-            insight_metadata["component_scores"] = component_scores
-            insight_metadata["horizon_weights"] = dict(weights)
-            if prediction_payload is not None:
-                insight_metadata["prediction_payload"] = prediction_payload
-            else:
-                insight_metadata.pop("prediction_payload", None)
+                ai_metadata = getattr(ai, "metadata", {}) or {}
+                latest_features = ai_metadata.get("latest_features")
+                if isinstance(latest_features, pd.DataFrame) and not latest_features.empty:
+                    latest_row = latest_features.iloc[0]
+                elif isinstance(features, pd.DataFrame) and not features.empty:
+                    latest_row = features.iloc[-1]
+                else:
+                    continue
 
-            insights.append(
-                TrendInsight(
-                    ticker=ticker,
-                    horizon=resolved_horizon,
-                    composite_score=float(composite),
-                    technical_score=technical_score,
-                    fundamental_score=fundamental_score,
-                    sentiment_score=sentiment_score,
-                    metadata=insight_metadata,
+                category_map: Mapping[str, Any] = ai_metadata.get("feature_categories", {})
+                technical_score = self._aggregate_score(
+                    latest_row, category_map, _TECHNICAL_TOKENS
                 )
-            )
+                fundamental_score = self._aggregate_score(
+                    latest_row, category_map, _FUNDAMENTAL_TOKENS
+                )
+                sentiment_score = self._aggregate_score(
+                    latest_row, category_map, _SENTIMENT_TOKENS
+                )
+
+                try:
+                    prediction_payload: Mapping[str, Any] | None = ai.predict(
+                        horizon=resolved_horizon
+                    )
+                except Exception as exc:  # pragma: no cover - optional deps
+                    LOGGER.debug(
+                        "Unable to generate predictions for %s at horizon %s: %s",
+                        ticker,
+                        resolved_horizon,
+                        exc,
+                    )
+                    prediction_payload = None
+
+                prediction_score = self._prediction_score_from_payload(prediction_payload)
+                weights = self._resolve_horizon_weights(resolved_horizon)
+                composite: float | None = None
+
+                if prediction_score is not None:
+                    weighted_components: dict[str, float] = {"prediction": prediction_score}
+                    if fundamental_score is not None:
+                        weighted_components["fundamental"] = fundamental_score
+                    if sentiment_score is not None:
+                        weighted_components["sentiment"] = sentiment_score
+                    composite = self._weighted_composite(weighted_components, weights)
+                else:
+                    components = [
+                        value
+                        for value in (technical_score, fundamental_score, sentiment_score)
+                        if value is not None
+                    ]
+                    if not components:
+                        continue
+                    composite = float(np.mean(components))
+
+                if composite is None:
+                    continue
+
+                if isinstance(ai_metadata, Mapping):
+                    insight_metadata: dict[str, Any] = dict(ai_metadata)
+                else:
+                    insight_metadata = {}
+                previous_component_scores = insight_metadata.get("component_scores")
+                if isinstance(previous_component_scores, Mapping):
+                    component_scores = dict(previous_component_scores)
+                else:
+                    component_scores = {}
+                component_scores.update(
+                    {
+                        "prediction": prediction_score,
+                        "technical": technical_score,
+                        "fundamental": fundamental_score,
+                        "sentiment": sentiment_score,
+                    }
+                )
+                insight_metadata["component_scores"] = component_scores
+                insight_metadata["horizon_weights"] = dict(weights)
+                if prediction_payload is not None:
+                    insight_metadata["prediction_payload"] = prediction_payload
+                else:
+                    insight_metadata.pop("prediction_payload", None)
+
+                insights.append(
+                    TrendInsight(
+                        ticker=ticker,
+                        horizon=resolved_horizon,
+                        composite_score=float(composite),
+                        technical_score=technical_score,
+                        fundamental_score=fundamental_score,
+                        sentiment_score=sentiment_score,
+                        metadata=insight_metadata,
+                    )
+                )
+            finally:
+                if progress_callback is not None:
+                    try:
+                        progress_callback(index + 1, total, progress_status)
+                    except Exception:  # pragma: no cover - defensive guard
+                        LOGGER.debug(
+                            "Trend scan progress callback failed for %s", ticker, exc_info=True
+                        )
 
         insights.sort(key=lambda item: item.composite_score, reverse=True)
         return insights[: max(0, int(limit))]

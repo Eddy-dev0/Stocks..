@@ -962,7 +962,7 @@ class StockPredictorDesktopApp:
         )
         self.trend_scan_button.grid(row=0, column=2, sticky=tk.W, padx=(12, 0))
 
-        self.trend_progress = ttk.Progressbar(controls, mode="indeterminate", length=120)
+        self.trend_progress = ttk.Progressbar(controls, mode="determinate", length=120)
         self.trend_progress.grid(row=0, column=3, sticky=tk.W, padx=(12, 0))
         self.trend_progress.grid_remove()
 
@@ -1284,9 +1284,24 @@ class StockPredictorDesktopApp:
         self._set_trend_busy(True, status)
         finder = self._get_trend_finder()
 
+        if self.trend_progress is not None:
+            self.trend_progress.configure(maximum=max(len(finder.universe), 1), value=0)
+
         def worker() -> None:
             try:
-                results = finder.scan(horizon=horizon_value, limit=5)
+                def progress_callback(current: int, total: int, message: str) -> None:
+                    self.root.after(
+                        0,
+                        lambda curr=current, tot=total, msg=message: self._update_trend_progress(
+                            curr, tot, msg
+                        ),
+                    )
+
+                results = finder.scan(
+                    horizon=horizon_value,
+                    limit=5,
+                    progress_callback=progress_callback,
+                )
             except Exception as exc:  # pragma: no cover - optional providers may fail
                 LOGGER.exception("Trend scan failed: %s", exc)
                 self.root.after(0, lambda err=exc: self._on_trend_scan_failure(err))
@@ -1334,11 +1349,24 @@ class StockPredictorDesktopApp:
                 self.trend_horizon_box.configure(state="readonly")
         if self.trend_progress is not None:
             if busy:
+                maximum = self.trend_progress.cget("maximum")
+                try:
+                    maximum_int = int(maximum)
+                except (TypeError, ValueError):  # pragma: no cover - defensive
+                    maximum_int = 1
+                self.trend_progress.configure(value=0, maximum=max(maximum_int, 1))
                 self.trend_progress.grid()
-                self.trend_progress.start(10)
             else:
-                self.trend_progress.stop()
+                self.trend_progress.configure(value=0, maximum=1)
                 self.trend_progress.grid_remove()
+
+    def _update_trend_progress(self, current: int, total: int, status: str) -> None:
+        if self.trend_progress is not None:
+            maximum = max(int(total), 1)
+            value = max(0, min(int(current), maximum))
+            self.trend_progress.configure(maximum=maximum, value=value)
+        if status:
+            self.trend_status_var.set(status)
 
     def _refresh_trend_table(self, empty_message: str | None = None) -> None:
         if self.trend_tree is None:
