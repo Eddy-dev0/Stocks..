@@ -8,6 +8,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
+from .fear_greed import compute_fear_greed_features
 from .indicator_bundle import compute_indicators
 from .sentiment import aggregate_daily_sentiment, attach_sentiment
 
@@ -98,12 +99,17 @@ def compute_price_features(price_df: pd.DataFrame) -> pd.DataFrame:
     df["Volume_Change"] = df["Volume"].pct_change()
 
     indicator_result = compute_indicators(df)
-    df = pd.concat([df, indicator_result.dataframe], axis=1)
+    fear_greed = compute_fear_greed_features(df)
+    df = pd.concat([df, indicator_result.dataframe, fear_greed], axis=1)
 
     df = df.ffill().bfill()
     indicator_columns = []
     seen: set[str] = set()
-    for column in [*LEGACY_INDICATOR_COLUMNS, *indicator_result.columns]:
+    for column in [
+        *LEGACY_INDICATOR_COLUMNS,
+        *indicator_result.columns,
+        *fear_greed.columns.tolist(),
+    ]:
         if column not in df.columns:
             continue
         if column in seen:

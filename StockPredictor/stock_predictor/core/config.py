@@ -110,6 +110,9 @@ class PredictorConfig:
     yahoo_rate_limit_per_second: float | None = None
     yahoo_rate_limit_per_minute: float | None = None
     yahoo_cooldown_seconds: float | None = None
+    price_provider_priority: tuple[str, ...] = field(default_factory=tuple)
+    disabled_providers: tuple[str, ...] = field(default_factory=tuple)
+    memory_cache_seconds: float | None = None
     market_timezone: str | None = None
 
     def __post_init__(self) -> None:
@@ -176,6 +179,14 @@ class PredictorConfig:
             self.yahoo_cooldown_seconds = max(
                 0.0, float(self.yahoo_cooldown_seconds)
             )
+        self.price_provider_priority = self._normalise_strings(
+            self.price_provider_priority, lower=True
+        )
+        self.disabled_providers = self._normalise_strings(
+            self.disabled_providers, lower=True
+        )
+        if self.memory_cache_seconds is not None:
+            self.memory_cache_seconds = max(60.0, float(self.memory_cache_seconds))
         if self.market_timezone is not None:
             tz_str = str(self.market_timezone).strip()
             self.market_timezone = tz_str or None
@@ -378,6 +389,9 @@ def build_config(
     volatility_window: Optional[int] = None,
     research_api_keys: Optional[Iterable[str] | str] = None,
     research_allow_list: Optional[Iterable[str] | str] = None,
+    price_provider_priority: Optional[Iterable[str] | str] = None,
+    disabled_providers: Optional[Iterable[str] | str] = None,
+    memory_cache_seconds: Optional[float] = None,
 ) -> PredictorConfig:
     """Build a :class:`PredictorConfig` instance from string parameters."""
 
@@ -402,6 +416,31 @@ def build_config(
     research_allow_value = research_allow_list or os.getenv(
         "STOCK_PREDICTOR_RESEARCH_ALLOW_LIST"
     )
+    provider_priority_value = price_provider_priority or os.getenv(
+        "STOCK_PREDICTOR_PRICE_PROVIDERS"
+    )
+    disabled_providers_value = disabled_providers or os.getenv(
+        "STOCK_PREDICTOR_DISABLED_PROVIDERS"
+    )
+
+    def _coerce_provider_tokens(value: Optional[Iterable[str] | str]) -> tuple[str, ...]:
+        if value is None:
+            return tuple()
+        if isinstance(value, str):
+            tokens = [part.strip() for part in value.split(",")]
+        else:
+            tokens = [str(item).strip() for item in value]
+        return PredictorConfig._normalise_strings(tokens, lower=True)
+
+    memory_cache_value = memory_cache_seconds or os.getenv(
+        "STOCK_PREDICTOR_MEMORY_CACHE_SECONDS"
+    )
+    memory_cache_float: float | None = None
+    if memory_cache_value is not None:
+        try:
+            memory_cache_float = float(memory_cache_value)
+        except (TypeError, ValueError):
+            memory_cache_float = None
 
     config = PredictorConfig(
         ticker=ticker.upper(),
@@ -449,6 +488,9 @@ def build_config(
             research_allow_value,
             (),
         ),
+        price_provider_priority=_coerce_provider_tokens(provider_priority_value),
+        disabled_providers=_coerce_provider_tokens(disabled_providers_value),
+        memory_cache_seconds=memory_cache_float,
     )
     config.ensure_directories()
     return config
