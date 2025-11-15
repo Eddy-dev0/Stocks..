@@ -98,7 +98,7 @@ class PredictorConfig:
     evaluation_folds: int = 5
     evaluation_window: int = DEFAULT_BACKTEST_WINDOW
     evaluation_step: int = DEFAULT_BACKTEST_STEP
-    direction_confidence_threshold: float = 0.55
+    direction_confidence_threshold: float = 0.5
     volatility_window: int = DEFAULT_VOLATILITY_WINDOW
     risk_free_rate: float = 0.0
     research_api_keys: tuple[str, ...] = field(default_factory=tuple)
