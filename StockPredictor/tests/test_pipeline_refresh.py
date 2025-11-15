@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 import sys
 
 import pandas as pd
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from stock_predictor.core.config import PredictorConfig
-from stock_predictor.core.pipeline import MarketDataETL
+from stock_predictor.core.pipeline import MarketDataETL, NoPriceDataError
 from stock_predictor.providers.base import (
     DatasetType,
     PriceBar,
@@ -28,7 +29,7 @@ def test_refresh_prices_downloads_when_cache_is_stale(monkeypatch, tmp_path) -> 
 
     db_file = tmp_path / "prices.db"
     database = Database(f"sqlite:///{db_file}")
-    config = PredictorConfig(ticker="AAPL", start_date=date(2024, 3, 18))
+    config = PredictorConfig(ticker="AAPL", start_date=date(2024, 3, 18), data_dir=tmp_path)
     etl = MarketDataETL(config, database)
 
     cached_dates = pd.date_range(start="2024-03-18", end="2024-03-25", freq="B")
@@ -94,6 +95,86 @@ def test_refresh_prices_downloads_when_cache_is_stale(monkeypatch, tmp_path) -> 
     refreshed_ts = database.get_refresh_timestamp("AAPL", "1d", "prices")
     assert refreshed_ts is not None
     assert refreshed_ts > old_refresh
+
+
+def test_refresh_prices_raises_when_database_cache_expired(monkeypatch, tmp_path) -> None:
+    db_file = tmp_path / "prices.db"
+    database = Database(f"sqlite:///{db_file}")
+    config = PredictorConfig(ticker="MSFT", start_date=date(2024, 3, 18), data_dir=tmp_path)
+    etl = MarketDataETL(config, database)
+
+    cached_dates = pd.date_range(start="2024-03-18", end="2024-03-20", freq="B")
+    cached_prices = pd.DataFrame(
+        {
+            "Date": cached_dates,
+            "Open": [100 + idx for idx in range(len(cached_dates))],
+            "High": [101 + idx for idx in range(len(cached_dates))],
+            "Low": [99 + idx for idx in range(len(cached_dates))],
+            "Close": [100.5 + idx for idx in range(len(cached_dates))],
+            "Adj Close": [100.5 + idx for idx in range(len(cached_dates))],
+            "Volume": [1_000_000 + idx for idx in range(len(cached_dates))],
+        }
+    )
+    database.upsert_prices("MSFT", "1d", cached_prices)
+    expired_timestamp = datetime.now(timezone.utc) - timedelta(days=2)
+    database.set_refresh_timestamp(
+        "MSFT", "1d", "prices", timestamp=expired_timestamp.replace(tzinfo=None)
+    )
+
+    summary = ProviderFetchSummary(results=[], failures=[])
+
+    def fake_fetch(self, dataset, params=None):  # pragma: no cover - deterministic stub
+        assert dataset == DatasetType.PRICES
+        return summary
+
+    monkeypatch.setattr(MarketDataETL, "_fetch_dataset", fake_fetch)
+
+    with pytest.raises(NoPriceDataError) as excinfo:
+        etl.refresh_prices()
+
+    message = str(excinfo.value)
+    assert "Database price cache" in message
+    assert "Cached data unavailable" in message
+
+
+def test_refresh_prices_raises_when_local_cache_expired(monkeypatch, tmp_path) -> None:
+    db_file = tmp_path / "prices.db"
+    database = Database(f"sqlite:///{db_file}")
+    config = PredictorConfig(ticker="TSLA", start_date=date(2024, 3, 18), data_dir=tmp_path)
+    etl = MarketDataETL(config, database)
+
+    cache_path = config.price_cache_path
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    expired_timestamp = datetime.now(timezone.utc) - timedelta(days=2)
+    cached_dates = pd.date_range(start="2024-03-18", end="2024-03-19", freq="B")
+    cache_frame = pd.DataFrame(
+        {
+            "Date": cached_dates,
+            "Open": [210 + idx for idx in range(len(cached_dates))],
+            "High": [211 + idx for idx in range(len(cached_dates))],
+            "Low": [209 + idx for idx in range(len(cached_dates))],
+            "Close": [210.5 + idx for idx in range(len(cached_dates))],
+            "Adj Close": [210.5 + idx for idx in range(len(cached_dates))],
+            "Volume": [500_000 + idx for idx in range(len(cached_dates))],
+            "CacheTimestamp": expired_timestamp.isoformat(),
+        }
+    )
+    cache_frame.to_csv(cache_path, index=False)
+
+    summary = ProviderFetchSummary(results=[], failures=[])
+
+    def fake_fetch(self, dataset, params=None):  # pragma: no cover - deterministic stub
+        assert dataset == DatasetType.PRICES
+        return summary
+
+    monkeypatch.setattr(MarketDataETL, "_fetch_dataset", fake_fetch)
+
+    with pytest.raises(NoPriceDataError) as excinfo:
+        etl.refresh_prices()
+
+    message = str(excinfo.value)
+    assert "Local price cache" in message
+    assert "Cached data unavailable" in message
 
 
 def test_latest_trading_session_with_midday_utc_reference_returns_previous_day() -> None:
