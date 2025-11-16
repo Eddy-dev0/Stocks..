@@ -85,7 +85,11 @@ def _fundamental_group_builder(context: FeatureBuildContext) -> FeatureBuildOutp
 
 
 def _macro_group_builder(context: FeatureBuildContext) -> FeatureBuildOutput:
-    blocks = [block for block in _build_macro_blocks(context.price_df) if block is not None]
+    blocks = [
+        block
+        for block in _build_macro_blocks(context.price_df, macro_df=context.macro_df)
+        if block is not None
+    ]
     status = "executed" if blocks else "skipped_no_data"
     return FeatureBuildOutput(blocks=blocks, status=status)
 
@@ -172,6 +176,7 @@ class FeatureAssembler:
         sentiment_enabled: bool,
         *,
         fundamentals_df: pd.DataFrame | None = None,
+        macro_df: pd.DataFrame | None = None,
     ) -> FeatureResult:
         if price_df.empty:
             raise ValueError("Price dataframe cannot be empty when building features.")
@@ -183,11 +188,15 @@ class FeatureAssembler:
         context_fundamentals = None
         if fundamentals_df is not None:
             context_fundamentals = fundamentals_df.copy()
+        context_macro = None
+        if macro_df is not None:
+            context_macro = macro_df.copy()
 
         context = FeatureBuildContext(
             price_df=processed,
             news_df=context_news,
             fundamentals_df=context_fundamentals,
+            macro_df=context_macro,
             sentiment_enabled=sentiment_enabled,
             technical_indicator_config=self.technical_indicator_config,
         )
@@ -761,11 +770,13 @@ def _sanitize_metric_name(metric: str) -> str:
     return token
 
 
-def _build_macro_blocks(price_df: pd.DataFrame) -> list[FeatureBlock | None]:
+def _build_macro_blocks(
+    price_df: pd.DataFrame, *, macro_df: pd.DataFrame | None = None
+) -> list[FeatureBlock | None]:
     return [
         _build_macro_context(price_df),
-        _build_macro_benchmarks(price_df),
-        _build_cross_sectional_betas(price_df),
+        _build_macro_benchmarks(price_df, macro_df=macro_df),
+        _build_cross_sectional_betas(price_df, macro_df=macro_df),
     ]
 
 
@@ -813,7 +824,9 @@ def _rolling_linear_trend(series: pd.Series, window: int) -> pd.Series:
     return pd.Series(slopes, index=series.index)
 
 
-def _build_macro_benchmarks(price_df: pd.DataFrame) -> FeatureBlock | None:
+def _build_macro_benchmarks(
+    price_df: pd.DataFrame, *, macro_df: pd.DataFrame | None = None
+) -> FeatureBlock | None:
     base_close_raw = price_df.get("Close")
     if base_close_raw is None:
         return None
@@ -827,7 +840,7 @@ def _build_macro_benchmarks(price_df: pd.DataFrame) -> FeatureBlock | None:
     features: Dict[str, pd.Series] = {}
     date_series = price_df.get("Date")
     for symbol, name in benchmarks.items():
-        benchmark = _extract_benchmark_series(price_df, symbol)
+        benchmark = _extract_benchmark_series(price_df, symbol, macro_df=macro_df)
         if benchmark is None:
             continue
         benchmark_returns = benchmark.pct_change()
@@ -850,7 +863,9 @@ def _build_macro_benchmarks(price_df: pd.DataFrame) -> FeatureBlock | None:
     return FeatureBlock(feature_frame.fillna(0.0), category="macro", column_categories=column_categories)
 
 
-def _build_cross_sectional_betas(price_df: pd.DataFrame) -> FeatureBlock | None:
+def _build_cross_sectional_betas(
+    price_df: pd.DataFrame, *, macro_df: pd.DataFrame | None = None
+) -> FeatureBlock | None:
     base_close_raw = price_df.get("Close")
     if base_close_raw is None:
         return None
@@ -864,7 +879,7 @@ def _build_cross_sectional_betas(price_df: pd.DataFrame) -> FeatureBlock | None:
 
     beta_features: Dict[str, pd.Series] = {}
     for symbol, label in benchmarks.items():
-        benchmark = _extract_benchmark_series(price_df, symbol)
+        benchmark = _extract_benchmark_series(price_df, symbol, macro_df=macro_df)
         if benchmark is None:
             continue
         benchmark_returns = benchmark.pct_change()
@@ -884,9 +899,10 @@ def _build_cross_sectional_betas(price_df: pd.DataFrame) -> FeatureBlock | None:
     return FeatureBlock(frame.fillna(0.0), category="macro", column_categories=column_categories)
 
 
-def _extract_benchmark_series(price_df: pd.DataFrame, symbol: str) -> pd.Series | None:
+def _extract_benchmark_series(
+    price_df: pd.DataFrame, symbol: str, *, macro_df: pd.DataFrame | None = None
+) -> pd.Series | None:
     normalized_symbol = symbol.replace("^", "")
-    candidates = []
     possible_names = [
         f"Close_{symbol}",
         f"Close_{normalized_symbol}",
@@ -897,18 +913,24 @@ def _extract_benchmark_series(price_df: pd.DataFrame, symbol: str) -> pd.Series 
         f"{symbol}_Adj Close",
         f"{normalized_symbol}_Adj Close",
     ]
-    for name in possible_names:
-        if name in price_df.columns:
-            candidates.append(name)
-    if not candidates:
-        for column in price_df.columns:
-            if normalized_symbol in column and "close" in column.lower():
-                candidates.append(column)
-    if not candidates:
-        return None
 
-    series = pd.to_numeric(price_df[candidates[0]], errors="coerce")
-    return series
+    frames = [price_df]
+    if macro_df is not None:
+        frames.append(macro_df)
+
+    for frame in frames:
+        candidates: list[str] = []
+        for name in possible_names:
+            if name in frame.columns:
+                candidates.append(name)
+        if not candidates:
+            for column in frame.columns:
+                if normalized_symbol in column and "close" in column.lower():
+                    candidates.append(column)
+        if candidates:
+            return pd.to_numeric(frame[candidates[0]], errors="coerce")
+
+    return None
 
 
 def _build_sentiment_features(news_df: pd.DataFrame) -> FeatureBlock | None:

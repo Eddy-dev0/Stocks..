@@ -144,6 +144,9 @@ class StockPredictorAI:
             news_df = self.fetcher.fetch_news_data()
         elif news_df is None:
             news_df = pd.DataFrame()
+
+        macro_frame = self._load_macro_indicators()
+        merged_price_df = self._merge_macro_columns(price_df, macro_frame)
         fundamentals_df: pd.DataFrame | None
         fetch_fundamentals = getattr(self.fetcher, "fetch_fundamentals", None)
         if callable(fetch_fundamentals):
@@ -152,10 +155,11 @@ class StockPredictorAI:
             fundamentals_df = pd.DataFrame()
 
         feature_result = self.feature_assembler.build(
-            price_df,
+            merged_price_df,
             news_df,
             self.config.sentiment,
             fundamentals_df=fundamentals_df,
+            macro_df=macro_frame if not macro_frame.empty else None,
         )
         metadata = dict(feature_result.metadata)
         raw_feature_columns = list(feature_result.features.columns)
@@ -172,7 +176,7 @@ class StockPredictorAI:
         volatility_spec = TARGET_SPECS.get("volatility")
         if volatility_spec and volatility_spec.label_fn:
             window = getattr(self.config, "volatility_window", 20)
-            price_history = price_df.copy()
+            price_history = merged_price_df.copy()
             if "Date" in price_history.columns:
                 price_history["Date"] = pd.to_datetime(price_history["Date"], errors="coerce")
                 price_history = price_history.dropna(subset=["Date"])
@@ -246,6 +250,75 @@ class StockPredictorAI:
         self.metadata = metadata
         self.preprocessor_templates = templates
         return features, feature_result.targets, templates
+
+    def _load_macro_indicators(self) -> pd.DataFrame:
+        """Load cached macro indicator close series and pivot them by date."""
+
+        fetch_macro = getattr(self.fetcher, "fetch_indicator_data", None)
+        if not callable(fetch_macro):
+            return pd.DataFrame()
+
+        try:
+            macro_rows = fetch_macro(category="macro")
+        except Exception as exc:  # pragma: no cover - guard around IO
+            LOGGER.debug("Failed to fetch macro indicators: %s", exc)
+            return pd.DataFrame()
+
+        if macro_rows is None or macro_rows.empty:
+            return pd.DataFrame()
+
+        required_columns = {"Date", "Indicator", "Value"}
+        if not required_columns.issubset(macro_rows.columns):
+            return pd.DataFrame()
+
+        working = macro_rows[["Date", "Indicator", "Value"]].copy()
+        working["Date"] = pd.to_datetime(working["Date"], errors="coerce")
+        working = working.dropna(subset=["Date"])
+        working["Indicator"] = working["Indicator"].astype(str)
+        working["Symbol"] = working["Indicator"].str.split(":", n=1).str[-1]
+        working = working[working["Symbol"].astype(bool)]
+        working["Column"] = working["Symbol"].apply(lambda sym: f"Close_{sym}")
+        working["Value"] = pd.to_numeric(working["Value"], errors="coerce")
+        working = working.dropna(subset=["Value"])
+        if working.empty:
+            return pd.DataFrame()
+
+        pivot = (
+            working.pivot_table(index="Date", columns="Column", values="Value", aggfunc="last")
+            .sort_index()
+            .reset_index()
+        )
+        if pivot.empty:
+            return pd.DataFrame()
+        pivot.columns = [str(col) for col in pivot.columns]
+        return pivot
+
+    def _merge_macro_columns(
+        self, price_df: pd.DataFrame, macro_frame: pd.DataFrame
+    ) -> pd.DataFrame:
+        """Merge macro benchmark columns onto the base price frame."""
+
+        if macro_frame is None or macro_frame.empty:
+            return price_df.copy()
+
+        price = price_df.copy()
+        macro = macro_frame.copy()
+
+        if "Date" not in price.columns:
+            if isinstance(price.index, pd.DatetimeIndex):
+                price = price.reset_index().rename(columns={"index": "Date"})
+            elif price.index.name and price.index.name.lower() == "date":
+                price = price.reset_index().rename(columns={price.index.name: "Date"})
+            else:
+                return price
+
+        price["Date"] = pd.to_datetime(price["Date"], errors="coerce")
+        macro["Date"] = pd.to_datetime(macro["Date"], errors="coerce")
+        price = price.dropna(subset=["Date"])
+        macro = macro.dropna(subset=["Date"])
+
+        merged = pd.merge(price, macro, on="Date", how="left")
+        return merged
 
     # ------------------------------------------------------------------
     # Model persistence helpers
