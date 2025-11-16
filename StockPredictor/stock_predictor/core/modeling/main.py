@@ -144,8 +144,19 @@ class StockPredictorAI:
             news_df = self.fetcher.fetch_news_data()
         elif news_df is None:
             news_df = pd.DataFrame()
+        fundamentals_df: pd.DataFrame | None
+        fetch_fundamentals = getattr(self.fetcher, "fetch_fundamentals", None)
+        if callable(fetch_fundamentals):
+            fundamentals_df = fetch_fundamentals()
+        else:
+            fundamentals_df = pd.DataFrame()
 
-        feature_result = self.feature_assembler.build(price_df, news_df, self.config.sentiment)
+        feature_result = self.feature_assembler.build(
+            price_df,
+            news_df,
+            self.config.sentiment,
+            fundamentals_df=fundamentals_df,
+        )
         metadata = dict(feature_result.metadata)
         raw_feature_columns = list(feature_result.features.columns)
         metadata.setdefault("feature_columns", raw_feature_columns)
@@ -1657,30 +1668,63 @@ class StockPredictorAI:
 
     def _fundamental_reasons(self, feature_row: pd.Series) -> list[str]:
         reasons: list[str] = []
-        ratio20 = self._safe_float(feature_row.get("Price_to_SMA20"))
-        if ratio20 is not None:
-            if ratio20 > 1.05:
+        pct_change_cols = [
+            column
+            for column in feature_row.index
+            if column.startswith("Fundamental_") and column.endswith("_PctChange_63")
+        ]
+        for column in sorted(pct_change_cols):
+            change = self._safe_float(feature_row.get(column))
+            if change is None or abs(change) < 0.05:
+                continue
+            metric_label = self._format_fundamental_label(column, suffix="_PctChange_63")
+            if change > 0:
                 reasons.append(
-                    f"Price sits {((ratio20 - 1) * 100):.1f}% above the 20-day average, pointing to stretched valuation versus recent trend."
+                    f"{metric_label} improved {change * 100:.1f}% versus the prior quarter, signalling healthier fundamentals."
                 )
-            elif ratio20 < 0.95:
-                reasons.append(
-                    f"Price sits {((1 - ratio20) * 100):.1f}% below the 20-day average, suggesting discounted pricing versus recent trend."
-                )
-
-        ratio200 = self._safe_float(feature_row.get("Price_to_SMA200"))
-        if ratio200 is not None:
-            if ratio200 > 1.10:
-                reasons.append("Price trading well above the 200-day average, reflecting optimistic longer-term positioning.")
-            elif ratio200 < 0.90:
-                reasons.append("Price trading well below the 200-day average, reflecting longer-term pessimism.")
-
-        momentum12 = self._safe_float(feature_row.get("Momentum_12"))
-        if momentum12 is not None and abs(momentum12) >= 0.1:
-            if momentum12 > 0:
-                reasons.append(f"Twelve-month momentum of {momentum12 * 100:.1f}% underscores longer-term strength.")
             else:
-                reasons.append(f"Twelve-month momentum of {momentum12 * 100:.1f}% highlights longer-term weakness.")
+                reasons.append(
+                    f"{metric_label} contracted {abs(change) * 100:.1f}% versus the prior quarter, pointing to emerging pressure."
+                )
+            if len(reasons) >= 3:
+                break
+
+        if len(reasons) < 3:
+            zscore_cols = [
+                column
+                for column in feature_row.index
+                if column.startswith("Fundamental_") and column.endswith("_ZScore_252")
+            ]
+            for column in sorted(zscore_cols):
+                zscore = self._safe_float(feature_row.get(column))
+                if zscore is None or abs(zscore) < 1.0:
+                    continue
+                metric_label = self._format_fundamental_label(column, suffix="_ZScore_252")
+                if zscore > 0:
+                    reasons.append(
+                        f"{metric_label} sits {zscore:.1f} standard deviations above its multi-year average, highlighting strength."
+                    )
+                else:
+                    reasons.append(
+                        f"{metric_label} sits {abs(zscore):.1f} standard deviations below its multi-year average, highlighting weakness."
+                    )
+                if len(reasons) >= 3:
+                    break
+
+        if not reasons:
+            latest_cols = [
+                column
+                for column in feature_row.index
+                if column.startswith("Fundamental_") and column.endswith("_Latest")
+            ]
+            for column in sorted(latest_cols):
+                value = self._safe_float(feature_row.get(column))
+                if value is None:
+                    continue
+                metric_label = self._format_fundamental_label(column, suffix="_Latest")
+                reasons.append(f"{metric_label} latest reading registered at {value:.2f}.")
+                if len(reasons) >= 2:
+                    break
 
         return reasons
 
@@ -2065,6 +2109,16 @@ class StockPredictorAI:
         if "volume" in token or "obv" in token:
             return "price"
         return "other"
+
+    @staticmethod
+    def _format_fundamental_label(column: str, *, suffix: str) -> str:
+        base = column[len("Fundamental_") :]
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+        label = base.replace("_", " ").strip()
+        if not label:
+            return "Fundamental metric"
+        return " ".join(part.capitalize() for part in label.split())
 
     @staticmethod
     def _safe_float(value: Any) -> Optional[float]:

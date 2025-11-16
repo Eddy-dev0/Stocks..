@@ -19,6 +19,7 @@ class FeatureBuildContext:
 
     price_df: "pd.DataFrame"
     news_df: "pd.DataFrame | None"
+    fundamentals_df: "pd.DataFrame | None"
     sentiment_enabled: bool
     technical_indicator_config: Mapping[str, Mapping[str, object]] | None
 
@@ -82,7 +83,7 @@ REGISTRY_BLUEPRINT: Dict[str, dict[str, object]] = {
         "implemented": True,
     },
     "fundamental": {
-        "description": "Rolling fundamental ratios and proxies derived from price inputs.",
+        "description": "Rolling features derived from fundamental statement data.",
         "dependencies": (),
         "default_enabled": True,
         "implemented": True,

@@ -20,6 +20,7 @@ class _MutableFetcher:
 
     def __init__(self, price_df: pd.DataFrame) -> None:
         self._price_df = price_df.copy()
+        self._fundamentals_df = pd.DataFrame()
 
     def set_price_data(self, price_df: pd.DataFrame) -> None:
         self._price_df = price_df.copy()
@@ -29,6 +30,9 @@ class _MutableFetcher:
 
     def fetch_news_data(self, force: bool = False) -> pd.DataFrame:
         return pd.DataFrame()
+
+    def fetch_fundamentals(self, force: bool = False) -> pd.DataFrame:
+        return self._fundamentals_df.copy()
 
     def get_data_sources(self) -> list[str]:
         return ["stub"]
