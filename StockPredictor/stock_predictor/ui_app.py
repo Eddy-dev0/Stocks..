@@ -461,6 +461,21 @@ class StockPredictorDesktopApp:
             "write", self._on_expected_low_multiplier_changed
         )
 
+        stop_loss_default = getattr(self.config, "k_stop", 1.0)
+        try:
+            stop_loss_value = float(stop_loss_default)
+        except (TypeError, ValueError):
+            stop_loss_value = 1.0
+        if not np.isfinite(stop_loss_value) or stop_loss_value <= 0:
+            stop_loss_value = 1.0
+        self._suspend_stop_loss_trace = False
+        self.stop_loss_multiplier_var = tk.DoubleVar(value=stop_loss_value)
+        self.stop_loss_multiplier = stop_loss_value
+        self.stop_loss_display_var = tk.StringVar(value=f"{stop_loss_value:.2f}×")
+        self.stop_loss_multiplier_var.trace_add(
+            "write", self._on_stop_loss_multiplier_changed
+        )
+
         self.trend_finder: TrendFinder | None = None
         self.trend_results: list[TrendInsight] = []
         self.trend_horizon_var = tk.StringVar(value=self.selected_horizon_label)
@@ -1229,6 +1244,27 @@ class StockPredictorDesktopApp:
             "Higher values subtract more volatility from the prediction to find the expected low.",
         )
 
+        stop_loss_row = ttk.Frame(display_box)
+        stop_loss_row.pack(fill=tk.X, pady=4)
+        ttk.Label(stop_loss_row, text="Stop-loss multiplier:").grid(row=0, column=0, sticky=tk.W)
+        stop_loss_row.columnconfigure(1, weight=1)
+        self.stop_loss_slider = ttk.Scale(
+            stop_loss_row,
+            from_=0.1,
+            to=5.0,
+            orient=tk.HORIZONTAL,
+            variable=self.stop_loss_multiplier_var,
+        )
+        self.stop_loss_slider.grid(row=0, column=1, padx=(8, 8), sticky=tk.EW)
+        self.stop_loss_value_label = ttk.Label(
+            stop_loss_row, textvariable=self.stop_loss_display_var, width=6, anchor=tk.W
+        )
+        self.stop_loss_value_label.grid(row=0, column=2, sticky=tk.W)
+        Tooltip(
+            self.stop_loss_slider,
+            "Scales the predicted volatility when computing protective stop-loss levels.",
+        )
+
         toggles_preferences = ttk.Frame(display_box)
         toggles_preferences.pack(fill=tk.X, pady=(4, 0))
         self.pnl_toggle = ttk.Checkbutton(
@@ -1498,6 +1534,27 @@ class StockPredictorDesktopApp:
         self.expected_low_multiplier = clipped
         self._refresh_numeric_views()
 
+    def _on_stop_loss_multiplier_changed(self, *_args: Any) -> None:
+        if getattr(self, "_suspend_stop_loss_trace", False):
+            return
+        try:
+            raw_value = float(self.stop_loss_multiplier_var.get())
+        except (tk.TclError, TypeError, ValueError):
+            raw_value = self.stop_loss_multiplier
+        if not np.isfinite(raw_value):
+            raw_value = self.stop_loss_multiplier
+        clipped = max(0.1, min(5.0, raw_value))
+        if abs(clipped - raw_value) > 1e-6:
+            self._suspend_stop_loss_trace = True
+            self.stop_loss_multiplier_var.set(clipped)
+            self._suspend_stop_loss_trace = False
+        if abs(clipped - self.stop_loss_multiplier) <= 1e-6:
+            return
+        self.stop_loss_multiplier = clipped
+        if hasattr(self, "stop_loss_display_var"):
+            self.stop_loss_display_var.set(f"{clipped:.2f}×")
+        self._sync_stop_loss_multiplier()
+
     def _on_pnl_toggle(self) -> None:
         self._update_pnl_visibility()
 
@@ -1507,6 +1564,20 @@ class StockPredictorDesktopApp:
             return
         self.apply_theme(enabled)
         self._refresh_numeric_views()
+
+    def _sync_stop_loss_multiplier(self) -> None:
+        value = float(self.stop_loss_multiplier)
+        config_obj = getattr(self, "config", None)
+        if config_obj is not None:
+            config_obj.k_stop = value
+        application = getattr(self, "application", None)
+        application_config = getattr(application, "config", None)
+        if application_config is not None:
+            application_config.k_stop = value
+        pipeline = getattr(application, "pipeline", None)
+        pipeline_config = getattr(pipeline, "config", None)
+        if pipeline_config is not None:
+            pipeline_config.k_stop = value
 
     def _on_currency_mode_changed(self, mode: str) -> None:
         previous_mode = getattr(self, "currency_mode", "local")
@@ -2452,6 +2523,7 @@ class StockPredictorDesktopApp:
             horizon_arg = self.selected_horizon_code
         else:
             horizon_arg = self.selected_horizon_offset
+        self._sync_stop_loss_multiplier()
         prediction = self.application.predict(horizon=horizon_arg, refresh=refresh)
         metadata = self.application.pipeline.metadata
         snapshot = metadata.get("latest_features") if isinstance(metadata, Mapping) else None
@@ -2488,6 +2560,7 @@ class StockPredictorDesktopApp:
             "price_history": price_history if isinstance(price_history, pd.DataFrame) else None,
             "indicator_history": indicators if isinstance(indicators, pd.DataFrame) else None,
             "horizons": horizon_values if horizon_values is not None else self.config.prediction_horizons,
+            "stop_loss_multiplier": self.stop_loss_multiplier,
         }
 
     # ------------------------------------------------------------------
