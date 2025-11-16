@@ -1496,7 +1496,7 @@ class StockPredictorAI:
             return None
         if volatility_value is None:
             return numeric_close
-        volatility_value = abs(float(volatility_value))
+        volatility_pct = abs(float(volatility_value))
         multiplier = getattr(self.config, "expected_low_sigma", DEFAULT_EXPECTED_LOW_SIGMA)
         try:
             multiplier_value = float(multiplier)
@@ -1504,7 +1504,11 @@ class StockPredictorAI:
             multiplier_value = DEFAULT_EXPECTED_LOW_SIGMA
         if not np.isfinite(multiplier_value) or multiplier_value <= 0:
             multiplier_value = DEFAULT_EXPECTED_LOW_SIGMA
-        return float(numeric_close - volatility_value * multiplier_value)
+        delta = float(numeric_close) * volatility_pct * multiplier_value
+        if not np.isfinite(delta):
+            delta = 0.0
+        expected_low = float(numeric_close - delta)
+        return float(max(0.0, expected_low))
 
     def _estimate_prediction_uncertainty(
         self,
