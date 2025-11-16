@@ -30,6 +30,7 @@ from ..ml_preprocessing import (
     get_feature_names_from_pipeline,
 )
 from ..pipeline import resolve_market_timezone
+from ..support_levels import indicator_support_floor
 from ..models import (
     ModelFactory,
     classification_metrics,
@@ -1337,11 +1338,13 @@ class StockPredictorAI:
             direction_probability_up = self._safe_float(dir_prob.get("up"))
             direction_probability_down = self._safe_float(dir_prob.get("down"))
 
+        indicator_floor, indicator_components = self._indicator_support_floor()
         expected_low = self._compute_expected_low(
             close_prediction,
             predicted_volatility,
             quantile_forecasts=quantile_forecasts,
             prediction_intervals=prediction_intervals,
+            indicator_floor=indicator_floor,
         )
 
         uncertainty_clean: dict[str, Dict[str, float]] = {}
@@ -1387,6 +1390,10 @@ class StockPredictorAI:
             "horizon": resolved_horizon,
             "target_date": _to_iso(target_date) or "",
         }
+        if indicator_floor is not None:
+            result["indicator_expected_low"] = indicator_floor
+        if indicator_components:
+            result["indicator_support_components"] = indicator_components
         if confidences:
             result["confidence"] = confidences
         if probabilities:
@@ -1438,6 +1445,7 @@ class StockPredictorAI:
         *,
         quantile_forecasts: Mapping[str, Dict[str, float]] | None,
         prediction_intervals: Mapping[str, Dict[str, float]] | None,
+        indicator_floor: float | None = None,
     ) -> Optional[float]:
         """Estimate a conservative lower bound for the forecasted close."""
 
@@ -1490,6 +1498,10 @@ class StockPredictorAI:
             if quantile_value is not None:
                 return quantile_value
 
+        indicator_value = self._safe_float(indicator_floor)
+        if indicator_value is not None and indicator_value > 0:
+            return float(indicator_value)
+
         numeric_close = self._safe_float(predicted_close)
         volatility_value = self._safe_float(predicted_volatility)
         if numeric_close is None:
@@ -1509,6 +1521,26 @@ class StockPredictorAI:
             delta = 0.0
         expected_low = float(numeric_close - delta)
         return float(max(0.0, expected_low))
+
+    def _indicator_support_floor(self) -> tuple[Optional[float], Dict[str, float]]:
+        latest_features = None
+        if isinstance(getattr(self, "metadata", None), Mapping):
+            latest_features = self.metadata.get("latest_features")
+        if not isinstance(latest_features, pd.DataFrame):
+            latest_features = None
+        floor_value, components = indicator_support_floor(latest_features)
+        cleaned_components: Dict[str, float] = {}
+        for column, value in components.items():
+            numeric = self._safe_float(value)
+            if numeric is None:
+                continue
+            if numeric <= 0:
+                continue
+            cleaned_components[str(column)] = float(numeric)
+        resolved_floor = self._safe_float(floor_value)
+        if resolved_floor is None and cleaned_components:
+            resolved_floor = min(cleaned_components.values())
+        return resolved_floor, cleaned_components
 
     def _estimate_prediction_uncertainty(
         self,

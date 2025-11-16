@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
+import pandas as pd
 import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -61,3 +62,53 @@ def test_ui_expected_low_matches_model_logic() -> None:
     )
 
     assert expected_low == pytest.approx(98.0)
+
+
+def test_model_expected_low_prefers_indicator_floor() -> None:
+    predictor = StockPredictorAI.__new__(StockPredictorAI)
+    predictor.config = _ConfigStub()
+    predictor.metadata = {
+        "latest_features": pd.DataFrame(
+            {
+                "BB_Lower_20": [96.0],
+                "Support_1": [94.5],
+                "Supertrend_7": [95.5],
+                "Supertrend_Direction_7": [1],
+            }
+        )
+    }
+
+    indicator_floor, components = predictor._indicator_support_floor()  # type: ignore[attr-defined]
+    assert indicator_floor == pytest.approx(94.5)
+    assert "Support_1" in components
+
+    expected_low = predictor._compute_expected_low(  # type: ignore[attr-defined]
+        100.0,
+        0.02,
+        quantile_forecasts=None,
+        prediction_intervals=None,
+        indicator_floor=indicator_floor,
+    )
+
+    assert expected_low == pytest.approx(94.5)
+
+
+def test_ui_expected_low_uses_indicator_snapshot() -> None:
+    app = StockPredictorDesktopApp.__new__(StockPredictorDesktopApp)
+    app.expected_low_multiplier = 1.0
+    app.feature_snapshot = pd.DataFrame({
+        "BB_Lower_20": [97.0],
+        "Support_1": [93.0],
+        "Supertrend_7": [95.0],
+    })
+    app.indicator_history = None
+
+    expected_low = app._compute_expected_low(  # type: ignore[attr-defined]
+        {
+            "predicted_close": 100.0,
+            "predicted_volatility": 0.02,
+        },
+        multiplier=1.0,
+    )
+
+    assert expected_low == pytest.approx(93.0)

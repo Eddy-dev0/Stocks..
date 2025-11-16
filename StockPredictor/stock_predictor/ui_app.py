@@ -37,6 +37,7 @@ from stock_predictor.core import (
 )
 from stock_predictor.core.pipeline import NoPriceDataError, resolve_market_timezone
 from stock_predictor.core.features import FEATURE_REGISTRY
+from stock_predictor.core.support_levels import indicator_support_floor
 
 LOGGER = logging.getLogger(__name__)
 
@@ -2749,6 +2750,12 @@ class StockPredictorDesktopApp:
             if lower is not None:
                 return lower
 
+        indicator_low = _safe_float(prediction.get("indicator_expected_low"))
+        if indicator_low is None:
+            indicator_low = self._indicator_expected_low_from_local_data()
+        if indicator_low is not None and indicator_low > 0:
+            return float(indicator_low)
+
         predicted_close = _safe_float(prediction.get("predicted_close"))
         predicted_volatility = _safe_float(prediction.get("predicted_volatility"))
         fallback = _safe_float(prediction.get("expected_low"))
@@ -2770,6 +2777,25 @@ class StockPredictorDesktopApp:
             delta = 0.0
         expected_low = predicted_close - delta
         return float(max(0.0, expected_low))
+
+    def _indicator_expected_low_from_local_data(self) -> float | None:
+        frames: list[pd.DataFrame] = []
+        snapshot = getattr(self, "feature_snapshot", None)
+        indicators = getattr(self, "indicator_history", None)
+        if isinstance(snapshot, pd.DataFrame) and not snapshot.empty:
+            frames.append(snapshot)
+        if isinstance(indicators, pd.DataFrame) and not indicators.empty:
+            frames.append(indicators)
+
+        best_value: float | None = None
+        for frame in frames:
+            indicator_value, _ = indicator_support_floor(frame)
+            numeric = _safe_float(indicator_value)
+            if numeric is None or numeric <= 0:
+                continue
+            if best_value is None or numeric < best_value:
+                best_value = numeric
+        return best_value
 
     def _update_metrics(self) -> None:
         prediction = self.current_prediction or {}
