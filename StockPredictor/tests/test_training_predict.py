@@ -91,6 +91,7 @@ def test_training_and_predict_handles_missing_volatility_model(tmp_path: Path) -
     predictor = StockPredictorAI(config)
     predictor.fetcher = fetcher
     prediction = predictor.predict(targets=("direction", "return", "volatility"))
+    assert "stop_loss" in prediction
 
     assert config.model_path_for("volatility", 1).exists()
     metrics = prediction.get("training_metrics", {}) or {}
