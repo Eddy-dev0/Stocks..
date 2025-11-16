@@ -43,14 +43,20 @@ def test_preprocessing_pipeline_reduces_dimensions_with_pca():
 
 
 class _DummyFetcher:
-    def __init__(self, price_df: pd.DataFrame) -> None:
+    def __init__(self, price_df: pd.DataFrame, fundamentals_df: pd.DataFrame | None = None) -> None:
         self._price_df = price_df
+        self._fundamentals_df = fundamentals_df
 
     def fetch_price_data(self) -> pd.DataFrame:
         return self._price_df.copy()
 
     def fetch_news_data(self) -> pd.DataFrame:
         return pd.DataFrame()
+
+    def fetch_fundamentals(self) -> pd.DataFrame:
+        if self._fundamentals_df is None:
+            return pd.DataFrame()
+        return self._fundamentals_df.copy()
 
     def get_data_sources(self) -> list[str]:
         return ["dummy"]
