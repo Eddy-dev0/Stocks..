@@ -2764,7 +2764,12 @@ class StockPredictorDesktopApp:
         if not np.isfinite(scale_value):
             scale_value = self.expected_low_multiplier
         scale_value = max(0.0, scale_value)
-        return predicted_close - predicted_volatility * scale_value
+        volatility_pct = abs(float(predicted_volatility))
+        delta = predicted_close * volatility_pct * scale_value
+        if not np.isfinite(delta):
+            delta = 0.0
+        expected_low = predicted_close - delta
+        return float(max(0.0, expected_low))
 
     def _update_metrics(self) -> None:
         prediction = self.current_prediction or {}
