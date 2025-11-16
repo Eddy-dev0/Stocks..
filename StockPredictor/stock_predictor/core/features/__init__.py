@@ -284,7 +284,7 @@ class FeatureAssembler:
         numeric_cols = merged.select_dtypes(include=[np.number]).columns
         merged[numeric_cols] = merged[numeric_cols].fillna(0.0)
 
-        merged["Close_Current"] = merged["Close"]
+        merged = merged.assign(Close_Current=merged["Close"])
 
         targets = _generate_targets(merged, self.horizons)
 
@@ -451,7 +451,7 @@ def _build_technical_features(
     metadata["indicator_columns"] = list(indicator_result.columns)
 
     feature_frame = pd.DataFrame({"Date": df["Date"].reset_index(drop=True)})
-    feature_frame["Return_1d"] = close.pct_change()
+    feature_frame["Return_1d"] = close.pct_change(fill_method=None)
     feature_frame["LogReturn_1d"] = np.log(close.replace(0, np.nan)).diff()
 
     for window in (5, 10):
@@ -463,9 +463,9 @@ def _build_technical_features(
         feature_frame[f"EMA_{span}"] = ema
 
     for window in (5, 10, 20, 63, 126):
-        feature_frame[f"ROC_{window}"] = close.pct_change(periods=window)
+        feature_frame[f"ROC_{window}"] = close.pct_change(periods=window, fill_method=None)
 
-    volume_change = volume.pct_change()
+    volume_change = volume.pct_change(fill_method=None)
     feature_frame["Volume_Change"] = volume_change
     if not volume.isna().all():
         for window in (10, 20, 50):
@@ -525,7 +525,7 @@ def _build_volume_liquidity_block(price_df: pd.DataFrame) -> FeatureBlock | None
     obv_direction.iloc[0] = 0.0
     on_balance_volume = (obv_direction * volume).cumsum()
 
-    pct_change = close.pct_change().fillna(0.0)
+    pct_change = close.pct_change(fill_method=None).fillna(0.0)
     volume_price_trend = (pct_change * volume).cumsum()
 
     raw_money_flow = typical_price * volume
@@ -650,7 +650,7 @@ def _build_fundamental_metrics(
     if aligned is None or aligned.empty:
         return None
 
-    metrics = pd.DataFrame({"Date": aligned["Date"]})
+    column_data: Dict[str, pd.Series] = {"Date": aligned["Date"]}
     column_categories: Dict[str, str] = {}
 
     value_columns = [column for column in aligned.columns if column != "Date"]
@@ -661,20 +661,20 @@ def _build_fundamental_metrics(
         base_name = _sanitize_metric_name(column)
         latest_col = f"Fundamental_{base_name}_Latest"
         filled = series.ffill()
-        metrics[latest_col] = filled
+        column_data[latest_col] = filled
         column_categories[latest_col] = "fundamental"
 
         pct_change_col = f"Fundamental_{base_name}_PctChange_63"
-        metrics[pct_change_col] = filled.pct_change(periods=63)
+        column_data[pct_change_col] = filled.pct_change(periods=63, fill_method=None)
         column_categories[pct_change_col] = "fundamental_trend"
 
         zscore_col = f"Fundamental_{base_name}_ZScore_252"
         rolling_mean = filled.rolling(window=252, min_periods=5).mean()
         rolling_std = filled.rolling(window=252, min_periods=5).std()
-        metrics[zscore_col] = (filled - rolling_mean) / rolling_std.replace(0, np.nan)
+        column_data[zscore_col] = (filled - rolling_mean) / rolling_std.replace(0, np.nan)
         column_categories[zscore_col] = "fundamental_trend"
 
-    metrics = metrics.fillna(0.0)
+    metrics = pd.DataFrame(column_data).fillna(0.0)
     if len(metrics.columns) <= 1:
         return None
     return FeatureBlock(metrics, category="fundamental", column_categories=column_categories)
@@ -785,7 +785,7 @@ def _build_macro_context(price_df: pd.DataFrame) -> FeatureBlock | None:
         return None
 
     df = price_df.sort_values("Date").reset_index(drop=True)
-    returns = pd.to_numeric(df["Close"], errors="coerce").pct_change()
+    returns = pd.to_numeric(df["Close"], errors="coerce").pct_change(fill_method=None)
 
     macro = pd.DataFrame({"Date": df["Date"]})
     macro["Volatility_21"] = returns.rolling(window=21, min_periods=5).std()
@@ -843,13 +843,15 @@ def _build_macro_benchmarks(
         benchmark = _extract_benchmark_series(price_df, symbol, macro_df=macro_df)
         if benchmark is None:
             continue
-        benchmark_returns = benchmark.pct_change()
+        benchmark_returns = benchmark.pct_change(fill_method=None)
         symbol_prefix = name.upper()
         features[f"{symbol_prefix}_Return"] = benchmark_returns
         features[f"{symbol_prefix}_RollingCorr_21"] = (
-            base_close.pct_change().rolling(window=21, min_periods=5).corr(benchmark_returns)
+            base_close.pct_change(fill_method=None)
+            .rolling(window=21, min_periods=5)
+            .corr(benchmark_returns)
         )
-        features[f"{symbol_prefix}_Relative_Return"] = base_close.pct_change() - benchmark_returns
+        features[f"{symbol_prefix}_Relative_Return"] = base_close.pct_change(fill_method=None) - benchmark_returns
         features[f"{symbol_prefix}_Price_Ratio"] = _safe_divide(base_close, benchmark)
 
     if not features:
@@ -871,7 +873,7 @@ def _build_cross_sectional_betas(
         return None
     base_close = pd.to_numeric(base_close_raw, errors="coerce")
 
-    base_returns = base_close.pct_change()
+    base_returns = base_close.pct_change(fill_method=None)
     benchmarks = {
         "^GSPC": "Beta_SP500",
         "^VIX": "Beta_VIX",
@@ -882,7 +884,7 @@ def _build_cross_sectional_betas(
         benchmark = _extract_benchmark_series(price_df, symbol, macro_df=macro_df)
         if benchmark is None:
             continue
-        benchmark_returns = benchmark.pct_change()
+        benchmark_returns = benchmark.pct_change(fill_method=None)
         for window in (21, 63, 126):
             cov = base_returns.rolling(window=window, min_periods=5).cov(benchmark_returns)
             var = benchmark_returns.rolling(window=window, min_periods=5).var()
@@ -978,7 +980,7 @@ def _empty_sentiment_frame() -> pd.DataFrame:
 
 def _generate_targets(merged: pd.DataFrame, horizons: Iterable[int]) -> Dict[int, Dict[str, pd.Series]]:
     merged = merged.copy()
-    merged["Daily_Return"] = merged["Close"].pct_change()
+    merged["Daily_Return"] = merged["Close"].pct_change(fill_method=None)
 
     targets_by_horizon: Dict[int, Dict[str, pd.Series]] = {}
     for horizon in horizons:
