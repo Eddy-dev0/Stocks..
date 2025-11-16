@@ -20,6 +20,7 @@ class FeatureBuildContext:
     price_df: "pd.DataFrame"
     news_df: "pd.DataFrame | None"
     fundamentals_df: "pd.DataFrame | None"
+    macro_df: "pd.DataFrame | None"
     sentiment_enabled: bool
     technical_indicator_config: Mapping[str, Mapping[str, object]] | None
 
