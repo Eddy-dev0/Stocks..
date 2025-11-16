@@ -40,6 +40,8 @@ from ..models import (
 
 LOGGER = logging.getLogger(__name__)
 
+DEFAULT_EXPECTED_LOW_SIGMA = 1.0
+
 
 LabelFunction = Callable[[pd.DataFrame, int, int], pd.Series]
 
@@ -1335,6 +1337,13 @@ class StockPredictorAI:
             direction_probability_up = self._safe_float(dir_prob.get("up"))
             direction_probability_down = self._safe_float(dir_prob.get("down"))
 
+        expected_low = self._compute_expected_low(
+            close_prediction,
+            predicted_volatility,
+            quantile_forecasts=quantile_forecasts,
+            prediction_intervals=prediction_intervals,
+        )
+
         uncertainty_clean: dict[str, Dict[str, float]] = {}
         for tgt, values in uncertainties.items():
             numeric_values = {
@@ -1371,6 +1380,7 @@ class StockPredictorAI:
             "expected_change_pct": pct_change,
             "predicted_return": predicted_return,
             "predicted_volatility": predicted_volatility,
+            "expected_low": expected_low,
             "direction_probability_up": direction_probability_up,
             "direction_probability_down": direction_probability_down,
             "predictions": predictions,
@@ -1420,6 +1430,81 @@ class StockPredictorAI:
             return features
 
         return features.to_numpy()
+
+    def _compute_expected_low(
+        self,
+        predicted_close: Any,
+        predicted_volatility: Any,
+        *,
+        quantile_forecasts: Mapping[str, Dict[str, float]] | None,
+        prediction_intervals: Mapping[str, Dict[str, float]] | None,
+    ) -> Optional[float]:
+        """Estimate a conservative lower bound for the forecasted close."""
+
+        def _extract_lower_bound(block: Mapping[str, Any] | None) -> Optional[float]:
+            if not isinstance(block, Mapping):
+                return None
+            preferred_keys = (
+                "lower",
+                "lower_bound",
+                "low",
+                "p10",
+                "10%",
+                "10",
+                "0.1",
+                "quantile_0.1",
+            )
+            for key in preferred_keys:
+                if key in block:
+                    candidate = self._safe_float(block.get(key))
+                    if candidate is not None:
+                        return candidate
+            numeric_values: list[float] = []
+            for value in block.values():
+                numeric = self._safe_float(value)
+                if numeric is not None:
+                    numeric_values.append(numeric)
+            if numeric_values:
+                return float(min(numeric_values))
+            return None
+
+        if isinstance(prediction_intervals, Mapping) and prediction_intervals:
+            close_interval = prediction_intervals.get("close")
+            interval_value = _extract_lower_bound(close_interval)
+            if interval_value is None:
+                for candidate in prediction_intervals.values():
+                    interval_value = _extract_lower_bound(candidate)
+                    if interval_value is not None:
+                        break
+            if interval_value is not None:
+                return interval_value
+
+        if isinstance(quantile_forecasts, Mapping) and quantile_forecasts:
+            close_quantiles = quantile_forecasts.get("close")
+            quantile_value = _extract_lower_bound(close_quantiles)
+            if quantile_value is None:
+                for candidate in quantile_forecasts.values():
+                    quantile_value = _extract_lower_bound(candidate)
+                    if quantile_value is not None:
+                        break
+            if quantile_value is not None:
+                return quantile_value
+
+        numeric_close = self._safe_float(predicted_close)
+        volatility_value = self._safe_float(predicted_volatility)
+        if numeric_close is None:
+            return None
+        if volatility_value is None:
+            return numeric_close
+        volatility_value = abs(float(volatility_value))
+        multiplier = getattr(self.config, "expected_low_sigma", DEFAULT_EXPECTED_LOW_SIGMA)
+        try:
+            multiplier_value = float(multiplier)
+        except (TypeError, ValueError):
+            multiplier_value = DEFAULT_EXPECTED_LOW_SIGMA
+        if not np.isfinite(multiplier_value) or multiplier_value <= 0:
+            multiplier_value = DEFAULT_EXPECTED_LOW_SIGMA
+        return float(numeric_close - volatility_value * multiplier_value)
 
     def _estimate_prediction_uncertainty(
         self,

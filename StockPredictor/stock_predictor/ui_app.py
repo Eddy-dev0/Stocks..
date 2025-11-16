@@ -453,6 +453,12 @@ class StockPredictorDesktopApp:
             "3 decimals": 3,
             "4 decimals": 4,
         }
+        self._suspend_expected_low_trace = False
+        self.expected_low_multiplier_var = tk.DoubleVar(value=1.0)
+        self.expected_low_multiplier = 1.0
+        self.expected_low_multiplier_var.trace_add(
+            "write", self._on_expected_low_multiplier_changed
+        )
 
         self.trend_finder: TrendFinder | None = None
         self.trend_results: list[TrendInsight] = []
@@ -888,6 +894,7 @@ class StockPredictorDesktopApp:
             ("as_of", "Market data as of"),
             ("last_close", "Last close"),
             ("predicted_close", "Predicted close"),
+            ("expected_low", "Expected low"),
             ("expected_change", "Expected change"),
             ("direction", "Direction"),
         ]
@@ -909,13 +916,20 @@ class StockPredictorDesktopApp:
             value.grid(row=row, column=column + 1, sticky=tk.E, padx=(0, 8), pady=2)
             self.metric_vars[key] = var
 
+        metric_rows = (len(metric_specs) + 1) // 2
         self.pnl_label = ttk.Label(
             summary_frame,
             textvariable=self.pnl_var,
             anchor=tk.W,
             font=("TkDefaultFont", 10, "bold"),
         )
-        self._pnl_grid_options = {"row": 3, "column": 0, "columnspan": 4, "sticky": tk.W, "pady": (12, 0)}
+        self._pnl_grid_options = {
+            "row": metric_rows,
+            "column": 0,
+            "columnspan": 4,
+            "sticky": tk.W,
+            "pady": (12, 0),
+        }
         self.pnl_label.grid(**self._pnl_grid_options)
 
         chart_container.grid_rowconfigure(0, weight=1)
@@ -1193,6 +1207,26 @@ class StockPredictorDesktopApp:
         self.number_format_box.grid(row=0, column=1, padx=(8, 0), sticky=tk.W)
         self.number_format_box.bind("<<ComboboxSelected>>", self._on_number_format_changed)
 
+        expected_low_row = ttk.Frame(display_box)
+        expected_low_row.pack(fill=tk.X, pady=4)
+        ttk.Label(expected_low_row, text="Expected-low sensitivity:").grid(
+            row=0, column=0, sticky=tk.W
+        )
+        self.expected_low_spinbox = ttk.Spinbox(
+            expected_low_row,
+            from_=0.0,
+            to=5.0,
+            increment=0.1,
+            format="%.1f",
+            width=6,
+            textvariable=self.expected_low_multiplier_var,
+        )
+        self.expected_low_spinbox.grid(row=0, column=1, padx=(8, 0), sticky=tk.W)
+        Tooltip(
+            self.expected_low_spinbox,
+            "Higher values subtract more volatility from the prediction to find the expected low.",
+        )
+
         toggles_preferences = ttk.Frame(display_box)
         toggles_preferences.pack(fill=tk.X, pady=(4, 0))
         self.pnl_toggle = ttk.Checkbutton(
@@ -1442,6 +1476,25 @@ class StockPredictorDesktopApp:
         if value not in self.chart_type_options:
             self.chart_type_var.set(self.chart_type_options[0])
         self._update_price_chart()
+
+    def _on_expected_low_multiplier_changed(self, *_args: Any) -> None:
+        if getattr(self, "_suspend_expected_low_trace", False):
+            return
+        try:
+            raw_value = float(self.expected_low_multiplier_var.get())
+        except (tk.TclError, TypeError, ValueError):
+            raw_value = self.expected_low_multiplier
+        if not np.isfinite(raw_value):
+            raw_value = self.expected_low_multiplier
+        clipped = max(0.0, min(5.0, raw_value))
+        if abs(clipped - raw_value) > 1e-6:
+            self._suspend_expected_low_trace = True
+            self.expected_low_multiplier_var.set(clipped)
+            self._suspend_expected_low_trace = False
+        if abs(clipped - self.expected_low_multiplier) <= 1e-6:
+            return
+        self.expected_low_multiplier = clipped
+        self._refresh_numeric_views()
 
     def _on_pnl_toggle(self) -> None:
         self._update_pnl_visibility()
@@ -2645,6 +2698,74 @@ class StockPredictorDesktopApp:
     # ------------------------------------------------------------------
     # UI updates
     # ------------------------------------------------------------------
+    def _compute_expected_low(
+        self,
+        prediction: Mapping[str, Any] | None,
+        *,
+        multiplier: float | None = None,
+    ) -> float | None:
+        if not isinstance(prediction, Mapping):
+            return None
+
+        def _extract_lower(block: Mapping[str, Any] | None) -> float | None:
+            if not isinstance(block, Mapping):
+                return None
+            preferred_keys = ("lower", "lower_bound", "low", "p10", "10%", "10", "0.1")
+            for key in preferred_keys:
+                if key in block:
+                    candidate = _safe_float(block.get(key))
+                    if candidate is not None:
+                        return candidate
+            numeric_values: list[float] = []
+            for value in block.values():
+                numeric = _safe_float(value)
+                if numeric is not None:
+                    numeric_values.append(numeric)
+            if numeric_values:
+                return float(min(numeric_values))
+            return None
+
+        intervals = prediction.get("prediction_intervals")
+        if isinstance(intervals, Mapping):
+            close_interval = intervals.get("close")
+            lower = _extract_lower(close_interval)
+            if lower is None:
+                for candidate in intervals.values():
+                    lower = _extract_lower(candidate)
+                    if lower is not None:
+                        break
+            if lower is not None:
+                return lower
+
+        quantiles = prediction.get("quantile_forecasts")
+        if isinstance(quantiles, Mapping):
+            close_quantiles = quantiles.get("close")
+            lower = _extract_lower(close_quantiles)
+            if lower is None:
+                for candidate in quantiles.values():
+                    lower = _extract_lower(candidate)
+                    if lower is not None:
+                        break
+            if lower is not None:
+                return lower
+
+        predicted_close = _safe_float(prediction.get("predicted_close"))
+        predicted_volatility = _safe_float(prediction.get("predicted_volatility"))
+        fallback = _safe_float(prediction.get("expected_low"))
+        if predicted_close is None:
+            return fallback
+        if predicted_volatility is None:
+            return fallback if fallback is not None else predicted_close
+        scale = multiplier if multiplier is not None else self.expected_low_multiplier
+        try:
+            scale_value = float(scale)
+        except (TypeError, ValueError):
+            scale_value = self.expected_low_multiplier
+        if not np.isfinite(scale_value):
+            scale_value = self.expected_low_multiplier
+        scale_value = max(0.0, scale_value)
+        return predicted_close - predicted_volatility * scale_value
+
     def _update_metrics(self) -> None:
         prediction = self.current_prediction or {}
         explanation = prediction.get("explanation") if isinstance(prediction, Mapping) else None
@@ -2683,6 +2804,12 @@ class StockPredictorDesktopApp:
             else:
                 predicted_display = f"{predicted_display} ({forecast_str})"
         self.metric_vars["predicted_close"].set(predicted_display)
+
+        expected_low_value = self._compute_expected_low(prediction, multiplier=self.expected_low_multiplier)
+        expected_low_converted = self._convert_currency(expected_low_value)
+        self.metric_vars["expected_low"].set(
+            fmt_ccy(expected_low_converted, self.currency_symbol, decimals=decimals)
+        )
 
         change_display = fmt_ccy(change_converted, self.currency_symbol, decimals=decimals)
         pct_display = fmt_pct(expected_change_pct, show_sign=True)
@@ -2852,6 +2979,15 @@ class StockPredictorDesktopApp:
         last_y = float(plotted_series.iloc[-1])
         last_display = fmt_ccy(last_y, self.currency_symbol, decimals=self.price_decimal_places)
 
+        try:
+            prediction_line_end = (
+                pd.to_datetime(forecast)
+                if forecast is not None
+                else pd.to_datetime(last_x) + pd.Timedelta(days=1)
+            )
+        except Exception:
+            prediction_line_end = pd.to_datetime(last_x) + pd.Timedelta(days=1)
+
         if use_candlestick and candlestick_frame is not None:
             date_numbers = date2num(candlestick_frame.index.to_pydatetime())
             if len(date_numbers) > 1:
@@ -2920,19 +3056,16 @@ class StockPredictorDesktopApp:
 
         predicted_close = _safe_float(prediction.get("predicted_close"))
         converted_prediction = self._convert_currency(predicted_close) if predicted_close is not None else None
+        opportunity_patch_handle: Rectangle | None = None
         if converted_prediction is not None:
             predicted_label = (
                 "Predicted close (price)"
                 if not self.currency_symbol
                 else f"Predicted close ({self.currency_symbol})"
             )
-            if forecast is not None:
-                line_end = forecast
-            else:
-                line_end = pd.to_datetime(last_x) + pd.Timedelta(days=1)
             if use_candlestick and candlestick_frame is not None:
                 last_x_num = float(last_x_value)
-                line_end_num = float(date2num(pd.to_datetime(line_end)))
+                line_end_num = float(date2num(pd.to_datetime(prediction_line_end)))
                 (predicted_handle,) = ax.plot(
                     [last_x_num, line_end_num],
                     [converted_prediction, converted_prediction],
@@ -2944,14 +3077,14 @@ class StockPredictorDesktopApp:
                 annotation_xy = (line_end_num, converted_prediction)
             else:
                 (predicted_handle,) = ax.plot(
-                    [last_x, line_end],
+                    [last_x, prediction_line_end],
                     [converted_prediction, converted_prediction],
                     color="tab:orange",
                     linestyle="--",
                     label=predicted_label,
                 )
                 legend_handles.append(predicted_handle)
-                annotation_xy = (pd.to_datetime(line_end), converted_prediction)
+                annotation_xy = (pd.to_datetime(prediction_line_end), converted_prediction)
             annotation_text = fmt_ccy(
                 converted_prediction,
                 self.currency_symbol,
@@ -2968,6 +3101,82 @@ class StockPredictorDesktopApp:
                 ha="left",
                 color="tab:orange",
             )
+
+        expected_low_value = self._compute_expected_low(prediction, multiplier=self.expected_low_multiplier)
+        expected_low_converted = (
+            self._convert_currency(expected_low_value) if expected_low_value is not None else None
+        )
+        zone_color = "#fcd34d"
+        expected_color = "#b45309"
+        if expected_low_converted is not None:
+            expected_label = (
+                "Expected low"
+                if not self.currency_symbol
+                else f"Expected low ({self.currency_symbol})"
+            )
+            if use_candlestick and candlestick_frame is not None:
+                last_x_num = float(last_x_value)
+                line_end_num = float(date2num(pd.to_datetime(prediction_line_end)))
+                (expected_handle,) = ax.plot(
+                    [last_x_num, line_end_num],
+                    [expected_low_converted, expected_low_converted],
+                    color=expected_color,
+                    linestyle=":",
+                    linewidth=1.6,
+                    label=expected_label,
+                )
+                annotation_xy = (line_end_num, expected_low_converted)
+            else:
+                (expected_handle,) = ax.plot(
+                    [last_x, prediction_line_end],
+                    [expected_low_converted, expected_low_converted],
+                    color=expected_color,
+                    linestyle=":",
+                    linewidth=1.6,
+                    label=expected_label,
+                )
+                annotation_xy = (pd.to_datetime(prediction_line_end), expected_low_converted)
+            legend_handles.append(expected_handle)
+            annotation_text = fmt_ccy(
+                expected_low_converted,
+                self.currency_symbol,
+                decimals=self.price_decimal_places,
+            )
+            annotation_text = f"{annotation_text} (expected low)"
+            ax.annotate(
+                annotation_text,
+                xy=annotation_xy,
+                xytext=(8, -10),
+                textcoords="offset points",
+                va="top",
+                ha="left",
+                color=expected_color,
+            )
+
+            zone_reference = converted_prediction if converted_prediction is not None else last_y
+            if zone_reference is not None:
+                lower, upper = sorted([expected_low_converted, float(zone_reference)])
+                if abs(upper - lower) > 1e-9:
+                    ax.axhspan(
+                        lower,
+                        upper,
+                        color=zone_color,
+                        alpha=0.15,
+                        zorder=0.5,
+                        label="_nolegend_",
+                    )
+                    opportunity_patch_handle = Rectangle(
+                        (0, 0),
+                        1,
+                        1,
+                        facecolor=zone_color,
+                        alpha=0.25,
+                        edgecolor="none",
+                        label="Opportunity zone",
+                    )
+
+        if opportunity_patch_handle is not None:
+            legend_handles.append(opportunity_patch_handle)
 
         ylabel = "Price"
         if self.currency_symbol:
