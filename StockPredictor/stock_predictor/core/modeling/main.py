@@ -1826,14 +1826,24 @@ class StockPredictorAI:
         if vol21 is not None and vol21 >= 0.03:
             reasons.append("Short-term realised volatility elevated, indicating choppy market conditions.")
 
-        trend_slope = self._safe_float(feature_row.get("Trend_Slope"))
+        slope_keys = ("Trend_Slope_21", "Trend_Slope")
+        trend_slope = None
+        for key in slope_keys:
+            trend_slope = self._safe_float(feature_row.get(key))
+            if trend_slope is not None:
+                break
         if trend_slope is not None:
             if trend_slope > 0:
                 reasons.append("Medium-term trend slope positive, supporting upward bias.")
             elif trend_slope < 0:
                 reasons.append("Medium-term trend slope negative, signalling downward bias.")
 
-        trend_curvature = self._safe_float(feature_row.get("Trend_Curvature"))
+        curvature_keys = ("Trend_Curvature_63", "Trend_Curvature")
+        trend_curvature = None
+        for key in curvature_keys:
+            trend_curvature = self._safe_float(feature_row.get(key))
+            if trend_curvature is not None:
+                break
         if trend_curvature is not None and trend_curvature < 0:
             reasons.append("Trend curvature turning lower, hinting at deceleration in momentum.")
 
