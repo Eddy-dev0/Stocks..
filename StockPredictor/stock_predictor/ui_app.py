@@ -1333,6 +1333,8 @@ class StockPredictorDesktopApp:
         self._apply_horizon_selection(label)
         self._update_forecast_label()
         self._refresh_overview()
+        if hasattr(self, "price_ax"):
+            self._update_price_chart()
         self._on_predict()
 
     def _on_trend_scan(self) -> None:
@@ -3297,6 +3299,73 @@ class StockPredictorDesktopApp:
 
         if opportunity_patch_handle is not None:
             legend_handles.append(opportunity_patch_handle)
+
+        stop_loss_value = prediction.get("stop_loss") if isinstance(prediction, Mapping) else None
+        stop_loss_converted = self._convert_currency(stop_loss_value)
+        stop_loss_numeric = _safe_float(stop_loss_converted)
+        if stop_loss_numeric is not None:
+            stop_color = "#dc2626"
+            stop_label = (
+                "Stop-loss" if not self.currency_symbol else f"Stop-loss ({self.currency_symbol})"
+            )
+            if use_candlestick and candlestick_frame is not None:
+                last_x_num = float(last_x_value)
+                line_end_num = float(date2num(pd.to_datetime(prediction_line_end)))
+                (stop_handle,) = ax.plot(
+                    [last_x_num, line_end_num],
+                    [stop_loss_numeric, stop_loss_numeric],
+                    color=stop_color,
+                    linestyle="--",
+                    linewidth=1.6,
+                    label=stop_label,
+                )
+                scatter_x = line_end_num
+            else:
+                (stop_handle,) = ax.plot(
+                    [last_x, prediction_line_end],
+                    [stop_loss_numeric, stop_loss_numeric],
+                    color=stop_color,
+                    linestyle="--",
+                    linewidth=1.6,
+                    label=stop_label,
+                )
+                scatter_x = pd.to_datetime(prediction_line_end)
+            legend_handles.append(stop_handle)
+            ax.scatter(
+                [scatter_x],
+                [stop_loss_numeric],
+                color=stop_color,
+                edgecolors="white",
+                linewidth=0.8,
+                s=36,
+                zorder=6,
+            )
+            annotation_text = fmt_ccy(
+                stop_loss_numeric,
+                self.currency_symbol,
+                decimals=self.price_decimal_places,
+            )
+            annotation_text = f"{annotation_text} (stop-loss)"
+            ax.annotate(
+                annotation_text,
+                xy=(scatter_x, stop_loss_numeric),
+                xytext=(8, 10),
+                textcoords="offset points",
+                va="bottom",
+                ha="left",
+                color=stop_color,
+            )
+            current_ylim = ax.get_ylim()
+            lower_bound = min(current_ylim[0], stop_loss_numeric)
+            if lower_bound < stop_loss_numeric - 1e-9:
+                ax.axhspan(
+                    lower_bound,
+                    stop_loss_numeric,
+                    color="#fecaca",
+                    alpha=0.25,
+                    zorder=0.1,
+                    label="_nolegend_",
+                )
 
         ylabel = "Price"
         if self.currency_symbol:
