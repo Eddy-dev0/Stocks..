@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import threading
@@ -905,35 +906,42 @@ class StockPredictorDesktopApp:
         overview.add(chart_container, weight=1)
 
         self.metric_vars: dict[str, tk.StringVar] = {}
-        metric_specs = [
-            ("ticker", "Ticker"),
-            ("as_of", "Market data as of"),
-            ("last_close", "Last close"),
-            ("predicted_close", "Predicted close"),
-            ("expected_low", "Expected low"),
-            ("stop_loss", "Stop loss"),
-            ("expected_change", "Expected change"),
-            ("direction", "Direction"),
+        stop_loss_var = tk.StringVar(value="—")
+        metric_specs: list[tuple[str, str, tk.StringVar | None]] = [
+            ("ticker", "Ticker", None),
+            ("as_of", "Market data as of", None),
+            ("last_close", "Last close", None),
+            ("predicted_close", "Predicted close", None),
+            ("expected_low", "Expected low", None),
+            (
+                "stop_loss",
+                "Recommended Stop-Loss Price",
+                stop_loss_var,
+            ),
+            ("expected_change", "Expected change", None),
+            ("direction", "Direction", None),
         ]
         for column in range(4):
             weight = 1 if column % 2 == 1 else 0
             summary_frame.grid_columnconfigure(column, weight=weight)
-        for idx, (key, label) in enumerate(metric_specs):
+        for idx, (key, label, var) in enumerate(metric_specs):
             row = idx // 2
             column = (idx % 2) * 2
             caption = ttk.Label(summary_frame, text=f"{label}:", anchor=tk.E)
             caption.grid(row=row, column=column, sticky=tk.E, padx=(4, 8), pady=2)
-            var = tk.StringVar(value="—")
+            metric_var = var or tk.StringVar(value="—")
             value = ttk.Label(
                 summary_frame,
-                textvariable=var,
+                textvariable=metric_var,
                 anchor=tk.E,
                 font=("TkDefaultFont", 10, "bold"),
             )
             value.grid(row=row, column=column + 1, sticky=tk.E, padx=(0, 8), pady=2)
-            self.metric_vars[key] = var
+            self.metric_vars[key] = metric_var
 
-        metric_rows = (len(metric_specs) + 1) // 2
+        self.stop_loss_var = stop_loss_var
+
+        metric_rows = math.ceil(len(metric_specs) / 2)
         self.pnl_label = ttk.Label(
             summary_frame,
             textvariable=self.pnl_var,
@@ -2918,9 +2926,10 @@ class StockPredictorDesktopApp:
 
         stop_loss_value = prediction.get("stop_loss") if isinstance(prediction, Mapping) else None
         stop_loss_converted = self._convert_currency(stop_loss_value)
-        self.metric_vars["stop_loss"].set(
-            fmt_ccy(stop_loss_converted, self.currency_symbol, decimals=decimals)
-        )
+        stop_loss_display = fmt_ccy(stop_loss_converted, self.currency_symbol, decimals=decimals)
+        stop_loss_var = getattr(self, "stop_loss_var", self.metric_vars.get("stop_loss"))
+        if stop_loss_var is not None:
+            stop_loss_var.set(stop_loss_display)
 
         change_display = fmt_ccy(change_converted, self.currency_symbol, decimals=decimals)
         pct_display = fmt_pct(expected_change_pct, show_sign=True)
