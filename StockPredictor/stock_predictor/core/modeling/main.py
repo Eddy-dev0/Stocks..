@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from numbers import Real
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import joblib
 import numpy as np
@@ -28,6 +29,7 @@ from ..ml_preprocessing import (
     PreprocessingBuilder,
     get_feature_names_from_pipeline,
 )
+from ..pipeline import resolve_market_timezone
 from ..models import (
     ModelFactory,
     classification_metrics,
@@ -40,6 +42,24 @@ LOGGER = logging.getLogger(__name__)
 
 
 LabelFunction = Callable[[pd.DataFrame, int, int], pd.Series]
+
+
+def _normalize_datetime_series(
+    values: pd.Series, *, target_timezone: ZoneInfo | None
+) -> pd.Series:
+    """Return a timezone-naive datetime series aligned to ``target_timezone``.
+
+    The input is coerced to datetimes and, if timezone-aware, converted to the
+    requested timezone before the timezone information is stripped. Naive values
+    are returned unchanged apart from the ``to_datetime`` coercion.
+    """
+
+    datetimes = pd.to_datetime(values, errors="coerce")
+    tzinfo = getattr(datetimes.dt, "tz", None)
+    if tzinfo is not None:
+        normalized_zone = target_timezone or tzinfo
+        datetimes = datetimes.dt.tz_convert(normalized_zone).dt.tz_localize(None)
+    return datetimes
 
 
 @dataclass(frozen=True)
@@ -112,6 +132,7 @@ class StockPredictorAI:
         self.feature_assembler = FeatureAssembler(
             config.feature_toggles, config.prediction_horizons
         )
+        self.market_timezone: ZoneInfo | None = resolve_market_timezone(self.config)
         self.tracker = ExperimentTracker(config)
         self.models: dict[Tuple[str, int], Any] = {}
         self.preprocessors: dict[Tuple[str, int], Pipeline] = {}
@@ -312,8 +333,12 @@ class StockPredictorAI:
             else:
                 return price
 
-        price["Date"] = pd.to_datetime(price["Date"], errors="coerce")
-        macro["Date"] = pd.to_datetime(macro["Date"], errors="coerce")
+        price["Date"] = _normalize_datetime_series(
+            price["Date"], target_timezone=self.market_timezone
+        )
+        macro["Date"] = _normalize_datetime_series(
+            macro["Date"], target_timezone=self.market_timezone
+        )
         price = price.dropna(subset=["Date"])
         macro = macro.dropna(subset=["Date"])
 
