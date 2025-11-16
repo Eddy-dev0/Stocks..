@@ -51,37 +51,11 @@ class _ConstantModel:
         return [0.0]
 
 
-def test_predict_refreshes_metadata_when_prices_advance(tmp_path: Path) -> None:
-    """New price rows should trigger feature regeneration and metadata updates."""
-
-    initial_prices = pd.DataFrame(
-        {
-            "Date": pd.to_datetime(["2024-01-02", "2024-01-03"]),
-            "Close": [100.0, 101.0],
-        }
-    )
-
-    fetcher = _MutableFetcher(initial_prices)
-
-    config = PredictorConfig(
-        ticker="TEST",
-        sentiment=False,
-        prediction_targets=("close",),
-        prediction_horizons=(1,),
-        data_dir=tmp_path,
-        models_dir=tmp_path / "models",
-        model_params={"global": {}},
-    )
-    config.ensure_directories()
-
-    predictor = StockPredictorAI(config)
-    predictor.fetcher = fetcher
-    predictor.models[("close", 1)] = _ConstantModel()
-
-    prepare_calls = {"count": 0}
+def _install_minimal_prepare(predictor: StockPredictorAI, tracker: dict[str, int]) -> None:
+    """Install a deterministic ``prepare_features`` implementation for tests."""
 
     def _minimal_prepare(self, price_df=None, news_df=None):
-        prepare_calls["count"] += 1
+        tracker["count"] += 1
         if price_df is None:
             price_df = self.fetcher.fetch_price_data()
         working = price_df.copy()
@@ -110,6 +84,37 @@ def test_predict_refreshes_metadata_when_prices_advance(tmp_path: Path) -> None:
         return features, {}, {}
 
     predictor.prepare_features = types.MethodType(_minimal_prepare, predictor)
+
+
+def test_predict_refreshes_metadata_when_prices_advance(tmp_path: Path) -> None:
+    """New price rows should trigger feature regeneration and metadata updates."""
+
+    initial_prices = pd.DataFrame(
+        {
+            "Date": pd.to_datetime(["2024-01-02", "2024-01-03"]),
+            "Close": [100.0, 101.0],
+        }
+    )
+
+    fetcher = _MutableFetcher(initial_prices)
+
+    config = PredictorConfig(
+        ticker="TEST",
+        sentiment=False,
+        prediction_targets=("close",),
+        prediction_horizons=(1,),
+        data_dir=tmp_path,
+        models_dir=tmp_path / "models",
+        model_params={"global": {}},
+    )
+    config.ensure_directories()
+
+    predictor = StockPredictorAI(config)
+    predictor.fetcher = fetcher
+    predictor.models[("close", 1)] = _ConstantModel()
+
+    prepare_calls = {"count": 0}
+    _install_minimal_prepare(predictor, prepare_calls)
 
     first_result = predictor.predict(targets=("close",), horizon=1)
 
@@ -153,3 +158,65 @@ def test_predict_refreshes_metadata_when_prices_advance(tmp_path: Path) -> None:
     assert refreshed_target is not None
     assert refreshed_target > latest_metadata_date
     assert refreshed_target == second_as_of + pd.tseries.offsets.BDay(1)
+
+
+def test_predict_refreshes_with_mismatched_timezones(tmp_path: Path) -> None:
+    """Mixed timezone metadata should not prevent refresh detection."""
+
+    initial_prices = pd.DataFrame(
+        {
+            "Date": pd.date_range("2024-01-02", periods=2, freq="D", tz="UTC"),
+            "Close": [100.0, 101.0],
+        }
+    )
+
+    fetcher = _MutableFetcher(initial_prices)
+
+    config = PredictorConfig(
+        ticker="TEST",
+        sentiment=False,
+        prediction_targets=("close",),
+        prediction_horizons=(1,),
+        data_dir=tmp_path,
+        models_dir=tmp_path / "models",
+        model_params={"global": {}},
+    )
+    config.ensure_directories()
+
+    predictor = StockPredictorAI(config)
+    predictor.fetcher = fetcher
+    predictor.models[("close", 1)] = _ConstantModel()
+
+    prepare_calls = {"count": 0}
+    _install_minimal_prepare(predictor, prepare_calls)
+
+    first_result = predictor.predict(targets=("close",), horizon=1)
+    first_as_of = pd.to_datetime(first_result["market_data_as_of"])
+    assert first_as_of == pd.Timestamp("2024-01-03", tz="UTC")
+
+    # Simulate historical metadata persisted without timezone information.
+    predictor.metadata["latest_date"] = pd.Timestamp("2024-01-03")
+
+    updated_prices = pd.concat(
+        [
+            initial_prices,
+            pd.DataFrame(
+                {
+                    "Date": [pd.Timestamp("2024-01-04", tz="UTC")],
+                    "Close": [102.0],
+                }
+            ),
+        ],
+        ignore_index=True,
+    )
+    fetcher.set_price_data(updated_prices)
+
+    second_result = predictor.predict(targets=("close",), horizon=1)
+
+    assert prepare_calls["count"] == 2
+    second_as_of = pd.to_datetime(second_result["market_data_as_of"])
+    assert second_as_of == pd.Timestamp("2024-01-04", tz="UTC")
+    assert second_as_of > first_as_of
+
+    refreshed_date = pd.to_datetime(predictor.metadata.get("latest_date"))
+    assert refreshed_date == second_as_of

@@ -62,6 +62,27 @@ def _normalize_datetime_series(
     return datetimes
 
 
+def _normalize_timestamp(
+    value: Any, *, target_timezone: ZoneInfo | None
+) -> Optional[pd.Timestamp]:
+    """Normalize a single datetime-like value for staleness comparison."""
+
+    if value is None:
+        return None
+
+    try:
+        normalized = _normalize_datetime_series(
+            pd.Series([value]), target_timezone=target_timezone
+        )
+    except (TypeError, ValueError):
+        return None
+
+    timestamp = normalized.iloc[0]
+    if pd.isna(timestamp):
+        return None
+    return timestamp
+
+
 @dataclass(frozen=True)
 class TargetSpec:
     """Description of a supported prediction target."""
@@ -1074,7 +1095,9 @@ class StockPredictorAI:
             LOGGER.debug("Unable to fetch price data for staleness check: %s", exc)
         else:
             if not price_df.empty and "Date" in price_df.columns:
-                candidate_dates = pd.to_datetime(price_df["Date"], errors="coerce").dropna()
+                candidate_dates = _normalize_datetime_series(
+                    price_df["Date"], target_timezone=self.market_timezone
+                ).dropna()
                 if not candidate_dates.empty:
                     latest_price_timestamp = candidate_dates.iloc[-1]
 
@@ -1082,13 +1105,9 @@ class StockPredictorAI:
         if self.metadata:
             raw_latest = self.metadata.get("latest_date")
             if raw_latest is not None:
-                try:
-                    metadata_latest_timestamp = pd.to_datetime(raw_latest)
-                except (TypeError, ValueError):
-                    metadata_latest_timestamp = None
-                else:
-                    if pd.isna(metadata_latest_timestamp):
-                        metadata_latest_timestamp = None
+                metadata_latest_timestamp = _normalize_timestamp(
+                    raw_latest, target_timezone=self.market_timezone
+                )
 
         if latest_price_timestamp is not None:
             if metadata_latest_timestamp is None or latest_price_timestamp > metadata_latest_timestamp:
