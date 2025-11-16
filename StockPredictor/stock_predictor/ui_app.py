@@ -896,6 +896,7 @@ class StockPredictorDesktopApp:
             ("last_close", "Last close"),
             ("predicted_close", "Predicted close"),
             ("expected_low", "Expected low"),
+            ("stop_loss", "Stop loss"),
             ("expected_change", "Expected change"),
             ("direction", "Direction"),
         ]
@@ -2840,6 +2841,12 @@ class StockPredictorDesktopApp:
         expected_low_converted = self._convert_currency(expected_low_value)
         self.metric_vars["expected_low"].set(
             fmt_ccy(expected_low_converted, self.currency_symbol, decimals=decimals)
+        )
+
+        stop_loss_value = prediction.get("stop_loss") if isinstance(prediction, Mapping) else None
+        stop_loss_converted = self._convert_currency(stop_loss_value)
+        self.metric_vars["stop_loss"].set(
+            fmt_ccy(stop_loss_converted, self.currency_symbol, decimals=decimals)
         )
 
         change_display = fmt_ccy(change_converted, self.currency_symbol, decimals=decimals)

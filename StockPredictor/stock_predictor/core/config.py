@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 
 from dataclasses import dataclass, field, fields
@@ -114,6 +115,7 @@ class PredictorConfig:
     disabled_providers: tuple[str, ...] = field(default_factory=tuple)
     memory_cache_seconds: float | None = None
     market_timezone: str | None = None
+    k_stop: float = 1.0
 
     def __post_init__(self) -> None:
         self.ticker = self.ticker.upper()
@@ -190,6 +192,12 @@ class PredictorConfig:
         if self.market_timezone is not None:
             tz_str = str(self.market_timezone).strip()
             self.market_timezone = tz_str or None
+        try:
+            self.k_stop = float(self.k_stop)
+        except (TypeError, ValueError):
+            self.k_stop = 1.0
+        if not math.isfinite(self.k_stop) or self.k_stop <= 0:
+            self.k_stop = 1.0
 
     def ensure_directories(self) -> None:
         """Ensure that data and model directories exist."""
@@ -392,6 +400,7 @@ def build_config(
     price_provider_priority: Optional[Iterable[str] | str] = None,
     disabled_providers: Optional[Iterable[str] | str] = None,
     memory_cache_seconds: Optional[float] = None,
+    k_stop: Optional[float] = None,
 ) -> PredictorConfig:
     """Build a :class:`PredictorConfig` instance from string parameters."""
 
@@ -442,56 +451,68 @@ def build_config(
         except (TypeError, ValueError):
             memory_cache_float = None
 
-    config = PredictorConfig(
-        ticker=ticker.upper(),
-        start_date=start_dt,
-        end_date=end_dt,
-        interval=interval,
-        model_type=model_type,
-        data_dir=Path(data_dir).expanduser().resolve()
+    stop_loss_value = k_stop
+    if stop_loss_value is None:
+        stop_loss_env = os.getenv("STOCK_PREDICTOR_STOP_LOSS_K")
+        if stop_loss_env:
+            try:
+                stop_loss_value = float(stop_loss_env)
+            except (TypeError, ValueError):
+                stop_loss_value = None
+    config_kwargs: dict[str, Any] = {
+        "ticker": ticker.upper(),
+        "start_date": start_dt,
+        "end_date": end_dt,
+        "interval": interval,
+        "model_type": model_type,
+        "data_dir": Path(data_dir).expanduser().resolve()
         if data_dir
         else DEFAULT_DATA_DIR,
-        models_dir=Path(models_dir).expanduser().resolve()
+        "models_dir": Path(models_dir).expanduser().resolve()
         if models_dir
         else DEFAULT_MODELS_DIR,
-        news_api_key=news_api_key
+        "news_api_key": news_api_key
         or os.getenv("FINANCIALMODELINGPREP_API_KEY")
         or os.getenv("NEWS_API_KEY")
         or os.getenv("ALPHAVANTAGE_API_KEY"),
-        news_limit=news_limit,
-        sentiment=sentiment,
-        database_url=db_url,
-        feature_toggles=_coerce_feature_toggles(
+        "news_limit": news_limit,
+        "sentiment": sentiment,
+        "database_url": db_url,
+        "feature_toggles": _coerce_feature_toggles(
             feature_toggles if feature_toggles is not None else feature_sets
         ),
-        prediction_targets=_coerce_iterable(
+        "prediction_targets": _coerce_iterable(
             prediction_targets, DEFAULT_PREDICTION_TARGETS
         ),
-        prediction_horizons=_coerce_int_iterable(
+        "prediction_horizons": _coerce_int_iterable(
             prediction_horizons, DEFAULT_PREDICTION_HORIZONS
         ),
-        model_params=model_params or {"global": {}},
-        test_size=test_size if test_size is not None else DEFAULT_TEST_SIZE,
-        shuffle_training=_coerce_bool(shuffle_training, default=True),
-        backtest_strategy=backtest_strategy or DEFAULT_BACKTEST_STRATEGY,
-        backtest_window=backtest_window
+        "model_params": model_params or {"global": {}},
+        "test_size": test_size if test_size is not None else DEFAULT_TEST_SIZE,
+        "shuffle_training": _coerce_bool(shuffle_training, default=True),
+        "backtest_strategy": backtest_strategy or DEFAULT_BACKTEST_STRATEGY,
+        "backtest_window": backtest_window
         if backtest_window is not None
         else DEFAULT_BACKTEST_WINDOW,
-        backtest_step=backtest_step if backtest_step is not None else DEFAULT_BACKTEST_STEP,
-        volatility_window=
+        "backtest_step": backtest_step if backtest_step is not None else DEFAULT_BACKTEST_STEP,
+        "volatility_window":
         volatility_window if volatility_window is not None else DEFAULT_VOLATILITY_WINDOW,
-        research_api_keys=_coerce_iterable(
+        "research_api_keys": _coerce_iterable(
             research_keys_value,
             (),
         ),
-        research_allow_list=_coerce_iterable(
+        "research_allow_list": _coerce_iterable(
             research_allow_value,
             (),
         ),
-        price_provider_priority=_coerce_provider_tokens(provider_priority_value),
-        disabled_providers=_coerce_provider_tokens(disabled_providers_value),
-        memory_cache_seconds=memory_cache_float,
-    )
+        "price_provider_priority": _coerce_provider_tokens(provider_priority_value),
+        "disabled_providers": _coerce_provider_tokens(disabled_providers_value),
+        "memory_cache_seconds": memory_cache_float,
+    }
+    if stop_loss_value is not None:
+        config_kwargs["k_stop"] = stop_loss_value
+
+    config = PredictorConfig(**config_kwargs)
     config.ensure_directories()
     return config
 
@@ -623,6 +644,12 @@ def load_config_from_mapping(payload: Mapping[str, Any]) -> PredictorConfig:
 
     if "model_params" not in data or data["model_params"] is None:
         data["model_params"] = {"global": {}}
+
+    if "k_stop" in data and data["k_stop"] is not None:
+        try:
+            data["k_stop"] = float(data["k_stop"])
+        except (TypeError, ValueError):
+            data.pop("k_stop")
 
     config = PredictorConfig(**data)  # type: ignore[arg-type]
     config.ensure_directories()

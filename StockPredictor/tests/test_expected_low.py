@@ -18,6 +18,7 @@ from stock_predictor.ui_app import StockPredictorDesktopApp  # noqa: E402  pylin
 
 class _ConfigStub:
     expected_low_sigma = 1.0
+    k_stop = 1.0
 
 
 @pytest.mark.parametrize("volatility", [0.02, -0.02])
@@ -91,6 +92,43 @@ def test_model_expected_low_prefers_indicator_floor() -> None:
     )
 
     assert expected_low == pytest.approx(94.5)
+
+
+def test_model_stop_loss_uses_percentage_formula() -> None:
+    predictor = StockPredictorAI.__new__(StockPredictorAI)
+    predictor.config = _ConfigStub()
+
+    stop_loss = predictor._compute_stop_loss(  # type: ignore[attr-defined]
+        100.0,
+        0.02,
+    )
+
+    assert stop_loss == pytest.approx(98.0)
+
+
+def test_model_stop_loss_is_clamped_between_zero_and_close() -> None:
+    predictor = StockPredictorAI.__new__(StockPredictorAI)
+    predictor.config = _ConfigStub()
+
+    stop_loss = predictor._compute_stop_loss(  # type: ignore[attr-defined]
+        10.0,
+        5.0,
+    )
+
+    assert stop_loss == pytest.approx(0.0)
+
+
+def test_model_stop_loss_falls_back_to_expected_low() -> None:
+    predictor = StockPredictorAI.__new__(StockPredictorAI)
+    predictor.config = _ConfigStub()
+
+    stop_loss = predictor._compute_stop_loss(  # type: ignore[attr-defined]
+        100.0,
+        None,
+        expected_low=92.0,
+    )
+
+    assert stop_loss == pytest.approx(92.0)
 
 
 def test_ui_expected_low_uses_indicator_snapshot() -> None:

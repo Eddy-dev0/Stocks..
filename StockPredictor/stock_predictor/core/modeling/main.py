@@ -42,6 +42,7 @@ from ..models import (
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_EXPECTED_LOW_SIGMA = 1.0
+DEFAULT_STOP_LOSS_MULTIPLIER = 1.0
 
 
 LabelFunction = Callable[[pd.DataFrame, int, int], pd.Series]
@@ -1346,6 +1347,11 @@ class StockPredictorAI:
             prediction_intervals=prediction_intervals,
             indicator_floor=indicator_floor,
         )
+        stop_loss = self._compute_stop_loss(
+            close_prediction,
+            predicted_volatility,
+            expected_low=expected_low,
+        )
 
         uncertainty_clean: dict[str, Dict[str, float]] = {}
         for tgt, values in uncertainties.items():
@@ -1384,6 +1390,7 @@ class StockPredictorAI:
             "predicted_return": predicted_return,
             "predicted_volatility": predicted_volatility,
             "expected_low": expected_low,
+            "stop_loss": stop_loss,
             "direction_probability_up": direction_probability_up,
             "direction_probability_down": direction_probability_down,
             "predictions": predictions,
@@ -1521,6 +1528,43 @@ class StockPredictorAI:
             delta = 0.0
         expected_low = float(numeric_close - delta)
         return float(max(0.0, expected_low))
+
+    def _compute_stop_loss(
+        self,
+        predicted_close: Any,
+        predicted_volatility: Any,
+        *,
+        expected_low: Any = None,
+    ) -> Optional[float]:
+        """Derive a stop-loss level using the forecasted volatility."""
+
+        numeric_close = self._safe_float(predicted_close)
+        fallback_low = self._safe_float(expected_low)
+        if numeric_close is None:
+            return fallback_low
+
+        volatility_pct = self._safe_float(predicted_volatility)
+        if volatility_pct is None:
+            if fallback_low is None:
+                return None
+            return float(max(0.0, min(numeric_close, fallback_low)))
+
+        multiplier = getattr(self.config, "k_stop", DEFAULT_STOP_LOSS_MULTIPLIER)
+        try:
+            multiplier_value = float(multiplier)
+        except (TypeError, ValueError):
+            multiplier_value = DEFAULT_STOP_LOSS_MULTIPLIER
+        if not np.isfinite(multiplier_value) or multiplier_value <= 0:
+            multiplier_value = DEFAULT_STOP_LOSS_MULTIPLIER
+
+        volatility_pct = abs(float(volatility_pct))
+        delta = float(numeric_close) * volatility_pct * multiplier_value
+        if not np.isfinite(delta):
+            delta = 0.0
+
+        stop_loss = float(numeric_close - delta)
+        stop_loss = max(0.0, min(float(numeric_close), stop_loss))
+        return float(stop_loss)
 
     def _indicator_support_floor(self) -> tuple[Optional[float], Dict[str, float]]:
         latest_features = None
