@@ -29,7 +29,7 @@ from ..ml_preprocessing import (
     PreprocessingBuilder,
     get_feature_names_from_pipeline,
 )
-from ..pipeline import resolve_market_timezone
+from ..pipeline import DEFAULT_MARKET_TIMEZONE, US_MARKET_CLOSE, resolve_market_timezone
 from ..support_levels import indicator_support_floor
 from ..models import (
     ModelFactory,
@@ -219,6 +219,13 @@ class StockPredictorAI:
         metadata["horizons"] = horizons
         metadata["active_horizon"] = self.horizon
 
+        latest_close, latest_date = self._latest_settled_close(price_df)
+        if latest_close is not None:
+            metadata["latest_close"] = latest_close
+            if latest_date is not None:
+                metadata["latest_date"] = latest_date
+                metadata.setdefault("market_data_as_of", latest_date)
+
         volatility_spec = TARGET_SPECS.get("volatility")
         if volatility_spec and volatility_spec.label_fn:
             window = getattr(self.config, "volatility_window", 20)
@@ -296,6 +303,59 @@ class StockPredictorAI:
         self.metadata = metadata
         self.preprocessor_templates = templates
         return features, feature_result.targets, templates
+
+    def _latest_settled_close(
+        self, price_df: Optional[pd.DataFrame]
+    ) -> tuple[float | None, pd.Timestamp | None]:
+        """Return the last completed session's close and timestamp.
+
+        Intraday intervals can surface prices for the current trading session,
+        which are not representative of the previous official close. This
+        helper walks backward from the current (or most recent) completed
+        session to find the latest settled close value.
+        """
+
+        if price_df is None or price_df.empty:
+            return None, None
+        if "Date" not in price_df.columns or "Close" not in price_df.columns:
+            return None, None
+
+        market_tz = self.market_timezone or DEFAULT_MARKET_TIMEZONE
+        frame = price_df.copy()
+        frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+        frame["Close"] = pd.to_numeric(frame["Close"], errors="coerce")
+        frame = frame.dropna(subset=["Date", "Close"])
+        if frame.empty:
+            return None, None
+
+        if getattr(frame["Date"].dt, "tz", None) is None:
+            frame["Date"] = frame["Date"].dt.tz_localize(market_tz)
+        else:
+            frame["Date"] = frame["Date"].dt.tz_convert(market_tz)
+
+        frame = frame.sort_values("Date")
+        available_dates = frame["Date"].dt.date
+        earliest_date = available_dates.min()
+        now = datetime.now(market_tz)
+        session_date = now.date()
+        if (now.hour, now.minute, now.second) < (
+            US_MARKET_CLOSE.hour,
+            US_MARKET_CLOSE.minute,
+            US_MARKET_CLOSE.second,
+        ):
+            session_date = session_date - timedelta(days=1)
+
+        while session_date not in set(available_dates):
+            session_date = session_date - timedelta(days=1)
+            if earliest_date is not None and session_date < earliest_date:
+                return None, None
+
+        settled_rows = frame[frame["Date"].dt.date == session_date]
+        if settled_rows.empty:
+            return None, None
+
+        latest_row = settled_rows.iloc[-1]
+        return float(latest_row["Close"]), latest_row["Date"]
 
     def _load_macro_indicators(self) -> pd.DataFrame:
         """Load cached macro indicator close series and pivot them by date."""
