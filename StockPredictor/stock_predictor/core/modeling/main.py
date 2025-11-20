@@ -1358,25 +1358,13 @@ class StockPredictorAI:
         if isinstance(target_dates, dict):
             target_date = target_dates.get(resolved_horizon)
 
-        latest_timestamp: Optional[pd.Timestamp] = None
-        if latest_date is not None:
-            try:
-                latest_timestamp = pd.to_datetime(latest_date)
-            except (TypeError, ValueError):
-                latest_timestamp = None
-            else:
-                if pd.isna(latest_timestamp):
-                    latest_timestamp = None
+        latest_timestamp = _normalize_timestamp(
+            latest_date, target_timezone=self.market_timezone
+        )
 
-        target_timestamp: Optional[pd.Timestamp] = None
-        if target_date is not None:
-            try:
-                target_timestamp = pd.to_datetime(target_date)
-            except (TypeError, ValueError):
-                target_timestamp = None
-            else:
-                if pd.isna(target_timestamp):
-                    target_timestamp = None
+        target_timestamp = _normalize_timestamp(
+            target_date, target_timezone=self.market_timezone
+        )
 
         if latest_timestamp is not None:
             if target_timestamp is None or target_timestamp <= latest_timestamp:
