@@ -14,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from stock_predictor.core.config import PredictorConfig
+from stock_predictor.core.data_pipeline import AsyncDataPipeline, PRICE_LOOKBACK_DAYS
 from stock_predictor.core.pipeline import MarketDataETL, NoPriceDataError
 from stock_predictor.providers.base import (
     DatasetType,
@@ -187,3 +188,50 @@ def test_latest_trading_session_with_midday_utc_reference_returns_previous_day()
     session = etl._latest_trading_session(reference=reference)
 
     assert session == date(2024, 3, 26)
+
+
+class _NullRegistry:
+    async def aclose(self) -> None:  # pragma: no cover - helper
+        return None
+
+    async def fetch_all(self, request):  # pragma: no cover - helper
+        raise RuntimeError("fetch_all should not be invoked in these tests")
+
+
+def test_default_params_use_cached_price_start(tmp_path) -> None:
+    db_file = tmp_path / "prices.db"
+    database = Database(f"sqlite:///{db_file}")
+    config = PredictorConfig(ticker="AAPL", start_date=date(2023, 1, 1))
+
+    cached_dates = pd.date_range("2024-01-01", periods=5, freq="B")
+    cached_prices = pd.DataFrame({"Date": cached_dates, "Close": [100 + i for i in range(5)]})
+    database.upsert_prices("AAPL", "1d", cached_prices)
+
+    pipeline = AsyncDataPipeline(config, registry=_NullRegistry(), database=database)
+
+    params = pipeline._default_params(DatasetType.PRICES)
+
+    expected_start = (cached_dates[-1].date() + timedelta(days=1)).isoformat()
+    assert params["start"] == expected_start
+    assert params["interval"] == "1d"
+
+
+def test_default_params_use_conservative_lookback_when_cache_empty(monkeypatch, tmp_path) -> None:
+    db_file = tmp_path / "prices.db"
+    database = Database(f"sqlite:///{db_file}")
+
+    config = PredictorConfig(ticker="MSFT", start_date=date(2020, 1, 1))
+
+    class _FixedDate(date):
+        @classmethod
+        def today(cls) -> date:  # pragma: no cover - deterministic override
+            return date(2024, 4, 15)
+
+    monkeypatch.setattr("stock_predictor.core.data_pipeline.date", _FixedDate)
+
+    pipeline = AsyncDataPipeline(config, registry=_NullRegistry(), database=database)
+
+    params = pipeline._default_params(DatasetType.PRICES)
+
+    expected_start = (_FixedDate.today() - timedelta(days=PRICE_LOOKBACK_DAYS)).isoformat()
+    assert params["start"] == expected_start

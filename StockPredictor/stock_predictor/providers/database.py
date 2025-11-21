@@ -911,6 +911,17 @@ class Database:
         frame = pd.DataFrame(data)
         return frame
 
+    def get_latest_price_date(self, ticker: str, interval: str) -> date | None:
+        stmt = (
+            select(Price.date)
+            .where(Price.ticker == ticker, Price.interval == interval)
+            .order_by(Price.date.desc())
+            .limit(1)
+        )
+        with self.session() as session:
+            latest = session.execute(stmt).scalar_one_or_none()
+        return latest
+
     def get_indicators(
         self,
         ticker: str,
