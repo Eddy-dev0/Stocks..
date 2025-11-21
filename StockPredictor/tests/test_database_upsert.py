@@ -75,3 +75,43 @@ def test_upsert_prices_batches_large_payload(tmp_path) -> None:
         )
 
     assert len(rows) == len(frame)
+
+
+def test_upsert_prices_appends_without_duplicates(tmp_path) -> None:
+    """Repeated price upserts should not duplicate historical dates."""
+
+    db_file = tmp_path / "prices.db"
+    database = Database(f"sqlite:///{db_file}")
+
+    initial_dates = pd.date_range("2024-02-01", periods=3, freq="B")
+    initial = pd.DataFrame(
+        {
+            "Date": initial_dates,
+            "Open": [100.0, 101.0, 102.0],
+            "High": [101.0, 102.0, 103.0],
+            "Low": [99.0, 100.0, 101.0],
+            "Close": [100.5, 101.5, 102.5],
+            "Adj Close": [100.5, 101.5, 102.5],
+            "Volume": [1_000_000, 1_100_000, 1_200_000],
+        }
+    )
+
+    follow_on = pd.DataFrame(
+        {
+            "Date": pd.date_range("2024-02-05", periods=3, freq="B"),
+            "Open": [103.0, 104.0, 105.0],
+            "High": [104.0, 105.0, 106.0],
+            "Low": [102.0, 103.0, 104.0],
+            "Close": [103.5, 104.5, 105.5],
+            "Adj Close": [103.5, 104.5, 105.5],
+            "Volume": [1_300_000, 1_400_000, 1_500_000],
+        }
+    )
+
+    database.upsert_prices("AAPL", "1d", initial)
+    database.upsert_prices("AAPL", "1d", follow_on)
+
+    prices = database.get_prices("AAPL", "1d")
+
+    assert len(prices) == 5
+    assert prices.iloc[-1]["Date"].date() == follow_on.iloc[-1]["Date"].date()

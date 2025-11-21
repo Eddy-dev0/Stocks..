@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import Counter
+from datetime import date, timedelta
 from typing import Iterable, Mapping, Sequence
 
 import pandas as pd
@@ -24,6 +25,7 @@ from stock_predictor.providers.base import (
 from stock_predictor.providers.database import Database
 
 LOGGER = logging.getLogger(__name__)
+PRICE_LOOKBACK_DAYS = 90
 
 
 class PipelineResult:
@@ -73,6 +75,7 @@ class AsyncDataPipeline:
         )
         self.database = database or Database(config.database_url)
         self._closed = False
+        self._latest_price_date: date | None = None
 
     async def aclose(self) -> None:
         if self._closed:
@@ -116,8 +119,9 @@ class AsyncDataPipeline:
             params: dict[str, object] = {
                 "interval": self.config.interval,
             }
-            if self.config.start_date:
-                params["start"] = self.config.start_date.isoformat()
+            start_date = self._price_request_start()
+            if start_date:
+                params["start"] = start_date.isoformat()
             if self.config.end_date:
                 params["end"] = self.config.end_date.isoformat()
             loader_path = self._price_loader_path()
@@ -160,6 +164,22 @@ class AsyncDataPipeline:
             return frame, persisted, source_counts
         LOGGER.info("No persistence strategy for dataset %s", dataset)
         return None, 0, source_counts
+
+    def _price_request_start(self) -> date:
+        """Determine the earliest date to request from price providers."""
+
+        if self._latest_price_date is None:
+            self._latest_price_date = self.database.get_latest_price_date(
+                self.config.ticker, self.config.interval
+            )
+
+        if self._latest_price_date:
+            return self._latest_price_date + timedelta(days=1)
+
+        conservative_start = date.today() - timedelta(days=PRICE_LOOKBACK_DAYS)
+        if self.config.start_date:
+            return max(self.config.start_date, conservative_start)
+        return conservative_start
 
     def _price_loader_path(self) -> str | None:
         """Return the configured path for local price loaders, if any."""
