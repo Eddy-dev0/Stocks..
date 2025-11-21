@@ -63,6 +63,60 @@ HORIZON_UNIT_TO_DAYS: dict[str, int] = {
 
 
 @dataclass
+class BuyZoneConfirmationSettings:
+    """Tunable thresholds for buy-zone confirmation checks."""
+
+    enable_rsi: bool = True
+    rsi_threshold: float = 40.0
+    enable_macd: bool = True
+    macd_hist_threshold: float = 0.0
+    enable_bollinger: bool = True
+    bollinger_proximity_pct: float = 0.02
+    enable_volatility: bool = True
+    max_atr_fraction_of_price: float = 0.04
+    enable_volume: bool = True
+    obv_lookback: int = 5
+    mfi_threshold: float = 45.0
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any] | None) -> "BuyZoneConfirmationSettings":
+        if not isinstance(payload, Mapping):
+            return cls()
+
+        def _coerce_bool(key: str, default: bool) -> bool:
+            raw = payload.get(key, default)
+            if isinstance(raw, str):
+                return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+            return bool(raw)
+
+        def _coerce_float(key: str, default: float) -> float:
+            try:
+                return float(payload.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        def _coerce_int(key: str, default: int) -> int:
+            try:
+                return int(payload.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        return cls(
+            enable_rsi=_coerce_bool("enable_rsi", True),
+            rsi_threshold=_coerce_float("rsi_threshold", 40.0),
+            enable_macd=_coerce_bool("enable_macd", True),
+            macd_hist_threshold=_coerce_float("macd_hist_threshold", 0.0),
+            enable_bollinger=_coerce_bool("enable_bollinger", True),
+            bollinger_proximity_pct=_coerce_float("bollinger_proximity_pct", 0.02),
+            enable_volatility=_coerce_bool("enable_volatility", True),
+            max_atr_fraction_of_price=_coerce_float("max_atr_fraction_of_price", 0.04),
+            enable_volume=_coerce_bool("enable_volume", True),
+            obv_lookback=_coerce_int("obv_lookback", 5),
+            mfi_threshold=_coerce_float("mfi_threshold", 45.0),
+        )
+
+
+@dataclass
 class PredictorConfig:
     """Runtime configuration for :class:`StockPredictorAI`."""
 
@@ -118,6 +172,9 @@ class PredictorConfig:
     k_stop: float = 1.0
     time_series_baselines: tuple[str, ...] = field(default_factory=tuple)
     time_series_params: dict[str, dict[str, Any]] = field(default_factory=dict)
+    buy_zone: BuyZoneConfirmationSettings = field(
+        default_factory=BuyZoneConfirmationSettings
+    )
 
     def __post_init__(self) -> None:
         self.ticker = self.ticker.upper()
@@ -204,6 +261,10 @@ class PredictorConfig:
             self.k_stop = 1.0
         if not math.isfinite(self.k_stop) or self.k_stop <= 0:
             self.k_stop = 1.0
+        if isinstance(self.buy_zone, Mapping):
+            self.buy_zone = BuyZoneConfirmationSettings.from_mapping(self.buy_zone)
+        elif not isinstance(self.buy_zone, BuyZoneConfirmationSettings):
+            self.buy_zone = BuyZoneConfirmationSettings()
 
     def ensure_directories(self) -> None:
         """Ensure that data and model directories exist."""
@@ -409,6 +470,7 @@ def build_config(
     k_stop: Optional[float] = None,
     time_series_baselines: Optional[Iterable[str] | str] = None,
     time_series_params: Optional[Mapping[str, Mapping[str, Any]] | str] = None,
+    buy_zone: Optional[Mapping[str, Any]] = None,
 ) -> PredictorConfig:
     """Build a :class:`PredictorConfig` instance from string parameters."""
 
@@ -533,6 +595,7 @@ def build_config(
         "memory_cache_seconds": memory_cache_float,
         "time_series_baselines": baseline_models,
         "time_series_params": baseline_params,
+        "buy_zone": buy_zone,
     }
     if stop_loss_value is not None:
         config_kwargs["k_stop"] = stop_loss_value
