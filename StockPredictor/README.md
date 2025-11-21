@@ -20,6 +20,8 @@ scenarios.
   sentiment information.
 - Machine learning model (Random Forest Regressor) with persisted metrics and
   trained model artefacts.
+- Optional classical time-series baselines (ARIMA, Holt-Winters, Prophet) with
+  seasonal controls for quick benchmarking against the ML stack.
 - Local SQLite database that stores prices, indicators, fundamentals and news
   for fast reuse across runs.
 - Extended database coverage for corporate events, options analytics,
@@ -111,6 +113,24 @@ dashboard. Closing the Tkinter window gracefully terminates the dashboard
 process.
 
 Run `python main.py --help` for the full list of options and defaults.
+
+### Time-series baselines
+
+Enable classical baselines for the regression targets by providing the
+`STOCK_PREDICTOR_TIME_SERIES_BASELINES` environment variable (comma-separated):
+
+```bash
+export STOCK_PREDICTOR_TIME_SERIES_BASELINES=arima,holt_winters,prophet
+# Optional seasonal tuning shared across baselines and model-specific overrides
+export STOCK_PREDICTOR_TIME_SERIES_PARAMS='{"global": {"seasonal_periods": 5}, "prophet": {"fourier_order": 7}}'
+```
+
+The training/evaluation pipeline will fit these univariate forecasters on the
+historical price targets using the same holdout, time-series CV, or rolling
+splits as the ML models. Metrics for each baseline (RMSE/MAE/MAPE) are stored
+alongside the existing model evaluation payloads under the `baselines` key in
+the persisted JSON metrics, making it easy to compare classical forecasts with
+the feature-driven models.
 
 ## Database configuration
 

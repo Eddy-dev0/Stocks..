@@ -116,6 +116,8 @@ class PredictorConfig:
     memory_cache_seconds: float | None = None
     market_timezone: str | None = None
     k_stop: float = 1.0
+    time_series_baselines: tuple[str, ...] = field(default_factory=tuple)
+    time_series_params: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.ticker = self.ticker.upper()
@@ -187,6 +189,10 @@ class PredictorConfig:
         self.disabled_providers = self._normalise_strings(
             self.disabled_providers, lower=True
         )
+        self.time_series_baselines = self._normalise_strings(
+            self.time_series_baselines, lower=True
+        )
+        self.time_series_params = self._normalise_model_params(self.time_series_params)
         if self.memory_cache_seconds is not None:
             self.memory_cache_seconds = max(60.0, float(self.memory_cache_seconds))
         if self.market_timezone is not None:
@@ -401,6 +407,8 @@ def build_config(
     disabled_providers: Optional[Iterable[str] | str] = None,
     memory_cache_seconds: Optional[float] = None,
     k_stop: Optional[float] = None,
+    time_series_baselines: Optional[Iterable[str] | str] = None,
+    time_series_params: Optional[Mapping[str, Mapping[str, Any]] | str] = None,
 ) -> PredictorConfig:
     """Build a :class:`PredictorConfig` instance from string parameters."""
 
@@ -459,6 +467,21 @@ def build_config(
                 stop_loss_value = float(stop_loss_env)
             except (TypeError, ValueError):
                 stop_loss_value = None
+    baselines_value = time_series_baselines or os.getenv(
+        "STOCK_PREDICTOR_TIME_SERIES_BASELINES"
+    )
+    baseline_models = _coerce_iterable(baselines_value, ())
+    params_value = time_series_params or os.getenv("STOCK_PREDICTOR_TIME_SERIES_PARAMS")
+    baseline_params: dict[str, dict[str, Any]] = {}
+    if isinstance(params_value, str):
+        try:
+            loaded = json.loads(params_value)
+            if isinstance(loaded, Mapping):
+                baseline_params = dict(loaded)  # type: ignore[arg-type]
+        except json.JSONDecodeError:
+            baseline_params = {}
+    elif isinstance(params_value, Mapping):
+        baseline_params = dict(params_value)
     config_kwargs: dict[str, Any] = {
         "ticker": ticker.upper(),
         "start_date": start_dt,
@@ -508,6 +531,8 @@ def build_config(
         "price_provider_priority": _coerce_provider_tokens(provider_priority_value),
         "disabled_providers": _coerce_provider_tokens(disabled_providers_value),
         "memory_cache_seconds": memory_cache_float,
+        "time_series_baselines": baseline_models,
+        "time_series_params": baseline_params,
     }
     if stop_loss_value is not None:
         config_kwargs["k_stop"] = stop_loss_value
@@ -644,6 +669,21 @@ def load_config_from_mapping(payload: Mapping[str, Any]) -> PredictorConfig:
 
     if "model_params" not in data or data["model_params"] is None:
         data["model_params"] = {"global": {}}
+
+    if "time_series_baselines" in data:
+        data["time_series_baselines"] = _coerce_iterable(
+            data["time_series_baselines"], ()
+        )
+
+    if "time_series_params" in payload and "time_series_params" not in data:
+        params_payload = payload.get("time_series_params")
+        if isinstance(params_payload, str):
+            try:
+                params_payload = json.loads(params_payload)
+            except json.JSONDecodeError:
+                params_payload = None
+        if params_payload is not None:
+            data["time_series_params"] = params_payload
 
     if "k_stop" in data and data["k_stop"] is not None:
         try:
