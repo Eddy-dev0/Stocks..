@@ -7,6 +7,7 @@ import os
 from datetime import date, timedelta
 from typing import Any, Dict, List
 
+import altair as alt
 import pandas as pd
 import requests
 import streamlit as st
@@ -104,6 +105,122 @@ def _normalise_timeseries(frame: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
+def _extract_forecast_low(payload: Any) -> float | None:
+    frame = _coerce_dataframe(payload)
+    if frame is not None and not frame.empty:
+        numeric_cols = frame.select_dtypes("number").columns
+        for candidate in ("close", "price", "prediction", "yhat"):
+            if candidate in frame.columns:
+                return float(frame[candidate].min())
+        if not numeric_cols.empty:
+            return float(frame[numeric_cols].min().min())
+    if isinstance(payload, dict):
+        for key in ("forecasts", "forecast", "predictions", "values"):
+            if key in payload:
+                return _extract_forecast_low(payload[key])
+    if isinstance(payload, list):
+        for item in payload:
+            nested = _extract_forecast_low(item)
+            if nested is not None:
+                return nested
+    return None
+
+
+def _derive_buy_zone(frame: pd.DataFrame, forecast_low: float | None) -> Dict[str, Any] | None:
+    if "close" not in frame.columns:
+        return None
+
+    working = frame.copy()
+    close = working["close"].astype(float)
+
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(window=14, min_periods=14).mean()
+    avg_loss = loss.rolling(window=14, min_periods=14).mean()
+    rs = avg_gain / avg_loss.replace(0, pd.NA)
+    working["RSI14"] = 100 - (100 / (1 + rs))
+
+    ema_12 = close.ewm(span=12, adjust=False).mean()
+    ema_26 = close.ewm(span=26, adjust=False).mean()
+    working["MACD"] = ema_12 - ema_26
+    working["MACD_signal"] = working["MACD"].ewm(span=9, adjust=False).mean()
+    working["MACD_cross_up"] = (working["MACD"] > working["MACD_signal"]) & (
+        working["MACD"].shift(1) <= working["MACD_signal"].shift(1)
+    )
+
+    working["BB_mid"] = close.rolling(window=20, min_periods=20).mean()
+    rolling_std = close.rolling(window=20, min_periods=20).std()
+    working["BB_lower"] = working["BB_mid"] - 2 * rolling_std
+    working["BB_upper"] = working["BB_mid"] + 2 * rolling_std
+
+    conditions = (
+        (working["RSI14"] < 30)
+        & working["MACD_cross_up"].fillna(False)
+        & (close <= working["BB_lower"])
+    )
+    candidates = working[conditions]
+    if candidates.empty:
+        return None
+
+    base_low = float(candidates["close"].min())
+    price_low = min(base_low, forecast_low) if forecast_low is not None else base_low
+    price_high = max(float(candidates["close"].max()), price_low * 1.02)
+    return {
+        "start": candidates.index.min(),
+        "end": candidates.index.max(),
+        "price_low": price_low,
+        "price_high": price_high,
+        "reason": (
+            "RSI < 30 with bullish MACD crossover and lower Bollinger-band touch"
+            "; anchored near forecasted lows" if forecast_low is not None else "RSI < 30 with bullish MACD crossover and lower Bollinger-band touch"
+        ),
+    }
+
+
+def _build_price_chart(
+    frame: pd.DataFrame,
+    *,
+    buy_zone: Dict[str, Any] | None = None,
+    show_buy_zone: bool = True,
+) -> alt.Chart:
+    time_index = frame.index.name or "timestamp"
+    data_frame = frame.reset_index().rename(columns={frame.index.name or "index": "time"})
+    value_vars = ["close"]
+    for candidate in ("MA20", "MA50"):
+        if candidate in data_frame.columns:
+            value_vars.append(candidate)
+    melted = data_frame.melt("time", value_vars=value_vars, var_name="series", value_name="value")
+
+    line_chart = (
+        alt.Chart(melted)
+        .mark_line()
+        .encode(
+            x=alt.X("time:T", title=time_index.capitalize()),
+            y=alt.Y("value:Q", title="Price"),
+            color=alt.Color("series:N", title="Series"),
+            tooltip=["time:T", "series:N", "value:Q"],
+        )
+    )
+
+    overlays: List[alt.Chart] = [line_chart]
+    if show_buy_zone and buy_zone:
+        rect_frame = pd.DataFrame([buy_zone])
+        overlays.append(
+            alt.Chart(rect_frame)
+            .mark_rect(opacity=0.15, color="steelblue")
+            .encode(
+                x=alt.X("start:T", title=time_index.capitalize()),
+                x2="end:T",
+                y="price_low:Q",
+                y2="price_high:Q",
+                tooltip=["reason"],
+            )
+        )
+
+    return alt.layer(*overlays).resolve_scale(color="independent")
+
+
 def _download_button(label: str, data: Any, file_name: str, mime: str) -> None:
     if data is None:
         return
@@ -157,12 +274,39 @@ with col_data:
     frame = _coerce_dataframe(payload)
     if frame is not None and not frame.empty:
         frame = _normalise_timeseries(frame)
-        numeric_cols = frame.select_dtypes("number").columns
-        if "close" in frame.columns and "close" in numeric_cols:
+        forecast_low = _extract_forecast_low(st.session_state.get("forecast_response"))
+        buy_zone = _derive_buy_zone(frame, forecast_low)
+        if "close" in frame.columns and "close" in frame.select_dtypes("number").columns:
             frame["MA20"] = frame["close"].rolling(window=20, min_periods=1).mean()
             frame["MA50"] = frame["close"].rolling(window=50, min_periods=1).mean()
-            numeric_cols = list(dict.fromkeys(list(numeric_cols) + ["MA20", "MA50"]))
-        st.line_chart(frame[numeric_cols])
+        show_buy_zone = st.checkbox(
+            "Show buy-zone overlay",
+            value=bool(buy_zone),
+            help="Highlight windows where RSI < 30, MACD crosses up, and price hugs the lower Bollinger band (anchored near forecast lows when available).",
+        )
+        st.altair_chart(
+            _build_price_chart(frame, buy_zone=buy_zone, show_buy_zone=show_buy_zone),
+            use_container_width=True,
+        )
+        with st.expander("How is the buy-zone derived?"):
+            st.markdown(
+                "The shaded region captures sessions where:\n"
+                "- 14-day RSI dips below 30 (oversold)\n"
+                "- The MACD line crosses above its signal (bullish momentum shift)\n"
+                "- Closing price touches/under-cuts the 20-day lower Bollinger band\n"
+                "If forecast data is present, the price floor leans on forecasted lows."
+            )
+            if buy_zone:
+                st.write(
+                    "Start:",
+                    buy_zone["start"],
+                    "| End:",
+                    buy_zone["end"],
+                    "| Price window:",
+                    f"${buy_zone['price_low']:.2f} - ${buy_zone['price_high']:.2f}",
+                )
+            else:
+                st.caption("No qualifying buy-zone window detected for the current view.")
         st.dataframe(frame.tail(20), use_container_width=True)
         _download_button(
             "Download data (CSV)",
