@@ -1498,6 +1498,8 @@ class StockPredictorAI:
             expected_low=expected_low,
         )
 
+        beta_metrics, beta_notes = self._beta_context()
+
         uncertainty_clean: dict[str, Dict[str, float]] = {}
         for tgt, values in uncertainties.items():
             numeric_values = {
@@ -1558,6 +1560,10 @@ class StockPredictorAI:
             result["quantile_forecasts"] = quantile_forecasts
         if prediction_intervals:
             result["prediction_intervals"] = prediction_intervals
+        if beta_metrics:
+            result["beta_metrics"] = beta_metrics
+        if beta_notes:
+            result["beta_warnings"] = beta_notes
         if training_report:
             result["training_metrics"] = training_report
         if prediction_warnings:
@@ -2032,6 +2038,10 @@ class StockPredictorAI:
         if quantiles:
             risk_guidance["quantiles"] = quantiles
 
+        beta_metrics, beta_rationales = self._beta_context()
+        if beta_metrics:
+            risk_guidance["beta"] = beta_metrics
+
         expected_pct_value = (
             float(expected_return * 100) if expected_return is not None else None
         )
@@ -2042,6 +2052,7 @@ class StockPredictorAI:
             "expected_return_pct": expected_pct_value,
             "key_drivers": key_drivers,
             "risk_guidance": risk_guidance,
+            "risk_rationale": beta_rationales,
         }
 
     def _technical_reasons(self, feature_row: pd.Series) -> list[str]:
@@ -2201,7 +2212,95 @@ class StockPredictorAI:
         if trend_curvature is not None and trend_curvature < 0:
             reasons.append("Trend curvature turning lower, hinting at deceleration in momentum.")
 
+        _, beta_reasons = self._beta_context(feature_row)
+        reasons.extend(beta_reasons)
+
         return reasons
+
+    def _beta_context(
+        self, feature_row: pd.Series | None = None
+    ) -> tuple[Dict[str, Dict[str, float]], list[str]]:
+        latest_features = None
+        if feature_row is None:
+            if isinstance(getattr(self, "metadata", None), Mapping):
+                latest_features = self.metadata.get("latest_features")
+            if isinstance(latest_features, pd.DataFrame) and not latest_features.empty:
+                try:
+                    feature_row = latest_features.iloc[0]
+                except (KeyError, IndexError):
+                    feature_row = None
+        if feature_row is None:
+            return {}, []
+
+        beta_values: Dict[str, Dict[str, float]] = {}
+        rationales: list[str] = []
+
+        for column, value in feature_row.items():
+            name = str(column)
+            if not name.startswith("Beta_"):
+                continue
+
+            numeric_value = self._safe_float(value)
+            if numeric_value is None:
+                continue
+
+            parts = name.split("_")
+            if len(parts) < 3:
+                continue
+
+            benchmark_key = parts[1].lower()
+            try:
+                window = int(parts[2])
+            except (TypeError, ValueError):
+                window = None
+
+            current = beta_values.get(benchmark_key)
+            if current is not None and window is not None and "window" in current:
+                try:
+                    current_window = int(current.get("window"))
+                except (TypeError, ValueError):
+                    current_window = None
+                if current_window is not None and window >= current_window:
+                    continue
+
+            label = self._format_beta_label(benchmark_key)
+            beta_payload: Dict[str, float] = {"label": label, "value": float(numeric_value)}
+            if window is not None:
+                beta_payload["window"] = int(window)
+
+            risk_level = self._beta_risk_band(numeric_value)
+            if risk_level:
+                beta_payload["risk_level"] = risk_level
+
+            beta_values[benchmark_key] = beta_payload
+
+            if numeric_value >= 1.5:
+                rationales.append(
+                    f"{label} beta at {numeric_value:.2f} (>1.5) signals elevated sensitivity to market swings."
+                )
+            elif numeric_value <= 0.7:
+                rationales.append(
+                    f"{label} beta at {numeric_value:.2f} (<0.7) points to a more defensive risk profile."
+                )
+
+        return beta_values, rationales
+
+    @staticmethod
+    def _format_beta_label(key: str) -> str:
+        normalized = key.lower()
+        if normalized in {"sp500", "gspc", "s&p500"}:
+            return "S&P 500"
+        if normalized == "vix":
+            return "VIX"
+        return key.upper()
+
+    @staticmethod
+    def _beta_risk_band(beta_value: float) -> str:
+        if beta_value >= 1.5:
+            return "high"
+        if beta_value <= 0.7:
+            return "defensive"
+        return "moderate"
 
     def _compose_summary(
         self,

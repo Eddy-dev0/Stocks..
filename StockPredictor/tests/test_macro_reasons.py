@@ -31,3 +31,14 @@ def test_macro_reasons_reads_macro_context_columns() -> None:
     assert any("volatility" in reason.lower() for reason in reasons)
     assert any("trend slope positive" in reason.lower() for reason in reasons)
     assert any("trend curvature turning lower" in reason.lower() for reason in reasons)
+
+
+def test_macro_reasons_include_beta_context() -> None:
+    predictor = StockPredictorAI.__new__(StockPredictorAI)
+    predictor.metadata = {}
+
+    feature_row = pd.Series({"Beta_SP500_63": 1.8})
+
+    reasons = predictor._macro_reasons(feature_row)
+
+    assert any("beta" in reason.lower() for reason in reasons)
