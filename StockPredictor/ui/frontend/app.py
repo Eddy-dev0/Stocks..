@@ -128,10 +128,7 @@ def _extract_forecast_low(payload: Any) -> float | None:
     return None
 
 
-def _derive_buy_zone(frame: pd.DataFrame, forecast_low: float | None) -> Dict[str, Any] | None:
-    if "close" not in frame.columns:
-        return None
-
+def _enrich_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     working = frame.copy()
     close = working["close"].astype(float)
 
@@ -147,6 +144,7 @@ def _derive_buy_zone(frame: pd.DataFrame, forecast_low: float | None) -> Dict[st
     ema_26 = close.ewm(span=26, adjust=False).mean()
     working["MACD"] = ema_12 - ema_26
     working["MACD_signal"] = working["MACD"].ewm(span=9, adjust=False).mean()
+    working["MACD_hist"] = working["MACD"] - working["MACD_signal"]
     working["MACD_cross_up"] = (working["MACD"] > working["MACD_signal"]) & (
         working["MACD"].shift(1) <= working["MACD_signal"].shift(1)
     )
@@ -155,6 +153,37 @@ def _derive_buy_zone(frame: pd.DataFrame, forecast_low: float | None) -> Dict[st
     rolling_std = close.rolling(window=20, min_periods=20).std()
     working["BB_lower"] = working["BB_mid"] - 2 * rolling_std
     working["BB_upper"] = working["BB_mid"] + 2 * rolling_std
+    working["BB_width"] = working["BB_upper"] - working["BB_lower"]
+
+    if {"high", "low"}.issubset(working.columns):
+        high = working["high"].astype(float)
+        low = working["low"].astype(float)
+        previous_close = close.shift(1)
+        tr = pd.concat([high - low, (high - previous_close).abs(), (low - previous_close).abs()], axis=1).max(axis=1)
+        working["ATR14"] = tr.rolling(window=14, min_periods=1).mean()
+
+    if "volume" in working.columns:
+        pv = close * working["volume"].astype(float)
+        cumulative_pv = pv.cumsum()
+        cumulative_volume = working["volume"].astype(float).cumsum()
+        working["VWAP"] = cumulative_pv / cumulative_volume.replace(0, pd.NA)
+
+    working["VOL30"] = close.pct_change().rolling(window=30, min_periods=20).std() * (252**0.5)
+
+    if "close" in working.select_dtypes("number").columns:
+        working["MA20"] = close.rolling(window=20, min_periods=1).mean()
+        working["MA50"] = close.rolling(window=50, min_periods=1).mean()
+        working["MA200"] = close.rolling(window=200, min_periods=1).mean()
+
+    return working
+
+
+def _find_buy_zone(frame: pd.DataFrame, forecast_low: float | None) -> Dict[str, Any] | None:
+    if "close" not in frame.columns:
+        return None
+
+    working = _enrich_indicators(frame)
+    close = working["close"].astype(float)
 
     conditions = (
         (working["RSI14"] < 30)
@@ -165,18 +194,28 @@ def _derive_buy_zone(frame: pd.DataFrame, forecast_low: float | None) -> Dict[st
     if candidates.empty:
         return None
 
-    base_low = float(candidates["close"].min())
+    base_row = candidates.loc[candidates["close"].idxmin()]
+    base_low = float(base_row["close"])
     price_low = min(base_low, forecast_low) if forecast_low is not None else base_low
     price_high = max(float(candidates["close"].max()), price_low * 1.02)
+
+    volatility = float(base_row.get("VOL30", float("nan")))
+    atr = float(base_row.get("ATR14", float("nan")))
+    reason = (
+        "RSI < 30, bullish MACD crossover, and lower Bollinger touch; "
+        f"volatility (30d) ~ {volatility:.2%}"
+    )
+    if not pd.isna(atr):
+        reason += f"; ATR14 ${atr:.2f}"
+    if forecast_low is not None:
+        reason += "; anchored near forecasted lows"
+
     return {
         "start": candidates.index.min(),
         "end": candidates.index.max(),
         "price_low": price_low,
         "price_high": price_high,
-        "reason": (
-            "RSI < 30 with bullish MACD crossover and lower Bollinger-band touch"
-            "; anchored near forecasted lows" if forecast_low is not None else "RSI < 30 with bullish MACD crossover and lower Bollinger-band touch"
-        ),
+        "reason": reason,
     }
 
 
@@ -185,16 +224,23 @@ def _build_price_chart(
     *,
     buy_zone: Dict[str, Any] | None = None,
     show_buy_zone: bool = True,
-) -> alt.Chart:
+    show_ma50: bool = True,
+    show_ma200: bool = False,
+    show_bollinger: bool = True,
+    show_vwap: bool = False,
+    show_volume: bool = True,
+) -> alt.VConcatChart:
     time_index = frame.index.name or "timestamp"
     data_frame = frame.reset_index().rename(columns={frame.index.name or "index": "time"})
-    value_vars = ["close"]
-    for candidate in ("MA20", "MA50"):
-        if candidate in data_frame.columns:
-            value_vars.append(candidate)
-    melted = data_frame.melt("time", value_vars=value_vars, var_name="series", value_name="value")
 
-    line_chart = (
+    price_series = ["close"]
+    if show_ma50 and "MA50" in data_frame.columns:
+        price_series.append("MA50")
+    if show_ma200 and "MA200" in data_frame.columns:
+        price_series.append("MA200")
+    melted = data_frame.melt("time", value_vars=price_series, var_name="series", value_name="value")
+
+    price_layers: List[alt.Chart] = [
         alt.Chart(melted)
         .mark_line()
         .encode(
@@ -203,12 +249,41 @@ def _build_price_chart(
             color=alt.Color("series:N", title="Series"),
             tooltip=["time:T", "series:N", "value:Q"],
         )
-    )
+    ]
 
-    overlays: List[alt.Chart] = [line_chart]
+    if show_bollinger and {"BB_lower", "BB_upper", "BB_mid"}.issubset(data_frame.columns):
+        bollinger_source = data_frame
+        price_layers.append(
+            alt.Chart(bollinger_source)
+            .mark_area(opacity=0.12, color="gray")
+            .encode(
+                x="time:T",
+                y="BB_lower:Q",
+                y2="BB_upper:Q",
+                tooltip=[
+                    "time:T",
+                    alt.Tooltip("BB_lower:Q", title="BB Lower"),
+                    alt.Tooltip("BB_upper:Q", title="BB Upper"),
+                    alt.Tooltip("BB_width:Q", title="BB Width"),
+                ],
+            )
+        )
+        price_layers.append(
+            alt.Chart(bollinger_source)
+            .mark_line(strokeDash=[4, 4], color="gray")
+            .encode(x="time:T", y="BB_mid:Q", tooltip=["time:T", alt.Tooltip("BB_mid:Q", title="BB Mid")])
+        )
+
+    if show_vwap and "VWAP" in data_frame.columns:
+        price_layers.append(
+            alt.Chart(data_frame)
+            .mark_line(color="orange")
+            .encode(x="time:T", y="VWAP:Q", tooltip=["time:T", alt.Tooltip("VWAP:Q", title="VWAP")])
+        )
+
     if show_buy_zone and buy_zone:
         rect_frame = pd.DataFrame([buy_zone])
-        overlays.append(
+        price_layers.append(
             alt.Chart(rect_frame)
             .mark_rect(opacity=0.15, color="steelblue")
             .encode(
@@ -220,7 +295,47 @@ def _build_price_chart(
             )
         )
 
-    return alt.layer(*overlays).resolve_scale(color="independent")
+    price_chart = alt.layer(*price_layers).resolve_scale(color="independent")
+
+    panels: List[alt.Chart] = [price_chart.properties(height=320)]
+
+    if show_volume and "volume" in data_frame.columns:
+        volume_chart = (
+            alt.Chart(data_frame)
+            .mark_bar(color="#4c78a8", opacity=0.6)
+            .encode(
+                x=alt.X("time:T", title=""),
+                y=alt.Y("volume:Q", title="Volume"),
+                tooltip=["time:T", alt.Tooltip("volume:Q", title="Volume")],
+            )
+            .properties(height=120)
+        )
+        panels.append(volume_chart)
+
+    if {"MACD", "MACD_signal", "MACD_hist"}.issubset(data_frame.columns):
+        macd_base = alt.Chart(data_frame)
+        macd_chart = alt.layer(
+            macd_base.mark_bar(color="#9ecae9").encode(x="time:T", y="MACD_hist:Q"),
+            macd_base.mark_line(color="#1f77b4").encode(x="time:T", y="MACD:Q", tooltip=["time:T", "MACD:Q"]),
+            macd_base.mark_line(color="#ff7f0e", strokeDash=[4, 3]).encode(
+                x="time:T", y="MACD_signal:Q", tooltip=[alt.Tooltip("MACD_signal:Q", title="Signal")]
+            ),
+        ).resolve_scale(y="shared").properties(height=140, title="MACD")
+        panels.append(macd_chart)
+
+    if "RSI14" in data_frame.columns:
+        rsi_source = data_frame
+        rsi_chart = alt.layer(
+            alt.Chart(rsi_source)
+            .mark_line(color="#2ca02c")
+            .encode(x="time:T", y=alt.Y("RSI14:Q", title="RSI"), tooltip=["time:T", alt.Tooltip("RSI14:Q", title="RSI14")]),
+            alt.Chart(pd.DataFrame({"y": [30, 70]}))
+            .mark_rule(strokeDash=[3, 3], color="gray")
+            .encode(y="y:Q"),
+        ).properties(height=140, title="RSI (14)")
+        panels.append(rsi_chart)
+
+    return alt.vconcat(*panels, spacing=16).resolve_scale(x="shared")
 
 
 def _download_button(label: str, data: Any, file_name: str, mime: str) -> None:
@@ -251,6 +366,17 @@ with st.sidebar:
     horizon_value = None
     if use_custom_horizon:
         horizon_value = st.number_input("Forecast horizon", min_value=1, max_value=365, value=5, step=1)
+
+    st.header("Chart overlays")
+    show_ma50 = st.checkbox("Show 50-day MA", value=True)
+    show_ma200 = st.checkbox("Show 200-day MA", value=False)
+    show_bollinger = st.checkbox("Show Bollinger bands", value=True)
+    show_volume = st.checkbox("Show volume histogram", value=True)
+    show_vwap = st.checkbox("Show VWAP", value=False, help="Requires volume data")
+
+    st.header("Risk & Volatility")
+    st.caption("Computed from visible market data")
+    risk_metrics_placeholder = st.container()
 
 st.title("Stock Predictor Dashboard")
 st.caption("Explore model forecasts, historical indicators, and curated research notes.")
@@ -290,18 +416,25 @@ with col_data:
     frame = _coerce_dataframe(payload)
     if frame is not None and not frame.empty:
         frame = _normalise_timeseries(frame)
+        frame = _enrich_indicators(frame)
         forecast_low = _extract_forecast_low(st.session_state.get("forecast_response"))
-        buy_zone = _derive_buy_zone(frame, forecast_low)
-        if "close" in frame.columns and "close" in frame.select_dtypes("number").columns:
-            frame["MA20"] = frame["close"].rolling(window=20, min_periods=1).mean()
-            frame["MA50"] = frame["close"].rolling(window=50, min_periods=1).mean()
+        buy_zone = _find_buy_zone(frame, forecast_low)
         show_buy_zone = st.checkbox(
             "Show buy-zone overlay",
             value=bool(buy_zone),
             help="Highlight windows where RSI < 30, MACD crosses up, and price hugs the lower Bollinger band (anchored near forecast lows when available).",
         )
         st.altair_chart(
-            _build_price_chart(frame, buy_zone=buy_zone, show_buy_zone=show_buy_zone),
+            _build_price_chart(
+                frame,
+                buy_zone=buy_zone,
+                show_buy_zone=show_buy_zone,
+                show_ma50=show_ma50,
+                show_ma200=show_ma200,
+                show_bollinger=show_bollinger,
+                show_vwap=show_vwap,
+                show_volume=show_volume,
+            ),
             use_container_width=True,
         )
         with st.expander("How is the buy-zone derived?"):
@@ -310,6 +443,7 @@ with col_data:
                 "- 14-day RSI dips below 30 (oversold)\n"
                 "- The MACD line crosses above its signal (bullish momentum shift)\n"
                 "- Closing price touches/under-cuts the 20-day lower Bollinger band\n"
+                "- Volatility context (ATR/30d vol) is captured in the tooltip\n"
                 "If forecast data is present, the price floor leans on forecasted lows."
             )
             if buy_zone:
@@ -378,6 +512,20 @@ with col_data:
                 st.dataframe(pd.DataFrame(rows))
             else:
                 st.caption("No confirmation signals returned by the API.")
+        with risk_metrics_placeholder:
+            latest_valid = frame.dropna(how="all")
+            if latest_valid.empty:
+                st.caption("Volatility metrics unavailable for the current selection.")
+            else:
+                latest = latest_valid.iloc[-1]
+                cols_risk = st.columns(2)
+                atr_value = latest.get("ATR14")
+                vol_value = latest.get("VOL30")
+                cols_risk[0].metric("ATR (14)", f"${atr_value:.2f}" if pd.notna(atr_value) else "—")
+                cols_risk[1].metric(
+                    "Volatility (30d ann.)",
+                    f"{vol_value:.2%}" if pd.notna(vol_value) else "—",
+                )
         st.dataframe(frame.tail(20), use_container_width=True)
         _download_button(
             "Download data (CSV)",
