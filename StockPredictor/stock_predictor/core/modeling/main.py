@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from numbers import Real
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, DefaultDict, Dict, Iterable, List, Mapping, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import joblib
@@ -38,6 +39,7 @@ from ..models import (
     model_supports_proba,
     regression_metrics,
 )
+from ..time_series import evaluate_time_series_baselines
 
 LOGGER = logging.getLogger(__name__)
 
@@ -698,6 +700,12 @@ class StockPredictorAI:
                 "parameters": evaluation.get("parameters", {}),
                 "samples": int(evaluation.get("evaluation_rows", 0)),
             }
+            if evaluation.get("baseline_aggregate"):
+                metrics["baselines"] = evaluation["baseline_aggregate"]
+                metrics["evaluation"]["baselines"] = evaluation["baseline_aggregate"]
+                metrics["evaluation"]["baseline_splits"] = evaluation.get(
+                    "baseline_splits", []
+                )
             if distribution_summary:
                 metrics["forecast_distribution"] = distribution_summary
                 self.metadata.setdefault("forecast_distribution", {})[
@@ -863,6 +871,57 @@ class StockPredictorAI:
                 f"Non-finite values detected in target '{target}' for horizon {horizon}."
             )
 
+    def _evaluate_time_series_baselines(
+        self, train_series: pd.Series, test_series: pd.Series
+    ) -> Dict[str, Any]:
+        if (
+            not self.config.time_series_baselines
+            or train_series.empty
+            or test_series.empty
+        ):
+            return {}
+
+        params = self.config.time_series_params or {}
+        global_params = params.get("global", {})
+        merged_params: Dict[str, Dict[str, Any]] = {}
+        for name in self.config.time_series_baselines:
+            lower = name.lower()
+            merged = dict(global_params)
+            merged.update(params.get(lower, {}))
+            merged_params[lower] = merged
+
+        seasonal_periods = global_params.get("seasonal_periods")
+        return evaluate_time_series_baselines(
+            train_series,
+            test_series,
+            self.config.time_series_baselines,
+            seasonal_periods=seasonal_periods,
+            model_params=merged_params,
+        )
+
+    def _aggregate_baseline_metrics(
+        self, metrics: Mapping[str, List[Dict[str, Any]]]
+    ) -> Dict[str, Dict[str, float]]:
+        aggregate: Dict[str, Dict[str, float]] = {}
+        for model_name, entries in metrics.items():
+            keys = {
+                key
+                for entry in entries
+                for key in entry.keys()
+                if key not in {"model", "split", "train_size", "test_size"}
+            }
+            summary: Dict[str, float] = {"splits": len(entries)}
+            for key in keys:
+                values = [
+                    float(value)
+                    for value in (entry.get(key) for entry in entries)
+                    if isinstance(value, Real) and np.isfinite(value)
+                ]
+                if values:
+                    summary[key] = float(np.mean(values))
+            aggregate[model_name] = summary
+        return aggregate
+
     def _evaluate_model(
         self,
         factory: ModelFactory,
@@ -877,6 +936,25 @@ class StockPredictorAI:
         evaluation_rows = 0
         parameters: Dict[str, Any] = {}
         splits: List[Dict[str, Any]] = []
+        baseline_records: DefaultDict[str, List[Dict[str, Any]]] = defaultdict(list)
+        baseline_splits: List[Dict[str, Any]] = []
+
+        def _record_baselines(
+            split_label: int, train_series: pd.Series, test_series: pd.Series
+        ) -> None:
+            if task != "regression":
+                return
+            results = self._evaluate_time_series_baselines(train_series, test_series)
+            for name, result in results.items():
+                entry = {
+                    "model": name,
+                    "split": split_label,
+                    "train_size": int(len(train_series)),
+                    "test_size": int(len(test_series)),
+                    **result.metrics,
+                }
+                baseline_records[name].append(entry)
+                baseline_splits.append(entry)
 
         if strategy == "holdout":
             split_idx = max(
@@ -920,6 +998,7 @@ class StockPredictorAI:
                 }
             )
             splits.append(metrics)
+            _record_baselines(1, y_train, y_test)
             aggregate = {
                 key: float(value)
                 for key, value in metrics.items()
@@ -968,10 +1047,11 @@ class StockPredictorAI:
                     {
                         "fold": fold,
                         "train_size": int(len(train_idx)),
-                        "test_size": int(len(test_idx)),
-                    }
-                )
-                splits.append(metrics)
+                    "test_size": int(len(test_idx)),
+                }
+            )
+            splits.append(metrics)
+            _record_baselines(fold, y_train, y_test)
             if not splits:
                 raise RuntimeError(
                     "Time series cross-validation produced no evaluation splits."
@@ -1000,8 +1080,23 @@ class StockPredictorAI:
                 "step": int(self.config.evaluation_step),
                 "mode": self.config.backtest_strategy,
             }
+            if task == "regression" and self.config.time_series_baselines:
+                for split_idx, (train_slice, test_slice) in enumerate(
+                    backtester._generate_splits(len(target_series)), start=1
+                ):
+                    y_train_split = target_series.iloc[train_slice]
+                    y_test_split = target_series.iloc[test_slice]
+                    if len(y_test_split) == 0:
+                        continue
+                    _record_baselines(split_idx, y_train_split, y_test_split)
         else:  # pragma: no cover - configuration guard
             raise ValueError(f"Unknown evaluation strategy: {strategy}")
+
+        baseline_aggregate = (
+            self._aggregate_baseline_metrics(baseline_records)
+            if baseline_records
+            else {}
+        )
 
         return {
             "strategy": strategy,
@@ -1009,6 +1104,8 @@ class StockPredictorAI:
             "aggregate": aggregate,
             "evaluation_rows": evaluation_rows,
             "parameters": parameters,
+            "baseline_splits": baseline_splits,
+            "baseline_aggregate": baseline_aggregate,
         }
 
     def _compute_evaluation_metrics(

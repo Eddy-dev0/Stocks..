@@ -16,6 +16,13 @@ from stock_predictor.core.trend_finder import (
     TrendFinder,
     TrendInsight,
 )
+from stock_predictor.core.time_series import (
+    ARIMAForecaster,
+    ForecastResult,
+    HoltWintersForecaster,
+    ProphetForecaster,
+    evaluate_time_series_baselines,
+)
 
 __all__ = [
     "AsyncDataPipeline",
@@ -34,4 +41,9 @@ __all__ = [
     "load_environment",
     "TrendFinder",
     "TrendInsight",
+    "ARIMAForecaster",
+    "HoltWintersForecaster",
+    "ProphetForecaster",
+    "ForecastResult",
+    "evaluate_time_series_baselines",
 ]
