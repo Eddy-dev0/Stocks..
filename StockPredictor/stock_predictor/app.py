@@ -15,6 +15,7 @@ from stock_predictor.api_app import run_api
 from stock_predictor.core import (
     PredictorConfig,
     StockPredictorAI,
+    BuyZoneAnalyzer,
     build_config,
     load_environment,
 )
@@ -106,6 +107,14 @@ class StockPredictorApplication:
 
         LOGGER.info("Running backtest for ticker %s", self.config.ticker)
         return self.pipeline.run_backtest(targets=targets)
+
+    def buy_zone(self, *, refresh: bool = False) -> dict[str, Any]:
+        """Compute a tactical buy zone for the configured ticker."""
+
+        LOGGER.info("Computing buy zone for %s (refresh=%s)", self.config.ticker, refresh)
+        analyzer = BuyZoneAnalyzer(self.config, fetcher=self.pipeline.fetcher)
+        result = analyzer.compute(refresh=refresh)
+        return result.as_dict()
 
     def feature_importance(self, target: str, *, horizon: int | None = None) -> dict[str, Any]:
         """Return feature importance scores for the specified target."""
