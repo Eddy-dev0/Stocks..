@@ -9,7 +9,7 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
-from .config import PredictorConfig
+from .config import BuyZoneConfirmationSettings, PredictorConfig
 from .data_fetcher import DataFetcher
 from .indicator_bundle import compute_indicators
 from .support_levels import indicator_support_floor
@@ -112,7 +112,8 @@ class BuyZoneAnalyzer:
             candidate = latest_date - timedelta(days=int(max(1, lookback_days)))
             window_start = max(candidate, earliest_date).to_pydatetime()
 
-        indicators = compute_indicators(cleaned_df)
+        indicator_result = compute_indicators(cleaned_df)
+        indicators = indicator_result.dataframe
         latest_indicators = indicators.iloc[-1] if not indicators.empty else pd.Series()
 
         support_level, support_components = indicator_support_floor(indicators)
@@ -121,7 +122,7 @@ class BuyZoneAnalyzer:
         atr_value = _safe_float(latest_indicators.get("ATR_14"))
         lower_bound, upper_bound = self._price_bounds(last_close, support_level, atr_value)
         confirmations = self._build_confirmations(
-            latest_indicators, last_close, support_level
+            indicators, last_close, support_level
         )
 
         return BuyZoneResult(
@@ -180,34 +181,87 @@ class BuyZoneAnalyzer:
 
     def _build_confirmations(
         self,
-        indicators: Mapping[str, Any],
+        indicators: pd.DataFrame,
         last_close: float | None,
         support_level: float | None,
     ) -> dict[str, IndicatorConfirmation]:
         confirmations: dict[str, IndicatorConfirmation] = {}
+        latest = indicators.iloc[-1] if not indicators.empty else pd.Series(dtype=float)
 
-        rsi_value = _safe_float(indicators.get("RSI_14"))
-        if rsi_value is not None:
+        settings = getattr(self.config, "buy_zone", BuyZoneConfirmationSettings())
+        if isinstance(settings, Mapping):
+            settings = BuyZoneConfirmationSettings.from_mapping(settings)
+        elif not isinstance(settings, BuyZoneConfirmationSettings):
+            settings = BuyZoneConfirmationSettings()
+
+        rsi_value = _safe_float(latest.get("RSI_14"))
+        if settings.enable_rsi and rsi_value is not None:
             confirmations["rsi_oversold"] = IndicatorConfirmation(
-                confirmed=rsi_value < 40,
+                confirmed=rsi_value < settings.rsi_threshold,
                 value=rsi_value,
-                threshold=40.0,
-                detail="RSI below 40 often signals oversold conditions.",
+                threshold=settings.rsi_threshold,
+                detail=f"RSI below {settings.rsi_threshold:.1f} often signals oversold conditions.",
             )
 
-        macd_hist = _safe_float(indicators.get("MACD_12_26_9_Hist"))
-        if macd_hist is not None:
+        macd_hist = _safe_float(latest.get("MACD_12_26_9_Hist"))
+        if settings.enable_macd and macd_hist is not None:
             confirmations["macd_bullish"] = IndicatorConfirmation(
-                confirmed=macd_hist > 0,
+                confirmed=macd_hist > settings.macd_hist_threshold,
                 value=macd_hist,
-                threshold=0.0,
+                threshold=settings.macd_hist_threshold,
                 detail="Positive MACD histogram suggests bullish momentum.",
             )
 
+        bb_lower = _safe_float(latest.get("BB_Lower_20"))
+        bb_upper = _safe_float(latest.get("BB_Upper_20"))
+        proximity_pct = max(0.0, float(settings.bollinger_proximity_pct))
+
+        def _pct_distance(value: float | None, reference: float | None) -> float | None:
+            if value is None or reference is None or reference == 0:
+                return None
+            return (value - reference) / abs(reference)
+
+        lower_distance = _pct_distance(last_close, bb_lower)
+        upper_distance = _pct_distance(bb_upper, last_close)
+        if settings.enable_bollinger and last_close is not None:
+            confirmations["bollinger_lower_proximity"] = IndicatorConfirmation(
+                confirmed=lower_distance is not None and lower_distance <= proximity_pct,
+                value=(lower_distance * 100) if lower_distance is not None else None,
+                threshold=proximity_pct * 100,
+                detail=(
+                    f"Price is within {proximity_pct * 100:.1f}% of the lower Bollinger band"
+                    if lower_distance is not None
+                    else "Lower Bollinger band proximity unavailable."
+                ),
+            )
+            confirmations["bollinger_upper_headroom"] = IndicatorConfirmation(
+                confirmed=upper_distance is not None and upper_distance >= proximity_pct,
+                value=(upper_distance * 100) if upper_distance is not None else None,
+                threshold=proximity_pct * 100,
+                detail=(
+                    f"At least {proximity_pct * 100:.1f}% room to the upper band"
+                    if upper_distance is not None
+                    else "Upper Bollinger band proximity unavailable."
+                ),
+            )
+
+        atr_value = _safe_float(latest.get("ATR_14"))
+        atr_fraction = (atr_value / last_close) if atr_value is not None and last_close else None
+        if settings.enable_volatility and atr_fraction is not None:
+            confirmations["volatility_contained"] = IndicatorConfirmation(
+                confirmed=atr_fraction <= settings.max_atr_fraction_of_price,
+                value=atr_fraction,
+                threshold=settings.max_atr_fraction_of_price,
+                detail=(
+                    "ATR as a fraction of price remains within the configured buffer,"
+                    " suggesting manageable volatility."
+                ),
+            )
+
         supertrend_direction = None
-        for name, value in indicators.items():
+        for name in indicators.columns:
             if str(name).startswith("Supertrend_Direction_"):
-                supertrend_direction = _safe_float(value)
+                supertrend_direction = _safe_float(latest.get(name))
                 break
         if supertrend_direction is not None:
             confirmations["supertrend_bullish"] = IndicatorConfirmation(
@@ -215,6 +269,41 @@ class BuyZoneAnalyzer:
                 value=supertrend_direction,
                 threshold=0.0,
                 detail="Upward Supertrend direction supports bullish bias.",
+            )
+
+        mfi_column = next((col for col in indicators.columns if str(col).startswith("MFI_")), None)
+        mfi_value = _safe_float(latest.get(mfi_column)) if mfi_column else None
+        obv_series = (
+            pd.to_numeric(indicators.get("OBV"), errors="coerce") if "OBV" in indicators else pd.Series(dtype=float)
+        )
+        obv_change: float | None = None
+        obv_confirmation = False
+        if settings.enable_volume and not obv_series.empty:
+            lookback = max(2, int(settings.obv_lookback))
+            recent_obv = obv_series.dropna().tail(lookback)
+            if len(recent_obv) >= 2:
+                obv_change = float(recent_obv.iloc[-1] - recent_obv.iloc[0])
+                obv_confirmation = obv_change > 0
+
+        mfi_confirmation = (
+            settings.enable_volume
+            and mfi_value is not None
+            and mfi_value >= settings.mfi_threshold
+        )
+        if settings.enable_volume and (mfi_value is not None or obv_change is not None):
+            confirmations["volume_inflows"] = IndicatorConfirmation(
+                confirmed=bool(mfi_confirmation or obv_confirmation),
+                value=mfi_value if mfi_value is not None else obv_change,
+                threshold=settings.mfi_threshold if mfi_value is not None else 0.0,
+                detail=(
+                    "Rising OBV and supportive MFI hint at accumulation."
+                    if mfi_confirmation and obv_confirmation
+                    else (
+                        "Money Flow Index is above the configured inflow threshold."
+                        if mfi_confirmation
+                        else "On-balance volume is trending higher over the recent window."
+                    )
+                ),
             )
 
         support_price = _safe_float(support_level)

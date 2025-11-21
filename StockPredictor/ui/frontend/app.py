@@ -26,6 +26,7 @@ for key, value in {
     "backtest_response": None,
     "train_response": None,
     "research_response": None,
+    "buy_zone_response": None,
 }.items():
     st.session_state.setdefault(key, value)
 
@@ -243,6 +244,9 @@ with st.sidebar:
     targets_raw = st.text_input("Prediction targets", help="Comma separated list of targets")
     force_refresh_market = st.checkbox("Refresh market data on fetch", value=False)
     refresh_before_forecast = st.checkbox("Refresh data before forecasting", value=False)
+    refresh_before_buy_zone = st.checkbox(
+        "Refresh data before buy-zone computation", value=False
+    )
     use_custom_horizon = st.checkbox("Specify forecast horizon", value=False)
     horizon_value = None
     if use_custom_horizon:
@@ -269,6 +273,17 @@ with col_data:
             if response is not None:
                 st.session_state["data_response"] = response
                 st.success("Market data loaded")
+
+    if st.button("Compute tactical buy zone", type="secondary"):
+        with st.spinner("Evaluating buy zone..."):
+            response = _request(
+                f"/buy-zone/{ticker}",
+                method="POST",
+                json_payload={"refresh": bool(refresh_before_buy_zone)},
+            )
+            if response is not None:
+                st.session_state["buy_zone_response"] = response
+                st.success("Buy zone analysis updated")
 
     data_response = st.session_state.get("data_response") or {}
     payload = data_response.get("data") if isinstance(data_response, dict) else data_response
@@ -308,6 +323,61 @@ with col_data:
                 )
             else:
                 st.caption("No qualifying buy-zone window detected for the current view.")
+
+        buy_zone_response = st.session_state.get("buy_zone_response") or {}
+        buy_zone_payload = (
+            buy_zone_response.get("buy_zone")
+            if isinstance(buy_zone_response, dict)
+            else None
+        )
+        if buy_zone_payload:
+            st.markdown("**Tactical buy-zone confirmations (API)**")
+            bounds = buy_zone_payload.get("price_bounds", {})
+            window = buy_zone_payload.get("window", {})
+            col_left, col_right = st.columns(2)
+            lower_bound = bounds.get("lower")
+            upper_bound = bounds.get("upper")
+            support_level = bounds.get("support")
+            last_close_value = bounds.get("last_close")
+            with col_left:
+                st.write(
+                    "Window:",
+                    window.get("start"),
+                    "to",
+                    window.get("end"),
+                )
+                st.write(
+                    "Bounds:",
+                    f"${lower_bound:.2f}" if lower_bound is not None else "—",
+                    "-",
+                    f"${upper_bound:.2f}" if upper_bound is not None else "—",
+                )
+            with col_right:
+                st.write(
+                    "Support:",
+                    f"${support_level:.2f}" if support_level is not None else "—",
+                )
+                st.write(
+                    "Last close:",
+                    f"${last_close_value:.2f}" if last_close_value is not None else "—",
+                )
+
+            confirmations = buy_zone_payload.get("confirmations", {})
+            if confirmations:
+                rows = []
+                for name, detail in confirmations.items():
+                    rows.append(
+                        {
+                            "signal": name,
+                            "confirmed": "✅" if detail.get("confirmed") else "❌",
+                            "value": detail.get("value"),
+                            "threshold": detail.get("threshold"),
+                            "detail": detail.get("detail"),
+                        }
+                    )
+                st.dataframe(pd.DataFrame(rows))
+            else:
+                st.caption("No confirmation signals returned by the API.")
         st.dataframe(frame.tail(20), use_container_width=True)
         _download_button(
             "Download data (CSV)",
