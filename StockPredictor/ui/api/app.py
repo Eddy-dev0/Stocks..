@@ -67,6 +67,62 @@ class BacktestRequest(BaseModel):
     )
 
 
+class BuyZoneRequest(BaseModel):
+    """Payload used to request buy-zone analysis for a ticker."""
+
+    refresh: bool = Field(
+        default=False,
+        description="Refresh underlying data sources before computing the buy zone.",
+    )
+
+
+class TimeWindow(BaseModel):
+    """Represents the time window used during buy-zone analysis."""
+
+    start: str | None = Field(None, description="ISO timestamp for the start of the window.")
+    end: str | None = Field(None, description="ISO timestamp for the end of the window.")
+
+
+class PriceBounds(BaseModel):
+    """Summary of the derived buy-zone price bounds."""
+
+    lower: float | None = Field(None, description="Lower edge of the computed buy zone.")
+    upper: float | None = Field(None, description="Upper edge of the computed buy zone.")
+    support: float | None = Field(None, description="Nearest detected support level.")
+    last_close: float | None = Field(None, description="Most recent close used in the calculation.")
+
+
+class IndicatorConfirmationResponse(BaseModel):
+    """Indicator-driven confirmation details returned by the buy-zone analysis."""
+
+    confirmed: bool = Field(..., description="Whether the indicator confirms the buy setup.")
+    value: float | None = Field(None, description="Latest indicator value used for the check.")
+    threshold: float | None = Field(None, description="Threshold applied to the indicator value.")
+    detail: str | None = Field(None, description="Human-readable explanation of the signal.")
+
+
+class BuyZoneResponse(BaseModel):
+    """Structured response for the buy-zone endpoint."""
+
+    ticker: str = Field(..., description="Ticker symbol analysed.")
+    window: TimeWindow
+    price_bounds: PriceBounds
+    confirmations: dict[str, IndicatorConfirmationResponse] = Field(
+        default_factory=dict, description="Indicator confirmations supporting the buy zone."
+    )
+    support_components: dict[str, float] = Field(
+        default_factory=dict,
+        description="Raw support level components extracted from indicators.",
+    )
+
+
+class BuyZoneEnvelope(BaseModel):
+    """Top-level envelope for buy-zone responses."""
+
+    status: str = Field("ok", description="Outcome of the request.")
+    buy_zone: BuyZoneResponse
+
+
 def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
     """Create a configured FastAPI application for the Stock Predictor UI."""
 
@@ -146,6 +202,19 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
         application = await _build_application(ticker, {})
         result = await _call_with_error_handling(application.backtest, targets=request.targets)
         return {"status": "ok", "backtest": result}
+
+    @app.post(
+        "/buy-zone/{ticker}",
+        dependencies=[Depends(require_api_key)],
+        response_model=BuyZoneEnvelope,
+    )
+    async def buy_zone(ticker: str, request: BuyZoneRequest) -> BuyZoneEnvelope:
+        application = await _build_application(ticker, {})
+        result = await _call_with_error_handling(
+            application.buy_zone,
+            refresh=request.refresh,
+        )
+        return BuyZoneEnvelope(status="ok", buy_zone=BuyZoneResponse(**result))
 
     @app.get("/research", dependencies=[Depends(require_api_key)])
     async def research_feed(

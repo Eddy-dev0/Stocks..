@@ -8,6 +8,7 @@ from stock_predictor.core.config import (
     build_config,
     load_environment,
 )
+from stock_predictor.core.buy_zone import BuyZoneAnalyzer, BuyZoneResult, IndicatorConfirmation
 from stock_predictor.core.data_pipeline import AsyncDataPipeline
 from stock_predictor.core.modeling import StockPredictorAI, TargetSpec, make_volatility_label
 from stock_predictor.core.trend_finder import (
@@ -23,6 +24,9 @@ __all__ = [
     "StockPredictorAI",
     "TargetSpec",
     "make_volatility_label",
+    "BuyZoneAnalyzer",
+    "BuyZoneResult",
+    "IndicatorConfirmation",
     "DEFAULT_PREDICTION_TARGETS",
     "DEFAULT_PREDICTION_HORIZONS",
     "DEFAULT_TREND_UNIVERSE",
