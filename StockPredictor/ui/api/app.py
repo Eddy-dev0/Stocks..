@@ -67,6 +67,20 @@ class BacktestRequest(BaseModel):
     )
 
 
+class TrainRequest(BaseModel):
+    """Payload used to retrain models for a ticker."""
+
+    targets: list[str] | None = Field(
+        default=None,
+        description="Optional list of targets to include during training.",
+    )
+    horizon: int | None = Field(
+        default=None,
+        ge=1,
+        description="Optional forecast horizon to train against.",
+    )
+
+
 class BuyZoneRequest(BaseModel):
     """Payload used to request buy-zone analysis for a ticker."""
 
@@ -202,6 +216,15 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
         application = await _build_application(ticker, {})
         result = await _call_with_error_handling(application.backtest, targets=request.targets)
         return {"status": "ok", "backtest": result}
+
+    @app.post("/train/{ticker}", dependencies=[Depends(require_api_key)])
+    async def retrain(ticker: str, request: TrainRequest) -> Dict[str, Any]:
+        application = await _build_application(ticker, {})
+        refresh_result = await _call_with_error_handling(application.refresh_data, force=False)
+        metrics = await _call_with_error_handling(
+            application.train, targets=request.targets, horizon=request.horizon
+        )
+        return {"status": "ok", "refresh": refresh_result, "metrics": metrics}
 
     @app.post(
         "/buy-zone/{ticker}",

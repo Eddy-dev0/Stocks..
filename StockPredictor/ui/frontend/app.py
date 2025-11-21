@@ -24,6 +24,7 @@ for key, value in {
     "data_response": None,
     "forecast_response": None,
     "backtest_response": None,
+    "train_response": None,
     "research_response": None,
 }.items():
     st.session_state.setdefault(key, value)
@@ -325,6 +326,28 @@ with col_data:
 
 with col_forecast:
     st.subheader("Forecasts & Backtests")
+    if st.button("Daten aktualisieren & Modell neu trainieren"):
+        with st.spinner("Aktualisiere Daten und trainiere Modelle..."):
+            response = _request(
+                f"/train/{ticker}",
+                method="POST",
+                json_payload={"targets": _parse_targets(targets_raw), "horizon": horizon_value},
+            )
+            if response is not None:
+                st.session_state["train_response"] = response
+                st.success("Training abgeschlossen")
+
+    train_response = st.session_state.get("train_response") or {}
+    if train_response:
+        st.write("**Training & Refresh Ergebnisse**")
+        st.json(train_response)
+        _download_button(
+            "Download Training JSON",
+            json.dumps(train_response, indent=2, default=str).encode("utf-8"),
+            file_name=f"{ticker}_training.json",
+            mime="application/json",
+        )
+
     if st.button("Run forecast"):
         with st.spinner("Generating forecasts..."):
             response = _request(
