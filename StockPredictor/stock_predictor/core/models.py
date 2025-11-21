@@ -44,6 +44,35 @@ class ModelFactory:
         "hist_gb": {"max_depth": 8, "learning_rate": 0.05, "max_iter": 400},
         "logistic": {"C": 1.0, "max_iter": 500},
         "ensemble": {"interval_alpha": 0.2},
+        "lstm": {
+            "sequence_length": 20,
+            "hidden_size": 64,
+            "num_layers": 2,
+            "dropout": 0.1,
+            "batch_size": 64,
+            "epochs": 10,
+            "lr": 1e-3,
+        },
+        "gru": {
+            "sequence_length": 20,
+            "hidden_size": 64,
+            "num_layers": 2,
+            "dropout": 0.1,
+            "batch_size": 64,
+            "epochs": 10,
+            "lr": 1e-3,
+        },
+        "transformer": {
+            "sequence_length": 30,
+            "hidden_size": 64,
+            "num_layers": 2,
+            "dropout": 0.1,
+            "batch_size": 64,
+            "epochs": 10,
+            "lr": 1e-3,
+            "nhead": 4,
+            "dim_feedforward": 256,
+        },
     }
 
     def __init__(self, model_type: str, overrides: Dict[str, Any] | None = None) -> None:
@@ -131,6 +160,16 @@ class ModelFactory:
             from .modeling import create_default_regression_ensemble
 
             estimator = create_default_regression_ensemble(**params)
+        elif self.model_type in {"lstm", "gru", "transformer"}:
+            from .deep_models import GRURegressor, LSTMRegressor, TransformerRegressor
+
+            model_cls = {
+                "lstm": LSTMRegressor,
+                "gru": GRURegressor,
+                "transformer": TransformerRegressor,
+            }[self.model_type]
+            estimator = _instantiate(model_cls, params)
+            needs_scaler = True
         else:
             if self.model_type in {"xgboost", "lightgbm", "hist_gb"}:
                 LOGGER.warning(
