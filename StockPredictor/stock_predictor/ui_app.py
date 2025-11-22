@@ -1895,6 +1895,7 @@ class StockPredictorDesktopApp:
         return fmt_pct(confidence, decimals=1)
 
     def _extract_indicator_series(self, indicator: str) -> pd.Series | None:
+        target_key = re.sub(r"[^a-z0-9]+", "", str(indicator).strip().lower())
         feature_history = (
             self.feature_history_converted
             if isinstance(self.feature_history_converted, pd.DataFrame)
@@ -1930,7 +1931,10 @@ class StockPredictorDesktopApp:
             value_col = columns.get("value")
             date_col = columns.get("date")
             if indicator_col and value_col:
-                subset = indicator_history[indicator_history[indicator_col] == indicator]
+                normalized_names = indicator_history[indicator_col].apply(
+                    lambda value: re.sub(r"[^a-z0-9]+", "", str(value).strip().lower())
+                )
+                subset = indicator_history.loc[normalized_names == target_key]
                 if subset.empty:
                     return None
                 subset = subset.copy()
