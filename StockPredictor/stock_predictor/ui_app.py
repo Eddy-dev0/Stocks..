@@ -432,6 +432,7 @@ class StockPredictorDesktopApp:
         self._indicator_names: list[str] = []
         self._indicator_user_override = False
         self.indicator_toggle_all_button: ttk.Button | None = None
+        self.indicator_show_all_button: ttk.Button | None = None
         self._indicator_selector_updating = False
         self.indicator_secondary_ax: Axes | None = None
         self._indicator_extra_axes: list[Axes] = []
@@ -1092,6 +1093,7 @@ class StockPredictorDesktopApp:
         toggle_frame = ttk.Frame(selector_box)
         toggle_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
         toggle_frame.grid_columnconfigure(0, weight=1)
+        toggle_frame.grid_columnconfigure(1, weight=1)
         self.indicator_toggle_all_button = ttk.Button(
             toggle_frame,
             text="Select all indicators",
@@ -1099,6 +1101,14 @@ class StockPredictorDesktopApp:
         )
         self.indicator_toggle_all_button.grid(row=0, column=0, sticky=tk.W)
         self.indicator_toggle_all_button.configure(state=tk.DISABLED)
+
+        self.indicator_show_all_button = ttk.Button(
+            toggle_frame,
+            text="Show all indicators",
+            command=self._on_indicator_show_all,
+        )
+        self.indicator_show_all_button.grid(row=0, column=1, sticky=tk.E)
+        self.indicator_show_all_button.configure(state=tk.DISABLED)
 
         self.indicator_listbox = tk.Listbox(
             selector_box,
@@ -1644,6 +1654,23 @@ class StockPredictorDesktopApp:
         self._update_indicator_toggle_button_state(self._indicator_names, self._indicator_selection_cache)
         self._update_indicator_chart(selections)
 
+    def _on_indicator_show_all(self) -> None:
+        if self._indicator_selector_updating or not hasattr(self, "indicator_listbox"):
+            return
+        names = list(self._indicator_names)
+        if not names:
+            return
+        self._indicator_selector_updating = True
+        try:
+            self.indicator_listbox.selection_set(0, tk.END)
+        finally:
+            self._indicator_selector_updating = False
+        selections: set[str] = set(names)
+        self._indicator_selection_cache = selections
+        self._indicator_user_override = True
+        self._update_indicator_toggle_button_state(names, selections)
+        self._update_indicator_chart(selections)
+
     def _on_indicator_toggle_all(self) -> None:
         if self._indicator_selector_updating or not hasattr(self, "indicator_listbox"):
             return
@@ -1762,6 +1789,7 @@ class StockPredictorDesktopApp:
         selections: Iterable[str] | None = None,
     ) -> None:
         button = getattr(self, "indicator_toggle_all_button", None)
+        show_all_button = getattr(self, "indicator_show_all_button", None)
         if button is None:
             return
         if names is not None:
@@ -1775,7 +1803,11 @@ class StockPredictorDesktopApp:
             selection_set &= set(available)
         if not available:
             button.configure(text="Select all indicators", state=tk.DISABLED)
+            if show_all_button is not None:
+                show_all_button.configure(state=tk.DISABLED)
             return
+        if show_all_button is not None:
+            show_all_button.configure(state=tk.NORMAL)
         button.configure(
             text="Deselect all indicators"
             if len(selection_set) == len(available)
@@ -3392,6 +3424,7 @@ class StockPredictorDesktopApp:
         self._indicator_selection_cache = set(selections)
         if not indicator_names:
             self._indicator_user_override = False
+        self._update_indicator_toggle_button_state(indicator_names, selections)
         self._update_indicator_info_panel(indicator_names)
         self._update_indicator_chart(selections)
 
