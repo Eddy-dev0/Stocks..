@@ -1895,30 +1895,32 @@ class StockPredictorDesktopApp:
         return fmt_pct(confidence, decimals=1)
 
     def _extract_indicator_series(self, indicator: str) -> pd.Series | None:
-        target_key = re.sub(r"[^a-z0-9]+", "", str(indicator).strip().lower())
+        target_key = str(indicator).strip().lower()
         feature_history = (
             self.feature_history_converted
             if isinstance(self.feature_history_converted, pd.DataFrame)
             else self.feature_history
         )
-        if isinstance(feature_history, pd.DataFrame) and indicator in feature_history.columns:
+        if isinstance(feature_history, pd.DataFrame) and not feature_history.empty:
             frame = feature_history.copy()
             columns = {str(col).lower(): col for col in frame.columns}
-            date_col = columns.get("date")
-            if date_col is not None:
-                frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
-                frame = frame.dropna(subset=[date_col]).sort_values(date_col)
-                index = pd.DatetimeIndex(frame[date_col])
-            else:
-                index = pd.to_datetime(frame.index, errors="coerce")
-                valid_mask = pd.notna(index)
-                frame = frame.loc[valid_mask]
-                index = pd.DatetimeIndex(index[valid_mask])
-            series = pd.to_numeric(frame[indicator], errors="coerce")
-            series = pd.Series(series.values, index=index)
-            series = series.dropna()
-            if not series.empty:
-                return series
+            col_name = columns.get(target_key)
+            if col_name is not None:
+                date_col = columns.get("date")
+                if date_col is not None:
+                    frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
+                    frame = frame.dropna(subset=[date_col]).sort_values(date_col)
+                    index = pd.DatetimeIndex(frame[date_col])
+                else:
+                    index = pd.to_datetime(frame.index, errors="coerce")
+                    valid_mask = pd.notna(index)
+                    frame = frame.loc[valid_mask]
+                    index = pd.DatetimeIndex(index[valid_mask])
+                series = pd.to_numeric(frame[col_name], errors="coerce")
+                series = pd.Series(series.values, index=index)
+                series = series.dropna()
+                if not series.empty:
+                    return series
 
         indicator_history = (
             self.indicator_history_converted
@@ -1931,13 +1933,19 @@ class StockPredictorDesktopApp:
             value_col = columns.get("value")
             date_col = columns.get("date")
             if indicator_col and value_col:
-                normalized_names = indicator_history[indicator_col].apply(
-                    lambda value: re.sub(r"[^a-z0-9]+", "", str(value).strip().lower())
-                )
-                subset = indicator_history.loc[normalized_names == target_key]
-                if subset.empty:
+                lower_names = {
+                    str(value).strip().lower(): str(value).strip()
+                    for value in indicator_history[indicator_col].dropna().unique()
+                }
+                if target_key not in lower_names:
                     return None
-                subset = subset.copy()
+                subset = indicator_history[
+                    indicator_history[indicator_col]
+                    .astype(str)
+                    .str.strip()
+                    .str.lower()
+                    == target_key
+                ].copy()
                 if date_col:
                     subset[date_col] = pd.to_datetime(subset[date_col], errors="coerce")
                 values = pd.to_numeric(subset[value_col], errors="coerce")
