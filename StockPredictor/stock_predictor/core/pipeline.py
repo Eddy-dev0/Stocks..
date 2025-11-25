@@ -1189,18 +1189,32 @@ class MarketDataETL:
                 if raw_time:
                     timestamp = pd.to_datetime(raw_time, errors="coerce")
 
-        if price is None or timestamp is None:
-            history = self._safe_download(
-                lambda: ticker.history(period="1d", interval="1m", prepost=True)
-            )
-            if isinstance(history, pd.DataFrame) and not history.empty:
-                history = history.dropna(how="all")
-                if not history.empty:
-                    last_bar = history.iloc[-1]
-                    if price is None:
-                        price = self._safe_float(last_bar.get("Close"))
-                    ts = history.index[-1]
-                    timestamp = pd.to_datetime(ts, errors="coerce")
+        history_price: float | None = None
+        history_timestamp: pd.Timestamp | None = None
+        history = self._safe_download(
+            lambda: ticker.history(period="1d", interval="1m", prepost=True)
+        )
+        if isinstance(history, pd.DataFrame) and not history.empty:
+            history = history.dropna(how="all")
+            if not history.empty:
+                last_bar = history.iloc[-1]
+                history_price = self._safe_float(last_bar.get("Close"))
+                ts = history.index[-1]
+                history_timestamp = pd.to_datetime(ts, errors="coerce")
+
+        # Prefer the most recent data point if both sources are available.
+        def _is_newer(candidate: pd.Timestamp | None, reference: pd.Timestamp | None) -> bool:
+            if candidate is None:
+                return False
+            if reference is None:
+                return True
+            if pd.isna(candidate) or pd.isna(reference):
+                return False
+            return candidate > reference
+
+        if _is_newer(history_timestamp, timestamp) or price is None:
+            price = history_price if history_price is not None else price
+            timestamp = history_timestamp if history_timestamp is not None else timestamp
 
         if timestamp is not None and not pd.isna(timestamp):
             if timestamp.tzinfo is None:
