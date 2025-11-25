@@ -185,6 +185,8 @@ class StockPredictorAI:
         self,
         price_df: Optional[pd.DataFrame] = None,
         news_df: Optional[pd.DataFrame] = None,
+        *,
+        force_live_price: bool = False,
     ) -> tuple[pd.DataFrame, dict[int, Dict[str, pd.Series]], dict[int, Pipeline]]:
         if price_df is None:
             price_df = self.fetcher.fetch_price_data()
@@ -227,6 +229,19 @@ class StockPredictorAI:
             if latest_date is not None:
                 metadata["latest_date"] = latest_date
                 metadata.setdefault("market_data_as_of", latest_date)
+
+        try:
+            live_price, live_timestamp = self.fetcher.fetch_live_price(
+                force=force_live_price
+            )
+        except Exception as exc:  # pragma: no cover - optional live quote path
+            LOGGER.debug("Live price fetch failed: %s", exc)
+        else:
+            if live_price is not None:
+                metadata["latest_price"] = float(live_price)
+                if live_timestamp is not None:
+                    metadata["market_data_as_of"] = live_timestamp
+                    metadata["latest_price_timestamp"] = live_timestamp
 
         volatility_spec = TARGET_SPECS.get("volatility")
         if volatility_spec and volatility_spec.label_fn:
@@ -358,6 +373,23 @@ class StockPredictorAI:
 
         latest_row = settled_rows.iloc[-1]
         return float(latest_row["Close"]), latest_row["Date"]
+
+    def _refresh_live_price_metadata(self, *, force: bool = False) -> None:
+        """Update cached live price metadata in-place when available."""
+
+        if not isinstance(self.metadata, dict):
+            return
+        try:
+            live_price, live_timestamp = self.fetcher.fetch_live_price(force=force)
+        except Exception as exc:  # pragma: no cover - optional dependency path
+            LOGGER.debug("Skipping live price refresh: %s", exc)
+            return
+        if live_price is None:
+            return
+        self.metadata["latest_price"] = float(live_price)
+        if live_timestamp is not None:
+            self.metadata["market_data_as_of"] = live_timestamp
+            self.metadata["latest_price_timestamp"] = live_timestamp
 
     def _load_macro_indicators(self) -> pd.DataFrame:
         """Load cached macro indicator close series and pivot them by date."""
@@ -1279,12 +1311,21 @@ class StockPredictorAI:
                     )
                 needs_feature_refresh = True
 
+        if not needs_feature_refresh:
+            self._refresh_live_price_metadata(force=refresh_data)
+
         if needs_feature_refresh:
             LOGGER.info("Preparing features before prediction.")
             if price_df is not None:
-                self.prepare_features(price_df=price_df)
+                try:
+                    self.prepare_features(price_df=price_df, force_live_price=refresh_data)
+                except TypeError:
+                    self.prepare_features(price_df=price_df)
             else:
-                self.prepare_features()
+                try:
+                    self.prepare_features(force_live_price=refresh_data)
+                except TypeError:
+                    self.prepare_features()
 
         latest_features = self.metadata.get("latest_features")
         if latest_features is None:
@@ -1463,6 +1504,11 @@ class StockPredictorAI:
             target_date, target_timezone=self.market_timezone
         )
 
+        market_data_as_of = self.metadata.get("market_data_as_of") or latest_date
+        last_price_value = self._safe_float(self.metadata.get("latest_price"))
+        if last_price_value is None:
+            last_price_value = latest_close
+
         if latest_timestamp is not None:
             if target_timestamp is None or target_timestamp <= latest_timestamp:
                 try:
@@ -1527,10 +1573,11 @@ class StockPredictorAI:
 
         result = {
             "ticker": self.config.ticker,
-            "as_of": _to_iso(latest_date) or "",
-            "market_data_as_of": _to_iso(latest_date) or "",
+            "as_of": _to_iso(market_data_as_of) or "",
+            "market_data_as_of": _to_iso(market_data_as_of) or "",
             "generated_at": _to_iso(prediction_timestamp) or "",
             "last_close": latest_close,
+            "last_price": last_price_value,
             "predicted_close": close_prediction,
             "expected_change": expected_change,
             "expected_change_pct": pct_change,

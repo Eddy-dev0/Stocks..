@@ -911,7 +911,7 @@ class StockPredictorDesktopApp:
         metric_specs: list[tuple[str, str, tk.StringVar | None]] = [
             ("ticker", "Ticker", None),
             ("as_of", "Market data as of", None),
-            ("last_close", "Last close", None),
+            ("last_close", "Last price", None),
             ("predicted_close", "Predicted close", None),
             ("expected_low", "Expected low", None),
             (
@@ -2937,12 +2937,19 @@ class StockPredictorDesktopApp:
             as_of_display = "—"
         self.metric_vars["as_of"].set(as_of_display)
 
+        status_message = (
+            f"Market data as of {as_of_display}" if as_of_display != "—" else "Market data timestamp unavailable."
+        )
+
         last_close = prediction.get("last_close")
+        last_price = prediction.get("last_price") if isinstance(prediction, Mapping) else None
+        if last_price is None:
+            last_price = last_close
         predicted_close = prediction.get("predicted_close")
         expected_change = prediction.get("expected_change")
         expected_change_pct = prediction.get("expected_change_pct")
 
-        last_close_converted = self._convert_currency(last_close)
+        last_close_converted = self._convert_currency(last_price)
         predicted_converted = self._convert_currency(predicted_close)
         change_converted = self._convert_currency(expected_change)
 
@@ -3002,7 +3009,10 @@ class StockPredictorDesktopApp:
         if explanation and isinstance(explanation, Mapping):
             summary = explanation.get("summary")
             if summary:
-                self._set_status(summary)
+                status_message = f"{status_message} • {summary}" if status_message else summary
+
+        if status_message:
+            self._set_status(status_message)
 
         self._recompute_pnl()
 

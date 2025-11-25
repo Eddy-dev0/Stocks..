@@ -107,6 +107,13 @@ class DataFetcher:
                 self._sources[key] = "remote"
         return summary
 
+    def fetch_live_price(self, force: bool = False) -> tuple[float | None, pd.Timestamp | None]:
+        """Fetch the most recent intraday price and timestamp."""
+
+        price, timestamp = self.etl.fetch_live_price(force=force)
+        self._set_source("prices", True)
+        return price, timestamp
+
     # ------------------------------------------------------------------
     # Convenience helpers for the UI layer
     # ------------------------------------------------------------------
