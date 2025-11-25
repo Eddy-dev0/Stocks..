@@ -270,6 +270,7 @@ class MarketDataETL:
         )
         self.market_timezone = resolve_market_timezone(self.config)
         self._last_price_cache_warning: str | None = None
+        self._live_price_cache: tuple[float | None, pd.Timestamp | None, float] | None = None
         ttl = getattr(self.config, "memory_cache_seconds", None)
         if ttl is None:
             ttl = self._memory_cache_default_ttl
@@ -1157,6 +1158,60 @@ class MarketDataETL:
             self._record_source("ownership_flows", provider)
         refreshed = self.database.get_ownership_flows(self.config.ticker)
         return RefreshResult(refreshed, downloaded=downloaded)
+
+    def fetch_live_price(
+        self, *, force: bool = False
+    ) -> tuple[float | None, pd.Timestamp | None]:
+        """Return the most recent intraday price and timestamp if available."""
+
+        now = time.time()
+        if not force and self._live_price_cache is not None:
+            cached_price, cached_timestamp, cached_at = self._live_price_cache
+            if now - cached_at < self._memory_cache_ttl:
+                return cached_price, cached_timestamp
+
+        ticker = yf.Ticker(self.config.ticker)
+        market_tz = self.market_timezone or DEFAULT_MARKET_TIMEZONE
+        price: float | None = None
+        timestamp: pd.Timestamp | None = None
+
+        fast_info = getattr(ticker, "fast_info", None)
+        if fast_info:
+            for key in ("last_price", "lastPrice"):
+                candidate = getattr(fast_info, key, None)
+                if candidate is None and isinstance(fast_info, Mapping):
+                    candidate = fast_info.get(key)
+                if candidate is not None:
+                    price = self._safe_float(candidate)
+                    break
+            if isinstance(fast_info, Mapping):
+                raw_time = fast_info.get("last_price_time") or fast_info.get("lastPriceTime")
+                if raw_time:
+                    timestamp = pd.to_datetime(raw_time, errors="coerce")
+
+        if price is None or timestamp is None:
+            history = self._safe_download(
+                lambda: ticker.history(period="1d", interval="1m", prepost=True)
+            )
+            if isinstance(history, pd.DataFrame) and not history.empty:
+                history = history.dropna(how="all")
+                if not history.empty:
+                    last_bar = history.iloc[-1]
+                    if price is None:
+                        price = self._safe_float(last_bar.get("Close"))
+                    ts = history.index[-1]
+                    timestamp = pd.to_datetime(ts, errors="coerce")
+
+        if timestamp is not None and not pd.isna(timestamp):
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.tz_localize(market_tz)
+            else:
+                timestamp = timestamp.tz_convert(market_tz)
+        elif price is not None:
+            timestamp = pd.Timestamp.now(tz=market_tz)
+
+        self._live_price_cache = (price, timestamp, now)
+        return price, timestamp
 
     def refresh_all(self, force: bool = False) -> dict[str, int]:
         prices_result = self.refresh_prices(force=force)
