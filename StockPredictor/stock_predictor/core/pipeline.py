@@ -1167,7 +1167,7 @@ class MarketDataETL:
         now = time.time()
         if not force and self._live_price_cache is not None:
             cached_price, cached_timestamp, cached_at = self._live_price_cache
-            if now - cached_at < self._memory_cache_ttl:
+            if cached_price is not None and now - cached_at < self._memory_cache_ttl:
                 return cached_price, cached_timestamp
 
         ticker = yf.Ticker(self.config.ticker)
@@ -1210,7 +1210,12 @@ class MarketDataETL:
         elif price is not None:
             timestamp = pd.Timestamp.now(tz=market_tz)
 
-        self._live_price_cache = (price, timestamp, now)
+        if price is not None or timestamp is not None:
+            self._live_price_cache = (price, timestamp, now)
+        else:
+            # Avoid caching failed lookups so that the next request can retry immediately.
+            self._live_price_cache = None
+
         return price, timestamp
 
     def refresh_all(self, force: bool = False) -> dict[str, int]:
