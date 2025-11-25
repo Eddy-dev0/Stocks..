@@ -27,11 +27,7 @@ def _ensure_dataframe(
     if isinstance(data, pd.DataFrame):
         frame = data.copy()
         if columns is not None:
-            missing = [col for col in columns if col not in frame.columns]
-            if missing:
-                for column in missing:
-                    frame[column] = np.nan
-            frame = frame.loc[:, list(columns)]
+            frame = frame.reindex(columns=list(columns))
         return frame
 
     array = np.asarray(data)
