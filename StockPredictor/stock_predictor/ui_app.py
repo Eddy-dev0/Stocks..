@@ -2925,6 +2925,18 @@ class StockPredictorDesktopApp:
                 best_value = numeric
         return best_value
 
+    def _reference_last_price(
+        self, prediction: Mapping[str, Any] | None = None
+    ) -> tuple[float | None, float | None]:
+        """Return the raw and converted reference price for calculations."""
+
+        data = prediction if isinstance(prediction, Mapping) else {}
+        raw_value = _safe_float(data.get("last_price"))
+        if raw_value is None:
+            raw_value = _safe_float(data.get("last_close"))
+        converted = self._convert_currency(raw_value)
+        return raw_value, converted
+
     def _update_metrics(self) -> None:
         prediction = self.current_prediction or {}
         explanation = prediction.get("explanation") if isinstance(prediction, Mapping) else None
@@ -2941,15 +2953,12 @@ class StockPredictorDesktopApp:
             f"Market data as of {as_of_display}" if as_of_display != "—" else "Market data timestamp unavailable."
         )
 
-        last_close = prediction.get("last_close")
-        last_price = prediction.get("last_price") if isinstance(prediction, Mapping) else None
-        if last_price is None:
-            last_price = last_close
+        _, last_price = self._reference_last_price(prediction)
         predicted_close = prediction.get("predicted_close")
         expected_change = prediction.get("expected_change")
         expected_change_pct = prediction.get("expected_change_pct")
 
-        last_close_converted = self._convert_currency(last_price)
+        last_close_converted = last_price
         predicted_converted = self._convert_currency(predicted_close)
         change_converted = self._convert_currency(expected_change)
 
@@ -3153,7 +3162,11 @@ class StockPredictorDesktopApp:
 
         last_x = plotted_series.index[-1]
         last_y = float(plotted_series.iloc[-1])
-        last_display = fmt_ccy(last_y, self.currency_symbol, decimals=self.price_decimal_places)
+        _, reference_last_converted = self._reference_last_price(prediction)
+        display_last_value = reference_last_converted if reference_last_converted is not None else last_y
+        last_display = fmt_ccy(
+            display_last_value, self.currency_symbol, decimals=self.price_decimal_places
+        )
 
         try:
             prediction_line_end = (
@@ -3188,10 +3201,10 @@ class StockPredictorDesktopApp:
                     alpha=0.9,
                 )
                 ax.add_patch(rect)
-            ax.scatter([date_numbers[-1]], [last_y], color="tab:blue", zorder=5)
+            ax.scatter([date_numbers[-1]], [display_last_value], color="tab:blue", zorder=5)
             ax.annotate(
                 f"Last: {last_display}",
-                xy=(date_numbers[-1], last_y),
+                xy=(date_numbers[-1], display_last_value),
                 xytext=(8, 0),
                 textcoords="offset points",
                 va="center",
@@ -3218,10 +3231,10 @@ class StockPredictorDesktopApp:
                 color="tab:blue",
             )
             legend_handles.append(line_handle)
-            ax.scatter([last_x], [last_y], color="tab:blue", zorder=5)
+            ax.scatter([last_x], [display_last_value], color="tab:blue", zorder=5)
             ax.annotate(
                 f"Last: {last_display}",
-                xy=(last_x, last_y),
+                xy=(last_x, display_last_value),
                 xytext=(8, 0),
                 textcoords="offset points",
                 va="center",
@@ -3329,7 +3342,9 @@ class StockPredictorDesktopApp:
                 color=expected_color,
             )
 
-            zone_reference = converted_prediction if converted_prediction is not None else last_y
+            zone_reference = (
+                converted_prediction if converted_prediction is not None else display_last_value
+            )
             if zone_reference is not None:
                 lower, upper = sorted([expected_low_converted, float(zone_reference)])
                 if abs(upper - lower) > 1e-9:
@@ -4064,13 +4079,12 @@ class StockPredictorDesktopApp:
         prefix = f"Expected P&L for {size:,} {share_label}: "
 
         prediction = self.current_prediction or {}
-        last_raw = _safe_float(prediction.get("last_close"))
+        last_raw, last_converted = self._reference_last_price(prediction)
         predicted_raw = _safe_float(prediction.get("predicted_close"))
         if last_raw is None or predicted_raw is None:
             self.pnl_var.set(prefix + "—")
             return
 
-        last_converted = self._convert_currency(last_raw)
         predicted_converted = self._convert_currency(predicted_raw)
         if last_converted is None or predicted_converted is None:
             self.pnl_var.set(prefix + "—")
