@@ -1660,16 +1660,44 @@ class StockPredictorDesktopApp:
         names = list(self._indicator_names)
         if not names:
             return
+        _, price_index = self._prepare_price_series_for_indicators()
+        if price_index.empty:
+            self._set_status("No price data available to visualise indicators.")
+            return
+
+        available: list[tuple[int, str]] = []
+        for idx, name in enumerate(names):
+            aligned = self._align_indicator_to_price_index(
+                self._extract_indicator_series(name), price_index
+            )
+            if aligned is not None and not aligned.empty:
+                available.append((idx, name))
+
+        if not available:
+            self.indicator_listbox.selection_clear(0, tk.END)
+            self._indicator_selection_cache = set()
+            self._indicator_user_override = True
+            self._update_indicator_toggle_button_state(names, set())
+            self._update_indicator_chart(set())
+            self._set_status("No indicators available for this symbol and date range.")
+            return
+
         self._indicator_selector_updating = True
         try:
-            self.indicator_listbox.selection_set(0, tk.END)
+            self.indicator_listbox.selection_clear(0, tk.END)
+            for index, _ in available:
+                self.indicator_listbox.selection_set(index)
         finally:
             self._indicator_selector_updating = False
-        selections: set[str] = set(names)
+
+        selections: set[str] = {name for _, name in available}
         self._indicator_selection_cache = selections
         self._indicator_user_override = True
         self._update_indicator_toggle_button_state(names, selections)
         self._update_indicator_chart(selections)
+        self._set_status(
+            f"Showing all {len(selections)} indicators available for the current view."
+        )
 
     def _on_indicator_toggle_all(self) -> None:
         if self._indicator_selector_updating or not hasattr(self, "indicator_listbox"):
@@ -1988,6 +2016,108 @@ class StockPredictorDesktopApp:
             self._indicator_family_colors[family] = palette[index]
         return self._indicator_family_colors[family]
 
+    def _prepare_price_series_for_indicators(
+        self,
+    ) -> tuple[pd.Series | None, pd.DatetimeIndex]:
+        price_frame = (
+            self.price_history_converted
+            if isinstance(self.price_history_converted, pd.DataFrame)
+            else self.price_history
+        )
+        if not isinstance(price_frame, pd.DataFrame) or price_frame.empty:
+            return None, pd.DatetimeIndex([])
+
+        frame = price_frame.copy()
+        columns = {str(col).lower(): col for col in frame.columns}
+        date_col = columns.get("date")
+        if date_col:
+            frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
+            frame = frame.dropna(subset=[date_col]).sort_values(date_col)
+            index = pd.DatetimeIndex(frame[date_col])
+        else:
+            index = pd.to_datetime(frame.index, errors="coerce")
+            valid_mask = pd.notna(index)
+            frame = frame.loc[valid_mask]
+            index = pd.DatetimeIndex(index[valid_mask])
+
+        if index.empty:
+            return None, pd.DatetimeIndex([])
+
+        close_col = None
+        for candidate in ("close", "adjclose", "adj_close"):
+            close_col = columns.get(candidate)
+            if close_col:
+                break
+        if close_col is None:
+            numeric_cols = frame.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols):
+                close_col = numeric_cols[0]
+        if close_col is None:
+            return None, pd.DatetimeIndex([])
+
+        price_series = pd.to_numeric(frame[close_col], errors="coerce")
+        price_series.index = index
+        price_series = price_series.dropna()
+        if price_series.empty:
+            return None, pd.DatetimeIndex([])
+
+        price_index = pd.DatetimeIndex(price_series.index)
+        if price_index.has_duplicates:
+            unique_mask = ~price_index.duplicated(keep="last")
+            price_series = price_series.loc[unique_mask]
+            price_index = pd.DatetimeIndex(price_series.index)
+        price_series = price_series.loc[price_index].sort_index()
+        price_index = pd.DatetimeIndex(price_series.index)
+        return price_series, price_index
+
+    def _align_indicator_to_price_index(
+        self, series: pd.Series | None, price_index: pd.DatetimeIndex
+    ) -> pd.Series | None:
+        if series is None or not isinstance(series, pd.Series) or series.empty:
+            return None
+        if price_index.empty:
+            return None
+
+        cleaned = pd.to_numeric(series, errors="coerce")
+        cleaned = cleaned.dropna()
+        if cleaned.empty:
+            return None
+
+        if isinstance(cleaned.index, pd.DatetimeIndex):
+            index = cleaned.index
+            valid_mask = pd.notna(index)
+            if not valid_mask.all():
+                cleaned = cleaned.loc[valid_mask]
+                index = index[valid_mask]
+            try:
+                index = index.tz_localize(None)
+            except (TypeError, AttributeError, ValueError):
+                try:
+                    index = index.tz_convert(None)
+                except Exception:
+                    pass
+            cleaned.index = pd.DatetimeIndex(index)
+            if cleaned.empty:
+                return None
+            dedup_mask = ~cleaned.index.duplicated(keep="last")
+            if not dedup_mask.all():
+                cleaned = cleaned.loc[dedup_mask]
+            cleaned = cleaned.sort_index()
+            aligned = cleaned.reindex(price_index).dropna()
+            if aligned.empty:
+                return None
+            return aligned
+
+        trimmed = cleaned.copy()
+        if len(trimmed) >= len(price_index):
+            trimmed = trimmed.iloc[-len(price_index):]
+            aligned_index = price_index
+        else:
+            aligned_index = price_index[-len(trimmed):]
+        trimmed = trimmed.copy()
+        trimmed.index = aligned_index
+        return trimmed
+
     def _update_indicator_chart(self, selections: Iterable[str] | None = None) -> None:
         if not hasattr(self, "indicator_price_ax"):
             return
@@ -2017,71 +2147,14 @@ class StockPredictorDesktopApp:
                     pass
             self._indicator_extra_axes = []
 
-        price_frame = (
-            self.price_history_converted
-            if isinstance(self.price_history_converted, pd.DataFrame)
-            else self.price_history
-        )
-        if not isinstance(price_frame, pd.DataFrame) or price_frame.empty:
+        price_series, price_index = self._prepare_price_series_for_indicators()
+        if price_series is None or price_series.empty or price_index.empty:
             show_empty_state()
             if canvas is not None:
                 self._style_figure(self.indicator_price_figure)
                 canvas.draw_idle()
             return
 
-        frame = price_frame.copy()
-        columns = {str(col).lower(): col for col in frame.columns}
-        date_col = columns.get("date")
-        if date_col:
-            frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
-            frame = frame.dropna(subset=[date_col]).sort_values(date_col)
-            index = pd.DatetimeIndex(frame[date_col])
-        else:
-            index = pd.to_datetime(frame.index, errors="coerce")
-            valid_mask = pd.notna(index)
-            frame = frame.loc[valid_mask]
-            index = pd.DatetimeIndex(index[valid_mask])
-
-        if index.empty:
-            show_empty_state()
-            if canvas is not None:
-                self._style_figure(self.indicator_price_figure)
-                canvas.draw_idle()
-            return
-
-        close_col = None
-        for candidate in ("close", "adjclose", "adj_close"):
-            close_col = columns.get(candidate)
-            if close_col:
-                break
-        if close_col is None:
-            numeric_cols = frame.select_dtypes(include=[np.number]).columns
-            if len(numeric_cols):
-                close_col = numeric_cols[0]
-        if close_col is None:
-            show_empty_state()
-            if canvas is not None:
-                self._style_figure(self.indicator_price_figure)
-                canvas.draw_idle()
-            return
-
-        price_series = pd.to_numeric(frame[close_col], errors="coerce")
-        price_series.index = index
-        price_series = price_series.dropna()
-        if price_series.empty:
-            show_empty_state()
-            if canvas is not None:
-                self._style_figure(self.indicator_price_figure)
-                canvas.draw_idle()
-            return
-
-        price_index = pd.DatetimeIndex(price_series.index)
-        if price_index.has_duplicates:
-            unique_mask = ~price_index.duplicated(keep="last")
-            price_series = price_series.loc[unique_mask]
-            price_index = pd.DatetimeIndex(price_series.index)
-        price_series = price_series.loc[price_index].sort_index()
-        price_index = pd.DatetimeIndex(price_series.index)
         price_start = price_index.min()
         price_end = price_index.max()
 
@@ -2104,45 +2177,7 @@ class StockPredictorDesktopApp:
             ax.set_xlim(price_start, price_end)
 
         def align_indicator_series(series: pd.Series) -> pd.Series | None:
-            if not isinstance(series, pd.Series) or series.empty:
-                return None
-            cleaned = pd.to_numeric(series, errors="coerce")
-            cleaned = cleaned.dropna()
-            if cleaned.empty:
-                return None
-            if isinstance(cleaned.index, pd.DatetimeIndex):
-                index = cleaned.index
-                valid_mask = pd.notna(index)
-                if not valid_mask.all():
-                    cleaned = cleaned.loc[valid_mask]
-                    index = index[valid_mask]
-                try:
-                    index = index.tz_localize(None)
-                except (TypeError, AttributeError, ValueError):
-                    try:
-                        index = index.tz_convert(None)
-                    except Exception:
-                        pass
-                cleaned.index = pd.DatetimeIndex(index)
-                if cleaned.empty:
-                    return None
-                dedup_mask = ~cleaned.index.duplicated(keep="last")
-                if not dedup_mask.all():
-                    cleaned = cleaned.loc[dedup_mask]
-                cleaned = cleaned.sort_index()
-                aligned = cleaned.reindex(price_index).dropna()
-                if aligned.empty:
-                    return None
-                return aligned
-            trimmed = cleaned.copy()
-            if len(trimmed) >= len(price_index):
-                trimmed = trimmed.iloc[-len(price_index):]
-                aligned_index = price_index
-            else:
-                aligned_index = price_index[-len(trimmed):]
-            trimmed = trimmed.copy()
-            trimmed.index = aligned_index
-            return trimmed
+            return self._align_indicator_to_price_index(series, price_index)
 
         if selections is None:
             selection_set = set(self._indicator_selection_cache)
