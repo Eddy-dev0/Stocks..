@@ -7,6 +7,7 @@ from stock_predictor.core.indicators import (
     IndicatorInputs,
     anchored_vwap,
     liquidity_proxies,
+    momentum,
     supertrend,
 )
 
@@ -92,3 +93,87 @@ def test_liquidity_proxies_generate_columns() -> None:
         "Sentiment_VolumeCorrelation_10",
     }
     assert expected.issubset(set(liquidity.columns))
+
+
+def test_cci_uses_talib_when_available(monkeypatch) -> None:
+    price_df = _sample_price_frame()
+    inputs = IndicatorInputs(
+        high=price_df["High"].set_axis(price_df["Date"]),
+        low=price_df["Low"].set_axis(price_df["Date"]),
+        close=price_df["Close"].set_axis(price_df["Date"]),
+    )
+
+    expected = pd.Series(np.linspace(-1, 1, len(price_df)), index=inputs.close.index, name="CCI_20")
+
+    class _FakeTalib:
+        @staticmethod
+        def CCI(high, low, close, timeperiod=20):
+            assert timeperiod == 20
+            pd.testing.assert_series_equal(high, inputs.high)
+            pd.testing.assert_series_equal(low, inputs.low)
+            pd.testing.assert_series_equal(close, inputs.close)
+            return expected
+
+    monkeypatch.setattr(momentum, "TA_LIB_AVAILABLE", True)
+    monkeypatch.setattr(momentum, "talib", _FakeTalib())
+
+    cci = momentum.commodity_channel_index(inputs, period=20)
+    pd.testing.assert_series_equal(cci["CCI_20"], expected)
+
+
+def test_cci_manual_calculation_matches_reference(monkeypatch) -> None:
+    price_df = _sample_price_frame()
+    inputs = IndicatorInputs(
+        high=price_df["High"].set_axis(price_df["Date"]),
+        low=price_df["Low"].set_axis(price_df["Date"]),
+        close=price_df["Close"].set_axis(price_df["Date"]),
+    )
+
+    monkeypatch.setattr(momentum, "TA_LIB_AVAILABLE", False)
+    monkeypatch.setattr(momentum, "talib", None)
+
+    result = momentum.commodity_channel_index(inputs, period=5)["CCI_5"]
+
+    typical_price = (inputs.high + inputs.low + inputs.close) / 3
+    rolling_mean = typical_price.rolling(window=5, min_periods=1).mean()
+    rolling_dev = typical_price.rolling(window=5, min_periods=1).apply(
+        lambda window: np.mean(np.abs(window - window.mean())), raw=False
+    )
+    expected = (typical_price - rolling_mean) / (0.015 * rolling_dev.replace(0, np.nan))
+    expected.name = "CCI_5"
+
+    pd.testing.assert_series_equal(result, expected)
+
+
+def test_indicator_bundle_exposes_configurable_mas_and_cci(monkeypatch) -> None:
+    price_df = _sample_price_frame(rows=120)
+
+    monkeypatch.setattr(momentum, "TA_LIB_AVAILABLE", False)
+    monkeypatch.setattr(momentum, "talib", None)
+
+    config = {
+        "moving_averages": {"sma_periods": (10, 20, 100), "ema_periods": (10, 26, 100)},
+        "cci": {"period": 30},
+    }
+
+    indicators = compute_indicators(price_df, config).dataframe
+
+    assert {"SMA_10", "SMA_100", "EMA_10", "EMA_100", "CCI_30"}.issubset(indicators.columns)
+
+
+def test_features_propagate_indicator_columns(monkeypatch) -> None:
+    price_df = _sample_price_frame(rows=90)
+
+    monkeypatch.setattr(momentum, "TA_LIB_AVAILABLE", False)
+    monkeypatch.setattr(momentum, "talib", None)
+
+    assembler = FeatureAssembler(
+        feature_toggles={"technical": True},
+        horizons=(1,),
+        technical_indicator_config={"cci": {"period": 15}},
+    )
+    result = assembler.build(price_df, news_df=None, sentiment_enabled=False)
+
+    columns = set(result.features.columns)
+    assert "CCI_15" in columns
+    assert any(col.startswith("Price_to_SMA_10") or col.startswith("Price_to_SMA_100") for col in columns)
