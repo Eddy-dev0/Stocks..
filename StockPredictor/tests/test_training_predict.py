@@ -93,6 +93,12 @@ def test_training_and_predict_handles_missing_volatility_model(tmp_path: Path) -
     prediction = predictor.predict(targets=("direction", "return", "volatility"))
     assert "stop_loss" in prediction
 
+    confluence = prediction.get("signal_confluence")
+    assert isinstance(confluence, dict)
+    assert "score" in confluence
+    assert "passed" in confluence
+    assert "confluence_confidence" in prediction
+
     assert config.model_path_for("volatility", 1).exists()
     metrics = prediction.get("training_metrics", {}) or {}
     assert "volatility" in metrics

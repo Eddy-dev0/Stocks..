@@ -31,6 +31,15 @@ from .indicators import (
 )
 
 
+@dataclass(frozen=True)
+class ConfluenceAssessment:
+    """Summary of whether multiple momentum signals align."""
+
+    passed: bool
+    score: float
+    components: dict[str, float]
+
+
 DEFAULT_INDICATOR_CONFIG: dict[str, dict[str, object]] = {
     "moving_averages": {"sma_periods": (10, 20, 50, 100, 200), "ema_periods": (10, 12, 26, 50, 100)},
     "supertrend": {"period": 10, "multiplier": 3.0},
@@ -238,4 +247,111 @@ def compute_indicators(
     return IndicatorResult(indicators, list(indicators.columns))
 
 
-__all__ = ["IndicatorResult", "compute_indicators", "DEFAULT_INDICATOR_CONFIG"]
+def _parse_ema_periods(index: pd.Index) -> list[int]:
+    """Return discovered EMA periods parsed from column names."""
+
+    periods: list[int] = []
+    for column in index:
+        if not isinstance(column, str) or not column.startswith("EMA_"):
+            continue
+        try:
+            period = int(column.split("_")[1])
+        except (IndexError, ValueError):
+            continue
+        periods.append(period)
+    return sorted(set(periods))
+
+
+def _linear_slope(series: pd.Series) -> float:
+    """Return the slope of a series using a simple linear fit."""
+
+    if series.size < 2:
+        return 0.0
+    x = np.arange(series.size)
+    coeffs = np.polyfit(x, series.values, 1)
+    return float(coeffs[0])
+
+
+def evaluate_signal_confluence(
+    indicator_frame: pd.DataFrame,
+    *,
+    ema_periods: Sequence[int] = (12, 26, 50),
+    rsi_column: str = "RSI_14",
+    obv_column: str = "OBV",
+    slope_window: int = 5,
+    pass_threshold: float = 0.6,
+) -> ConfluenceAssessment:
+    """Assess whether several momentum signals align.
+
+    The evaluator inspects stacked EMAs (uptrend bias), RSI strength and slope,
+    and the On-Balance Volume (OBV) slope. It returns a composite score between
+    0 and 1 alongside a boolean gate indicating whether confluence is
+    considered present.
+    """
+
+    if not isinstance(indicator_frame, pd.DataFrame) or indicator_frame.empty:
+        return ConfluenceAssessment(False, 0.0, {})
+
+    window = max(2, int(slope_window))
+    frame = indicator_frame.tail(window)
+    latest = frame.iloc[-1]
+
+    components: dict[str, float] = {}
+
+    # EMA alignment: favour higher short-term EMAs relative to long-term EMAs.
+    discovered_periods = _parse_ema_periods(latest.index)
+    relevant_periods = [period for period in ema_periods if period in discovered_periods]
+    ema_score = 0.0
+    if len(relevant_periods) >= 2:
+        ema_values: list[float] = []
+        for period in sorted(relevant_periods):
+            value = latest.get(f"EMA_{period}")
+            numeric = float(value) if pd.notna(value) else np.nan
+            ema_values.append(numeric)
+        pairs = [(a, b) for a, b in zip(ema_values, ema_values[1:]) if np.isfinite(a) and np.isfinite(b)]
+        if pairs:
+            positive = sum(1 for short, long in pairs if short > long)
+            ema_score = positive / len(pairs)
+    components["ema_alignment"] = ema_score
+
+    # RSI bullishness: reward values above 50 and positive slope.
+    rsi_score = 0.0
+    rsi_series = frame.get(rsi_column)
+    if isinstance(rsi_series, pd.Series):
+        rsi_tail = rsi_series.dropna().tail(window)
+        if not rsi_tail.empty:
+            latest_rsi = float(rsi_tail.iloc[-1])
+            slope = _linear_slope(rsi_tail)
+            above_neutral = max(0.0, (latest_rsi - 50.0) / 50.0)
+            slope_bonus = 0.25 if slope > 0 else 0.0
+            rsi_score = min(1.0, above_neutral + slope_bonus)
+    components["rsi_bullish"] = rsi_score
+
+    # OBV slope: prefer a rising accumulation profile.
+    obv_score = 0.0
+    obv_series = frame.get(obv_column)
+    if isinstance(obv_series, pd.Series):
+        obv_tail = obv_series.dropna().tail(window)
+        if obv_tail.size >= 2:
+            slope = _linear_slope(obv_tail)
+            obv_score = 1.0 if slope > 0 else 0.0
+    components["obv_slope"] = obv_score
+
+    available_scores = [score for score in components.values() if np.isfinite(score)]
+    if available_scores:
+        score = float(np.mean(available_scores))
+    else:
+        score = 0.0
+
+    passed = bool(score >= pass_threshold and ema_score > 0 and rsi_score > 0)
+
+    return ConfluenceAssessment(passed, score, components)
+
+
+__all__ = [
+    "ConfluenceAssessment",
+    "IndicatorResult",
+    "compute_indicators",
+    "DEFAULT_INDICATOR_CONFIG",
+    "evaluate_signal_confluence",
+]

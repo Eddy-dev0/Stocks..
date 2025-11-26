@@ -26,6 +26,7 @@ from ..config import PredictorConfig
 from ..data_fetcher import DataFetcher
 from ..database import ExperimentTracker
 from ..features import FeatureAssembler
+from ..indicator_bundle import evaluate_signal_confluence
 from ..ml_preprocessing import (
     PreprocessingBuilder,
     get_feature_names_from_pipeline,
@@ -1336,6 +1337,9 @@ class StockPredictorAI:
             self.metadata["raw_feature_columns"] = raw_feature_columns
         self.metadata["active_horizon"] = resolved_horizon
 
+        confluence_assessment = evaluate_signal_confluence(latest_features)
+        self.metadata["signal_confluence"] = confluence_assessment
+
         requested_targets = list(targets) if targets else list(self.config.prediction_targets)
         predictions: dict[str, Any] = {}
         confidences: dict[str, float] = {}
@@ -1571,6 +1575,42 @@ class StockPredictorAI:
                 return None
             return timestamp.to_pydatetime().isoformat(timespec="seconds")
 
+        confluence_block = None
+        combined_confidence = None
+        confluence_score = None
+        confluence_passed = False
+        if confluence_assessment is not None:
+            confluence_score = float(confluence_assessment.score)
+            confluence_passed = bool(confluence_assessment.passed)
+            confluence_block = {
+                "passed": confluence_passed,
+                "score": confluence_score,
+                "components": dict(confluence_assessment.components),
+            }
+
+        base_confidence = None
+        if confidences:
+            numeric_conf = [
+                self._safe_float(value)
+                for value in confidences.values()
+                if self._safe_float(value) is not None
+            ]
+            if numeric_conf:
+                base_confidence = max(numeric_conf)
+        if base_confidence is None and direction_probability_up is not None:
+            base_confidence = max(
+                value
+                for value in (direction_probability_up, direction_probability_down)
+                if value is not None
+            )
+        if base_confidence is not None:
+            combined_confidence = float(base_confidence)
+            if confluence_score is not None:
+                combined_confidence *= max(0.0, min(1.0, confluence_score))
+            if confluence_passed is False:
+                combined_confidence *= 0.5
+            combined_confidence = float(combined_confidence)
+
         result = {
             "ticker": self.config.ticker,
             "as_of": _to_iso(market_data_as_of) or "",
@@ -1591,6 +1631,10 @@ class StockPredictorAI:
             "horizon": resolved_horizon,
             "target_date": _to_iso(target_date) or "",
         }
+        if confluence_block:
+            result["signal_confluence"] = confluence_block
+        if combined_confidence is not None:
+            result["confluence_confidence"] = combined_confidence
         if indicator_floor is not None:
             result["indicator_expected_low"] = indicator_floor
         if indicator_components:
