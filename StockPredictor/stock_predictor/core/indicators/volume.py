@@ -89,9 +89,44 @@ def money_flow_index(
     return pd.DataFrame({f"MFI_{period}": mfi})
 
 
+def accumulation_distribution_line(inputs: IndicatorInputs) -> pd.DataFrame:
+    """Compute the Accumulation/Distribution Line (ADL)."""
+
+    high = inputs.high
+    low = inputs.low
+    close = inputs.close
+    volume = inputs.volume
+
+    if volume is None:
+        adl = pd.Series(np.nan, index=close.index)
+    else:
+        price_range = (high - low).replace(0, np.nan)
+        money_flow_multiplier = ((close - low) - (high - close)) / price_range
+        money_flow_multiplier = money_flow_multiplier.fillna(0.0)
+        money_flow_volume = money_flow_multiplier * volume.fillna(0.0)
+        adl = money_flow_volume.cumsum()
+
+    return pd.DataFrame({"ADL": adl})
+
+
+def chaikin_accumulation_distribution(
+    inputs: IndicatorInputs, *, short_period: int = 3, long_period: int = 10
+) -> pd.DataFrame:
+    """Compute the Chaikin Accumulation/Distribution oscillator."""
+
+    adl = accumulation_distribution_line(inputs)["ADL"]
+    short_ema = adl.ewm(span=short_period, adjust=False, min_periods=1).mean()
+    long_ema = adl.ewm(span=long_period, adjust=False, min_periods=1).mean()
+    chaikin = short_ema - long_ema
+    name = f"Chaikin_AD_{short_period}_{long_period}"
+    return pd.DataFrame({name: chaikin})
+
+
 __all__ = [
     "volume_weighted_average_price",
     "anchored_vwap",
     "on_balance_volume",
     "money_flow_index",
+    "accumulation_distribution_line",
+    "chaikin_accumulation_distribution",
 ]
