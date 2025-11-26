@@ -1673,8 +1673,34 @@ class StockPredictorDesktopApp:
             aligned = self._align_indicator_to_price_index(series, price_index)
             if aligned is None or aligned.empty:
                 if isinstance(series.index, pd.DatetimeIndex) and not price_index.empty:
-                    start, end = price_index.min(), price_index.max()
-                    series = series.loc[(series.index >= start) & (series.index <= end)]
+                    price_start, price_end = price_index.min(), price_index.max()
+                    series_index = series.index
+                    price_tz = getattr(price_index, "tz", None)
+                    series_tz = getattr(series_index, "tz", None)
+
+                    if price_tz != series_tz:
+                        try:
+                            series_index = series_index.tz_localize(None)
+                        except (TypeError, AttributeError, ValueError):
+                            try:
+                                series_index = series_index.tz_convert(None)
+                            except Exception:
+                                continue
+                        try:
+                            price_index = price_index.tz_localize(None)
+                        except (TypeError, AttributeError, ValueError):
+                            try:
+                                price_index = price_index.tz_convert(None)
+                            except Exception:
+                                continue
+                        price_start, price_end = price_index.min(), price_index.max()
+
+                    if getattr(series_index, "tz", None) != getattr(price_index, "tz", None):
+                        continue
+
+                    series = series.copy()
+                    series.index = series_index
+                    series = series.loc[(series_index >= price_start) & (series_index <= price_end)]
                     aligned = self._align_indicator_to_price_index(series, price_index)
             if aligned is not None and not aligned.empty:
                 available.append((idx, name))
