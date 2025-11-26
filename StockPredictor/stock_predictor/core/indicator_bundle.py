@@ -13,7 +13,9 @@ from .indicators import (
     IndicatorInputs,
     adx_dmi,
     anchored_vwap,
+    accumulation_distribution_line,
     average_true_range,
+    chaikin_accumulation_distribution,
     commodity_channel_index,
     composite_score,
     ichimoku,
@@ -50,6 +52,7 @@ DEFAULT_INDICATOR_CONFIG: dict[str, dict[str, object]] = {
     "wavetrend": {"channel_length": 10, "average_length": 21},
     "liquidity": {"window": 20},
     "composite": {"columns": None},
+    "adl": {"enabled": True, "chaikin_enabled": False, "short_period": 3, "long_period": 10},
 }
 
 
@@ -214,6 +217,19 @@ def compute_indicators(
 
     indicators = indicators.join(on_balance_volume(inputs), how="outer")
     indicators = indicators.join(money_flow_index(inputs, period=int(config_map["mfi"]["period"])) , how="outer")
+
+    adl_config = config_map["adl"]
+    if adl_config.get("enabled", True):
+        indicators = indicators.join(accumulation_distribution_line(inputs), how="outer")
+        if adl_config.get("chaikin_enabled", False):
+            indicators = indicators.join(
+                chaikin_accumulation_distribution(
+                    inputs,
+                    short_period=int(adl_config.get("short_period", 3)),
+                    long_period=int(adl_config.get("long_period", 10)),
+                ),
+                how="outer",
+            )
 
     composite_df = composite_score(indicators, columns=config_map["composite"].get("columns"))
     indicators = indicators.join(composite_df, how="outer")

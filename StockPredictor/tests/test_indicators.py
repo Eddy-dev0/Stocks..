@@ -5,7 +5,9 @@ from stock_predictor.core.features import FeatureAssembler
 from stock_predictor.core.indicator_bundle import compute_indicators
 from stock_predictor.core.indicators import (
     IndicatorInputs,
+    accumulation_distribution_line,
     anchored_vwap,
+    chaikin_accumulation_distribution,
     liquidity_proxies,
     momentum,
     supertrend,
@@ -177,3 +179,52 @@ def test_features_propagate_indicator_columns(monkeypatch) -> None:
     columns = set(result.features.columns)
     assert "CCI_15" in columns
     assert any(col.startswith("Price_to_SMA_10") or col.startswith("Price_to_SMA_100") for col in columns)
+
+
+def test_accumulation_distribution_matches_manual_calculation() -> None:
+    price_df = _sample_price_frame(rows=30)
+    inputs = IndicatorInputs(
+        high=price_df["High"].set_axis(price_df["Date"]),
+        low=price_df["Low"].set_axis(price_df["Date"]),
+        close=price_df["Close"].set_axis(price_df["Date"]),
+        volume=price_df["Volume"].set_axis(price_df["Date"]),
+    )
+
+    adl = accumulation_distribution_line(inputs)["ADL"]
+
+    base = price_df["Close"] - price_df["Low"]
+    mfm = (base - (price_df["High"] - price_df["Close"])) / (price_df["High"] - price_df["Low"])
+    money_flow_volume = mfm * price_df["Volume"]
+    expected = money_flow_volume.cumsum().set_axis(price_df["Date"])
+    expected.name = "ADL"
+
+    pd.testing.assert_series_equal(adl, expected)
+
+
+def test_chaikin_ad_added_via_config_and_matches_reference() -> None:
+    price_df = _sample_price_frame(rows=25)
+    inputs = IndicatorInputs(
+        high=price_df["High"].set_axis(price_df["Date"]),
+        low=price_df["Low"].set_axis(price_df["Date"]),
+        close=price_df["Close"].set_axis(price_df["Date"]),
+        volume=price_df["Volume"].set_axis(price_df["Date"]),
+    )
+
+    adl = accumulation_distribution_line(inputs)["ADL"]
+    expected = chaikin_accumulation_distribution(inputs, short_period=2, long_period=5)
+
+    indicators = compute_indicators(
+        price_df,
+        {"adl": {"chaikin_enabled": True, "short_period": 2, "long_period": 5}},
+    ).dataframe
+
+    pd.testing.assert_series_equal(indicators["ADL"], adl)
+    pd.testing.assert_series_equal(indicators["Chaikin_AD_2_5"], expected.iloc[:, 0])
+
+
+def test_adl_handles_missing_volume_gracefully() -> None:
+    price_df = _sample_price_frame(rows=15).drop(columns=["Volume"])
+    indicators = compute_indicators(price_df).dataframe
+
+    assert "ADL" in indicators.columns
+    assert indicators["ADL"].isna().all()
