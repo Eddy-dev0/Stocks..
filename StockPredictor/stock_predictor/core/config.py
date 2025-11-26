@@ -32,6 +32,7 @@ DEFAULT_PREDICTION_TARGETS: tuple[str, ...] = (
     "direction",
     "return",
     "volatility",
+    "target_hit",
 )
 
 DEFAULT_PREDICTION_HORIZONS: tuple[int, ...] = (1, 5, 21, 63)
@@ -170,6 +171,7 @@ class PredictorConfig:
     memory_cache_seconds: float | None = None
     market_timezone: str | None = None
     k_stop: float = 1.0
+    target_return_threshold: float = 0.02
     time_series_baselines: tuple[str, ...] = field(default_factory=tuple)
     time_series_params: dict[str, dict[str, Any]] = field(default_factory=dict)
     buy_zone: BuyZoneConfirmationSettings = field(
@@ -218,6 +220,7 @@ class PredictorConfig:
             raise ValueError("volatility_window must be a positive integer.")
         self.volatility_window = int(self.volatility_window)
         self.risk_free_rate = float(self.risk_free_rate)
+        self.target_return_threshold = max(0.0, float(self.target_return_threshold))
         self.research_api_keys = self._normalise_strings(self.research_api_keys)
         self.research_allow_list = self._normalise_strings(
             self.research_allow_list, lower=True

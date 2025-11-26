@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from numbers import Real
-from typing import Any, Callable, DefaultDict, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, DefaultDict, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 import joblib
@@ -132,6 +132,9 @@ TARGET_SPECS: dict[str, TargetSpec] = {
     "volatility": TargetSpec(
         "volatility", "regression", default_model_type="random_forest", label_fn=make_volatility_label
     ),
+    "target_hit": TargetSpec(
+        "target_hit", "classification", default_model_type="logistic"
+    ),
 }
 
 SUPPORTED_TARGETS = frozenset(TARGET_SPECS)
@@ -158,7 +161,9 @@ class StockPredictorAI:
         self.horizon = self.config.resolve_horizon(horizon)
         self.fetcher = DataFetcher(config)
         self.feature_assembler = FeatureAssembler(
-            config.feature_toggles, config.prediction_horizons
+            config.feature_toggles,
+            config.prediction_horizons,
+            target_return_threshold=config.target_return_threshold,
         )
         self.market_timezone: ZoneInfo | None = resolve_market_timezone(self.config)
         self.tracker = ExperimentTracker(config)
@@ -673,7 +678,7 @@ class StockPredictorAI:
             if calibrate_override is None:
                 calibrate_override = global_params.get("calibrate")
             if calibrate_override is None:
-                calibrate_flag = task == "classification" and target == "direction"
+                calibrate_flag = task == "classification"
             else:
                 calibrate_flag = bool(calibrate_override)
 
@@ -1183,6 +1188,34 @@ class StockPredictorAI:
         metrics["signed_error"] = float(np.mean(y_pred - y_true.to_numpy()))
         return metrics
 
+    def _build_probability_map(
+        self, proba: np.ndarray, classes: Sequence[Any] | None
+    ) -> Dict[Any, float]:
+        flattened = np.atleast_1d(proba).ravel()
+        if classes is not None and len(classes) == len(flattened):
+            return {cls: float(prob) for cls, prob in zip(classes, flattened)}
+        return {idx: float(prob) for idx, prob in enumerate(flattened)}
+
+    def _positive_probability(
+        self, proba: np.ndarray, classes: Sequence[Any] | None
+    ) -> float:
+        flattened = np.atleast_1d(proba).ravel()
+        if flattened.size == 0:
+            return 0.0
+
+        positive_index: int | None = None
+        if classes is not None and len(classes) == len(flattened):
+            for idx, cls in enumerate(classes):
+                if cls in {1, True, "1", "up", "hit", "target_hit", "yes"}:
+                    positive_index = idx
+                    break
+            if positive_index is None:
+                positive_index = int(np.argmax(flattened))
+        else:
+            positive_index = int(np.argmax(flattened))
+
+        return float(flattened[positive_index])
+
     def _calibration_report(
         self,
         y_true: np.ndarray,
@@ -1350,6 +1383,7 @@ class StockPredictorAI:
         prediction_warnings: List[str] = []
         training_report: dict[str, Any] = {}
         event_probabilities: dict[str, Dict[str, float]] = {}
+        target_hit_probability: float | None = None
 
         filtered_targets: list[str] = []
         for target in requested_targets:
@@ -1410,6 +1444,9 @@ class StockPredictorAI:
             pred_value = model.predict(model_input)[0]
             predictions[target] = float(pred_value)
 
+            spec = TARGET_SPECS.get(target)
+            task = spec.task if spec else ("classification" if target == "direction" else "regression")
+
             uncertainty = self._estimate_prediction_uncertainty(
                 target, model, transformed_features
             )
@@ -1432,41 +1469,43 @@ class StockPredictorAI:
                         if self._safe_float(value) is not None
                     }
 
-            if model_supports_proba(model) and target == "direction":
+            if task == "classification" and model_supports_proba(model):
                 proba = model.predict_proba(model_input)[0]
                 estimator = model.named_steps.get("estimator")
                 classes = getattr(estimator, "classes_", None)
-                class_prob_map: Dict[Any, float] = {}
-                if classes is not None:
-                    class_prob_map = {
-                        cls: float(prob)
-                        for cls, prob in zip(classes, proba)
-                    }
-                up_prob = float(
-                    class_prob_map.get(1)
-                    or class_prob_map.get(1.0)
-                    or class_prob_map.get("1")
-                    or class_prob_map.get(True)
-                    or (float(proba[1]) if len(proba) > 1 else 0.0)
-                )
-                down_prob = float(
-                    class_prob_map.get(0)
-                    or class_prob_map.get(0.0)
-                    or class_prob_map.get("0")
-                    or class_prob_map.get(False)
-                    or (float(proba[0]) if len(proba) > 0 else 0.0)
-                )
-                probabilities[target] = {"up": up_prob, "down": down_prob}
-                confidence_value = float(max(up_prob, down_prob))
-                confidences[target] = confidence_value
-                threshold = float(self.config.direction_confidence_threshold)
-                if confidence_value < threshold:
-                    warning_msg = (
-                        f"Direction model confidence {confidence_value:.3f} below threshold "
-                        f"{threshold:.2f}. Consider tuning 'direction_confidence_threshold'."
+                prob_map = self._build_probability_map(proba, classes)
+                probabilities[target] = prob_map
+                positive_prob = self._positive_probability(proba, classes)
+                confidences[target] = float(max(positive_prob, 1.0 - positive_prob))
+
+                if target == "direction":
+                    up_prob = float(
+                        prob_map.get(1)
+                        or prob_map.get(1.0)
+                        or prob_map.get("1")
+                        or prob_map.get(True)
+                        or (float(proba[1]) if len(np.atleast_1d(proba)) > 1 else 0.0)
                     )
-                    LOGGER.warning(warning_msg)
-                    prediction_warnings.append(warning_msg)
+                    down_prob = float(
+                        prob_map.get(0)
+                        or prob_map.get(0.0)
+                        or prob_map.get("0")
+                        or prob_map.get(False)
+                        or (float(proba[0]) if len(np.atleast_1d(proba)) > 0 else 0.0)
+                    )
+                    probabilities[target] = {"up": up_prob, "down": down_prob}
+                    confidence_value = float(max(up_prob, down_prob))
+                    confidences[target] = confidence_value
+                    threshold = float(self.config.direction_confidence_threshold)
+                    if confidence_value < threshold:
+                        warning_msg = (
+                            f"Direction model confidence {confidence_value:.3f} below threshold "
+                            f"{threshold:.2f}. Consider tuning 'direction_confidence_threshold'."
+                        )
+                        LOGGER.warning(warning_msg)
+                        prediction_warnings.append(warning_msg)
+                elif target == "target_hit":
+                    target_hit_probability = float(positive_prob * 100.0)
 
             event_threshold = self._event_threshold(target)
             event_prob = self._estimate_event_probability(
@@ -1485,9 +1524,11 @@ class StockPredictorAI:
         latest_close = float(self.metadata.get("latest_close", np.nan))
         expected_change = None
         pct_change = None
+        target_price = None
         if close_prediction is not None and np.isfinite(latest_close):
             expected_change = close_prediction - latest_close
             pct_change = expected_change / latest_close if latest_close else 0.0
+            target_price = float(latest_close * (1.0 + float(self.config.target_return_threshold)))
 
         prediction_timestamp = datetime.now()
 
@@ -1621,6 +1662,8 @@ class StockPredictorAI:
             "predicted_close": close_prediction,
             "expected_change": expected_change,
             "expected_change_pct": pct_change,
+            "target_price": target_price,
+            "target_hit_probability": target_hit_probability,
             "predicted_return": predicted_return,
             "predicted_volatility": predicted_volatility,
             "expected_low": expected_low,

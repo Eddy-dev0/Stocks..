@@ -144,6 +144,7 @@ class FeatureAssembler:
         *,
         registry: Mapping[str, FeatureGroupSpec] | None = None,
         technical_indicator_config: Mapping[str, Mapping[str, object]] | None = None,
+        target_return_threshold: float = 0.0,
     ) -> None:
         self.registry: Dict[str, FeatureGroupSpec] = dict(registry or FEATURE_REGISTRY)
         if not self.registry:
@@ -165,6 +166,7 @@ class FeatureAssembler:
         if horizons is None:
             horizons = (1,)
         self.horizons = _normalise_horizons(horizons)
+        self.target_return_threshold = max(0.0, float(target_return_threshold))
 
     # ------------------------------------------------------------------
     # Public API
@@ -274,7 +276,8 @@ class FeatureAssembler:
         if not feature_blocks:
             raise RuntimeError("No feature blocks were generated. Check configuration.")
 
-        merged = processed[["Date", "Close"]].copy()
+        base_price_columns = [col for col in ["Date", "Close", "High", "Low", "Open"] if col in processed.columns]
+        merged = processed[base_price_columns].copy()
         for block in feature_blocks:
             merged = merged.merge(block.frame, on="Date", how="left")
 
@@ -286,9 +289,12 @@ class FeatureAssembler:
 
         merged = merged.assign(Close_Current=merged["Close"])
 
-        targets = _generate_targets(merged, self.horizons)
+        targets = _generate_targets(
+            merged, self.horizons, target_return_threshold=self.target_return_threshold
+        )
 
-        feature_columns = [col for col in merged.columns if col not in {"Date", "Close"}]
+        excluded_price_cols = {"Date", "Close", "High", "Low", "Open", "Adj Close"}
+        feature_columns = [col for col in merged.columns if col not in excluded_price_cols]
         metadata.update(
             {
                 "feature_columns": feature_columns,
@@ -298,6 +304,7 @@ class FeatureAssembler:
                 "horizons": self.horizons,
                 "target_dates": _estimate_target_dates(merged["Date"], self.horizons),
                 "feature_categories": feature_categories,
+                "target_return_threshold": float(self.target_return_threshold),
             }
         )
 
@@ -975,7 +982,12 @@ def _empty_sentiment_frame() -> pd.DataFrame:
 # Target generation
 # ----------------------------------------------------------------------
 
-def _generate_targets(merged: pd.DataFrame, horizons: Iterable[int]) -> Dict[int, Dict[str, pd.Series]]:
+def _generate_targets(
+    merged: pd.DataFrame,
+    horizons: Iterable[int],
+    *,
+    target_return_threshold: float = 0.0,
+) -> Dict[int, Dict[str, pd.Series]]:
     merged = merged.copy()
     merged["Daily_Return"] = merged["Close"].pct_change(fill_method=None)
 
@@ -989,11 +1001,22 @@ def _generate_targets(merged: pd.DataFrame, horizons: Iterable[int]) -> Dict[int
             merged["Daily_Return"].rolling(window=horizon, min_periods=1).std().shift(-horizon)
         )
 
+        if "High" in merged.columns:
+            future_high = (
+                merged["High"].shift(-(horizon - 1)).rolling(window=horizon, min_periods=1).max()
+            )
+            price_target = merged["Close"] * (1.0 + float(target_return_threshold))
+            target_hit = (future_high >= price_target).astype(float)
+            target_hit[future_high.isna() | price_target.isna()] = np.nan
+        else:
+            target_hit = pd.Series([np.nan] * len(merged))
+
         horizon_targets: Dict[str, pd.Series] = {
             "close": future_close,
             "return": future_return,
             "direction": direction,
             "volatility": volatility,
+            "target_hit": target_hit,
         }
 
         valid_targets: Dict[str, pd.Series] = {}
