@@ -477,16 +477,13 @@ def _build_technical_features(
         feature_frame["Volume_to_Price"] = _safe_divide(volume, close)
 
     combined = pd.concat([feature_frame, indicator_frame], axis=1)
+    combined = combined.loc[:, ~combined.columns.duplicated()]
 
-    for window in (20, 50, 100, 200):
-        column = f"SMA_{window}"
-        if column in combined:
-            combined[f"Price_to_SMA_{window}"] = _safe_divide(close, combined[column])
+    for column in sorted(col for col in combined.columns if col.startswith("SMA_")):
+        combined[f"Price_to_{column}"] = _safe_divide(close, combined[column])
 
-    for span in (12, 26):
-        column = f"EMA_{span}"
-        if column in combined:
-            combined[f"Price_to_EMA_{span}"] = _safe_divide(close, combined[column])
+    for column in sorted(col for col in combined.columns if col.startswith("EMA_")):
+        combined[f"Price_to_{column}"] = _safe_divide(close, combined[column])
 
     return FeatureBlock(combined, category="technical"), metadata
 

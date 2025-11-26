@@ -85,6 +85,26 @@ def wavetrend(
     )
 
 
+def commodity_channel_index(inputs: IndicatorInputs, *, period: int = 20) -> pd.DataFrame:
+    """Compute the Commodity Channel Index (CCI)."""
+
+    high = inputs.high
+    low = inputs.low
+    close = inputs.close
+
+    if TA_LIB_AVAILABLE:  # pragma: no branch
+        cci = talib.CCI(high, low, close, timeperiod=period)
+    else:
+        typical_price = inputs.typical_price
+        rolling_mean = typical_price.rolling(window=period, min_periods=1).mean()
+        rolling_mean_dev = typical_price.rolling(window=period, min_periods=1).apply(
+            lambda window: np.mean(np.abs(window - window.mean())), raw=False
+        )
+        denominator = 0.015 * rolling_mean_dev.replace(0, np.nan)
+        cci = (typical_price - rolling_mean) / denominator
+    return pd.DataFrame({f"CCI_{period}": cci})
+
+
 def composite_score(indicators: pd.DataFrame, columns: list[str] | None = None) -> pd.DataFrame:
     """Combine provided indicator columns into a composite z-score."""
 
@@ -113,4 +133,9 @@ def composite_score(indicators: pd.DataFrame, columns: list[str] | None = None) 
     return pd.DataFrame({"Composite_Score": composite.fillna(0.0)})
 
 
-__all__ = ["stochastic", "wavetrend", "composite_score"]
+__all__ = [
+    "stochastic",
+    "wavetrend",
+    "commodity_channel_index",
+    "composite_score",
+]

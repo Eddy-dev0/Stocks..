@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .liquidity import liquidity_proxies
-from .momentum import composite_score, stochastic, wavetrend
+from .momentum import commodity_channel_index, composite_score, stochastic, wavetrend
 from .support import pivot_points
 from .trend import adx_dmi, ichimoku, parabolic_sar, supertrend
 from .utils import IndicatorInputs, TA_LIB_AVAILABLE, ensure_series, talib
@@ -29,4 +29,5 @@ __all__ = [
     "wavetrend",
     "liquidity_proxies",
     "composite_score",
+    "commodity_channel_index",
 ]

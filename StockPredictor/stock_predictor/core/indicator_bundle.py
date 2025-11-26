@@ -14,6 +14,7 @@ from .indicators import (
     adx_dmi,
     anchored_vwap,
     average_true_range,
+    commodity_channel_index,
     composite_score,
     ichimoku,
     liquidity_proxies,
@@ -29,6 +30,7 @@ from .indicators import (
 
 
 DEFAULT_INDICATOR_CONFIG: dict[str, dict[str, object]] = {
+    "moving_averages": {"sma_periods": (10, 20, 50, 100, 200), "ema_periods": (10, 12, 26, 50, 100)},
     "supertrend": {"period": 10, "multiplier": 3.0},
     "ichimoku": {
         "conversion_period": 9,
@@ -42,6 +44,7 @@ DEFAULT_INDICATOR_CONFIG: dict[str, dict[str, object]] = {
     "anchored_vwap": {"anchor": None},
     "adx": {"period": 14},
     "mfi": {"period": 14},
+    "cci": {"period": 20},
     "parabolic_sar": {"acceleration": 0.02, "maximum": 0.2},
     "pivot_points": {"method": "classic"},
     "wavetrend": {"channel_length": 10, "average_length": 21},
@@ -132,8 +135,15 @@ def compute_indicators(
 
     inputs = IndicatorInputs(high=high, low=low, close=close, volume=volume, open=open_)
 
-    ema12 = _ema(close, 12)
-    ema26 = _ema(close, 26)
+    ma_config = config_map.get("moving_averages", {})
+    sma_periods = set(ma_config.get("sma_periods", (20, 50, 200))) | {20, 50, 200}
+    ema_periods = set(ma_config.get("ema_periods", (12, 26))) | {12, 26}
+
+    sma_values = {period: close.rolling(window=period, min_periods=1).mean() for period in sorted(sma_periods)}
+    ema_values = {period: _ema(close, period) for period in sorted(ema_periods)}
+
+    ema12 = ema_values[12]
+    ema26 = ema_values[26]
     macd = ema12 - ema26
     signal = macd.ewm(span=9, adjust=False, min_periods=1).mean()
     histogram = macd - signal
@@ -144,9 +154,8 @@ def compute_indicators(
 
     indicators = pd.DataFrame(
         {
-            "SMA_20": sma20,
-            "SMA_50": close.rolling(window=50, min_periods=1).mean(),
-            "SMA_200": close.rolling(window=200, min_periods=1).mean(),
+            **{f"SMA_{period}": sma for period, sma in sma_values.items()},
+            **{f"EMA_{period}": ema_values[period] for period in sorted(ema_periods)},
             "EMA_12": ema12,
             "EMA_26": ema26,
             "MACD_12_26_9_Line": macd,
@@ -195,6 +204,9 @@ def compute_indicators(
 
     vwap_df = volume_weighted_average_price(inputs)
     indicators = indicators.join(vwap_df, how="outer")
+
+    cci_df = commodity_channel_index(inputs, period=int(config_map["cci"]["period"]))
+    indicators = indicators.join(cci_df, how="outer")
 
     anchor = config_map["anchored_vwap"].get("anchor")
     if anchor:
