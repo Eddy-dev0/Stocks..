@@ -1932,6 +1932,15 @@ class StockPredictorDesktopApp:
 
     def _compute_confidence_metric(self) -> str:
         prediction = self.current_prediction if isinstance(self.current_prediction, Mapping) else {}
+        confluence_block = prediction.get("signal_confluence") if isinstance(prediction, Mapping) else None
+        confluence_passed = bool(confluence_block.get("passed")) if isinstance(confluence_block, Mapping) else False
+
+        gated_confidence = _safe_float(prediction.get("confluence_confidence"))
+        if gated_confidence is not None:
+            if not confluence_passed:
+                return "—"
+            return fmt_pct(gated_confidence, decimals=1)
+
         confidence = None
         confidence_block = prediction.get("confidence") if isinstance(prediction, Mapping) else None
         if isinstance(confidence_block, Mapping):
@@ -3019,6 +3028,14 @@ class StockPredictorDesktopApp:
         status_message = (
             f"Market data as of {as_of_display}" if as_of_display != "—" else "Market data timestamp unavailable."
         )
+
+        confluence_info = prediction.get("signal_confluence") if isinstance(prediction, Mapping) else None
+        if isinstance(confluence_info, Mapping):
+            if confluence_info.get("passed"):
+                gate_note = "Signal confluence confirmed; targets and alerts are active."
+            else:
+                gate_note = "Signal confluence not met; target price and alerts are gated."
+            status_message = f"{status_message} • {gate_note}" if status_message else gate_note
 
         _, last_price = self._reference_last_price(prediction)
         predicted_close = prediction.get("predicted_close")
