@@ -1667,9 +1667,15 @@ class StockPredictorDesktopApp:
 
         available: list[tuple[int, str]] = []
         for idx, name in enumerate(names):
-            aligned = self._align_indicator_to_price_index(
-                self._extract_indicator_series(name), price_index
-            )
+            series = self._extract_indicator_series(name)
+            if series is None or series.empty:
+                continue
+            aligned = self._align_indicator_to_price_index(series, price_index)
+            if aligned is None or aligned.empty:
+                if isinstance(series.index, pd.DatetimeIndex) and not price_index.empty:
+                    start, end = price_index.min(), price_index.max()
+                    series = series.loc[(series.index >= start) & (series.index <= end)]
+                    aligned = self._align_indicator_to_price_index(series, price_index)
             if aligned is not None and not aligned.empty:
                 available.append((idx, name))
 
