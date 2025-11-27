@@ -1040,7 +1040,15 @@ class StockPredictorDesktopApp:
         table_frame.grid_columnconfigure(0, weight=1)
         table_frame.grid_rowconfigure(0, weight=1)
 
-        columns = ("ticker", "score", "technical", "fundamental", "sentiment")
+        columns = (
+            "rank",
+            "ticker",
+            "confidence",
+            "score",
+            "technical",
+            "fundamental",
+            "sentiment",
+        )
         self.trend_tree = ttk.Treeview(
             table_frame,
             columns=columns,
@@ -1049,7 +1057,9 @@ class StockPredictorDesktopApp:
             selectmode="browse",
         )
         headings = {
+            "rank": "#",
             "ticker": "Ticker",
+            "confidence": "Confidence",
             "score": "Composite",
             "technical": "Technical",
             "fundamental": "Fundamental",
@@ -1057,8 +1067,13 @@ class StockPredictorDesktopApp:
         }
         for column, title in headings.items():
             self.trend_tree.heading(column, text=title)
-            anchor = tk.CENTER if column == "ticker" else tk.E
-            width = 90 if column == "ticker" else 120
+            anchor = tk.CENTER if column in {"ticker", "rank"} else tk.E
+            if column == "rank":
+                width = 60
+            elif column == "ticker":
+                width = 90
+            else:
+                width = 120
             self.trend_tree.column(column, anchor=anchor, width=width, stretch=True)
 
         trend_scrollbar = ttk.Scrollbar(
@@ -1402,9 +1417,9 @@ class StockPredictorDesktopApp:
             return
         summary = self._horizon_summary_phrase(label)
         if summary:
-            status = f"Scanning universe {summary}…"
+            status = f"Scanning universe for Top 10 opportunities {summary}…"
         else:
-            status = "Scanning universe…"
+            status = "Scanning universe for Top 10 opportunities…"
         self._set_trend_busy(True, status)
         finder = self._get_trend_finder()
 
@@ -1423,7 +1438,7 @@ class StockPredictorDesktopApp:
 
                 results = finder.scan(
                     horizon=horizon_value,
-                    limit=5,
+                    limit=10,
                     progress_callback=progress_callback,
                 )
             except Exception as exc:  # pragma: no cover - optional providers may fail
@@ -1442,12 +1457,13 @@ class StockPredictorDesktopApp:
 
     def _on_trend_scan_success(self, label: str, results: list[TrendInsight]) -> None:
         self.trend_results = list(results)
+        target = 10
         if results:
             summary = self._horizon_summary_phrase(label)
             if summary:
-                message = f"Top {len(results)} opportunities {summary} ready."
+                message = f"Top {target} opportunities {summary} ready."
             else:
-                message = f"Top {len(results)} opportunities ready."
+                message = f"Top {target} opportunities ready."
         else:
             message = "No opportunities found for the selected horizon."
         self._refresh_trend_table(
@@ -1518,9 +1534,14 @@ class StockPredictorDesktopApp:
         if self.trend_placeholder is not None:
             self.trend_placeholder.grid_remove()
         self.trend_tree.grid(row=0, column=0, sticky="nsew")
-        for insight in self.trend_results:
+        sorted_results = self._sorted_trend_results()
+        for rank, insight in enumerate(sorted_results[:10], start=1):
+            confidence = self._trend_confidence_value(insight)
+            confidence_display = fmt_pct(confidence, decimals=1) if confidence is not None else "—"
             values = (
+                rank,
                 insight.ticker,
+                confidence_display,
                 self._format_trend_score(insight.composite_score),
                 self._format_trend_score(insight.technical_score),
                 self._format_trend_score(insight.fundamental_score),
@@ -1535,6 +1556,38 @@ class StockPredictorDesktopApp:
         scaled = max(-1.0, min(1.0, float(numeric)))
         percentile = (scaled + 1.0) / 2.0 * 100.0
         return f"{percentile:0.1f}%"
+
+    def _trend_confidence_value(self, insight: TrendInsight) -> float | None:
+        metadata = insight.metadata if isinstance(insight, TrendInsight) else {}
+        if not isinstance(metadata, Mapping):
+            metadata = {}
+        confidence_block = metadata.get("confidence") if isinstance(metadata, Mapping) else None
+
+        confidence_value: Any | None = None
+        if isinstance(confidence_block, Mapping):
+            for key in (
+                "confidence_rank",
+                "direction_confidence",
+                "signal_confluence_score",
+                "confluence_confidence",
+            ):
+                if confidence_value is None:
+                    confidence_value = confidence_block.get(key)
+
+        if confidence_value is None:
+            confidence_value = getattr(insight, "confidence_rank", None)
+
+        return _safe_float(confidence_value)
+
+    def _sorted_trend_results(self) -> list[TrendInsight]:
+        def sort_key(insight: TrendInsight) -> tuple[float, float]:
+            confidence = self._trend_confidence_value(insight)
+            composite = _safe_float(getattr(insight, "composite_score", None))
+            confidence_key = confidence if confidence is not None else -math.inf
+            composite_key = composite if composite is not None else -math.inf
+            return (confidence_key, composite_key)
+
+        return sorted(self.trend_results, key=sort_key, reverse=True)
 
     def _get_trend_finder(self) -> TrendFinder:
         if self.trend_finder is None:
