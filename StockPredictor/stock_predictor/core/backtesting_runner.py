@@ -111,6 +111,9 @@ def _build_config(args: argparse.Namespace) -> PredictorConfig:
         backtest_strategy=args.backtest_strategy,
         backtest_window=args.backtest_window,
         backtest_step=args.backtest_step,
+        evaluation_slippage_bps=args.evaluation_slippage_bps,
+        evaluation_fee_bps=args.evaluation_fee_bps,
+        evaluation_fixed_cost=args.evaluation_fixed_cost,
     )
     return config
 
@@ -127,6 +130,9 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backtest-strategy", default=None, help="Backtest strategy (e.g. rolling)")
     parser.add_argument("--backtest-window", type=int, default=None, help="Backtest lookback window")
     parser.add_argument("--backtest-step", type=int, default=None, help="Step size between backtest windows")
+    parser.add_argument("--evaluation-slippage-bps", type=float, default=None, help="Slippage in basis points for evaluation metrics")
+    parser.add_argument("--evaluation-fee-bps", type=float, default=None, help="Per-trade fee in basis points for evaluation metrics")
+    parser.add_argument("--evaluation-fixed-cost", type=float, default=None, help="Fixed per-trade cost to subtract in evaluation metrics (in return units)")
     parser.add_argument("--data-dir", help="Directory containing cached datasets")
     parser.add_argument("--models-dir", help="Directory containing persisted models")
     parser.add_argument("--config-file", help="Path to JSON/YAML configuration file")

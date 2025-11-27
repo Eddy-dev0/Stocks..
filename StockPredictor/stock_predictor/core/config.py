@@ -159,6 +159,9 @@ class PredictorConfig:
     evaluation_folds: int = 5
     evaluation_window: int = DEFAULT_BACKTEST_WINDOW
     evaluation_step: int = DEFAULT_BACKTEST_STEP
+    evaluation_slippage_bps: float = 0.0
+    evaluation_fee_bps: float = 0.0
+    evaluation_fixed_cost: float = 0.0
     direction_confidence_threshold: float = 0.5
     volatility_window: int = DEFAULT_VOLATILITY_WINDOW
     target_gain_pct: float = DEFAULT_TARGET_GAIN_PCT
@@ -231,6 +234,9 @@ class PredictorConfig:
             raise ValueError("evaluation_window must be positive.")
         if self.evaluation_step <= 0:
             raise ValueError("evaluation_step must be positive.")
+        self.evaluation_slippage_bps = max(0.0, float(self.evaluation_slippage_bps))
+        self.evaluation_fee_bps = max(0.0, float(self.evaluation_fee_bps))
+        self.evaluation_fixed_cost = max(0.0, float(self.evaluation_fixed_cost))
         if not 0.5 <= float(self.direction_confidence_threshold) < 1:
             raise ValueError("direction_confidence_threshold must be between 0.5 and 1.0.")
         if int(self.volatility_window) <= 0:
@@ -512,6 +518,9 @@ def build_config(
     time_series_baselines: Optional[Iterable[str] | str] = None,
     time_series_params: Optional[Mapping[str, Mapping[str, Any]] | str] = None,
     buy_zone: Optional[Mapping[str, Any]] = None,
+    evaluation_slippage_bps: Optional[float] = None,
+    evaluation_fee_bps: Optional[float] = None,
+    evaluation_fixed_cost: Optional[float] = None,
 ) -> PredictorConfig:
     """Build a :class:`PredictorConfig` instance from string parameters."""
 
@@ -643,6 +652,13 @@ def build_config(
         "time_series_baselines": baseline_models,
         "time_series_params": baseline_params,
         "buy_zone": buy_zone,
+        "evaluation_slippage_bps": evaluation_slippage_bps
+        if evaluation_slippage_bps is not None
+        else 0.0,
+        "evaluation_fee_bps": evaluation_fee_bps if evaluation_fee_bps is not None else 0.0,
+        "evaluation_fixed_cost": evaluation_fixed_cost
+        if evaluation_fixed_cost is not None
+        else 0.0,
     }
     if stop_loss_value is not None:
         config_kwargs["k_stop"] = stop_loss_value
