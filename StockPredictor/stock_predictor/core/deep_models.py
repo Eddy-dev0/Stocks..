@@ -194,6 +194,115 @@ class GRURegressor(_BaseSequentialRegressor):
         return _RNNModel(nn.GRU, input_size, self.hidden_size, self.num_layers, self.dropout)
 
 
+class _BaseSequentialClassifier(_BaseSequentialRegressor):
+    """Sequence classifier that outputs class probabilities."""
+
+    def _build_dataset(self, X: Any, y: Any) -> tuple[TensorDataset, int, int]:
+        features = _to_float_array(X)
+        targets = np.asarray(y, dtype=np.int64)
+        sequences = _prepare_sequences(features, self.sequence_length)
+        X_tensor = torch.from_numpy(sequences)  # type: ignore[arg-type]
+        y_tensor = torch.from_numpy(targets).long()  # type: ignore[arg-type]
+        dataset = TensorDataset(X_tensor, y_tensor)
+        n_samples, _, n_features = sequences.shape
+        return dataset, n_samples, n_features
+
+    def _train_loop(self, dataloader: DataLoader, model: nn.Module) -> None:
+        optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
+        criterion = nn.CrossEntropyLoss()
+        for epoch in range(self.epochs):
+            epoch_loss = 0.0
+            model.train()
+            for batch_X, batch_y in dataloader:
+                batch_X = batch_X.to(self.device)
+                batch_y = batch_y.to(self.device)
+                optimizer.zero_grad()
+                logits = model(batch_X)
+                loss = criterion(logits, batch_y)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += float(loss.item())
+            if self.verbose:
+                LOGGER.info("Epoch %s | Loss %.6f", epoch + 1, epoch_loss / max(len(dataloader), 1))
+
+    def predict_proba(self, X: Any) -> np.ndarray:
+        _require_torch()
+        if self._model is None:
+            raise RuntimeError("Model has not been fitted yet.")
+        features = _to_float_array(X)
+        sequences = _prepare_sequences(features, self.sequence_length)
+        tensor = torch.from_numpy(sequences).to(self.device)  # type: ignore[arg-type]
+        self._model.eval()
+        with torch.no_grad():
+            logits = self._model(tensor)
+            probs = torch.softmax(logits, dim=-1).cpu().numpy()
+        return probs
+
+    def predict(self, X: Any) -> np.ndarray:  # type: ignore[override]
+        probs = self.predict_proba(X)
+        labels = np.argmax(probs, axis=1)
+        return labels
+
+    def fit(self, X: Any, y: Any) -> "_BaseSequentialClassifier":  # type: ignore[override]
+        _require_torch()
+        dataset, n_samples, n_features = self._build_dataset(X, y)
+        self.device = torch.device(self.device_name)  # type: ignore[arg-type]
+        self._model = self._build_model(input_size=n_features)
+        self._model.to(self.device)
+        dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        self._train_loop(dataloader, self._model)
+        self.classes_ = np.array([0, 1])
+        LOGGER.debug(
+            "Trained %s with %s samples and %s features (classification)",
+            self.__class__.__name__,
+            n_samples,
+            n_features,
+        )
+        return self
+
+
+class _RNNClassifier(nn.Module):
+    def __init__(
+        self,
+        rnn_layer: type[nn.RNNBase],
+        input_size: int,
+        hidden_size: int,
+        num_layers: int,
+        dropout: float,
+        num_classes: int = 2,
+    ) -> None:
+        super().__init__()
+        self.rnn = rnn_layer(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.head = nn.Linear(hidden_size, num_classes)
+
+    def forward(self, x: Tensor) -> Tensor:  # type: ignore[override]
+        output, _ = self.rnn(x)
+        final_state = output[:, -1, :]
+        return self.head(final_state)
+
+
+class LSTMClassifier(_BaseSequentialClassifier):
+    """Sequence classifier backed by an LSTM encoder."""
+
+    def _build_model(self, *, input_size: int) -> nn.Module:
+        return _RNNClassifier(
+            nn.LSTM, input_size, self.hidden_size, self.num_layers, self.dropout
+        )
+
+
+class GRUClassifier(_BaseSequentialClassifier):
+    """Sequence classifier backed by a GRU encoder."""
+
+    def _build_model(self, *, input_size: int) -> nn.Module:
+        return _RNNClassifier(nn.GRU, input_size, self.hidden_size, self.num_layers, self.dropout)
+
+
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 5000) -> None:
         super().__init__()

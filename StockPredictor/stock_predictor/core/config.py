@@ -41,6 +41,7 @@ DEFAULT_BACKTEST_STRATEGY = "rolling"
 DEFAULT_BACKTEST_WINDOW = 252
 DEFAULT_BACKTEST_STEP = 21
 DEFAULT_VOLATILITY_WINDOW = 20
+DEFAULT_TARGET_GAIN_PCT = 0.03
 
 
 HORIZON_UNIT_TO_DAYS: dict[str, int] = {
@@ -155,6 +156,7 @@ class PredictorConfig:
     evaluation_step: int = DEFAULT_BACKTEST_STEP
     direction_confidence_threshold: float = 0.5
     volatility_window: int = DEFAULT_VOLATILITY_WINDOW
+    target_gain_pct: float = DEFAULT_TARGET_GAIN_PCT
     risk_free_rate: float = 0.0
     research_api_keys: tuple[str, ...] = field(default_factory=tuple)
     research_allow_list: tuple[str, ...] = field(default_factory=tuple)
@@ -217,6 +219,12 @@ class PredictorConfig:
         if int(self.volatility_window) <= 0:
             raise ValueError("volatility_window must be a positive integer.")
         self.volatility_window = int(self.volatility_window)
+        try:
+            self.target_gain_pct = float(self.target_gain_pct)
+        except (TypeError, ValueError):
+            self.target_gain_pct = DEFAULT_TARGET_GAIN_PCT
+        if self.target_gain_pct <= -0.5:
+            raise ValueError("target_gain_pct must be greater than -0.5.")
         self.risk_free_rate = float(self.risk_free_rate)
         self.research_api_keys = self._normalise_strings(self.research_api_keys)
         self.research_allow_list = self._normalise_strings(

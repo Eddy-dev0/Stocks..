@@ -68,3 +68,26 @@ def test_transformer_factory_integration():
     assert preds.shape == y.shape
     # ensure predictions reflect correlation with target trend
     assert np.corrcoef(preds, y.to_numpy())[0, 1] > 0.5
+
+
+def test_lstm_classifier_outputs_probabilities():
+    X, y = _synthetic_series(samples=32)
+    labels = (y > y.median()).astype(int)
+    factory = ModelFactory(
+        "lstm",
+        {
+            "sequence_length": 4,
+            "hidden_size": 8,
+            "num_layers": 1,
+            "epochs": 2,
+            "batch_size": 4,
+            "lr": 1e-3,
+        },
+    )
+    model = factory.create("classification")
+    model.fit(X, labels)
+    proba = model.predict_proba(X)
+    assert proba.shape[0] == len(labels)
+    assert proba.shape[1] == 2
+    row_sums = np.sum(proba, axis=1)
+    assert np.allclose(row_sums, 1, atol=1e-3)

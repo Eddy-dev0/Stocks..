@@ -102,3 +102,45 @@ def test_training_and_predict_handles_missing_volatility_model(tmp_path: Path) -
     assert config.model_path_for("volatility", 1).exists()
     metrics = prediction.get("training_metrics", {}) or {}
     assert "volatility" in metrics
+
+
+def test_target_hit_training_and_probability_output(tmp_path: Path) -> None:
+    price_df = _synthetic_price_frame(70)
+    fetcher = _StaticFetcher(price_df)
+
+    config = PredictorConfig(
+        ticker="HIT",
+        sentiment=False,
+        prediction_targets=("target_hit",),
+        prediction_horizons=(10,),
+        data_dir=tmp_path,
+        models_dir=tmp_path / "models",
+        model_type="logistic",
+        model_params={
+            "global": {"random_state": 0, "calibrate": True},
+            "preprocessing": {"clip_outliers": False},
+        },
+        target_gain_pct=0.008,
+    )
+    config.ensure_directories()
+
+    trainer = StockPredictorAI(config)
+    trainer.fetcher = fetcher
+    report = trainer.train_model(targets=("target_hit",))
+    assert "target_hit" in report["targets"]
+
+    model = trainer.models.get(("target_hit", 10))
+    assert model is not None
+    estimator = model.named_steps.get("estimator")
+    from sklearn.calibration import CalibratedClassifierCV
+
+    assert isinstance(estimator, CalibratedClassifierCV)
+
+    predictor = StockPredictorAI(config)
+    predictor.fetcher = fetcher
+    prediction = predictor.predict(targets=("target_hit",))
+    prob = prediction.get("target_hit_probability")
+    assert prob is not None
+    assert 0.0 <= prob <= 1.0
+    target_probs = prediction.get("probabilities", {}).get("target_hit", {})
+    assert isinstance(target_probs, dict) and target_probs

@@ -1955,7 +1955,8 @@ class StockPredictorDesktopApp:
         if confidence is None:
             up = _safe_float(prediction.get("direction_probability_up"))
             down = _safe_float(prediction.get("direction_probability_down"))
-            candidates = [value for value in (up, down) if value is not None]
+            target_hit = _safe_float(prediction.get("target_hit_probability"))
+            candidates = [value for value in (up, down, target_hit) if value is not None]
             if candidates:
                 confidence = max(candidates)
 
@@ -3090,13 +3091,17 @@ class StockPredictorDesktopApp:
 
         prob_up = prediction.get("direction_probability_up")
         prob_down = prediction.get("direction_probability_down")
+        hit_prob = prediction.get("target_hit_probability")
         prob_up_str = fmt_pct(prob_up, decimals=1)
         prob_down_str = fmt_pct(prob_down, decimals=1)
+        hit_prob_str = fmt_pct(hit_prob, decimals=1)
         parts: list[str] = []
         if prob_up_str != "—":
             parts.append(f"↑ {prob_up_str}")
         if prob_down_str != "—":
             parts.append(f"↓ {prob_down_str}")
+        if hit_prob_str != "—":
+            parts.append(f"🎯 {hit_prob_str}")
         self.metric_vars["direction"].set("   ".join(parts) if parts else "—")
 
         if explanation and isinstance(explanation, Mapping):

@@ -48,7 +48,7 @@ DEFAULT_EXPECTED_LOW_SIGMA = 1.0
 DEFAULT_STOP_LOSS_MULTIPLIER = 1.0
 
 
-LabelFunction = Callable[[pd.DataFrame, int, int], pd.Series]
+LabelFunction = Callable[[pd.DataFrame, int, Any], pd.Series]
 
 
 def _normalize_datetime_series(
@@ -125,6 +125,31 @@ def make_volatility_label(
     return volatility.shift(-shift)
 
 
+def make_target_hit_label(
+    df: pd.DataFrame, horizon: int, target_gain_pct: float = 0.05
+) -> pd.Series:
+    """Label rows where the price reaches a target within the horizon."""
+
+    if horizon <= 0:
+        raise ValueError("horizon must be a positive integer")
+
+    working = df.copy()
+    lower_columns = {column.lower(): column for column in working.columns}
+    close_column = lower_columns.get("close")
+    if close_column is None:
+        raise KeyError("Input dataframe must contain a 'close' column for target-hit labels.")
+
+    closes = pd.to_numeric(working[close_column], errors="coerce")
+    gain = float(target_gain_pct)
+    target_prices = closes * (1 + gain)
+    window = int(horizon)
+    future_max = closes.shift(-1).rolling(window=window, min_periods=1).max()
+
+    hits = (future_max >= target_prices).astype(float)
+    hits[target_prices.isna() | future_max.isna()] = np.nan
+    return hits
+
+
 TARGET_SPECS: dict[str, TargetSpec] = {
     "close": TargetSpec("close", "regression"),
     "direction": TargetSpec("direction", "classification"),
@@ -132,6 +157,7 @@ TARGET_SPECS: dict[str, TargetSpec] = {
     "volatility": TargetSpec(
         "volatility", "regression", default_model_type="random_forest", label_fn=make_volatility_label
     ),
+    "target_hit": TargetSpec("target_hit", "classification", default_model_type="logistic"),
 }
 
 SUPPORTED_TARGETS = frozenset(TARGET_SPECS)
@@ -284,6 +310,46 @@ class StockPredictorAI:
                 horizon_targets = feature_result.targets.setdefault(int(horizon_value), {})
                 horizon_targets["volatility"] = label_series
             metadata["volatility_window"] = int(window)
+
+        target_hit_spec = TARGET_SPECS.get("target_hit")
+        if target_hit_spec:
+            gain_pct = getattr(self.config, "target_gain_pct", 0.0)
+            price_history = merged_price_df.copy()
+            if "Date" in price_history.columns:
+                price_history["Date"] = pd.to_datetime(price_history["Date"], errors="coerce")
+                price_history = price_history.dropna(subset=["Date"])
+                price_history = price_history.sort_values("Date").reset_index(drop=True)
+            else:
+                price_history = price_history.sort_index().reset_index(drop=True)
+
+            for horizon_value in horizons:
+                try:
+                    label_series = make_target_hit_label(
+                        price_history, int(horizon_value), float(gain_pct)
+                    )
+                except Exception as exc:  # pragma: no cover - defensive guard
+                    LOGGER.debug(
+                        "Failed to compute target-hit labels for horizon %s: %s",
+                        horizon_value,
+                        exc,
+                    )
+                    continue
+                if label_series is None:
+                    continue
+                label_series = pd.Series(label_series, name="target_hit")
+                if label_series.dropna().empty:
+                    continue
+                label_series = label_series.reset_index(drop=True)
+                label_series.index = feature_result.features.index
+                horizon_targets = feature_result.targets.setdefault(int(horizon_value), {})
+                horizon_targets["target_hit"] = label_series
+            metadata["target_gain_pct"] = float(gain_pct)
+            latest_close = metadata.get("latest_close")
+            if latest_close is not None:
+                try:
+                    metadata["target_price"] = float(latest_close) * (1 + float(gain_pct))
+                except Exception:
+                    pass
 
         preprocess_section = self.config.model_params.get("preprocessing", {})
         if isinstance(preprocess_section, dict):
@@ -673,7 +739,7 @@ class StockPredictorAI:
             if calibrate_override is None:
                 calibrate_override = global_params.get("calibrate")
             if calibrate_override is None:
-                calibrate_flag = task == "classification" and target == "direction"
+                calibrate_flag = task == "classification"
             else:
                 calibrate_flag = bool(calibrate_override)
 
@@ -1360,6 +1426,8 @@ class StockPredictorAI:
                 filtered_targets.append(target)
 
         for target in filtered_targets:
+            spec = TARGET_SPECS.get(target)
+            task = spec.task if spec else ("classification" if target == "direction" else "regression")
             model = self.models.get((target, resolved_horizon))
             if model is None:
                 try:
@@ -1432,7 +1500,7 @@ class StockPredictorAI:
                         if self._safe_float(value) is not None
                     }
 
-            if model_supports_proba(model) and target == "direction":
+            if model_supports_proba(model) and task == "classification":
                 proba = model.predict_proba(model_input)[0]
                 estimator = model.named_steps.get("estimator")
                 classes = getattr(estimator, "classes_", None)
@@ -1442,31 +1510,36 @@ class StockPredictorAI:
                         cls: float(prob)
                         for cls, prob in zip(classes, proba)
                     }
-                up_prob = float(
-                    class_prob_map.get(1)
-                    or class_prob_map.get(1.0)
-                    or class_prob_map.get("1")
-                    or class_prob_map.get(True)
-                    or (float(proba[1]) if len(proba) > 1 else 0.0)
-                )
-                down_prob = float(
-                    class_prob_map.get(0)
-                    or class_prob_map.get(0.0)
-                    or class_prob_map.get("0")
-                    or class_prob_map.get(False)
-                    or (float(proba[0]) if len(proba) > 0 else 0.0)
-                )
-                probabilities[target] = {"up": up_prob, "down": down_prob}
-                confidence_value = float(max(up_prob, down_prob))
-                confidences[target] = confidence_value
-                threshold = float(self.config.direction_confidence_threshold)
-                if confidence_value < threshold:
-                    warning_msg = (
-                        f"Direction model confidence {confidence_value:.3f} below threshold "
-                        f"{threshold:.2f}. Consider tuning 'direction_confidence_threshold'."
+                else:
+                    class_prob_map = {idx: float(prob) for idx, prob in enumerate(proba)}
+
+                probabilities[target] = class_prob_map
+                confidence_value = max(class_prob_map.values()) if class_prob_map else 0.0
+                confidences[target] = float(confidence_value)
+                if target == "direction":
+                    up_prob = float(
+                        class_prob_map.get(1)
+                        or class_prob_map.get(1.0)
+                        or class_prob_map.get("1")
+                        or class_prob_map.get(True)
+                        or (float(proba[1]) if len(proba) > 1 else 0.0)
                     )
-                    LOGGER.warning(warning_msg)
-                    prediction_warnings.append(warning_msg)
+                    down_prob = float(
+                        class_prob_map.get(0)
+                        or class_prob_map.get(0.0)
+                        or class_prob_map.get("0")
+                        or class_prob_map.get(False)
+                        or (float(proba[0]) if len(proba) > 0 else 0.0)
+                    )
+                    probabilities[target] = {"up": up_prob, "down": down_prob}
+                    threshold = float(self.config.direction_confidence_threshold)
+                    if confidence_value < threshold:
+                        warning_msg = (
+                            f"Direction model confidence {confidence_value:.3f} below threshold "
+                            f"{threshold:.2f}. Consider tuning 'direction_confidence_threshold'."
+                        )
+                        LOGGER.warning(warning_msg)
+                        prediction_warnings.append(warning_msg)
 
             event_threshold = self._event_threshold(target)
             event_prob = self._estimate_event_probability(
@@ -1533,6 +1606,17 @@ class StockPredictorAI:
         if isinstance(dir_prob, dict):
             direction_probability_up = self._safe_float(dir_prob.get("up"))
             direction_probability_down = self._safe_float(dir_prob.get("down"))
+        target_hit_prob = probabilities.get("target_hit") if isinstance(probabilities, dict) else None
+        target_hit_probability = None
+        if isinstance(target_hit_prob, dict):
+            hit_candidates = [
+                target_hit_prob.get(key)
+                for key in (1, 1.0, "1", True, "hit")
+            ]
+            hit_candidates = [self._safe_float(value) for value in hit_candidates]
+            hit_candidates = [value for value in hit_candidates if value is not None]
+            if hit_candidates:
+                target_hit_probability = max(hit_candidates)
 
         indicator_floor, indicator_components = self._indicator_support_floor()
         expected_low = self._compute_expected_low(
@@ -1627,6 +1711,8 @@ class StockPredictorAI:
             "stop_loss": stop_loss,
             "direction_probability_up": direction_probability_up,
             "direction_probability_down": direction_probability_down,
+            "target_hit_probability": target_hit_probability,
+            "target_price": self.metadata.get("target_price"),
             "predictions": predictions,
             "horizon": resolved_horizon,
             "target_date": _to_iso(target_date) or "",
@@ -1949,6 +2035,13 @@ class StockPredictorAI:
         if estimator is None:
             return None
         try:
+            if hasattr(estimator, "predict_proba"):
+                probs = estimator.predict_proba(features)
+                if isinstance(probs, list):  # pragma: no cover - defensive
+                    probs = np.asarray(probs)
+                if probs.ndim == 2:
+                    return float(np.mean(probs[:, -1]))
+                return float(np.mean(probs))
             if hasattr(estimator, "estimators_"):
                 if isinstance(features, pd.DataFrame):
                     feature_matrix = features.to_numpy()
@@ -2520,6 +2613,14 @@ class StockPredictorAI:
         if confidence_sections:
             sentences.append("Confidence cues: " + "; ".join(confidence_sections) + ".")
 
+        target_hit_prob = confidence_indicators.get("target_hit_probability")
+        if isinstance(target_hit_prob, dict) and target_hit_prob:
+            hit_value = self._safe_float(target_hit_prob.get("hit"))
+            if hit_value is not None:
+                sentences.append(
+                    f"Target price hit probability {hit_value * 100:.1f}% within the horizon."
+                )
+
         summary = " ".join(sentence.strip() for sentence in sentences if sentence)
         return summary.strip()
 
@@ -2576,6 +2677,23 @@ class StockPredictorAI:
             if down_prob is not None:
                 probability_block["down"] = down_prob
             indicators["direction_probability"] = probability_block
+
+        hit_prob = self._safe_float(prediction.get("target_hit_probability"))
+        if hit_prob is not None:
+            hit_block: Dict[str, float] = {"hit": hit_prob}
+            prob_store = prediction.get("probabilities")
+            if isinstance(prob_store, dict):
+                hit_probs = prob_store.get("target_hit")
+                if isinstance(hit_probs, dict):
+                    miss_prob = self._safe_float(
+                        hit_probs.get(0)
+                        or hit_probs.get(0.0)
+                        or hit_probs.get("0")
+                        or hit_probs.get(False)
+                    )
+                    if miss_prob is not None:
+                        hit_block["miss"] = miss_prob
+            indicators["target_hit_probability"] = hit_block
 
         uncertainties_raw = prediction.get("prediction_uncertainty")
         if isinstance(uncertainties_raw, dict):
