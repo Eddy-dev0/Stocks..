@@ -1364,6 +1364,16 @@ class StockPredictorAI:
                 )
                 if calibration_metrics:
                     metrics.update(calibration_metrics)
+            trading_metrics = self._simple_trading_metrics(
+                target_name,
+                y_true,
+                y_pred,
+                raw_X_test,
+                proba=proba,
+                classes=classes,
+            )
+            if trading_metrics:
+                metrics.update(trading_metrics)
             return metrics
 
         metrics = regression_metrics(y_true.to_numpy(), y_pred)
@@ -1384,7 +1394,113 @@ class StockPredictorAI:
         else:
             metrics["directional_accuracy"] = 0.0
         metrics["signed_error"] = float(np.mean(y_pred - y_true.to_numpy()))
+        trading_metrics = self._simple_trading_metrics(
+            target_name, y_true, y_pred, raw_X_test
+        )
+        if trading_metrics:
+            metrics.update(trading_metrics)
         return metrics
+
+    def _simple_trading_metrics(
+        self,
+        target_name: str,
+        y_true: pd.Series,
+        y_pred: np.ndarray,
+        raw_X_test: pd.DataFrame,
+        *,
+        proba: np.ndarray | None = None,
+        classes: Sequence[Any] | None = None,
+    ) -> Dict[str, float]:
+        signals = self._long_flat_signals(
+            target_name, y_pred, raw_X_test, proba=proba, classes=classes
+        )
+        actual_returns = self._actual_returns_for_metrics(target_name, y_true, raw_X_test)
+        if signals.size == 0 or actual_returns.size == 0:
+            return {
+                "pnl_sharpe": 0.0,
+                "pnl_max_drawdown": 0.0,
+                "pnl_net_return": 0.0,
+                "pnl_hit_rate": 0.0,
+            }
+
+        n = min(signals.size, actual_returns.size)
+        trimmed_signals = signals[:n]
+        trimmed_returns = actual_returns[:n]
+        net_returns = trimmed_signals * trimmed_returns
+        equity_curve = np.cumprod(1 + net_returns)
+
+        sharpe = 0.0
+        if net_returns.size > 1:
+            excess = net_returns - 0.0
+            std = float(np.std(excess, ddof=1))
+            if std > 0:
+                sharpe = float(np.mean(excess) / std * np.sqrt(net_returns.size))
+
+        max_drawdown = 0.0
+        if equity_curve.size:
+            running_max = np.maximum.accumulate(equity_curve)
+            safe_running = np.where(running_max == 0, 1.0, running_max)
+            drawdowns = equity_curve / safe_running - 1.0
+            max_drawdown = float(np.min(drawdowns))
+
+        pnl_metrics = {
+            "pnl_sharpe": float(sharpe),
+            "pnl_max_drawdown": max_drawdown,
+            "pnl_net_return": float(equity_curve[-1] - 1) if equity_curve.size else 0.0,
+            "pnl_hit_rate": float(np.mean(net_returns > 0)) if net_returns.size else 0.0,
+        }
+        return pnl_metrics
+
+    def _long_flat_signals(
+        self,
+        target_name: str,
+        y_pred: np.ndarray,
+        raw_X_test: pd.DataFrame,
+        *,
+        proba: np.ndarray | None = None,
+        classes: Sequence[Any] | None = None,
+    ) -> np.ndarray:
+        forecast = np.asarray(y_pred, dtype=float)
+        if forecast.size == 0:
+            return np.array([])
+
+        if target_name == "close" and "Close_Current" in raw_X_test:
+            baseline = raw_X_test["Close_Current"].to_numpy(dtype=float)
+            denominator = np.clip(np.abs(baseline), 1e-6, None)
+            forecast = (forecast - baseline) / denominator
+
+        if proba is not None and proba.size:
+            probability_array = np.asarray(proba, dtype=float)
+            positive_index = 1 if probability_array.ndim > 1 else 0
+            if probability_array.ndim > 1 and classes is not None:
+                for idx, cls in enumerate(classes):
+                    if cls in {1, True, "1", "up"}:
+                        positive_index = idx
+                        break
+            positive_proba = (
+                probability_array
+                if probability_array.ndim == 1
+                else probability_array[:, min(positive_index, probability_array.shape[1] - 1)]
+            )
+            return np.where(positive_proba >= 0.55, 1.0, 0.0)
+
+        return np.where(forecast > 0.0, 1.0, 0.0)
+
+    def _actual_returns_for_metrics(
+        self, target_name: str, y_true: pd.Series, raw_X_test: pd.DataFrame
+    ) -> np.ndarray:
+        if target_name == "close" and "Close_Current" in raw_X_test:
+            baseline = raw_X_test["Close_Current"].to_numpy(dtype=float)
+            denominator = np.clip(np.abs(baseline), 1e-6, None)
+            return (y_true.to_numpy(dtype=float) - baseline) / denominator
+
+        if target_name == "log_return":
+            return np.expm1(y_true.to_numpy(dtype=float))
+
+        if target_name == "direction":
+            return np.where(y_true.to_numpy(dtype=float) > 0, 0.01, -0.01)
+
+        return y_true.to_numpy(dtype=float)
 
     def _calibration_report(
         self,
