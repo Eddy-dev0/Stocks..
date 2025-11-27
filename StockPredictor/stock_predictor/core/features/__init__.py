@@ -309,6 +309,8 @@ class FeatureAssembler:
                 "horizons": self.horizons,
                 "target_dates": _estimate_target_dates(merged["Date"], self.horizons),
                 "feature_categories": feature_categories,
+                "target_kind": "pct_return",
+                "target_variants": ("return", "log_return"),
             }
         )
 
@@ -998,12 +1000,15 @@ def _empty_sentiment_frame() -> pd.DataFrame:
 
 def _generate_targets(merged: pd.DataFrame, horizons: Iterable[int]) -> Dict[int, Dict[str, pd.Series]]:
     merged = merged.copy()
-    merged["Daily_Return"] = merged["Close"].pct_change(fill_method=None)
+    pct_returns = merged["Close"].pct_change(fill_method=None)
+    merged["Daily_Return"] = pct_returns
+    daily_log_returns = np.log(merged["Close"]).diff()
 
     targets_by_horizon: Dict[int, Dict[str, pd.Series]] = {}
     for horizon in horizons:
         future_close = merged["Close"].shift(-horizon)
-        future_return = (future_close - merged["Close"]) / merged["Close"]
+        future_return = pct_returns.shift(-horizon)
+        log_return = daily_log_returns.shift(-horizon)
         direction = (future_return > 0).astype(float)
         direction[future_return.isna()] = np.nan
         volatility = (
@@ -1013,6 +1018,7 @@ def _generate_targets(merged: pd.DataFrame, horizons: Iterable[int]) -> Dict[int
         horizon_targets: Dict[str, pd.Series] = {
             "close": future_close,
             "return": future_return,
+            "log_return": log_return,
             "direction": direction,
             "volatility": volatility,
         }

@@ -758,6 +758,8 @@ class StockPredictorAI:
             "indicator_columns": self.metadata.get("indicator_columns", []),
             "horizon": horizon,
             "target_dates": self.metadata.get("target_dates", {}),
+            "target_kind": self.metadata.get("target_kind"),
+            "target_variants": self.metadata.get("target_variants"),
         }
         path = self.config.metrics_path_for(target, horizon)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -957,6 +959,7 @@ class StockPredictorAI:
                 in_sample_pred,
                 transformed_X,
                 aligned_X,
+                target,
                 in_sample_proba,
                 getattr(estimator, "classes_", None),
             )
@@ -1218,6 +1221,7 @@ class StockPredictorAI:
                 y_pred,
                 X_test_transformed,
                 X_test,
+                target_name,
                 proba,
                 getattr(estimator, "classes_", None),
             )
@@ -1271,6 +1275,7 @@ class StockPredictorAI:
                     y_pred,
                     X_test_transformed,
                     X_test,
+                    target_name,
                     proba,
                     getattr(estimator, "classes_", None),
                 )
@@ -1346,6 +1351,7 @@ class StockPredictorAI:
         y_pred: np.ndarray,
         X_test: pd.DataFrame,
         raw_X_test: pd.DataFrame,
+        target_name: str,
         proba: np.ndarray | None = None,
         classes: Sequence[Any] | None = None,
     ) -> Dict[str, Any]:
@@ -1365,11 +1371,10 @@ class StockPredictorAI:
             metrics["r2"] = float(r2_score(y_true, y_pred))
         except ValueError:
             metrics["r2"] = float("nan")
-        baseline = (
-            raw_X_test["Close_Current"].to_numpy()
-            if "Close_Current" in raw_X_test
-            else np.zeros_like(y_pred)
-        )
+        baseline = np.zeros_like(y_pred)
+        if target_name == "close" and "Close_Current" in raw_X_test:
+            baseline = raw_X_test["Close_Current"].to_numpy()
+
         predicted_direction = np.sign(y_pred - baseline)
         actual_direction = np.sign(y_true.to_numpy() - baseline)
         if len(actual_direction) > 0:
