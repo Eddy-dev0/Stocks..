@@ -449,10 +449,10 @@ with st.sidebar:
     end_date = st.date_input("End date", value=date.today())
     interval = st.selectbox("Interval", options=["1d", "1wk", "1mo"], index=0)
     targets_raw = st.text_input("Prediction targets", help="Comma separated list of targets")
-    force_refresh_market = st.checkbox("Refresh market data on fetch", value=False)
-    refresh_before_forecast = st.checkbox("Refresh data before forecasting", value=False)
+    force_refresh_market = st.checkbox("Refresh market data on fetch", value=True)
+    refresh_before_forecast = st.checkbox("Refresh data before forecasting", value=True)
     refresh_before_buy_zone = st.checkbox(
-        "Refresh data before buy-zone computation", value=False
+        "Refresh data before buy-zone computation", value=True
     )
     use_custom_horizon = st.checkbox("Specify forecast horizon", value=False)
     horizon_value = None
