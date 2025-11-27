@@ -40,6 +40,7 @@ from ..models import (
     model_supports_proba,
     regression_metrics,
 )
+from .simulation import run_monte_carlo
 from ..time_series import evaluate_time_series_baselines
 
 LOGGER = logging.getLogger(__name__)
@@ -161,6 +162,33 @@ TARGET_SPECS: dict[str, TargetSpec] = {
 }
 
 SUPPORTED_TARGETS = frozenset(TARGET_SPECS)
+
+
+def _historical_drift_volatility(
+    price_df: pd.DataFrame, window: int = 90
+) -> tuple[float | None, float | None]:
+    """Return mean/log-return drift and volatility from price history."""
+
+    if price_df is None or price_df.empty:
+        return None, None
+
+    lower_columns = {column.lower(): column for column in price_df.columns}
+    close_column = lower_columns.get("close") or lower_columns.get("adj close")
+    if close_column is None:
+        return None, None
+
+    closes = pd.to_numeric(price_df[close_column], errors="coerce").dropna()
+    if closes.empty:
+        return None, None
+
+    log_returns = np.log(closes / closes.shift(1)).dropna()
+    if window and len(log_returns) > window:
+        log_returns = log_returns.tail(window)
+
+    if log_returns.empty:
+        return None, None
+
+    return float(log_returns.mean()), float(log_returns.std())
 
 
 class ModelNotFoundError(FileNotFoundError):
@@ -1618,6 +1646,40 @@ class StockPredictorAI:
             if hit_candidates:
                 target_hit_probability = max(hit_candidates)
 
+        monte_carlo_target_probability = None
+        target_price_value = self.metadata.get("target_price")
+        if (
+            target_price_value is not None
+            and price_df is not None
+            and resolved_horizon is not None
+            and latest_close is not None
+            and np.isfinite(latest_close)
+        ):
+            hist_drift, hist_vol = _historical_drift_volatility(price_df)
+            drift_value = hist_drift
+            volatility_value = hist_vol
+            if drift_value is None and predicted_return is not None and resolved_horizon > 0:
+                drift_value = float(predicted_return) / float(resolved_horizon)
+            if volatility_value is None and predicted_volatility is not None:
+                volatility_value = float(predicted_volatility)
+
+            if drift_value is not None and volatility_value is not None:
+                monte_carlo_target_probability = run_monte_carlo(
+                    current_price=float(latest_close),
+                    target_price=float(target_price_value),
+                    drift=float(drift_value),
+                    volatility=float(volatility_value),
+                    horizon=int(resolved_horizon),
+                    paths=10_000,
+                )
+                event_probabilities["monte_carlo_target_hit"] = {
+                    "probability": monte_carlo_target_probability,
+                    "paths": 10_000,
+                    "drift": float(drift_value),
+                    "volatility": float(volatility_value),
+                    "method": "geometric_brownian_motion",
+                }
+
         indicator_floor, indicator_components = self._indicator_support_floor()
         expected_low = self._compute_expected_low(
             close_prediction,
@@ -1712,6 +1774,7 @@ class StockPredictorAI:
             "direction_probability_up": direction_probability_up,
             "direction_probability_down": direction_probability_down,
             "target_hit_probability": target_hit_probability,
+            "monte_carlo_target_hit_probability": monte_carlo_target_probability,
             "target_price": self.metadata.get("target_price"),
             "predictions": predictions,
             "horizon": resolved_horizon,

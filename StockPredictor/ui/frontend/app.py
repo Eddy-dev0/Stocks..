@@ -584,7 +584,22 @@ with col_forecast:
     forecast_response = st.session_state.get("forecast_response") or {}
     if forecast_response:
         st.write("**Forecast summary**")
-        st.json(forecast_response.get("forecasts", forecast_response))
+        forecast_block = forecast_response.get("forecasts", forecast_response)
+        monte_carlo_prob = None
+        if isinstance(forecast_block, dict):
+            monte_carlo_prob = forecast_block.get("monte_carlo_target_hit_probability")
+            if monte_carlo_prob is None:
+                event_probs = forecast_block.get("event_probabilities", {})
+                if isinstance(event_probs, dict):
+                    monte_carlo_prob = (
+                        event_probs.get("monte_carlo_target_hit", {}) or {}
+                    ).get("probability")
+        if isinstance(monte_carlo_prob, (int, float)):
+            st.metric(
+                "Monte Carlo probability of target hit",
+                f"{float(monte_carlo_prob) * 100:.2f}%",
+            )
+        st.json(forecast_block)
         _download_button(
             "Download forecast JSON",
             json.dumps(forecast_response, indent=2, default=str).encode("utf-8"),

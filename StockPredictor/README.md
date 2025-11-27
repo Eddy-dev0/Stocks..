@@ -31,6 +31,15 @@ scenarios.
 - FastAPI backend (`ui/api`) secured with API keys and a Streamlit dashboard (`ui/frontend`) for
   interactive exploration of data, forecasts, backtests and research artefacts.
 
+## Monte Carlo target-hit simulation
+
+The predictor reports a Monte Carlo estimate of the probability that the configured
+target price will be touched within the forecast horizon. The simulation assumes a
+geometric Brownian motion with constant drift and volatility, normally distributed
+log-returns, and no jumps or regime shifts. Paths start from the latest observed
+price with drift/volatility inferred from recent log returns, and the reported
+probability reflects the share of simulated paths that hit the target at any step.
+
 ## Project layout
 
 ```
