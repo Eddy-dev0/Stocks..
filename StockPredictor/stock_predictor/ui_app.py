@@ -420,6 +420,7 @@ class StockPredictorDesktopApp:
         self.selected_horizon_offset: int = 0
         self._configure_horizons(horizon_values)
         self.current_prediction: dict[str, Any] = {}
+        self.current_market_timestamp: pd.Timestamp | None = None
         self.price_history: pd.DataFrame | None = None
         self.feature_snapshot: pd.DataFrame | None = None
         self.feature_history: pd.DataFrame | None = None
@@ -2756,6 +2757,7 @@ class StockPredictorDesktopApp:
         indicator_history = payload.get("indicator_history")
 
         self.current_prediction = prediction if isinstance(prediction, Mapping) else {}
+        self.current_market_timestamp = self._now()
         if snapshot is None and isinstance(feature_history, pd.DataFrame) and not feature_history.empty:
             snapshot = feature_history.iloc[[-1]]
         self.feature_snapshot = snapshot if isinstance(snapshot, pd.DataFrame) else None
@@ -2815,6 +2817,13 @@ class StockPredictorDesktopApp:
     def _today(self) -> pd.Timestamp:
         return self._now().normalize()
 
+    def _resolve_market_timestamp(self) -> pd.Timestamp:
+        timestamp = self.current_market_timestamp
+        if timestamp is None:
+            timestamp = self._now()
+        localized = self._localize_market_timestamp(timestamp)
+        return localized if localized is not None else self._now()
+
     def _localize_market_timestamp(self, value: Any) -> pd.Timestamp | None:
         if value is None:
             return None
@@ -2842,9 +2851,7 @@ class StockPredictorDesktopApp:
             return ts.tz_localize(tz)
 
     def _forecast_base_date(self) -> pd.Timestamp:
-        prediction = self.current_prediction or {}
-        as_of = prediction.get("market_data_as_of") if isinstance(prediction, Mapping) else None
-        timestamp = self._localize_market_timestamp(as_of)
+        timestamp = self._resolve_market_timestamp()
         if timestamp is not None:
             return timestamp.normalize()
 
@@ -3108,12 +3115,10 @@ class StockPredictorDesktopApp:
         prediction = self.current_prediction or {}
         explanation = prediction.get("explanation") if isinstance(prediction, Mapping) else None
         self.metric_vars["ticker"].set(str(prediction.get("ticker") or self.config.ticker))
-        as_of_raw = prediction.get("market_data_as_of") if isinstance(prediction, Mapping) else None
-        localized_as_of = self._localize_market_timestamp(as_of_raw)
-        if localized_as_of is not None:
-            as_of_display = localized_as_of.strftime("%Y-%m-%d %H:%M %Z")
-        else:
-            as_of_display = "—"
+        localized_as_of = self._resolve_market_timestamp()
+        as_of_display = (
+            localized_as_of.strftime("%Y-%m-%d %H:%M %Z") if localized_as_of is not None else "—"
+        )
         self.metric_vars["as_of"].set(as_of_display)
 
         status_message = (

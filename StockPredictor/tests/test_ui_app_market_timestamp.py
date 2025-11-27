@@ -25,6 +25,7 @@ class _DummyVar:
 def _build_stubbed_app() -> StockPredictorDesktopApp:
     app = StockPredictorDesktopApp.__new__(StockPredictorDesktopApp)
     app.market_timezone = ZoneInfo("America/New_York")
+    app._now = lambda: pd.Timestamp("2024-05-01 15:00", tz=ZoneInfo("UTC"))
     app.metric_vars = {
         key: _DummyVar()
         for key in (
@@ -41,6 +42,7 @@ def _build_stubbed_app() -> StockPredictorDesktopApp:
     app.stop_loss_var = app.metric_vars["stop_loss"]
     app.sentiment_label_var = _DummyVar()
     app.sentiment_score_var = _DummyVar()
+    app.current_market_timestamp = pd.Timestamp("2024-05-01 15:00", tz="UTC")
     app.currency_symbol = "$"
     app.price_decimal_places = 2
     app.expected_low_multiplier = 1.0
