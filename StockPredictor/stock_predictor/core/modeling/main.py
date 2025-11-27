@@ -1686,6 +1686,14 @@ class StockPredictorAI:
                     label = f"{target}>{event_threshold}"
                 event_probabilities.setdefault(target, {})[label] = float(event_prob)
 
+        confluence_block = None
+        combined_confidence = None
+        confluence_score = None
+        confluence_passed = False
+        sentiment_factor = None
+        trend_alignment_note = None
+        confidence_notes: list[str] = []
+
         close_prediction = predictions.get("close")
         latest_close = float(self.metadata.get("latest_close", np.nan))
         expected_change = None
@@ -1862,13 +1870,6 @@ class StockPredictorAI:
                 return None
             return timestamp.to_pydatetime().isoformat(timespec="seconds")
 
-        confluence_block = None
-        combined_confidence = None
-        confluence_score = None
-        confluence_passed = False
-        sentiment_factor = None
-        trend_alignment_note = None
-        confidence_notes: list[str] = []
         if confluence_assessment is not None:
             confluence_score = float(confluence_assessment.score)
             confluence_passed = bool(confluence_assessment.passed)
