@@ -1960,11 +1960,26 @@ class StockPredictorDesktopApp:
         confluence_block = prediction.get("signal_confluence") if isinstance(prediction, Mapping) else None
         confluence_passed = bool(confluence_block.get("passed")) if isinstance(confluence_block, Mapping) else False
 
+        note_fragments: list[str] = []
+        if isinstance(confluence_block, Mapping) and not confluence_passed:
+            note_fragments.append("Confluence weak; probability scaled")
+        confidence_note = prediction.get("confidence_note") if isinstance(prediction, Mapping) else None
+        if confidence_note:
+            note_fragments.append(str(confidence_note))
+
         gated_confidence = _safe_float(prediction.get("confluence_confidence"))
         if gated_confidence is not None:
-            if not confluence_passed:
-                return "—"
-            return fmt_pct(gated_confidence, decimals=1)
+            display = fmt_pct(gated_confidence, decimals=1)
+            if note_fragments:
+                display = f"{display} ({'; '.join(note_fragments)})"
+            return display
+
+        historical_confidence = _safe_float(prediction.get("historical_confidence"))
+        if historical_confidence is not None:
+            display = fmt_pct(historical_confidence, decimals=1)
+            if note_fragments:
+                display = f"{display} ({'; '.join(note_fragments)})"
+            return display
 
         confidence = None
         confidence_block = prediction.get("confidence") if isinstance(prediction, Mapping) else None
@@ -1987,7 +2002,11 @@ class StockPredictorDesktopApp:
 
         if confidence is None:
             return "—"
-        return fmt_pct(confidence, decimals=1)
+
+        display = fmt_pct(confidence, decimals=1)
+        if note_fragments:
+            display = f"{display} ({'; '.join(note_fragments)})"
+        return display
 
     def _extract_indicator_series(self, indicator: str) -> pd.Series | None:
         target_key = str(indicator).strip().lower()
