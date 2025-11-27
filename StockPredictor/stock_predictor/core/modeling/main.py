@@ -743,6 +743,12 @@ class StockPredictorAI:
                         "horizon",
                     }
                 }
+                target_kind = stored.get("target_kind")
+                if target_kind:
+                    self.metadata["target_kind"] = target_kind
+                target_variants = stored.get("target_variants")
+                if target_variants:
+                    self.metadata["target_variants"] = target_variants
                 if metrics_payload:
                     metrics_store = self.metadata.setdefault("metrics", {})
                     horizon_metrics = metrics_store.setdefault(target, {})
@@ -1307,6 +1313,7 @@ class StockPredictorAI:
                 target_series,
                 target_name,
                 preprocessor_template=preprocessor,
+                target_kind=self.metadata.get("target_kind"),
             )
             splits = result.splits
             aggregate = result.aggregate
@@ -3659,8 +3666,10 @@ class StockPredictorAI:
                 target,
                 preprocessor_template=template,
                 auxiliary_targets=auxiliary_df,
+                target_kind=self.metadata.get("target_kind"),
             )
             results[target] = {
+                "target_kind": result.target_kind,
                 "aggregate": result.aggregate,
                 "splits": result.splits,
                 "feature_importance": result.feature_importance,
@@ -3681,6 +3690,7 @@ class StockPredictorAI:
                     "splits": result.splits,
                     "horizon": resolved_horizon,
                     "feature_importance": result.feature_importance,
+                    "target_kind": result.target_kind,
                 },
             )
         self.metadata["active_horizon"] = resolved_horizon

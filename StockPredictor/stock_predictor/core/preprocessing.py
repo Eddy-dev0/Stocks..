@@ -138,19 +138,28 @@ def merge_with_sentiment(
 
 
 def build_supervised_dataset(
-    price_df: pd.DataFrame, sentiment_df: pd.DataFrame | None = None
+    price_df: pd.DataFrame,
+    sentiment_df: pd.DataFrame | None = None,
+    *,
+    use_log_returns: bool = False,
 ) -> Tuple[pd.DataFrame, pd.Series, Dict[str, object]]:
     """Prepare the feature matrix and target vector."""
 
-    price_features, waves = compute_price_features(price_df)
+    price_features = compute_price_features(price_df)
     sentiment_df = sentiment_df if sentiment_df is not None else pd.DataFrame()
     indicator_columns = price_features.attrs.get("indicator_columns", [])
     price_columns_attr = price_features.attrs.get("price_columns", [])
     merged, aggregated = merge_with_sentiment(price_features, sentiment_df)
 
     dataset = merged.copy()
-    pct_returns = dataset["Close"].pct_change(fill_method=None)
-    target = pct_returns.shift(-1)
+    if use_log_returns:
+        returns = np.log(dataset["Close"]).diff()
+        target_kind = "log_return"
+    else:
+        returns = dataset["Close"].pct_change(fill_method=None)
+        target_kind = "pct_return"
+
+    target = returns.shift(-1)
     dataset = dataset.assign(Target=target)
 
     if "Target" not in dataset.columns:
@@ -175,7 +184,8 @@ def build_supervised_dataset(
         "latest_date": pd.to_datetime(price_df.iloc[-1]["Date"]),
         "indicator_columns": indicator_columns,
         "price_columns": price_columns_attr,
-        "target_kind": "pct_return",
+        "target_kind": target_kind,
+        "target_variants": ("pct_return", "log_return"),
         "target_horizon": 1,
     }
     return X, y, metadata

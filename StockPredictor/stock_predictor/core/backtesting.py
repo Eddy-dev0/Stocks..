@@ -25,6 +25,7 @@ LOGGER = logging.getLogger(__name__)
 @dataclass(slots=True)
 class BacktestResult:
     target: str
+    target_kind: str | None
     splits: List[Dict[str, float]]
     aggregate: Dict[str, float]
     feature_importance: Dict[str, float]
@@ -66,6 +67,7 @@ class Backtester:
         *,
         preprocessor_template: Optional[Pipeline] = None,
         auxiliary_targets: Optional[pd.DataFrame] = None,
+        target_kind: str | None = None,
     ) -> BacktestResult:
         task = "classification" if target == "direction" else "regression"
         splits = list(self._generate_splits(len(X)))
@@ -149,6 +151,7 @@ class Backtester:
 
         return BacktestResult(
             target=target,
+            target_kind=target_kind,
             splits=split_metrics,
             aggregate=aggregate,
             feature_importance=aggregated_importance,
