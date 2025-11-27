@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import logging
 import inspect
-from typing import Any, Dict
+from typing import Any, Dict, Sequence
 
 import numpy as np
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, mean_squared_error
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    mean_absolute_error,
+    mean_squared_error,
+    precision_score,
+    recall_score,
+)
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -219,10 +226,27 @@ def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, floa
     return {"rmse": rmse, "mae": mae, "mape": mape}
 
 
-def classification_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+def classification_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_proba: np.ndarray | None = None,
+    classes: Sequence[Any] | None = None,
+) -> Dict[str, float]:
     accuracy = float(accuracy_score(y_true, y_pred))
     f1 = float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
-    return {"accuracy": accuracy, "f1": f1}
+    precision = float(
+        precision_score(y_true, y_pred, average="weighted", zero_division=0)
+    )
+    recall = float(recall_score(y_true, y_pred, average="weighted", zero_division=0))
+
+    metrics: Dict[str, float] = {
+        "accuracy": accuracy,
+        "f1": f1,
+        "precision": precision,
+        "recall": recall,
+    }
+
+    return metrics
 
 
 def extract_feature_importance(model: Pipeline, feature_names: list[str]) -> Dict[str, float]:
