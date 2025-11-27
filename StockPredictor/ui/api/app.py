@@ -223,7 +223,7 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
         if isinstance(sentiment_df, pd.DataFrame) and not sentiment_df.empty:
             sentiment_payload["records"] = sentiment_df.tail(10).to_dict(orient="records")
             latest = sentiment_df.iloc[-1]
-            for candidate in ("sentiment", "Sentiment_Avg", "sentiment_score"):
+            for candidate in ("sentiment", "Sentiment_Avg", "sentiment_score", "Score", "score"):
                 if candidate in latest and pd.notna(latest[candidate]):
                     sentiment_payload["latest_score"] = float(latest[candidate])
                     break
