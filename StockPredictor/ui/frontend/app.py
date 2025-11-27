@@ -96,6 +96,45 @@ def _coerce_dataframe(payload: Any) -> pd.DataFrame | None:
     return None
 
 
+def _beta_band_description(level: str) -> str:
+    normalized = str(level).lower()
+    if normalized == "high":
+        return "high volatility"
+    if normalized == "defensive":
+        return "defensive / low sensitivity"
+    return "market-like sensitivity"
+
+
+def _summarise_beta_guidance(beta_block: Dict[str, Any]) -> List[str]:
+    summaries: List[str] = []
+    for key, payload in sorted(beta_block.items()):
+        if not isinstance(payload, dict):
+            continue
+        label = payload.get("label") or key.upper()
+        value = payload.get("value")
+        if value is None:
+            continue
+        window = payload.get("window")
+        risk_level = payload.get("risk_level")
+        band_text = _beta_band_description(risk_level) if risk_level else "market-like sensitivity"
+        window_text = f" ({int(window)}-day window)" if isinstance(window, (int, float)) else ""
+        summaries.append(f"{label} beta {float(value):.2f}{window_text} – {band_text}")
+    return summaries
+
+
+def _extract_risk_guidance(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    if "risk_guidance" in payload and isinstance(payload.get("risk_guidance"), dict):
+        return payload["risk_guidance"]
+    recommendation = payload.get("recommendation")
+    if isinstance(recommendation, dict) and isinstance(
+        recommendation.get("risk_guidance"), dict
+    ):
+        return recommendation["risk_guidance"]
+    return {}
+
+
 def _normalise_timeseries(frame: pd.DataFrame) -> pd.DataFrame:
     frame = frame.copy()
     for column in ("date", "datetime", "timestamp"):
@@ -599,6 +638,23 @@ with col_forecast:
                 "Monte Carlo probability of target hit",
                 f"{float(monte_carlo_prob) * 100:.2f}%",
             )
+        risk_guidance = _extract_risk_guidance(forecast_block)
+        if risk_guidance:
+            st.markdown("**Risk guidance**")
+            risk_cols = st.columns(2)
+            vol_value = risk_guidance.get("volatility")
+            uncert_value = risk_guidance.get("uncertainty_std")
+            if vol_value is not None:
+                risk_cols[0].metric("Forecast volatility", f"{float(vol_value):.2%}")
+            if uncert_value is not None:
+                risk_cols[1].metric("Prediction uncertainty", f"{float(uncert_value):.3f}")
+
+            beta_block = risk_guidance.get("beta")
+            beta_summaries = _summarise_beta_guidance(beta_block) if beta_block else []
+            if beta_summaries:
+                st.markdown("**Beta sensitivity**")
+                for summary in beta_summaries:
+                    st.write(summary)
         st.json(forecast_block)
         _download_button(
             "Download forecast JSON",
