@@ -2830,10 +2830,10 @@ class StockPredictorDesktopApp:
             return ts
         if ts.tzinfo is None:
             try:
-                return ts.tz_localize("UTC").tz_convert(tz)
+                return ts.tz_localize(tz)
             except Exception:  # pragma: no cover - defensive fallback
                 try:
-                    return ts.tz_localize(tz)
+                    return ts.tz_localize("UTC").tz_convert(tz)
                 except Exception:
                     return None
         try:
@@ -3059,7 +3059,7 @@ class StockPredictorDesktopApp:
                 return None
 
         avg: float | None = None
-        for key in ("Sentiment_Avg", "sentiment"):
+        for key in ("Sentiment_Avg", "sentiment", "Score", "score", "sentiment_score"):
             avg = _safe_float(getter(key))
             if avg is not None:
                 break
