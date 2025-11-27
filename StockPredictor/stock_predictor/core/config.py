@@ -16,6 +16,7 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 from dotenv import load_dotenv
 
 from .features import FEATURE_REGISTRY, default_feature_toggles
+from .preprocessing import default_price_feature_toggles
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
@@ -42,6 +43,7 @@ DEFAULT_BACKTEST_WINDOW = 252
 DEFAULT_BACKTEST_STEP = 21
 DEFAULT_VOLATILITY_WINDOW = 20
 DEFAULT_TARGET_GAIN_PCT = 0.03
+DEFAULT_MACRO_MERGE_SYMBOLS: tuple[str, ...] = ("^VIX", "DXY", "^TNX")
 
 
 HORIZON_UNIT_TO_DAYS: dict[str, int] = {
@@ -133,6 +135,9 @@ class PredictorConfig:
     sentiment: bool = True
     database_url: str = field(default_factory=_default_database_url)
     feature_toggles: dict[str, bool] = field(default_factory=default_feature_toggles)
+    price_feature_toggles: dict[str, bool] = field(
+        default_factory=default_price_feature_toggles
+    )
     prediction_targets: tuple[str, ...] = field(
         default_factory=lambda: DEFAULT_PREDICTION_TARGETS
     )
@@ -180,6 +185,9 @@ class PredictorConfig:
     buy_zone: BuyZoneConfirmationSettings = field(
         default_factory=BuyZoneConfirmationSettings
     )
+    macro_merge_symbols: tuple[str, ...] = field(
+        default_factory=lambda: DEFAULT_MACRO_MERGE_SYMBOLS
+    )
 
     def __post_init__(self) -> None:
         self.ticker = self.ticker.upper()
@@ -196,6 +204,12 @@ class PredictorConfig:
         self.evaluation_strategy = str(self.evaluation_strategy).strip().lower() or "holdout"
         if not self.sentiment:
             self.feature_toggles["sentiment"] = False
+        self.price_feature_toggles = _coerce_price_feature_toggles(
+            self.price_feature_toggles
+        )
+        self.macro_merge_symbols = _coerce_iterable(
+            self.macro_merge_symbols, DEFAULT_MACRO_MERGE_SYMBOLS
+        )
         if not 0 < self.test_size < 1:
             raise ValueError("test_size must be between 0 and 1.")
         if self.backtest_window <= 0:
@@ -478,6 +492,8 @@ def build_config(
     database_url: Optional[str] = None,
     feature_sets: Optional[Mapping[str, Any] | Iterable[str] | str] = None,
     feature_toggles: Optional[Mapping[str, Any] | Iterable[str] | str] = None,
+    price_feature_toggles: Optional[Mapping[str, Any] | Iterable[str] | str] = None,
+    macro_merge_symbols: Optional[Iterable[str] | str] = None,
     prediction_targets: Optional[Iterable[str] | str] = None,
     prediction_horizons: Optional[Iterable[int] | str] = None,
     model_params: Optional[Mapping[str, Mapping[str, Any]]] = None,
@@ -591,6 +607,12 @@ def build_config(
         "feature_toggles": _coerce_feature_toggles(
             feature_toggles if feature_toggles is not None else feature_sets
         ),
+        "price_feature_toggles": _coerce_price_feature_toggles(
+            price_feature_toggles
+        ),
+        "macro_merge_symbols": _coerce_iterable(
+            macro_merge_symbols, DEFAULT_MACRO_MERGE_SYMBOLS
+        ),
         "prediction_targets": _coerce_iterable(
             prediction_targets, DEFAULT_PREDICTION_TARGETS
         ),
@@ -666,6 +688,36 @@ def _coerce_feature_toggles(
     return defaults
 
 
+def _coerce_price_feature_toggles(
+    value: Optional[Mapping[str, Any] | Iterable[str] | str],
+    default: Optional[Mapping[str, bool]] = None,
+) -> dict[str, bool]:
+    defaults = dict(default or default_price_feature_toggles())
+    if value is None:
+        return defaults
+
+    toggles: dict[str, bool] = {}
+    if isinstance(value, Mapping):
+        for key, enabled in value.items():
+            name = str(key).strip().lower()
+            if name in defaults:
+                toggles[name] = bool(enabled)
+    else:
+        if isinstance(value, str):
+            tokens = [part.strip() for part in value.split(",")]
+        else:
+            tokens = [str(item).strip() for item in value]
+        for token in tokens:
+            if not token:
+                continue
+            name = token.lower()
+            if name in defaults:
+                toggles[name] = True
+
+    defaults.update(toggles)
+    return defaults
+
+
 def _coerce_iterable(
     value: Optional[Iterable[str] | str], default: Sequence[str]
 ) -> tuple[str, ...]:
@@ -731,6 +783,20 @@ def load_config_from_mapping(payload: Mapping[str, Any]) -> PredictorConfig:
         data["feature_toggles"] = _coerce_feature_toggles(toggles_input)
     elif "feature_toggles" in data:
         data["feature_toggles"] = _coerce_feature_toggles(data["feature_toggles"])
+
+    if "price_feature_toggles" in payload:
+        data["price_feature_toggles"] = _coerce_price_feature_toggles(
+            payload.get("price_feature_toggles")
+        )
+    elif "price_feature_toggles" in data:
+        data["price_feature_toggles"] = _coerce_price_feature_toggles(
+            data["price_feature_toggles"]
+        )
+
+    if "macro_merge_symbols" in payload:
+        data["macro_merge_symbols"] = _coerce_iterable(
+            payload.get("macro_merge_symbols"), DEFAULT_MACRO_MERGE_SYMBOLS
+        )
 
     if "sentiment" in data:
         data["sentiment"] = _coerce_bool(data["sentiment"], default=True)
