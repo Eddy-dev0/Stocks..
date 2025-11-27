@@ -289,9 +289,18 @@ class TrendFinder:
                             "Trend scan progress callback failed for %s", ticker, exc_info=True
                         )
 
-        strong_insights = [
-            insight for insight in insights if self._is_strong_confluence(insight)
-        ]
+        strong_insights: list[TrendInsight] = []
+        for insight in insights:
+            rejection_reason = self._confluence_rejection_reason(insight)
+            if rejection_reason:
+                LOGGER.info(
+                    "Dropping %s due to confluence gating: %s",
+                    getattr(insight, "ticker", "unknown"),
+                    rejection_reason,
+                )
+                continue
+            if self._is_strong_confluence(insight):
+                strong_insights.append(insight)
         strong_insights.sort(
             key=lambda item: (
                 self._safe_float(getattr(item, "confidence_rank", None))
@@ -498,6 +507,53 @@ class TrendFinder:
         return details
 
     @staticmethod
+    def _extract_confluence_passed(metadata: Mapping[str, Any] | None) -> bool | None:
+        if not isinstance(metadata, Mapping):
+            return None
+
+        confluence_block = metadata.get("signal_confluence")
+        if isinstance(confluence_block, Mapping):
+            if "passed" in confluence_block:
+                return bool(confluence_block.get("passed"))
+
+        confidence_block = metadata.get("confidence")
+        if isinstance(confidence_block, Mapping):
+            if "signal_confluence_passed" in confidence_block:
+                return bool(confidence_block.get("signal_confluence_passed"))
+
+        if "signal_confluence_passed" in metadata:
+            return bool(metadata.get("signal_confluence_passed"))
+
+        return None
+
+    @staticmethod
+    def _confluence_rejection_reason(insight: TrendInsight | Mapping[str, Any]) -> str | None:
+        metadata: Mapping[str, Any] | None = None
+        if isinstance(insight, TrendInsight):
+            metadata = insight.metadata
+        elif isinstance(insight, Mapping):
+            metadata = insight
+
+        payload = metadata.get("prediction_payload") if isinstance(metadata, Mapping) else None
+        metadata_blocks: tuple[Mapping[str, Any] | None, ...] = (metadata, payload)
+
+        for block in metadata_blocks:
+            if isinstance(block, Mapping) and block.get("confluence_scaled"):
+                return "confluence scaling detected"
+
+        for block in metadata_blocks:
+            note = block.get("confidence_note") if isinstance(block, Mapping) else None
+            if isinstance(note, str) and "scale" in note.lower():
+                return "confidence note indicates scaling"
+
+        for block in metadata_blocks:
+            confluence_passed = TrendFinder._extract_confluence_passed(block)
+            if confluence_passed is False:
+                return "signal confluence marked as failed"
+
+        return None
+
+    @staticmethod
     def _is_strong_confluence(insight: TrendInsight | Mapping[str, Any]) -> bool:
         if isinstance(insight, TrendInsight):
             metadata = insight.metadata
@@ -544,6 +600,8 @@ class TrendFinder:
             confidence_block.get("signal_confluence_score")
         )
         confluence_passed = confidence_block.get("signal_confluence_passed")
+        if confluence_passed is None:
+            confluence_passed = TrendFinder._extract_confluence_passed(metadata)
 
         if confluence_passed is not True:
             return False

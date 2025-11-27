@@ -1870,6 +1870,8 @@ class StockPredictorAI:
                 return None
             return timestamp.to_pydatetime().isoformat(timespec="seconds")
 
+        confluence_scaled = False
+
         if confluence_assessment is not None:
             confluence_score = float(confluence_assessment.score)
             confluence_passed = bool(confluence_assessment.passed)
@@ -1900,6 +1902,7 @@ class StockPredictorAI:
                 combined_confidence *= max(0.0, min(1.0, confluence_score))
             if confluence_passed is False:
                 combined_confidence *= 0.5
+                confluence_scaled = True
                 confidence_notes.append(
                     "Confluence checks failed; probability scaled instead of hidden."
                 )
@@ -1953,6 +1956,8 @@ class StockPredictorAI:
             result["signal_confluence"] = confluence_block
         if combined_confidence is not None:
             result["confluence_confidence"] = combined_confidence
+        if confluence_scaled:
+            result["confluence_scaled"] = True
         if historical_confidence is not None:
             result["historical_confidence"] = historical_confidence
         if trend_alignment_note:
