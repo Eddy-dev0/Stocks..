@@ -267,6 +267,15 @@ class StockPredictorAI:
             macro_df=macro_frame if not macro_frame.empty else None,
         )
         metadata = dict(feature_result.metadata)
+        snapshot_fetcher = getattr(self.fetcher, "fetch_fundamental_snapshot", None)
+        if callable(snapshot_fetcher):
+            try:
+                snapshot = snapshot_fetcher()
+            except Exception as exc:  # pragma: no cover - optional metadata path
+                LOGGER.debug("Failed to fetch headline fundamentals: %s", exc)
+            else:
+                if snapshot:
+                    metadata["fundamental_snapshot"] = snapshot
         raw_feature_columns = list(feature_result.features.columns)
         metadata.setdefault("feature_columns", raw_feature_columns)
         metadata["raw_feature_columns"] = raw_feature_columns
@@ -2285,6 +2294,14 @@ class StockPredictorAI:
         if quantiles:
             risk_guidance["quantiles"] = quantiles
 
+        confidence, fundamentals = self._apply_fundamental_penalty(
+            confidence,
+            expected_return,
+        )
+        if fundamentals:
+            risk_guidance["fundamentals"] = fundamentals
+            self.metadata["fundamental_confidence"] = fundamentals
+
         beta_metrics, beta_rationales = self._beta_context()
         if beta_metrics:
             risk_guidance["beta"] = beta_metrics
@@ -2301,6 +2318,81 @@ class StockPredictorAI:
             "risk_guidance": risk_guidance,
             "risk_rationale": beta_rationales,
         }
+
+    def _apply_fundamental_penalty(
+        self, confidence: float, expected_return: float | None
+    ) -> tuple[float, dict[str, float]]:
+        snapshot = self.metadata.get("fundamental_snapshot")
+        fundamentals: dict[str, float] = {}
+        if not isinstance(snapshot, dict) or not snapshot:
+            return float(np.clip(confidence, 0.0, 1.0)), fundamentals
+
+        latest_close = self._safe_float(self.metadata.get("latest_close"))
+        pe_ratio = self._safe_float(snapshot.get("pe_ratio"))
+        sector_pe = self._safe_float(snapshot.get("sector_pe"))
+        debt_to_equity = self._safe_float(snapshot.get("debt_to_equity"))
+        sector_debt = self._safe_float(snapshot.get("sector_debt_to_equity"))
+        earnings_growth = self._safe_float(snapshot.get("earnings_growth"))
+        sector_growth = self._safe_float(snapshot.get("sector_growth"))
+        eps = self._safe_float(snapshot.get("eps"))
+
+        implied_pe = None
+        if eps is not None and latest_close is not None and expected_return is not None:
+            implied_price = latest_close * (1 + expected_return)
+            implied_pe = implied_price / eps if eps else None
+        elif pe_ratio is not None and expected_return is not None:
+            implied_pe = pe_ratio * (1 + expected_return)
+        elif pe_ratio is not None:
+            implied_pe = pe_ratio
+
+        penalty = 1.0
+
+        if implied_pe is not None:
+            fundamentals["implied_pe"] = float(implied_pe)
+        if sector_pe is not None:
+            fundamentals["sector_pe"] = float(sector_pe)
+
+        if implied_pe is not None and sector_pe is not None and sector_pe > 0:
+            valuation_gap = implied_pe / sector_pe
+            fundamentals["valuation_gap"] = float(valuation_gap)
+            if valuation_gap >= 2.0:
+                penalty *= 0.7
+            elif valuation_gap >= 1.5:
+                penalty *= 0.85
+            elif valuation_gap >= 1.2:
+                penalty *= 0.95
+            elif valuation_gap <= 0.6:
+                penalty *= 0.9
+
+        if debt_to_equity is not None:
+            fundamentals["debt_to_equity"] = float(debt_to_equity)
+        if sector_debt is not None:
+            fundamentals["sector_debt_to_equity"] = float(sector_debt)
+
+        if (
+            debt_to_equity is not None
+            and sector_debt is not None
+            and sector_debt > 0
+            and debt_to_equity > sector_debt * 1.5
+        ):
+            penalty *= 0.9
+            fundamentals["leverage_flag"] = 1.0
+
+        if earnings_growth is not None:
+            fundamentals["earnings_growth"] = float(earnings_growth)
+        if sector_growth is not None:
+            fundamentals["sector_growth"] = float(sector_growth)
+
+        if (
+            earnings_growth is not None
+            and sector_growth is not None
+            and earnings_growth < sector_growth * 0.5
+        ):
+            penalty *= 0.92
+            fundamentals["growth_flag"] = 1.0
+
+        adjusted = float(np.clip(confidence * penalty, 0.0, 1.0))
+        return adjusted, fundamentals
 
     def _technical_reasons(self, feature_row: pd.Series) -> list[str]:
         reasons: list[str] = []
@@ -2624,6 +2716,10 @@ class StockPredictorAI:
         if volatility is not None and np.isfinite(volatility) and volatility > 0:
             sentences.append(f"Anticipated volatility around {volatility * 100:.2f}%.")
 
+        fundamental_sentence = self._render_fundamental_headline()
+        if fundamental_sentence:
+            sentences.append(fundamental_sentence)
+
         driver_sections: list[str] = []
         for category, names in sorted(top_feature_drivers.items()):
             if not names:
@@ -2691,6 +2787,33 @@ class StockPredictorAI:
 
         summary = " ".join(sentence.strip() for sentence in sentences if sentence)
         return summary.strip()
+
+    def _render_fundamental_headline(self) -> str | None:
+        snapshot = self.metadata.get("fundamental_snapshot")
+        if not isinstance(snapshot, dict) or not snapshot:
+            return None
+
+        sentences: list[str] = []
+        pe_ratio = self._safe_float(snapshot.get("pe_ratio"))
+        sector_pe = self._safe_float(snapshot.get("sector_pe"))
+        if pe_ratio is not None and sector_pe is not None:
+            sentences.append(f"Current P/E {pe_ratio:.1f} vs sector {sector_pe:.1f}")
+        debt_to_equity = self._safe_float(snapshot.get("debt_to_equity"))
+        sector_debt = self._safe_float(snapshot.get("sector_debt_to_equity"))
+        if debt_to_equity is not None and sector_debt is not None:
+            sentences.append(
+                f"Debt/Equity {debt_to_equity:.1f} vs sector {sector_debt:.1f}"
+            )
+        earnings_growth = self._safe_float(snapshot.get("earnings_growth"))
+        sector_growth = self._safe_float(snapshot.get("sector_growth"))
+        if earnings_growth is not None and sector_growth is not None:
+            sentences.append(
+                f"Earnings growth {earnings_growth * 100:.1f}% vs sector {sector_growth * 100:.1f}%"
+            )
+
+        if not sentences:
+            return None
+        return "; ".join(sentences) + "."
 
     def _collect_feature_importance(
         self, horizon: Optional[int] = None, top_n: int = 10
@@ -2812,6 +2935,10 @@ class StockPredictorAI:
         validation_scores = self._validation_metrics("close", horizon)
         if validation_scores:
             indicators["validation_scores"] = validation_scores
+
+        fundamentals = self.metadata.get("fundamental_confidence")
+        if isinstance(fundamentals, dict) and fundamentals:
+            indicators["fundamentals"] = fundamentals
 
         return indicators
 
