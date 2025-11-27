@@ -28,6 +28,7 @@ class BacktestResult:
     splits: List[Dict[str, float]]
     aggregate: Dict[str, float]
     feature_importance: Dict[str, float]
+    decision_thresholds: Dict[str, float]
 
 
 class Backtester:
@@ -114,6 +115,8 @@ class Backtester:
                 y_test,
                 X_test,
                 auxiliary_test,
+                y_proba=y_proba,
+                classes=classes,
             )
             metrics.update(trading_metrics)
             metrics["split"] = index
@@ -132,12 +135,18 @@ class Backtester:
 
         aggregate = self._aggregate_metrics(split_metrics)
         aggregated_importance = self._normalise_feature_importance(feature_totals, feature_counts)
+        threshold_summary = {
+            key: value
+            for key, value in aggregate.items()
+            if "threshold" in key
+        }
 
         return BacktestResult(
             target=target,
             splits=split_metrics,
             aggregate=aggregate,
             feature_importance=aggregated_importance,
+            decision_thresholds=threshold_summary,
         )
 
     def _score_predictions(
@@ -259,8 +268,17 @@ class Backtester:
         y_test: pd.Series,
         raw_X: pd.DataFrame,
         auxiliary_test: Optional[pd.DataFrame],
+        *,
+        y_proba: np.ndarray | None = None,
+        classes: np.ndarray | None = None,
     ) -> Dict[str, float]:
         actual_returns = self._actual_returns(target, y_test, raw_X, auxiliary_test)
+        thresholds = self._optimise_thresholds(
+            target,
+            y_proba,
+            classes,
+            actual_returns,
+        )
         if actual_returns.size == 0:
             return {
                 "turnover": 0.0,
@@ -270,9 +288,17 @@ class Backtester:
                 "max_drawdown": 0.0,
                 "hit_rate": 0.0,
                 "net_return": 0.0,
+                **thresholds,
             }
 
-        signals = self._signal_from_predictions(target, predictions, raw_X)
+        signals = self._signal_from_predictions(
+            target,
+            predictions,
+            raw_X,
+            y_proba=y_proba,
+            classes=classes,
+            thresholds=thresholds,
+        )
         if signals.size == 0:
             return {
                 "turnover": 0.0,
@@ -282,8 +308,16 @@ class Backtester:
                 "max_drawdown": 0.0,
                 "hit_rate": 0.0,
                 "net_return": 0.0,
+                **thresholds,
             }
 
+        stats = self._trading_statistics(signals, actual_returns)
+        stats.update(thresholds)
+        return stats
+
+    def _trading_statistics(
+        self, signals: np.ndarray, actual_returns: np.ndarray
+    ) -> Dict[str, float]:
         position_changes = np.diff(np.concatenate(([0.0], signals)))
         turnover = float(np.sum(np.abs(position_changes)))
         transaction_costs = np.abs(position_changes) * self.cost_per_turn
@@ -375,25 +409,101 @@ class Backtester:
         target: str,
         predictions: np.ndarray,
         raw_X: pd.DataFrame,
+        *,
+        y_proba: np.ndarray | None = None,
+        classes: np.ndarray | None = None,
+        thresholds: Dict[str, float] | None = None,
     ) -> np.ndarray:
         forecast = np.asarray(predictions, dtype=float)
         if forecast.size == 0:
             return np.array([])
 
-        if target == "direction":
-            return np.where(forecast >= 0.5, 1.0, -1.0)
+        thresholds = thresholds or {}
+        if target == "direction" and y_proba is not None and y_proba.size:
+            positive_info = self._positive_class_proba(y_proba, classes)
+            if positive_info is None:
+                return np.where(forecast >= 0.5, 1.0, -1.0)
+
+            positive_proba, _ = positive_info
+            if positive_proba.size == 0:
+                return np.where(forecast >= 0.5, 1.0, -1.0)
+
+            long_threshold = max(0.5, float(thresholds.get("long_probability_threshold", 0.5)))
+            short_threshold = float(thresholds.get("short_probability_threshold", 0.5))
+            signals = np.zeros_like(positive_proba, dtype=float)
+            signals[positive_proba >= long_threshold] = 1.0
+            signals[positive_proba <= short_threshold] = -1.0
+            return signals
 
         if target == "close" and "Close_Current" in raw_X:
             baseline = raw_X["Close_Current"].to_numpy(dtype=float)
             denominator = np.clip(np.abs(baseline), 1e-6, None)
             forecast = (forecast - baseline) / denominator
 
-        threshold = self.neutral_threshold
+        threshold = float(thresholds.get("neutral_threshold", self.neutral_threshold))
         return np.where(
             forecast > threshold,
             1.0,
             np.where(forecast < -threshold, -1.0, 0.0),
         )
+
+    def _optimise_thresholds(
+        self,
+        target: str,
+        y_proba: np.ndarray | None,
+        classes: np.ndarray | None,
+        actual_returns: np.ndarray,
+    ) -> Dict[str, float]:
+        thresholds: Dict[str, float] = {
+            "neutral_threshold": self.neutral_threshold,
+            "long_probability_threshold": 0.5,
+            "short_probability_threshold": 0.5,
+        }
+        if (
+            target != "direction"
+            or y_proba is None
+            or y_proba.size == 0
+            or actual_returns.size == 0
+        ):
+            return thresholds
+
+        positive_info = self._positive_class_proba(y_proba, classes)
+        if positive_info is None:
+            return thresholds
+
+        positive_proba, _ = positive_info
+        if positive_proba.size == 0:
+            return thresholds
+
+        candidate_thresholds = sorted(
+            set(
+                float(value)
+                for value in np.concatenate(
+                    (
+                        np.linspace(0.55, 0.9, 8),
+                        np.quantile(positive_proba, [0.6, 0.7, 0.8, 0.9]),
+                    )
+                )
+            )
+        )
+        best_threshold = 0.5
+        best_score = -np.inf
+
+        for threshold in candidate_thresholds:
+            if threshold <= 0.5 or threshold >= 1.0:
+                continue
+            signals = np.zeros_like(positive_proba, dtype=float)
+            signals[positive_proba >= threshold] = 1.0
+            signals[positive_proba <= 1.0 - threshold] = -1.0
+            stats = self._trading_statistics(signals, actual_returns)
+            score = stats.get("net_return", -np.inf)
+            if score > best_score:
+                best_score = score
+                best_threshold = float(threshold)
+
+        thresholds["long_probability_threshold"] = best_threshold
+        thresholds["short_probability_threshold"] = max(0.0, 1.0 - best_threshold)
+        return thresholds
 
     def _aggregate_metrics(self, split_metrics: List[Dict[str, float]]) -> Dict[str, float]:
         aggregate: Dict[str, float] = {}
