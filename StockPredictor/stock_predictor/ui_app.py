@@ -421,6 +421,7 @@ class StockPredictorDesktopApp:
         self._configure_horizons(horizon_values)
         self.current_prediction: dict[str, Any] = {}
         self.current_market_timestamp: pd.Timestamp | None = None
+        self.current_market_price: float | None = None
         self.price_history: pd.DataFrame | None = None
         self.feature_snapshot: pd.DataFrame | None = None
         self.feature_history: pd.DataFrame | None = None
@@ -1166,7 +1167,13 @@ class StockPredictorDesktopApp:
         for row, (key, label) in enumerate(info_specs):
             caption = ttk.Label(info_box, text=f"{label}:")
             caption.grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-            value = ttk.Label(info_box, textvariable=self.indicator_info_vars[key], anchor=tk.E)
+            value = ttk.Label(
+                info_box,
+                textvariable=self.indicator_info_vars[key],
+                anchor=tk.W,
+                justify=tk.LEFT,
+                wraplength=260,
+            )
             value.grid(row=row, column=1, sticky=tk.EW, pady=2)
 
     def _build_explanation_tab(self) -> None:
@@ -2776,7 +2783,12 @@ class StockPredictorDesktopApp:
         indicator_history = payload.get("indicator_history")
 
         self.current_prediction = prediction if isinstance(prediction, Mapping) else {}
-        self.current_market_timestamp = self._now()
+        prediction_timestamp = None
+        if isinstance(self.current_prediction, Mapping):
+            prediction_timestamp = self._localize_market_timestamp(
+                self.current_prediction.get("market_data_as_of")
+                or self.current_prediction.get("as_of")
+            )
         if snapshot is None and isinstance(feature_history, pd.DataFrame) and not feature_history.empty:
             snapshot = feature_history.iloc[[-1]]
         self.feature_snapshot = snapshot if isinstance(snapshot, pd.DataFrame) else None
@@ -2786,6 +2798,17 @@ class StockPredictorDesktopApp:
         self._update_local_currency_profile(self.price_history)
         self._sync_horizon_from_prediction(self.current_prediction)
         self.market_holidays = self._resolve_market_holidays(self.current_prediction)
+        latest_price, latest_timestamp = self._extract_latest_price_point()
+        localized_price_timestamp = self._localize_market_timestamp(latest_timestamp)
+        self.current_market_timestamp = (
+            localized_price_timestamp or prediction_timestamp or self._now()
+        )
+        self.current_market_price = latest_price
+        if self.current_market_price is None:
+            self.current_market_price = _safe_float(
+                self.current_prediction.get("last_price")
+                or self.current_prediction.get("last_close")
+            )
         self._apply_currency(mode=self.currency_mode)
         self._update_forecast_label(self.current_prediction.get("target_date"))
         self._update_metrics()
@@ -2839,9 +2862,61 @@ class StockPredictorDesktopApp:
     def _resolve_market_timestamp(self) -> pd.Timestamp:
         timestamp = self.current_market_timestamp
         if timestamp is None:
+            _, latest_timestamp = self._extract_latest_price_point()
+            timestamp = latest_timestamp
+        if timestamp is None:
             timestamp = self._now()
         localized = self._localize_market_timestamp(timestamp)
         return localized if localized is not None else self._now()
+
+    def _extract_latest_price_point(
+        self, frame: pd.DataFrame | None = None
+    ) -> tuple[float | None, pd.Timestamp | None]:
+        if frame is None:
+            frame = self.price_history
+
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            return None, None
+
+        columns = {str(column).lower(): column for column in frame.columns}
+        timestamp_series: pd.Series | pd.Index | None = None
+        if "date" in columns:
+            timestamp_series = pd.to_datetime(frame[columns["date"]], errors="coerce")
+        else:
+            timestamp_series = pd.to_datetime(frame.index, errors="coerce")
+
+        valid_mask = pd.notna(timestamp_series)
+        if isinstance(timestamp_series, pd.Series):
+            timestamps = pd.DatetimeIndex(timestamp_series[valid_mask])
+            data_frame = frame.loc[valid_mask]
+        else:
+            timestamps = pd.DatetimeIndex(timestamp_series[valid_mask])
+            data_frame = frame.loc[valid_mask]
+
+        if timestamps.empty:
+            return None, None
+
+        price_col = None
+        for key in ("close", "adj close", "adjclose", "adj_close", "last", "price"):
+            if key in columns:
+                price_col = columns[key]
+                break
+
+        if price_col is None:
+            numeric_cols = [
+                col for col in data_frame.columns if pd.api.types.is_numeric_dtype(data_frame[col])
+            ]
+            price_col = numeric_cols[0] if numeric_cols else None
+
+        if price_col is None:
+            return None, timestamps[-1]
+
+        prices = pd.to_numeric(data_frame[price_col], errors="coerce")
+        price_series = pd.Series(prices.values, index=timestamps).dropna()
+        if price_series.empty:
+            return None, timestamps[-1]
+
+        return float(price_series.iloc[-1]), price_series.index[-1]
 
     def _localize_market_timestamp(self, value: Any) -> pd.Timestamp | None:
         if value is None:
@@ -3061,9 +3136,13 @@ class StockPredictorDesktopApp:
         """Return the raw and converted reference price for calculations."""
 
         data = prediction if isinstance(prediction, Mapping) else {}
-        raw_value = _safe_float(data.get("last_price"))
+        raw_value = self.current_market_price
+        if raw_value is None:
+            raw_value = _safe_float(data.get("last_price"))
         if raw_value is None:
             raw_value = _safe_float(data.get("last_close"))
+        if raw_value is None:
+            raw_value, _ = self._extract_latest_price_point()
         converted = self._convert_currency(raw_value)
         return raw_value, converted
 
