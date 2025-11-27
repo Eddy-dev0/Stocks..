@@ -2690,7 +2690,7 @@ class StockPredictorDesktopApp:
         return self._predict_payload(refresh=True)
 
     def _predict_only(self) -> dict[str, Any]:
-        return self._predict_payload()
+        return self._predict_payload(refresh=True)
 
     def _predict_payload(self, *, refresh: bool = False) -> dict[str, Any]:
         horizon_arg: Any
