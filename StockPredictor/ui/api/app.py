@@ -50,7 +50,7 @@ class ForecastRequest(BaseModel):
         example=["close", "direction"],
     )
     refresh: bool = Field(
-        default=False,
+        default=True,
         description="If true, the underlying datasets will be refreshed before predicting.",
     )
     horizon: int | None = Field(
@@ -87,7 +87,7 @@ class BuyZoneRequest(BaseModel):
     """Payload used to request buy-zone analysis for a ticker."""
 
     refresh: bool = Field(
-        default=False,
+        default=True,
         description="Refresh underlying data sources before computing the buy zone.",
     )
 
@@ -190,7 +190,7 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
     @app.get("/data/{ticker}", dependencies=[Depends(require_api_key)])
     async def get_data(
         ticker: str,
-        refresh: bool = Query(False, description="Refresh underlying data sources."),
+        refresh: bool = Query(True, description="Refresh underlying data sources."),
         start_date: str | None = Query(None, description="Optional ISO start date override."),
         end_date: str | None = Query(None, description="Optional ISO end date override."),
         interval: str | None = Query(None, description="Historical data interval override."),
