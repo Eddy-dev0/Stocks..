@@ -1734,6 +1734,7 @@ class StockPredictorAI:
         combined_confidence = None
         confluence_score = None
         confluence_passed = False
+        sentiment_factor = None
         if confluence_assessment is not None:
             confluence_score = float(confluence_assessment.score)
             confluence_passed = bool(confluence_assessment.passed)
@@ -1766,6 +1767,23 @@ class StockPredictorAI:
                 combined_confidence *= 0.5
             combined_confidence = float(combined_confidence)
 
+        (
+            combined_confidence,
+            direction_probability_up,
+            direction_probability_down,
+            sentiment_factor,
+        ) = self._apply_sentiment_adjustment(
+            combined_confidence,
+            direction_probability_up,
+            direction_probability_down,
+        )
+
+        if sentiment_factor is not None and isinstance(probabilities.get("direction"), dict):
+            probabilities["direction"] = {
+                "up": direction_probability_up,
+                "down": direction_probability_down,
+            }
+
         result = {
             "ticker": self.config.ticker,
             "as_of": _to_iso(market_data_as_of) or "",
@@ -1793,6 +1811,8 @@ class StockPredictorAI:
             result["signal_confluence"] = confluence_block
         if combined_confidence is not None:
             result["confluence_confidence"] = combined_confidence
+        if sentiment_factor is not None:
+            result["sentiment_factor"] = sentiment_factor
         if indicator_floor is not None:
             result["indicator_expected_low"] = indicator_floor
         if indicator_components:
@@ -2523,6 +2543,84 @@ class StockPredictorAI:
                 else:
                     reasons.append("Sentiment momentum deteriorating versus the prior period.")
         return reasons
+
+    def _sentiment_confidence_factor(self) -> Optional[float]:
+        if not getattr(self.config, "sentiment_confidence_adjustment", False):
+            return None
+
+        sentiment_df = self.metadata.get("sentiment_daily")
+        if not isinstance(sentiment_df, pd.DataFrame) or sentiment_df.empty:
+            return None
+
+        df = sentiment_df
+        if "Date" in df.columns:
+            try:
+                df = df.sort_values("Date")
+            except Exception:  # pragma: no cover - defensive against malformed data
+                df = sentiment_df
+
+        value_column = None
+        for candidate in ("Sentiment_Avg", "sentiment"):
+            if candidate in df.columns:
+                value_column = candidate
+                break
+
+        if value_column is None:
+            return None
+
+        window = getattr(self.config, "sentiment_confidence_window", 7)
+        try:
+            window = int(window)
+        except (TypeError, ValueError):  # pragma: no cover - defensive defaulting
+            window = 7
+        window = max(1, window)
+
+        recent_values = pd.to_numeric(df[value_column].tail(window), errors="coerce").dropna()
+        if recent_values.empty:
+            return None
+
+        average = float(np.nanmean(recent_values))
+        if not np.isfinite(average):
+            return None
+        return float(np.clip(average, -1.0, 1.0))
+
+    def _apply_sentiment_adjustment(
+        self,
+        combined_confidence: Optional[float],
+        direction_probability_up: Optional[float],
+        direction_probability_down: Optional[float],
+    ) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+        if not getattr(self.config, "sentiment_confidence_adjustment", False):
+            return combined_confidence, direction_probability_up, direction_probability_down, None
+
+        sentiment_factor = self._sentiment_confidence_factor()
+        if sentiment_factor is None:
+            return combined_confidence, direction_probability_up, direction_probability_down, None
+
+        try:
+            weight = float(getattr(self.config, "sentiment_confidence_weight", 0.2))
+        except (TypeError, ValueError):  # pragma: no cover - defensive defaulting
+            weight = 0.2
+
+        weight = max(0.0, min(weight, 2.0))
+        multiplier = max(0.0, 1.0 + sentiment_factor * weight)
+
+        adjusted_confidence = combined_confidence
+        if adjusted_confidence is not None:
+            adjusted_confidence = float(np.clip(adjusted_confidence * multiplier, 0.0, 1.0))
+
+        adjusted_up = direction_probability_up
+        adjusted_down = direction_probability_down
+        if adjusted_up is not None and adjusted_down is not None:
+            prob_delta = sentiment_factor * weight
+            adjusted_up_raw = max(0.0, float(adjusted_up) * (1.0 + prob_delta))
+            adjusted_down_raw = max(0.0, float(adjusted_down) * (1.0 - prob_delta))
+            total = adjusted_up_raw + adjusted_down_raw
+            if total > 0:
+                adjusted_up = float(adjusted_up_raw / total)
+                adjusted_down = float(adjusted_down_raw / total)
+
+        return adjusted_confidence, adjusted_up, adjusted_down, sentiment_factor
 
     def _macro_reasons(self, feature_row: pd.Series) -> list[str]:
         reasons: list[str] = []

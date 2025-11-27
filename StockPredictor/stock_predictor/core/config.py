@@ -160,6 +160,9 @@ class PredictorConfig:
     risk_free_rate: float = 0.0
     research_api_keys: tuple[str, ...] = field(default_factory=tuple)
     research_allow_list: tuple[str, ...] = field(default_factory=tuple)
+    sentiment_confidence_adjustment: bool = False
+    sentiment_confidence_window: int = 7
+    sentiment_confidence_weight: float = 0.2
     # Provide a local CSV file path to enable the CSVPriceLoader provider.
     csv_price_loader_path: Path | None = None
     # Provide a local Parquet file path to enable the ParquetPriceLoader provider.
@@ -230,6 +233,20 @@ class PredictorConfig:
         self.research_allow_list = self._normalise_strings(
             self.research_allow_list, lower=True
         )
+        self.sentiment_confidence_adjustment = bool(self.sentiment_confidence_adjustment)
+        try:
+            self.sentiment_confidence_window = int(self.sentiment_confidence_window)
+        except (TypeError, ValueError):  # pragma: no cover - defensive defaulting
+            self.sentiment_confidence_window = 7
+        if self.sentiment_confidence_window <= 0:
+            raise ValueError("sentiment_confidence_window must be positive.")
+        try:
+            self.sentiment_confidence_weight = float(self.sentiment_confidence_weight)
+        except (TypeError, ValueError):  # pragma: no cover - defensive defaulting
+            self.sentiment_confidence_weight = 0.2
+        if self.sentiment_confidence_weight < 0:
+            raise ValueError("sentiment_confidence_weight must be non-negative.")
+        self.sentiment_confidence_weight = float(min(self.sentiment_confidence_weight, 2.0))
         if self.csv_price_loader_path is not None:
             self.csv_price_loader_path = Path(self.csv_price_loader_path).expanduser()
         if self.parquet_price_loader_path is not None:
