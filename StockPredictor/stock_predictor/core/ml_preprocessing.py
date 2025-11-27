@@ -76,7 +76,13 @@ class DataFrameSimpleImputer(_BaseDataFrameTransformer):
         frame = _ensure_dataframe(X)
         self.imputer.set_params(strategy=self.strategy)
         self.imputer.fit(frame, y)
-        self._set_feature_names(frame.columns)
+        # Align stored feature names with the imputer's learned schema to avoid
+        # mismatches during ``transform`` if the underlying estimator trims or
+        # reorders inputs.
+        if hasattr(self.imputer, "get_feature_names_out"):
+            self._set_feature_names(self.imputer.get_feature_names_out())
+        else:
+            self._set_feature_names(frame.columns)
         return self
 
     def transform(self, X: pd.DataFrame):  # type: ignore[override]
