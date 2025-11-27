@@ -7,6 +7,8 @@ import os
 from functools import lru_cache
 from typing import Any, Dict
 
+import pandas as pd
+
 from fastapi import Depends, FastAPI, HTTPException, Query, Security
 from fastapi.concurrency import run_in_threadpool
 from fastapi.security import APIKeyHeader
@@ -199,6 +201,33 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
         )
         data = await _call_with_error_handling(application.refresh_data, force=refresh)
         return {"status": "ok", "data": data}
+
+    @app.get("/insights/{ticker}", dependencies=[Depends(require_api_key)])
+    async def get_insights(
+        ticker: str,
+        refresh: bool = Query(False, description="Refresh fundamentals and sentiment."),
+    ) -> Dict[str, Any]:
+        application = await _build_application(ticker, {})
+        snapshot = await _call_with_error_handling(
+            application.pipeline.fetcher.fetch_fundamental_snapshot, force=refresh
+        )
+        sentiment_df: pd.DataFrame | None = None
+        try:
+            sentiment_df = await _call_with_error_handling(
+                application.pipeline.fetcher.fetch_sentiment_signals, force=refresh
+            )
+        except Exception:
+            sentiment_df = None
+
+        sentiment_payload: Dict[str, Any] = {}
+        if isinstance(sentiment_df, pd.DataFrame) and not sentiment_df.empty:
+            sentiment_payload["records"] = sentiment_df.tail(10).to_dict(orient="records")
+            latest = sentiment_df.iloc[-1]
+            for candidate in ("sentiment", "Sentiment_Avg", "sentiment_score"):
+                if candidate in latest and pd.notna(latest[candidate]):
+                    sentiment_payload["latest_score"] = float(latest[candidate])
+                    break
+        return {"status": "ok", "fundamentals": snapshot or {}, "sentiment": sentiment_payload}
 
     @app.post("/forecasts/{ticker}", dependencies=[Depends(require_api_key)])
     async def forecast(ticker: str, request: ForecastRequest) -> Dict[str, Any]:

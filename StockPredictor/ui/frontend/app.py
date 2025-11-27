@@ -27,6 +27,7 @@ for key, value in {
     "train_response": None,
     "research_response": None,
     "buy_zone_response": None,
+    "insights_response": None,
 }.items():
     st.session_state.setdefault(key, value)
 
@@ -165,6 +166,58 @@ def _extract_forecast_low(payload: Any) -> float | None:
             if nested is not None:
                 return nested
     return None
+
+
+def _extract_probabilities(payload: Any) -> tuple[float | None, float | None]:
+    forecast_block = payload.get("forecasts", payload) if isinstance(payload, dict) else {}
+    monte_carlo_prob = None
+    model_pred_prob = None
+    if isinstance(forecast_block, dict):
+        monte_carlo_prob = forecast_block.get("monte_carlo_target_hit_probability")
+        if monte_carlo_prob is None:
+            event_probs = forecast_block.get("event_probabilities", {})
+            if isinstance(event_probs, dict):
+                monte_carlo_prob = (event_probs.get("monte_carlo_target_hit", {}) or {}).get(
+                    "probability"
+                )
+        prob_block = forecast_block.get("probabilities") or forecast_block.get(
+            "prediction_probabilities"
+        )
+        if isinstance(prob_block, dict):
+            for candidate in ("direction", "close", "target"):
+                if candidate in prob_block and isinstance(prob_block[candidate], dict):
+                    values = prob_block[candidate]
+                    up_prob = values.get("up") or values.get("bullish") or values.get("positive")
+                    down_prob = values.get("down") or values.get("bearish") or values.get("negative")
+                    if isinstance(up_prob, (int, float)) and isinstance(down_prob, (int, float)):
+                        model_pred_prob = max(float(up_prob), float(down_prob))
+                        break
+                    numeric = [float(value) for value in values.values() if isinstance(value, (int, float))]
+                    if numeric:
+                        model_pred_prob = max(numeric)
+                        break
+    return monte_carlo_prob, model_pred_prob
+
+
+def _risk_level(value: float | None, *, thresholds: tuple[float, float]) -> str:
+    if value is None:
+        return "unknown"
+    low, high = thresholds
+    if value >= high:
+        return "high"
+    if value >= low:
+        return "moderate"
+    return "low"
+
+
+def _sentiment_label(score: float | None) -> str:
+    if score is None:
+        return "neutral"
+    if score > 0.1:
+        return "positive"
+    if score < -0.1:
+        return "negative"
+    return "neutral"
 
 
 def _enrich_indicators(frame: pd.DataFrame) -> pd.DataFrame:
@@ -440,6 +493,109 @@ with st.sidebar:
     show_bollinger = overlay_flags["show_bollinger"]
     show_vwap = overlay_flags["show_vwap"]
     show_volume = overlay_flags["show_volume"]
+
+    st.header("Insights & Risk Panel")
+    st.caption("Aggregated probabilities, beta, volatility, fundamentals, and sentiment.")
+    insights_refresh = st.checkbox(
+        "Refresh fundamentals & sentiment", value=False, key="insights_refresh_toggle"
+    )
+    if st.button("Load insights", type="secondary"):
+        with st.spinner("Fetching fundamentals and sentiment..."):
+            response = _request(
+                f"/insights/{ticker}", params={"refresh": bool(insights_refresh)}
+            )
+            if response is not None:
+                st.session_state["insights_response"] = response
+                st.success("Insights updated")
+
+    probability_block = _extract_probabilities(st.session_state.get("forecast_response") or {})
+    monte_carlo_prob, model_pred_prob = probability_block
+    forecast_block = (st.session_state.get("forecast_response") or {}).get(
+        "forecasts", st.session_state.get("forecast_response") or {}
+    )
+    risk_guidance = _extract_risk_guidance(forecast_block)
+    beta_block = risk_guidance.get("beta") if isinstance(risk_guidance, dict) else None
+    vol_value = risk_guidance.get("volatility") if isinstance(risk_guidance, dict) else None
+    insights_payload = st.session_state.get("insights_response") or {}
+    sentiment_block = insights_payload.get("sentiment", {})
+    sentiment_score = sentiment_block.get("latest_score")
+    sentiment_state = _sentiment_label(sentiment_score)
+
+    metric_rows = st.container()
+    with metric_rows:
+        prob_cols = st.columns(2)
+        prob_cols[0].metric(
+            "Monte Carlo target hit", f"{float(monte_carlo_prob) * 100:.2f}%" if monte_carlo_prob is not None else "—",
+            help="Probability the simulated price path reaches the target by the forecast horizon."
+        )
+        prob_cols[1].metric(
+            "Model prediction", f"{float(model_pred_prob) * 100:.2f}%" if model_pred_prob is not None else "—",
+            help="Highest directional probability returned by the model (bullish vs. bearish)."
+        )
+        risk_cols = st.columns(2)
+        if beta_block and isinstance(beta_block, dict):
+            for idx, (name, detail) in enumerate(sorted(beta_block.items())):
+                if not isinstance(detail, dict):
+                    continue
+                value = detail.get("value")
+                if value is None:
+                    continue
+                level = _risk_level(float(value), thresholds=(0.9, 1.2))
+                risk_cols[idx % 2].metric(
+                    f"Beta ({detail.get('label') or name})",
+                    f"{float(value):.2f}",
+                    delta=f"{level.title()} risk",
+                    delta_color="inverse" if level == "high" else "normal",
+                    help="Beta above 1 implies amplified moves vs. the market; below 1 dampens swings.",
+                )
+        risk_level = _risk_level(vol_value if isinstance(vol_value, (int, float)) else None, thresholds=(0.25, 0.5))
+        risk_cols[1].metric(
+            "Volatility (forecast)",
+            f"{float(vol_value):.2%}" if isinstance(vol_value, (int, float)) else "—",
+            delta=f"{risk_level.title()} risk" if vol_value is not None else "",
+            delta_color="inverse" if risk_level == "high" else "normal",
+            help="Annualised volatility derived from forecast dispersion.",
+        )
+        sentiment_col = st.container()
+        with sentiment_col:
+            st.metric(
+                "News sentiment", f"{float(sentiment_score):+.2f}" if sentiment_score is not None else "—",
+                delta=sentiment_state.title(),
+                delta_color="normal" if sentiment_state == "positive" else "inverse" if sentiment_state == "negative" else "off",
+                help="Rolling news polarity; positive skews bullish, negative hints at downside risk.",
+            )
+
+    fundamentals_block = insights_payload.get("fundamentals", {})
+    if fundamentals_block:
+        with st.expander("Fundamental snapshot", expanded=False):
+            keys_of_interest = [
+                "trailing_pe",
+                "forward_pe",
+                "peg_ratio",
+                "dividend_yield",
+                "profit_margin",
+                "return_on_equity",
+            ]
+            available = {k: fundamentals_block.get(k) for k in keys_of_interest if k in fundamentals_block}
+            if available:
+                cols = st.columns(2)
+                items = list(available.items())
+                for idx, (label, value) in enumerate(items):
+                    cols[idx % 2].metric(
+                        label.replace("_", " ").title(),
+                        f"{value:.2f}" if isinstance(value, (int, float)) else str(value),
+                    )
+            else:
+                st.write(fundamentals_block)
+
+    with st.expander("How to interpret these metrics"):
+        st.markdown(
+            "- **Monte Carlo target hit**: likelihood simulated price paths touch the configured target.\n"
+            "- **Model prediction**: most confident directional probability from the model outputs.\n"
+            "- **Beta**: sensitivity vs. the market (1.2+ = high risk).\n"
+            "- **Volatility**: annualised dispersion; higher values increase drawdown risk.\n"
+            "- **News sentiment**: rolling polarity from recent headlines; sustained negatives can weigh on returns."
+        )
 
     st.header("Risk & Volatility")
     st.caption("Computed from visible market data")
