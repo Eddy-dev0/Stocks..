@@ -40,6 +40,7 @@ from ..models import (
     model_supports_proba,
     regression_metrics,
 )
+from ..sentiment import aggregate_daily_sentiment, attach_sentiment
 from .simulation import run_monte_carlo
 from ..time_series import evaluate_time_series_baselines
 
@@ -494,6 +495,99 @@ class StockPredictorAI:
         if live_timestamp is not None:
             self.metadata["market_data_as_of"] = live_timestamp
             self.metadata["latest_price_timestamp"] = live_timestamp
+
+    def _collect_live_sentiment(
+        self, *, force: bool = False
+    ) -> tuple[float | None, float | None, pd.DataFrame | None, str | None]:
+        """Fetch recent sentiment and compute headline averages.
+
+        News or pre-aggregated sentiment signals are fetched via the provider layer.
+        When only raw headlines are available we run ``attach_sentiment`` locally so
+        the UI always surfaces a computed score and short-term trend.
+        """
+
+        aggregated: pd.DataFrame | None = None
+        error_message: str | None = None
+
+        sentiment_df: pd.DataFrame | None = None
+        try:
+            # Prefer the dedicated sentiment endpoint which already aggregates
+            # multiple providers (database or live API depending on ``force``).
+            sentiment_df = self.fetcher.fetch_sentiment_signals(force=force)
+        except Exception as exc:  # pragma: no cover - optional dependency path
+            LOGGER.debug("Live sentiment signal fetch failed: %s", exc)
+            error_message = str(exc)
+
+        if isinstance(sentiment_df, pd.DataFrame) and not sentiment_df.empty:
+            working = sentiment_df.copy()
+            date_col = None
+            for candidate in ("AsOf", "Date"):
+                if candidate in working.columns:
+                    date_col = candidate
+                    break
+
+            if date_col:
+                working[date_col] = pd.to_datetime(working[date_col], errors="coerce")
+                working = working.dropna(subset=[date_col])
+                working["Date"] = working[date_col].dt.date
+
+            score_col = None
+            for candidate in (
+                "Score",
+                "sentiment",
+                "Sentiment_Avg",
+                "sentiment_score",
+            ):
+                if candidate in working.columns:
+                    score_col = candidate
+                    break
+
+            if date_col and score_col:
+                # Aggregate by calendar day to stabilise noisy intraday signals.
+                aggregated = (
+                    working.groupby("Date")[score_col]
+                    .mean()
+                    .rename("Sentiment_Avg")
+                    .reset_index()
+                )
+
+        if (aggregated is None or aggregated.empty) and getattr(
+            self.config, "sentiment", False
+        ):
+            try:
+                # Fall back to headline text, annotating it with VADER/FinBERT
+                # scores locally so we still produce a numeric sentiment feed.
+                news_df = self.fetcher.fetch_news_data(force=force)
+                if isinstance(news_df, pd.DataFrame) and not news_df.empty:
+                    scored = attach_sentiment(news_df)
+                    aggregated = aggregate_daily_sentiment(scored)
+            except Exception as exc:  # pragma: no cover - optional dependency path
+                LOGGER.debug("Headline sentiment scoring failed: %s", exc)
+                if error_message is None:
+                    error_message = str(exc)
+
+        if aggregated is None or aggregated.empty:
+            return None, None, aggregated, error_message
+
+        aggregated["Date"] = pd.to_datetime(aggregated["Date"], errors="coerce")
+        aggregated = aggregated.dropna(subset=["Date"]).sort_values("Date")
+        if not aggregated.empty:
+            error_message = None
+        sentiment_series = None
+        if "Sentiment_Avg" in aggregated.columns:
+            sentiment_series = aggregated["Sentiment_Avg"]
+        elif "sentiment" in aggregated.columns:
+            sentiment_series = aggregated["sentiment"]
+        if sentiment_series is not None:
+            aggregated["sentiment"] = sentiment_series
+
+        latest_avg = self._safe_float(aggregated.iloc[-1].get("sentiment"))
+        trailing = pd.to_numeric(aggregated["sentiment"], errors="coerce").dropna()
+        trend_avg: float | None = None
+        if not trailing.empty:
+            trend_avg = float(trailing.tail(7).mean()) if trailing.tail(7).size else None
+
+        return latest_avg, trend_avg, aggregated, error_message
 
     def _load_macro_indicators(self) -> pd.DataFrame:
         """Load cached macro indicator close series and pivot them by date."""
@@ -1655,6 +1749,25 @@ class StockPredictorAI:
             if hit_candidates:
                 target_hit_probability = max(hit_candidates)
 
+        sentiment_avg = None
+        sentiment_trend = None
+        sentiment_error = None
+        if getattr(self.config, "sentiment", False):
+            sentiment_avg, sentiment_trend, sentiment_frame, sentiment_error = (
+                self._collect_live_sentiment(force=refresh_data)
+            )
+            if isinstance(sentiment_frame, pd.DataFrame) and not sentiment_frame.empty:
+                # Keep the short-run series so downstream UI and explanations have
+                # access to the same live sentiment baseline used for display.
+                self.metadata["sentiment_daily"] = sentiment_frame
+            snapshot_meta = self.metadata.setdefault("sentiment_snapshot", {})
+            if sentiment_avg is not None:
+                snapshot_meta["average"] = sentiment_avg
+            if sentiment_trend is not None:
+                snapshot_meta["trend_7d"] = sentiment_trend
+            if sentiment_error:
+                snapshot_meta["error"] = sentiment_error
+
         monte_carlo_target_probability = None
         target_price_value = self.metadata.get("target_price")
         if (
@@ -1844,6 +1957,13 @@ class StockPredictorAI:
             result["training_metrics"] = training_report
         if prediction_warnings:
             result["warnings"] = prediction_warnings
+        if sentiment_avg is not None:
+            result["Sentiment_Avg"] = sentiment_avg
+            result["sentiment_score"] = sentiment_avg
+        if sentiment_trend is not None:
+            result["Sentiment_7d"] = sentiment_trend
+        if sentiment_error:
+            result["sentiment_error"] = sentiment_error
         explanation = self._build_prediction_explanation(result, predictions)
         if explanation:
             result["explanation"] = explanation

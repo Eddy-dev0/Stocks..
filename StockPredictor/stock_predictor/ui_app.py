@@ -3199,12 +3199,22 @@ class StockPredictorDesktopApp:
             parts.append(f"🎯 {hit_prob_str}")
         self.metric_vars["direction"].set("   ".join(parts) if parts else "—")
 
+        sentiment_error = prediction.get("sentiment_error") if isinstance(prediction, Mapping) else None
         avg_sentiment, trend_sentiment = self._resolve_sentiment_snapshot(prediction)
-        sentiment_label, sentiment_score = self._format_sentiment_status(
-            avg_sentiment, trend_sentiment
-        )
-        self.sentiment_label_var.set(sentiment_label)
-        self.sentiment_score_var.set(sentiment_score)
+        if sentiment_error:
+            self.sentiment_label_var.set("Sentiment fetch failed")
+            self.sentiment_score_var.set(str(sentiment_error))
+            status_message = (
+                f"{status_message} • Sentiment unavailable: {sentiment_error}"
+                if status_message
+                else f"Sentiment unavailable: {sentiment_error}"
+            )
+        else:
+            sentiment_label, sentiment_score = self._format_sentiment_status(
+                avg_sentiment, trend_sentiment
+            )
+            self.sentiment_label_var.set(sentiment_label)
+            self.sentiment_score_var.set(sentiment_score)
 
         if explanation and isinstance(explanation, Mapping):
             summary = explanation.get("summary")
