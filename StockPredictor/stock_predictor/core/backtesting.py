@@ -90,8 +90,19 @@ class Backtester:
             model = self.model_factory.create(task, calibrate=(target == "direction"))
             model.fit(X_train_transformed, y_train)
             y_pred = model.predict(X_test_transformed)
+            y_proba = None
+            classes = None
+            if task == "classification":
+                try:
+                    y_proba = model.predict_proba(X_test_transformed)
+                except Exception:
+                    LOGGER.debug("Model does not support predict_proba; skipping probability metrics.")
+                estimator = getattr(model, "named_steps", {}).get("estimator")
+                classes = getattr(estimator, "classes_", None)
 
-            metrics = self._score_predictions(task, y_test, y_pred, X_test)
+            metrics = self._score_predictions(
+                task, y_test, y_pred, X_test, y_proba=y_proba, classes=classes
+            )
             auxiliary_test = (
                 auxiliary_targets.iloc[test_slice]
                 if auxiliary_targets is not None
@@ -135,10 +146,20 @@ class Backtester:
         y_true: pd.Series,
         y_pred: np.ndarray,
         raw_X: pd.DataFrame,
+        *,
+        y_proba: np.ndarray | None = None,
+        classes: np.ndarray | None = None,
     ) -> Dict[str, float]:
         if task == "classification":
-            metrics = classification_metrics(y_true.to_numpy(), y_pred)
+            metrics = classification_metrics(
+                y_true.to_numpy(), y_pred, y_proba=y_proba, classes=classes
+            )
             metrics["directional_accuracy"] = metrics.get("accuracy", 0.0)
+
+            calibration_metrics = self._calibration_by_bin(
+                y_true.to_numpy(), y_proba, classes
+            )
+            metrics.update(calibration_metrics)
             return metrics
 
         metrics = regression_metrics(y_true.to_numpy(), y_pred)
@@ -154,6 +175,82 @@ class Backtester:
         )
         metrics["signed_error"] = float(np.mean(y_pred - y_true.to_numpy()))
         return metrics
+
+    def _calibration_by_bin(
+        self,
+        y_true: np.ndarray,
+        y_proba: np.ndarray | None,
+        classes: np.ndarray | None,
+        *,
+        bin_size: float = 0.1,
+    ) -> Dict[str, float]:
+        if y_proba is None or y_proba.size == 0:
+            return {}
+
+        positive_info = self._positive_class_proba(y_proba, classes)
+        if positive_info is None:
+            return {}
+
+        positive_proba, positive_index = positive_info
+        if positive_proba.size == 0:
+            return {}
+
+        y_binary = self._binary_targets(y_true, classes, positive_index)
+        if y_binary.size == 0:
+            return {}
+
+        bins = np.arange(0.0, 1.0, bin_size)
+        calibration: Dict[str, float] = {}
+        for lower in bins:
+            upper = round(min(1.0, lower + bin_size), 2)
+            in_bin = (positive_proba >= lower) & (
+                positive_proba < upper if upper < 1.0 else positive_proba <= upper
+            )
+            key = f"calibration_hit_rate_{lower:.1f}_{upper:.1f}"
+            if not np.any(in_bin):
+                calibration[key] = float("nan")
+                continue
+            calibration[key] = float(np.mean(y_binary[in_bin]))
+        return calibration
+
+    def _positive_class_proba(
+        self, y_proba: np.ndarray, classes: np.ndarray | None
+    ) -> tuple[np.ndarray, int] | None:
+        proba_array = np.asarray(y_proba, dtype=float)
+        if proba_array.ndim == 1:
+            return np.clip(proba_array, 0.0, 1.0), 0
+        if proba_array.shape[1] == 0:
+            return None
+
+        positive_index = 1 if proba_array.shape[1] > 1 else 0
+        if classes is not None and len(classes) > positive_index:
+            for idx, cls in enumerate(classes):
+                if cls in {1, True, "1", "up"}:  # type: ignore[operator]
+                    positive_index = idx
+                    break
+        positive_index = int(min(max(0, positive_index), proba_array.shape[1] - 1))
+        return np.clip(proba_array[:, positive_index], 0.0, 1.0), positive_index
+
+    def _binary_targets(
+        self, y_true: np.ndarray, classes: np.ndarray | None, positive_index: int
+    ) -> np.ndarray:
+        if classes is not None and len(classes) > 0:
+            mapping = {cls: idx for idx, cls in enumerate(classes)}
+            positive_label = classes[min(positive_index, len(classes) - 1)]
+            return np.array(
+                [
+                    1
+                    if mapping.get(value, value)
+                    == mapping.get(positive_label, positive_index)
+                    else 0
+                    for value in y_true
+                ],
+                dtype=float,
+            )
+        return np.array(
+            [1 if value in {1, True, "1", "up"} else 0 for value in y_true],
+            dtype=float,
+        )
 
     def _simulate_trading(
         self,
