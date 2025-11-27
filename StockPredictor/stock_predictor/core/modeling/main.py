@@ -1422,6 +1422,9 @@ class StockPredictorAI:
         *,
         proba: np.ndarray | None = None,
         classes: Sequence[Any] | None = None,
+        slippage_bps: float | None = None,
+        fee_bps: float | None = None,
+        fixed_cost: float | None = None,
     ) -> Dict[str, float]:
         signals = self._long_flat_signals(
             target_name, y_pred, raw_X_test, proba=proba, classes=classes
@@ -1438,7 +1441,27 @@ class StockPredictorAI:
         n = min(signals.size, actual_returns.size)
         trimmed_signals = signals[:n]
         trimmed_returns = actual_returns[:n]
-        net_returns = trimmed_signals * trimmed_returns
+        per_trade_slippage_bps = (
+            float(slippage_bps)
+            if slippage_bps is not None
+            else float(getattr(self.config, "evaluation_slippage_bps", 0.0))
+        )
+        per_trade_fee_bps = (
+            float(fee_bps)
+            if fee_bps is not None
+            else float(getattr(self.config, "evaluation_fee_bps", 0.0))
+        )
+        per_trade_fixed_cost = (
+            float(fixed_cost)
+            if fixed_cost is not None
+            else float(getattr(self.config, "evaluation_fixed_cost", 0.0))
+        )
+        trade_change_mask = np.abs(np.diff(np.insert(trimmed_signals, 0, 0.0)))
+        per_trade_cost_rate = max(0.0, per_trade_slippage_bps + per_trade_fee_bps) / 10000.0
+        per_trade_cost_rate += max(0.0, per_trade_fixed_cost)
+        trade_costs = trade_change_mask * per_trade_cost_rate
+
+        net_returns = trimmed_signals * trimmed_returns - trade_costs
         equity_curve = np.cumprod(1 + net_returns)
 
         sharpe = 0.0
