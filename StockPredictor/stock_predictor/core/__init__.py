@@ -47,3 +47,14 @@ __all__ = [
     "ForecastResult",
     "evaluate_time_series_baselines",
 ]
+
+# Lazy accessors for optional imports
+__all__.append("BacktestingJob")
+
+
+def __getattr__(name: str):  # pragma: no cover - thin convenience wrapper
+    if name == "BacktestingJob":
+        from stock_predictor.core.backtesting_runner import BacktestingJob
+
+        return BacktestingJob
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
