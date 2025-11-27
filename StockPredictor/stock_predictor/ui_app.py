@@ -405,6 +405,13 @@ class StockPredictorDesktopApp:
         self.currency_mode: str = "local"
         self.currency_symbol: str = self._currency_symbol("local")
 
+        self.settings_vars: dict[str, tk.StringVar] = {
+            "ticker": tk.StringVar(),
+            "interval": tk.StringVar(),
+            "model": tk.StringVar(),
+            "targets": tk.StringVar(),
+        }
+
         horizon_values = self.config.prediction_horizons or DEFAULT_PREDICTION_HORIZONS
         self.horizon_notice_var = tk.StringVar(value="")
         self.horizon_notice_label: ttk.Label | None = None
@@ -891,6 +898,16 @@ class StockPredictorDesktopApp:
         self.progress.grid(row=0, column=1, sticky=tk.E, padx=(8, 0))
         return status_frame
 
+    def _refresh_settings_labels(self) -> None:
+        if not self.settings_vars:
+            return
+
+        targets = ", ".join(self.config.prediction_targets) if self.config.prediction_targets else "—"
+        self.settings_vars["ticker"].set(f"Ticker: {self.config.ticker}")
+        self.settings_vars["interval"].set(f"Interval: {self.config.interval}")
+        self.settings_vars["model"].set(f"Model: {self.config.model_type}")
+        self.settings_vars["targets"].set(f"Prediction targets: {targets}")
+
     # ------------------------------------------------------------------
     # Tab builders
     # ------------------------------------------------------------------
@@ -1255,10 +1272,11 @@ class StockPredictorDesktopApp:
 
         info_box = ttk.LabelFrame(frame, text="Configuration", padding=8)
         info_box.pack(fill=tk.X)
-        ttk.Label(info_box, text=f"Ticker: {self.config.ticker}").pack(anchor=tk.W)
-        ttk.Label(info_box, text=f"Interval: {self.config.interval}").pack(anchor=tk.W)
-        ttk.Label(info_box, text=f"Model: {self.config.model_type}").pack(anchor=tk.W)
-        ttk.Label(info_box, text=f"Prediction targets: {', '.join(self.config.prediction_targets)}").pack(anchor=tk.W)
+        self._refresh_settings_labels()
+        ttk.Label(info_box, textvariable=self.settings_vars["ticker"]).pack(anchor=tk.W)
+        ttk.Label(info_box, textvariable=self.settings_vars["interval"]).pack(anchor=tk.W)
+        ttk.Label(info_box, textvariable=self.settings_vars["model"]).pack(anchor=tk.W)
+        ttk.Label(info_box, textvariable=self.settings_vars["targets"]).pack(anchor=tk.W)
 
         display_box = ttk.LabelFrame(frame, text="Display preferences", padding=8)
         display_box.pack(fill=tk.X, pady=(12, 0))
@@ -2729,6 +2747,7 @@ class StockPredictorDesktopApp:
         self.market_timezone = resolve_market_timezone(self.config)
         self.root.title(f"Stock Predictor – {self.config.ticker}")
         self.ticker_var.set(self.config.ticker)
+        self._refresh_settings_labels()
         self._configure_horizons(self.config.prediction_horizons)
         self.market_holidays = []
         self.current_forecast_date = None
