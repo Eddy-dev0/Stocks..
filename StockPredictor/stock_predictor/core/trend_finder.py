@@ -292,8 +292,7 @@ class TrendFinder:
         strong_insights = [
             insight for insight in insights if self._is_strong_confluence(insight)
         ]
-        ranked_insights = strong_insights or insights
-        ranked_insights.sort(
+        strong_insights.sort(
             key=lambda item: (
                 self._safe_float(getattr(item, "confidence_rank", None))
                 if getattr(item, "confidence_rank", None) is not None
@@ -310,7 +309,7 @@ class TrendFinder:
             except (TypeError, ValueError):
                 effective_limit = 10
 
-        return ranked_insights[:effective_limit]
+        return strong_insights[:effective_limit]
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -507,6 +506,24 @@ class TrendFinder:
         else:
             return False
 
+        indicator_scores: dict[str, float | None] = {}
+        for key in ("technical", "fundamental", "sentiment"):
+            value = None
+            if isinstance(insight, TrendInsight):
+                value = getattr(insight, f"{key}_score", None)
+            if value is None and isinstance(metadata, Mapping):
+                component_scores = metadata.get("component_scores")
+                if isinstance(component_scores, Mapping):
+                    value = component_scores.get(key)
+            indicator_scores[key] = TrendFinder._safe_float(value)
+
+        indicator_threshold = 0.5
+        if not all(
+            score is not None and score > indicator_threshold
+            for score in indicator_scores.values()
+        ):
+            return False
+
         confidence_block = metadata.get("confidence") if isinstance(metadata, Mapping) else None
         if not isinstance(confidence_block, Mapping):
             prediction_payload = metadata.get("prediction_payload") if isinstance(metadata, Mapping) else None
@@ -515,7 +532,10 @@ class TrendFinder:
         if not confidence_block:
             return False
 
-        threshold = 0.6
+        high_cutoff = 0.95
+        direction_cutoff = 0.95
+        edge_cutoff = 0.8
+
         rank = TrendFinder._safe_float(confidence_block.get("confidence_rank"))
         confluence_confidence = TrendFinder._safe_float(
             confidence_block.get("confluence_confidence")
@@ -523,18 +543,40 @@ class TrendFinder:
         confluence_score = TrendFinder._safe_float(
             confidence_block.get("signal_confluence_score")
         )
-        passed = confidence_block.get("signal_confluence_passed")
+        confluence_passed = confidence_block.get("signal_confluence_passed")
 
-        if isinstance(passed, bool) and passed:
-            return True
-        if confluence_confidence is not None and confluence_confidence >= threshold:
-            return True
-        if confluence_score is not None and confluence_score >= threshold:
-            return True
-        if rank is not None and rank >= threshold:
-            return True
+        if confluence_passed is not True:
+            return False
 
-        return False
+        confluence_values = [confluence_confidence, confluence_score, rank]
+        if any(value is None for value in confluence_values):
+            return False
+        if any(value < high_cutoff for value in confluence_values if value is not None):
+            return False
+
+        dir_prob_up = TrendFinder._safe_float(confidence_block.get("direction_probability_up"))
+        dir_prob_down = TrendFinder._safe_float(
+            confidence_block.get("direction_probability_down")
+        )
+        if dir_prob_up is None and dir_prob_down is None:
+            return False
+
+        dominant_prob = max(value for value in (dir_prob_up, dir_prob_down) if value is not None)
+        if dominant_prob < direction_cutoff:
+            return False
+
+        direction_edge = None
+        if dir_prob_up is not None and dir_prob_down is not None:
+            direction_edge = dir_prob_up - dir_prob_down
+        elif dir_prob_up is not None:
+            direction_edge = dir_prob_up - 0.5
+        elif dir_prob_down is not None:
+            direction_edge = 0.5 - dir_prob_down
+
+        if direction_edge is None or abs(direction_edge) < edge_cutoff:
+            return False
+
+        return True
 
     @staticmethod
     def _resolve_horizon_weights(horizon: int) -> Mapping[str, float]:
