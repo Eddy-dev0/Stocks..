@@ -102,7 +102,13 @@ class Backtester:
                 classes = getattr(estimator, "classes_", None)
 
             metrics = self._score_predictions(
-                task, y_test, y_pred, X_test, y_proba=y_proba, classes=classes
+                target,
+                task,
+                y_test,
+                y_pred,
+                X_test,
+                y_proba=y_proba,
+                classes=classes,
             )
             auxiliary_test = (
                 auxiliary_targets.iloc[test_slice]
@@ -151,6 +157,7 @@ class Backtester:
 
     def _score_predictions(
         self,
+        target: str,
         task: str,
         y_true: pd.Series,
         y_pred: np.ndarray,
@@ -172,11 +179,9 @@ class Backtester:
             return metrics
 
         metrics = regression_metrics(y_true.to_numpy(), y_pred)
-        baseline = (
-            raw_X["Close_Current"].to_numpy()
-            if "Close_Current" in raw_X
-            else np.zeros_like(y_pred)
-        )
+        baseline = np.zeros_like(y_pred)
+        if target == "close" and "Close_Current" in raw_X:
+            baseline = raw_X["Close_Current"].to_numpy(dtype=float)
         predicted_direction = np.sign(y_pred - baseline)
         actual_direction = np.sign(y_true.to_numpy() - baseline)
         metrics["directional_accuracy"] = float(
@@ -382,6 +387,9 @@ class Backtester:
     ) -> np.ndarray:
         if target == "return":
             return y_test.to_numpy(dtype=float)
+
+        if target == "log_return":
+            return np.expm1(y_test.to_numpy(dtype=float))
 
         if target == "close":
             baseline = (

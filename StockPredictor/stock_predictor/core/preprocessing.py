@@ -149,7 +149,8 @@ def build_supervised_dataset(
     merged, aggregated = merge_with_sentiment(price_features, sentiment_df)
 
     dataset = merged.copy()
-    target = dataset["Close"].shift(-1)
+    pct_returns = dataset["Close"].pct_change(fill_method=None)
+    target = pct_returns.shift(-1)
     dataset = dataset.assign(Target=target)
 
     if "Target" not in dataset.columns:
@@ -174,5 +175,7 @@ def build_supervised_dataset(
         "latest_date": pd.to_datetime(price_df.iloc[-1]["Date"]),
         "indicator_columns": indicator_columns,
         "price_columns": price_columns_attr,
+        "target_kind": "pct_return",
+        "target_horizon": 1,
     }
     return X, y, metadata
