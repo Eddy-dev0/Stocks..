@@ -1197,6 +1197,11 @@ class StockPredictorAI:
                 baseline_splits.append(entry)
 
         if strategy == "holdout":
+            if getattr(self.config, "shuffle_training", False):
+                raise ValueError(
+                    "shuffle_training must be False when using holdout evaluation to "
+                    "preserve chronological splits."
+                )
             split_idx = max(
                 1, int(len(features) * (1 - self.config.test_size))
             )

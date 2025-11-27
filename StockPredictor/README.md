@@ -123,6 +123,15 @@ process.
 
 Run `python main.py --help` for the full list of options and defaults.
 
+## Data Splitting
+
+Model evaluation defaults to a chronological holdout split: the earliest
+``(1 - test_size)`` portion of the data is used for training and the most recent
+rows form the test set. Shuffling is disabled for holdout to preserve the time
+ordering of samples; attempting to enable shuffling alongside holdout raises a
+configuration error. Time-series cross-validation and rolling backtests likewise
+maintain chronological order when generating their splits.
+
 ### Time-series baselines
 
 Enable classical baselines for the regression targets by providing the

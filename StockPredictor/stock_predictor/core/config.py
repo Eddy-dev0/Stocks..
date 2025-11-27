@@ -143,7 +143,7 @@ class PredictorConfig:
         default_factory=lambda: {"global": {}}
     )
     test_size: float = DEFAULT_TEST_SIZE
-    shuffle_training: bool = True
+    shuffle_training: bool = False
     backtest_strategy: str = DEFAULT_BACKTEST_STRATEGY
     backtest_window: int = DEFAULT_BACKTEST_WINDOW
     backtest_step: int = DEFAULT_BACKTEST_STEP
@@ -599,7 +599,7 @@ def build_config(
         ),
         "model_params": model_params or {"global": {}},
         "test_size": test_size if test_size is not None else DEFAULT_TEST_SIZE,
-        "shuffle_training": _coerce_bool(shuffle_training, default=True),
+        "shuffle_training": _coerce_bool(shuffle_training, default=False),
         "backtest_strategy": backtest_strategy or DEFAULT_BACKTEST_STRATEGY,
         "backtest_window": backtest_window
         if backtest_window is not None
@@ -735,7 +735,7 @@ def load_config_from_mapping(payload: Mapping[str, Any]) -> PredictorConfig:
     if "sentiment" in data:
         data["sentiment"] = _coerce_bool(data["sentiment"], default=True)
     if "shuffle_training" in data:
-        data["shuffle_training"] = _coerce_bool(data["shuffle_training"], default=True)
+        data["shuffle_training"] = _coerce_bool(data["shuffle_training"], default=False)
 
     if "start_date" in data and isinstance(data["start_date"], str) and data["start_date"]:
         data["start_date"] = date.fromisoformat(data["start_date"])
