@@ -2830,9 +2830,12 @@ class StockPredictorDesktopApp:
             return ts
         if ts.tzinfo is None:
             try:
-                return ts.tz_localize(tz)
-            except Exception:  # pragma: no cover - defensive fallback
                 return ts.tz_localize("UTC").tz_convert(tz)
+            except Exception:  # pragma: no cover - defensive fallback
+                try:
+                    return ts.tz_localize(tz)
+                except Exception:
+                    return None
         try:
             return ts.tz_convert(tz)
         except Exception:  # pragma: no cover - defensive fallback
