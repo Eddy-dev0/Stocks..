@@ -502,6 +502,8 @@ class StockPredictorDesktopApp:
         self.position_size_var = tk.IntVar(value=1)
         self.pnl_var = tk.StringVar(value="Expected P&L for 1 share: —")
         self.position_size_var.trace_add("write", self._on_position_size_changed)
+        self.sentiment_label_var = tk.StringVar(value="Sentiment unavailable")
+        self.sentiment_score_var = tk.StringVar(value="—")
 
         self._busy = False
 
@@ -943,6 +945,28 @@ class StockPredictorDesktopApp:
         self.stop_loss_var = stop_loss_var
 
         metric_rows = math.ceil(len(metric_specs) / 2)
+        sentiment_row = metric_rows
+        sentiment_frame = ttk.LabelFrame(
+            summary_frame, text="News sentiment", padding=6
+        )
+        sentiment_frame.grid(
+            row=sentiment_row, column=0, columnspan=4, sticky=tk.EW, pady=(8, 0)
+        )
+        sentiment_frame.grid_columnconfigure(0, weight=1)
+        self.sentiment_status_label = ttk.Label(
+            sentiment_frame,
+            textvariable=self.sentiment_label_var,
+            anchor=tk.W,
+            font=("TkDefaultFont", 10, "bold"),
+        )
+        self.sentiment_status_label.grid(row=0, column=0, sticky=tk.W)
+        self.sentiment_score_label = ttk.Label(
+            sentiment_frame,
+            textvariable=self.sentiment_score_var,
+            anchor=tk.W,
+        )
+        self.sentiment_score_label.grid(row=1, column=0, sticky=tk.W, pady=(2, 0))
+
         self.pnl_label = ttk.Label(
             summary_frame,
             textvariable=self.pnl_var,
@@ -950,7 +974,7 @@ class StockPredictorDesktopApp:
             font=("TkDefaultFont", 10, "bold"),
         )
         self._pnl_grid_options = {
-            "row": metric_rows,
+            "row": sentiment_row + 1,
             "column": 0,
             "columnspan": 4,
             "sticky": tk.W,
@@ -3014,6 +3038,69 @@ class StockPredictorDesktopApp:
         converted = self._convert_currency(raw_value)
         return raw_value, converted
 
+    def _extract_sentiment_from_row(
+        self, row: Mapping[str, Any] | pd.Series | None
+    ) -> tuple[float | None, float | None]:
+        if row is None:
+            return None, None
+
+        def getter(key: str) -> Any:
+            if hasattr(row, "get"):
+                try:
+                    return row.get(key)
+                except Exception:  # pragma: no cover - defensive
+                    return None
+            try:
+                return row[key]
+            except Exception:  # pragma: no cover - defensive
+                return None
+
+        avg: float | None = None
+        for key in ("Sentiment_Avg", "sentiment"):
+            avg = _safe_float(getter(key))
+            if avg is not None:
+                break
+        trend = _safe_float(getter("Sentiment_7d"))
+        return avg, trend
+
+    def _resolve_sentiment_snapshot(
+        self, prediction: Mapping[str, Any] | None = None
+    ) -> tuple[float | None, float | None]:
+        candidates: list[tuple[float | None, float | None]] = []
+
+        if isinstance(prediction, Mapping):
+            candidates.append(self._extract_sentiment_from_row(prediction))
+
+        for frame in (self.feature_snapshot, self.feature_history):
+            if isinstance(frame, pd.DataFrame) and not frame.empty:
+                candidates.append(self._extract_sentiment_from_row(frame.iloc[-1]))
+
+        for avg, trend in candidates:
+            if avg is not None or trend is not None:
+                return avg, trend
+        return None, None
+
+    def _format_sentiment_status(
+        self, avg: float | None, trend: float | None
+    ) -> tuple[str, str]:
+        if avg is None and trend is None:
+            return "Sentiment unavailable", "—"
+
+        label = "Neutral"
+        if avg is not None:
+            if avg >= 0.15:
+                label = "Positive"
+            elif avg <= -0.15:
+                label = "Negative"
+
+        parts: list[str] = []
+        if avg is not None:
+            parts.append(f"Avg: {avg:+.2f}")
+        if trend is not None:
+            parts.append(f"7d: {trend:+.2f}")
+        score = " | ".join(parts) if parts else "—"
+        return label, score
+
     def _update_metrics(self) -> None:
         prediction = self.current_prediction or {}
         explanation = prediction.get("explanation") if isinstance(prediction, Mapping) else None
@@ -3103,6 +3190,13 @@ class StockPredictorDesktopApp:
         if hit_prob_str != "—":
             parts.append(f"🎯 {hit_prob_str}")
         self.metric_vars["direction"].set("   ".join(parts) if parts else "—")
+
+        avg_sentiment, trend_sentiment = self._resolve_sentiment_snapshot(prediction)
+        sentiment_label, sentiment_score = self._format_sentiment_status(
+            avg_sentiment, trend_sentiment
+        )
+        self.sentiment_label_var.set(sentiment_label)
+        self.sentiment_score_var.set(sentiment_score)
 
         if explanation and isinstance(explanation, Mapping):
             summary = explanation.get("summary")
