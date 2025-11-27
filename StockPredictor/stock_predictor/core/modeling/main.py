@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -1693,6 +1694,24 @@ class StockPredictorAI:
             expected_change = close_prediction - latest_close
             pct_change = expected_change / latest_close if latest_close else 0.0
 
+        historical_confidence, historical_note = self._historical_confidence_score(
+            expected_change=expected_change, horizon=resolved_horizon
+        )
+        if historical_confidence is not None:
+            self.metadata["historical_confidence"] = historical_confidence
+            if combined_confidence is None:
+                combined_confidence = historical_confidence
+            else:
+                combined_confidence = float(
+                    np.clip(
+                        0.7 * combined_confidence + 0.3 * historical_confidence,
+                        0.0,
+                        1.0,
+                    )
+                )
+        if historical_note:
+            confidence_notes.append(historical_note)
+
         prediction_timestamp = datetime.now()
 
         latest_date = self.metadata.get("latest_date")
@@ -1849,6 +1868,7 @@ class StockPredictorAI:
         confluence_passed = False
         sentiment_factor = None
         trend_alignment_note = None
+        confidence_notes: list[str] = []
         if confluence_assessment is not None:
             confluence_score = float(confluence_assessment.score)
             confluence_passed = bool(confluence_assessment.passed)
@@ -1879,6 +1899,9 @@ class StockPredictorAI:
                 combined_confidence *= max(0.0, min(1.0, confluence_score))
             if confluence_passed is False:
                 combined_confidence *= 0.5
+                confidence_notes.append(
+                    "Confluence checks failed; probability scaled instead of hidden."
+                )
             combined_confidence = float(combined_confidence)
 
         combined_confidence, trend_alignment_note = self._apply_trend_alignment_adjustment(
@@ -1929,6 +1952,8 @@ class StockPredictorAI:
             result["signal_confluence"] = confluence_block
         if combined_confidence is not None:
             result["confluence_confidence"] = combined_confidence
+        if historical_confidence is not None:
+            result["historical_confidence"] = historical_confidence
         if trend_alignment_note:
             result["trend_alignment_note"] = trend_alignment_note
         if sentiment_factor is not None:
@@ -1957,6 +1982,8 @@ class StockPredictorAI:
             result["training_metrics"] = training_report
         if prediction_warnings:
             result["warnings"] = prediction_warnings
+        if confidence_notes:
+            result["confidence_note"] = "; ".join(confidence_notes)
         if sentiment_avg is not None:
             result["Sentiment_Avg"] = sentiment_avg
             result["sentiment_score"] = sentiment_avg
@@ -2540,6 +2567,57 @@ class StockPredictorAI:
 
         adjusted = float(np.clip(confidence * penalty, 0.0, 1.0))
         return adjusted, fundamentals
+
+    def _historical_confidence_score(
+        self, *, expected_change: float | None, horizon: Optional[int]
+    ) -> tuple[Optional[float], Optional[str]]:
+        """Estimate reliability from backtests and historical error dispersion.
+
+        The score combines two signals derived from historical performance:
+
+        * Directional accuracy observed during backtesting.
+        * Probability that a move of the forecasted magnitude would have landed
+          within historical error bands assuming normally distributed residuals.
+
+        Both components are clipped to [0, 1] and averaged so the result can be
+        used as a probability-like discount factor for live predictions.
+        """
+
+        metrics = self._validation_metrics("close", horizon)
+        if not metrics:
+            return None, None
+
+        directional_accuracy = self._safe_float(metrics.get("directional_accuracy"))
+        error_scale = self._safe_float(metrics.get("rmse")) or self._safe_float(
+            metrics.get("mae")
+        )
+
+        probability_within_band = None
+        if expected_change is not None and error_scale is not None and error_scale > 0:
+            magnitude = abs(expected_change)
+            z_score = magnitude / max(error_scale, 1e-6)
+            tail_cdf = 0.5 * (1.0 + math.erf(z_score / math.sqrt(2.0)))
+            probability_within_band = float(np.clip(2 * tail_cdf - 1.0, 0.0, 1.0))
+
+        components: list[float] = []
+        if directional_accuracy is not None and np.isfinite(directional_accuracy):
+            components.append(float(np.clip(directional_accuracy, 0.0, 1.0)))
+        if probability_within_band is not None:
+            components.append(probability_within_band)
+
+        if not components:
+            return None, None
+
+        historical_score = float(np.clip(float(np.mean(components)), 0.0, 1.0))
+        notes: list[str] = []
+        if directional_accuracy is not None and np.isfinite(directional_accuracy):
+            notes.append(f"Directional accuracy {directional_accuracy:.1%} from backtests")
+        if probability_within_band is not None:
+            notes.append(
+                f"{probability_within_band:.1%} likelihood move fits historical error band (σ≈{error_scale:.4f})"
+            )
+
+        return historical_score, "; ".join(notes) if notes else None
 
     def _technical_reasons(self, feature_row: pd.Series) -> list[str]:
         reasons: list[str] = []
