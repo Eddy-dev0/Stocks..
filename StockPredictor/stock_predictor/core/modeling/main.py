@@ -1735,6 +1735,7 @@ class StockPredictorAI:
         confluence_score = None
         confluence_passed = False
         sentiment_factor = None
+        trend_alignment_note = None
         if confluence_assessment is not None:
             confluence_score = float(confluence_assessment.score)
             confluence_passed = bool(confluence_assessment.passed)
@@ -1766,6 +1767,10 @@ class StockPredictorAI:
             if confluence_passed is False:
                 combined_confidence *= 0.5
             combined_confidence = float(combined_confidence)
+
+        combined_confidence, trend_alignment_note = self._apply_trend_alignment_adjustment(
+            combined_confidence
+        )
 
         (
             combined_confidence,
@@ -1811,6 +1816,8 @@ class StockPredictorAI:
             result["signal_confluence"] = confluence_block
         if combined_confidence is not None:
             result["confluence_confidence"] = combined_confidence
+        if trend_alignment_note:
+            result["trend_alignment_note"] = trend_alignment_note
         if sentiment_factor is not None:
             result["sentiment_factor"] = sentiment_factor
         if indicator_floor is not None:
@@ -2461,6 +2468,12 @@ class StockPredictorAI:
             else:
                 reasons.append("Volume contraction versus prior day, weakening conviction in the latest move.")
 
+        trend_note = None
+        if isinstance(self.metadata, Mapping):
+            trend_note = self.metadata.get("trend_alignment_note")
+        if trend_note:
+            reasons.append(str(trend_note))
+
         return reasons
 
     def _fundamental_reasons(self, feature_row: pd.Series) -> list[str]:
@@ -2621,6 +2634,67 @@ class StockPredictorAI:
                 adjusted_down = float(adjusted_down_raw / total)
 
         return adjusted_confidence, adjusted_up, adjusted_down, sentiment_factor
+
+    def _apply_trend_alignment_adjustment(
+        self, combined_confidence: Optional[float]
+    ) -> tuple[Optional[float], Optional[str]]:
+        summary = self.metadata.get("trend_summary") if isinstance(self.metadata, Mapping) else None
+        note: Optional[str] = None
+
+        if not isinstance(summary, Mapping):
+            return combined_confidence, note
+
+        base_label = summary.get("base_timeframe") or "daily"
+        timeframes = summary.get("timeframes") or {}
+        base_snapshot = timeframes.get(base_label)
+        if not isinstance(base_snapshot, Mapping):
+            return combined_confidence, note
+
+        base_bias = base_snapshot.get("bias")
+        if not base_bias or base_bias == "neutral":
+            return combined_confidence, note
+
+        aligned: list[str] = []
+        conflicts: list[str] = []
+        conflict_biases: list[str] = []
+        for label, snapshot in timeframes.items():
+            if label == base_label or not isinstance(snapshot, Mapping):
+                continue
+            bias = snapshot.get("bias")
+            if bias is None or bias == "neutral":
+                continue
+            if bias == base_bias:
+                aligned.append(label)
+            else:
+                conflicts.append(label)
+                conflict_biases.append(str(bias))
+
+        factor: Optional[float] = None
+        if aligned and not conflicts:
+            factor = 1.1
+            joined = ", ".join(label.title() for label in aligned)
+            note = f"{joined} trend {base_bias} supports {base_label} view."
+        elif conflicts and not aligned:
+            factor = 0.85
+            joined = ", ".join(label.title() for label in conflicts)
+            conflict_bias = conflict_biases[0] if conflict_biases else "opposing"
+            note = f"{joined} trend {conflict_bias} conflicts with {base_label} {base_bias}, tempering conviction."
+        elif aligned and conflicts:
+            factor = 0.95
+            joined = ", ".join(label.title() for label in aligned + conflicts)
+            note = f"Mixed higher-timeframe trends across {joined} versus {base_label} {base_bias}."
+
+        adjusted_confidence = combined_confidence
+        if factor is not None and adjusted_confidence is not None:
+            adjusted_confidence = float(np.clip(adjusted_confidence * factor, 0.0, 1.0))
+
+        if isinstance(self.metadata, dict):
+            if note:
+                self.metadata["trend_alignment_note"] = note
+            else:
+                self.metadata.pop("trend_alignment_note", None)
+
+        return adjusted_confidence, note
 
     def _macro_reasons(self, feature_row: pd.Series) -> list[str]:
         reasons: list[str] = []
@@ -2804,6 +2878,12 @@ class StockPredictorAI:
             if clause:
                 base_sentence += f" driven by {clause}"
         sentences.append(base_sentence + ".")
+
+        trend_note = prediction.get("trend_alignment_note") or self.metadata.get(
+            "trend_alignment_note"
+        )
+        if trend_note:
+            sentences.append(str(trend_note))
 
         if pct_change is not None and np.isfinite(pct_change) and pct_change != 0:
             sentences.append(f"Expected move of {pct_change * 100:.2f}% versus the last close.")

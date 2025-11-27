@@ -272,6 +272,173 @@ def _linear_slope(series: pd.Series) -> float:
     return float(coeffs[0])
 
 
+def _trend_snapshot(
+    close: pd.Series, *, label: str, slope_window: int = 5
+) -> dict[str, object]:
+    """Summarize trend bias and strength for a single timeframe."""
+
+    if not isinstance(close, pd.Series) or close.empty:
+        return {"label": label, "bias": "neutral", "strength": 0.0}
+
+    sma_50 = close.rolling(window=50, min_periods=1).mean()
+    sma_200 = close.rolling(window=200, min_periods=1).mean()
+
+    window = max(2, min(int(slope_window), len(close)))
+    slope_50 = _linear_slope(sma_50.tail(window))
+    slope_200 = _linear_slope(sma_200.tail(window))
+
+    rsi_series = _rsi(close, period=14)
+    latest_rsi = float(rsi_series.iloc[-1]) if not rsi_series.empty else 50.0
+
+    ema_fast = _ema(close, span=20).iloc[-1]
+    ema_slow = _ema(close, span=50).iloc[-1]
+
+    bullish_components: list[float] = []
+    bearish_components: list[float] = []
+
+    for slope in (slope_50, slope_200):
+        if slope > 0:
+            bullish_components.append(1.0)
+        elif slope < 0:
+            bearish_components.append(1.0)
+
+    if latest_rsi > 55:
+        bullish_components.append(min(1.0, (latest_rsi - 50.0) / 50.0))
+    elif latest_rsi < 45:
+        bearish_components.append(min(1.0, (50.0 - latest_rsi) / 50.0))
+
+    if ema_fast > ema_slow:
+        bullish_components.append(1.0)
+    elif ema_fast < ema_slow:
+        bearish_components.append(1.0)
+
+    bullish_score = float(np.mean(bullish_components)) if bullish_components else 0.0
+    bearish_score = float(np.mean(bearish_components)) if bearish_components else 0.0
+
+    bias = "neutral"
+    strength = max(bullish_score, bearish_score)
+    if bullish_score >= max(0.5, bearish_score + 0.05):
+        bias = "bullish"
+        strength = bullish_score
+    elif bearish_score >= max(0.5, bullish_score + 0.05):
+        bias = "bearish"
+        strength = bearish_score
+
+    return {
+        "label": label,
+        "bias": bias,
+        "strength": float(np.clip(strength, 0.0, 1.0)),
+        "bullish_score": bullish_score,
+        "bearish_score": bearish_score,
+        "slopes": {"sma50": slope_50, "sma200": slope_200},
+        "latest": {
+            "rsi": latest_rsi,
+            "ema_fast": float(ema_fast),
+            "ema_slow": float(ema_slow),
+            "sma_50": float(sma_50.iloc[-1]),
+            "sma_200": float(sma_200.iloc[-1]),
+        },
+    }
+
+
+def compute_multi_timeframe_trends(
+    price_df: pd.DataFrame,
+    *,
+    timeframes: Mapping[str, str] | None = None,
+    slope_window: int = 5,
+    include_base: bool = True,
+    base_label: str = "daily",
+) -> dict[str, object]:
+    """Assess trend alignment across multiple timeframes.
+
+    The helper resamples close prices to weekly and monthly intervals by
+    default, evaluates key indicators (50/200 SMA slopes, EMA stacking, RSI),
+    and returns per-timeframe trend biases alongside aggregate alignment
+    metadata suitable for user-facing explanations.
+    """
+
+    if price_df is None or price_df.empty:
+        return {}
+
+    if "Date" not in price_df.columns or "Close" not in price_df.columns:
+        return {}
+
+    close = pd.to_numeric(price_df["Close"], errors="coerce")
+    dates = pd.to_datetime(price_df["Date"], errors="coerce")
+    frame = pd.Series(close.values, index=dates).dropna()
+    frame = frame.sort_index()
+    if frame.empty:
+        return {}
+
+    rules = timeframes or {"weekly": "W", "monthly": "ME"}
+    assessments: dict[str, dict[str, object]] = {}
+
+    if include_base:
+        assessments[base_label] = _trend_snapshot(frame, label=base_label, slope_window=slope_window)
+
+    for label, rule in rules.items():
+        resampled = frame.resample(rule).last().dropna()
+        if resampled.empty:
+            continue
+        assessments[label] = _trend_snapshot(resampled, label=label, slope_window=slope_window)
+
+    if not assessments:
+        return {}
+
+    base_bias = assessments.get(base_label, {}).get("bias")
+    aligned: list[str] = []
+    conflicts: list[str] = []
+
+    for label, snapshot in assessments.items():
+        if label == base_label:
+            continue
+        bias = snapshot.get("bias")
+        if bias and base_bias and bias != "neutral" and base_bias != "neutral":
+            if bias == base_bias:
+                aligned.append(label)
+            else:
+                conflicts.append(label)
+
+    overall_bias = max(
+        assessments.values(),
+        key=lambda snap: snap.get("strength", 0.0),
+        default={"bias": "neutral"},
+    ).get("bias", "neutral")
+
+    alignment_notes: list[str] = []
+    if base_bias:
+        if aligned and not conflicts:
+            labels = ", ".join(label.title() for label in aligned)
+            alignment_notes.append(f"{labels} trend {base_bias} aligns with {base_label} bias.")
+        elif conflicts and not aligned:
+            labels = ", ".join(label.title() for label in conflicts)
+            alignment_notes.append(
+                f"{labels} trend conflicts with {base_label} bias {base_bias}; expect choppier conviction."
+            )
+        elif aligned and conflicts:
+            labels = ", ".join(label.title() for label in aligned + conflicts)
+            alignment_notes.append(
+                f"Mixed alignment across {labels} versus {base_label} bias {base_bias}."
+            )
+
+    average_strength = float(
+        np.nanmean([snap.get("strength", np.nan) for snap in assessments.values()])
+    )
+
+    return {
+        "timeframes": assessments,
+        "base_timeframe": base_label if include_base else None,
+        "overall_bias": overall_bias,
+        "alignment_notes": alignment_notes,
+        "alignment": {
+            "aligned": aligned,
+            "conflicts": conflicts,
+            "agreement": bool(aligned and not conflicts),
+        },
+        "average_strength": average_strength,
+    }
+
+
 def evaluate_signal_confluence(
     indicator_frame: pd.DataFrame,
     *,
@@ -352,6 +519,7 @@ __all__ = [
     "ConfluenceAssessment",
     "IndicatorResult",
     "compute_indicators",
+    "compute_multi_timeframe_trends",
     "DEFAULT_INDICATOR_CONFIG",
     "evaluate_signal_confluence",
 ]

@@ -10,7 +10,11 @@ from typing import Dict, Iterable, Iterator, Mapping, Optional, Sequence
 import numpy as np
 import pandas as pd
 
-from ..indicator_bundle import DEFAULT_INDICATOR_CONFIG, compute_indicators
+from ..indicator_bundle import (
+    DEFAULT_INDICATOR_CONFIG,
+    compute_indicators,
+    compute_multi_timeframe_trends,
+)
 from ..sentiment import aggregate_daily_sentiment, attach_sentiment
 from .feature_registry import (
     FeatureBuildContext,
@@ -456,6 +460,16 @@ def _build_technical_features(
     indicator_result = compute_indicators(df, indicator_config)
     indicator_frame = indicator_result.dataframe.reset_index(drop=True)
     metadata["indicator_columns"] = list(indicator_result.columns)
+
+    trend_summary = compute_multi_timeframe_trends(df)
+    if trend_summary:
+        metadata["trend_summary"] = trend_summary
+        higher_timeframes = {
+            key: value
+            for key, value in trend_summary.get("timeframes", {}).items()
+            if key != trend_summary.get("base_timeframe")
+        }
+        metadata["higher_timeframe_trends"] = higher_timeframes
 
     feature_frame = pd.DataFrame({"Date": df["Date"].reset_index(drop=True)})
     feature_frame["Return_1d"] = close.pct_change(fill_method=None)
