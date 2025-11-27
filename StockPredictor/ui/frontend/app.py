@@ -407,11 +407,39 @@ with st.sidebar:
         horizon_value = st.number_input("Forecast horizon", min_value=1, max_value=365, value=5, step=1)
 
     st.header("Chart overlays")
-    show_ma50 = st.checkbox("Show 50-day MA", value=True)
-    show_ma200 = st.checkbox("Show 200-day MA", value=False)
-    show_bollinger = st.checkbox("Show Bollinger bands", value=True)
-    show_volume = st.checkbox("Show volume histogram", value=True)
-    show_vwap = st.checkbox("Show VWAP", value=False, help="Requires volume data")
+    show_all_indicators = st.checkbox(
+        "Show all indicators",
+        value=False,
+        help="Master toggle to enable every overlay (moving averages, Bollinger bands, VWAP, volume, and more).",
+    )
+    show_ma50 = st.checkbox("Show 50-day MA", value=True, disabled=show_all_indicators)
+    show_ma200 = st.checkbox("Show 200-day MA", value=False, disabled=show_all_indicators)
+    show_bollinger = st.checkbox(
+        "Show Bollinger bands", value=True, disabled=show_all_indicators
+    )
+    show_volume = st.checkbox(
+        "Show volume histogram", value=True, disabled=show_all_indicators
+    )
+    show_vwap = st.checkbox(
+        "Show VWAP", value=False, help="Requires volume data", disabled=show_all_indicators
+    )
+
+    overlay_flags = {
+        "show_ma50": show_ma50,
+        "show_ma200": show_ma200,
+        "show_bollinger": show_bollinger,
+        "show_vwap": show_vwap,
+        "show_volume": show_volume,
+    }
+
+    if show_all_indicators:
+        overlay_flags = {key: True for key in overlay_flags}
+
+    show_ma50 = overlay_flags["show_ma50"]
+    show_ma200 = overlay_flags["show_ma200"]
+    show_bollinger = overlay_flags["show_bollinger"]
+    show_vwap = overlay_flags["show_vwap"]
+    show_volume = overlay_flags["show_volume"]
 
     st.header("Risk & Volatility")
     st.caption("Computed from visible market data")
