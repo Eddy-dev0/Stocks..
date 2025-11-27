@@ -43,6 +43,8 @@ def _build_stubbed_app() -> StockPredictorDesktopApp:
     app.sentiment_label_var = _DummyVar()
     app.sentiment_score_var = _DummyVar()
     app.current_market_timestamp = pd.Timestamp("2024-05-01 15:00", tz="UTC")
+    app.current_market_price = None
+    app.price_history = None
     app.currency_symbol = "$"
     app.price_decimal_places = 2
     app.expected_low_multiplier = 1.0
@@ -53,7 +55,6 @@ def _build_stubbed_app() -> StockPredictorDesktopApp:
     }
     app.status_var = _DummyVar()
     app.config = SimpleNamespace(ticker="TSLA")
-    app._reference_last_price = lambda prediction: (None, None)
     app._convert_currency = lambda value: value
     app._compute_forecast_date = lambda target=None: None
     app._compute_expected_low = lambda prediction, multiplier=None: None
@@ -68,3 +69,36 @@ def test_naive_market_timestamp_localizes_from_utc() -> None:
     app._update_metrics()
 
     assert app.metric_vars["as_of"].value == "2024-05-01 11:00 EDT"
+
+
+def test_market_timestamp_from_price_history() -> None:
+    app = _build_stubbed_app()
+    app.current_market_timestamp = None
+    app.price_history = pd.DataFrame(
+        {
+            "Date": pd.date_range(
+                "2024-04-30 15:00", periods=2, freq="D", tz=ZoneInfo("UTC")
+            ),
+            "Close": [100.0, 101.0],
+        }
+    )
+
+    app._update_metrics()
+
+    assert app.metric_vars["as_of"].value == "2024-05-01 11:00 EDT"
+
+
+def test_last_price_prefers_price_history() -> None:
+    app = _build_stubbed_app()
+    app.current_market_price = None
+    app.price_history = pd.DataFrame(
+        {
+            "Date": [pd.Timestamp("2024-05-01 15:00", tz=ZoneInfo("UTC"))],
+            "Close": [321.5],
+        }
+    )
+
+    raw, converted = app._reference_last_price(app.current_prediction)
+
+    assert raw == 321.5
+    assert converted == 321.5
