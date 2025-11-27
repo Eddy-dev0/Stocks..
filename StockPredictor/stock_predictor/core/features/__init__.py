@@ -900,9 +900,19 @@ def _build_cross_sectional_betas(
     }
 
     beta_features: Dict[str, pd.Series] = {}
+    placeholder_index = price_df.index
     for symbol, label in benchmarks.items():
         benchmark = _extract_benchmark_series(price_df, symbol, macro_df=macro_df)
         if benchmark is None:
+            # Preserve a stable feature schema even when benchmark data is missing
+            # by emitting NaN-filled columns for each rolling window. This prevents
+            # downstream preprocessors (e.g., imputers) from erroring out when a
+            # previously seen feature suddenly disappears because the benchmark
+            # series could not be located in the current dataset.
+            for window in (21, 63, 126):
+                beta_features[f"{label}_{window}"] = pd.Series(
+                    np.nan, index=placeholder_index
+                )
             continue
         benchmark_returns = benchmark.pct_change(fill_method=None)
         for window in (21, 63, 126):
