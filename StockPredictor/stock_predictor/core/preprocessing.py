@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Mapping, Tuple
 
 import numpy as np
 import pandas as pd
@@ -49,8 +49,50 @@ def _identify_price_columns(df: pd.DataFrame) -> list[str]:
     return price_columns
 
 
-def compute_price_features(price_df: pd.DataFrame) -> pd.DataFrame:
-    """Compute technical indicators and lag features from price data."""
+PRICE_FEATURE_DEFAULTS: dict[str, bool] = {
+    "obv": True,
+    "volume_weighted_momentum": True,
+    "orderflow": True,
+    "macro_merge": True,
+}
+
+
+def default_price_feature_toggles() -> dict[str, bool]:
+    return dict(PRICE_FEATURE_DEFAULTS)
+
+
+def _coerce_price_feature_toggles(
+    toggles: Mapping[str, object] | Iterable[str] | None,
+) -> dict[str, bool]:
+    defaults = default_price_feature_toggles()
+    if toggles is None:
+        return defaults
+
+    normalised: dict[str, bool] = {}
+    if isinstance(toggles, Mapping):
+        source = toggles.items()
+    else:
+        if isinstance(toggles, str):
+            source = ((token, True) for token in toggles.split(","))
+        else:
+            source = ((token, True) for token in toggles)
+    for key, enabled in source:
+        name = str(key).strip().lower()
+        if name in defaults:
+            normalised[name] = bool(enabled)
+
+    defaults.update(normalised)
+    return defaults
+
+
+def compute_price_features(
+    price_df: pd.DataFrame,
+    *,
+    feature_toggles: Mapping[str, object] | Iterable[str] | None = None,
+    macro_df: pd.DataFrame | None = None,
+    macro_symbols: Iterable[str] | None = None,
+) -> pd.DataFrame:
+    """Compute technical indicators, lag features, and optional contextual series."""
 
     if price_df.empty:
         raise ValueError("Price dataframe is empty.")
@@ -89,6 +131,8 @@ def compute_price_features(price_df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         raise ValueError("Price dataframe has no valid rows after cleaning.")
 
+    toggles = _coerce_price_feature_toggles(feature_toggles)
+
     df = df.sort_values("Date").reset_index(drop=True)
     df["Return_1d"] = df["Close"].pct_change()
     df["LogReturn_1d"] = np.log(df["Close"]).diff()
@@ -97,6 +141,40 @@ def compute_price_features(price_df: pd.DataFrame) -> pd.DataFrame:
     df["EMA_9"] = df["Close"].ewm(span=9, adjust=False).mean()
     df["Volatility_5"] = df["Return_1d"].rolling(window=5, min_periods=1).std()
     df["Volume_Change"] = df["Volume"].pct_change()
+
+    volume_feature_columns: list[str] = []
+    if toggles.get("obv", False) and "Volume" in df.columns:
+        direction = np.sign(df["Close"].diff().fillna(0.0))
+        df["Volume_OBV"] = (direction * df["Volume"]).fillna(0.0).cumsum()
+        volume_feature_columns.append("Volume_OBV")
+
+    if toggles.get("volume_weighted_momentum", False) and "Volume" in df.columns:
+        weighted_returns = df["Close"].pct_change(fill_method=None) * df["Volume"]
+        for window in (5, 10):
+            column = f"VWMomentum_{window}"
+            df[column] = weighted_returns.rolling(window=window, min_periods=1).mean()
+            volume_feature_columns.append(column)
+
+    if toggles.get("orderflow", False) and "Volume" in df.columns:
+        signed_volume = df["Volume"] * np.sign(df["Close"].diff().fillna(0.0))
+        for window in (5, 20):
+            imbalance_col = f"Orderflow_Imbalance_{window}"
+            tick_col = f"Tick_Imbalance_{window}"
+            df[imbalance_col] = signed_volume.rolling(window=window, min_periods=1).sum()
+            df[tick_col] = (
+                np.sign(df["Close"].diff().fillna(0.0))
+                .rolling(window=window, min_periods=1)
+                .sum()
+            )
+            volume_feature_columns.extend([imbalance_col, tick_col])
+
+    if toggles.get("macro_merge", False) and macro_df is not None and not macro_df.empty:
+        symbols = list(macro_symbols) if macro_symbols is not None else ["^VIX", "DXY", "^TNX"]
+        merged = _merge_macro_series(df, macro_df, symbols)
+        df = merged
+        volume_feature_columns.extend(
+            [col for col in df.columns if col.startswith("Macro_")]
+        )
 
     indicator_result = compute_indicators(df)
     fear_greed = compute_fear_greed_features(df)
@@ -109,6 +187,7 @@ def compute_price_features(price_df: pd.DataFrame) -> pd.DataFrame:
         *LEGACY_INDICATOR_COLUMNS,
         *indicator_result.columns,
         *fear_greed.columns.tolist(),
+        *volume_feature_columns,
     ]:
         if column not in df.columns:
             continue
@@ -119,6 +198,58 @@ def compute_price_features(price_df: pd.DataFrame) -> pd.DataFrame:
     df.attrs["indicator_columns"] = indicator_columns
     df.attrs["price_columns"] = _identify_price_columns(df)
     return df
+
+
+def _merge_macro_series(
+    base_df: pd.DataFrame, macro_df: pd.DataFrame, symbols: list[str]
+) -> pd.DataFrame:
+    macro_df = macro_df.copy()
+    if "Date" not in macro_df.columns:
+        return base_df
+    macro_df["Date"] = pd.to_datetime(macro_df["Date"], errors="coerce")
+    macro_df = macro_df.dropna(subset=["Date"]).sort_values("Date")
+
+    macro_features: dict[str, pd.Series] = {"Date": base_df["Date"]}
+    for symbol in symbols:
+        series = _extract_macro_series(macro_df, symbol)
+        if series is None:
+            continue
+        normalized = symbol.replace("^", "")
+        close_col = f"Macro_{normalized}_Close"
+        return_col = f"Macro_{normalized}_Return"
+        macro_features[close_col] = series
+        macro_features[return_col] = pd.to_numeric(series, errors="coerce").pct_change(
+            fill_method=None
+        )
+
+    if len(macro_features) == 1:
+        return base_df
+
+    feature_frame = pd.DataFrame(macro_features)
+    merged = base_df.merge(feature_frame, on="Date", how="left")
+    return merged
+
+
+def _extract_macro_series(macro_df: pd.DataFrame, symbol: str) -> pd.Series | None:
+    normalized_symbol = symbol.replace("^", "")
+    candidates = [
+        f"Close_{symbol}",
+        f"Close_{normalized_symbol}",
+        f"{symbol}_Close",
+        f"{normalized_symbol}_Close",
+        f"Adj Close_{symbol}",
+        f"Adj Close_{normalized_symbol}",
+        f"{symbol}_Adj Close",
+        f"{normalized_symbol}_Adj Close",
+        symbol,
+        normalized_symbol,
+    ]
+    for column in macro_df.columns:
+        if column in candidates:
+            return pd.to_numeric(macro_df[column], errors="coerce")
+        if normalized_symbol in column and "close" in column.lower():
+            return pd.to_numeric(macro_df[column], errors="coerce")
+    return None
 
 
 def merge_with_sentiment(
@@ -142,10 +273,18 @@ def build_supervised_dataset(
     sentiment_df: pd.DataFrame | None = None,
     *,
     use_log_returns: bool = False,
+    feature_toggles: Mapping[str, object] | Iterable[str] | None = None,
+    macro_df: pd.DataFrame | None = None,
+    macro_symbols: Iterable[str] | None = None,
 ) -> Tuple[pd.DataFrame, pd.Series, Dict[str, object]]:
     """Prepare the feature matrix and target vector."""
 
-    price_features = compute_price_features(price_df)
+    price_features = compute_price_features(
+        price_df,
+        feature_toggles=feature_toggles,
+        macro_df=macro_df,
+        macro_symbols=macro_symbols,
+    )
     sentiment_df = sentiment_df if sentiment_df is not None else pd.DataFrame()
     indicator_columns = price_features.attrs.get("indicator_columns", [])
     price_columns_attr = price_features.attrs.get("price_columns", [])

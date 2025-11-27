@@ -18,6 +18,9 @@ scenarios.
 - Automatic sentiment scoring for news articles using VADER.
 - Feature engineering with common technical indicators and aggregated
   sentiment information.
+- Volume-aware price features (OBV, volume-weighted momentum, orderflow
+  imbalance) plus optional macro series merges for benchmarks like VIX, DXY
+  or Treasury yields, all controllable via feature toggles.
 - Machine learning model (Random Forest Regressor) with persisted metrics and
   trained model artefacts.
 - Optional classical time-series baselines (ARIMA, Holt-Winters, Prophet) with
