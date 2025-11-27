@@ -87,6 +87,7 @@ class TrendInsight:
     ticker: str
     horizon: int
     composite_score: float
+    confidence_rank: float | None = None
     technical_score: float | None = None
     fundamental_score: float | None = None
     sentiment_score: float | None = None
@@ -99,6 +100,7 @@ class TrendInsight:
             "ticker": self.ticker,
             "horizon": self.horizon,
             "composite_score": self.composite_score,
+            "confidence_rank": self.confidence_rank,
             "technical_score": self.technical_score,
             "fundamental_score": self.fundamental_score,
             "sentiment_score": self.sentiment_score,
@@ -137,7 +139,7 @@ class TrendFinder:
         *,
         horizon: int | str | None = None,
         universe: Sequence[str] | None = None,
-        limit: int = 5,
+        limit: int | None = None,
         progress_callback: Callable[[int, int, str], None] | None = None,
     ) -> list[TrendInsight]:
         """Return the strongest opportunities for ``horizon``."""
@@ -211,6 +213,10 @@ class TrendFinder:
                     prediction_payload = None
 
                 prediction_score = self._prediction_score_from_payload(prediction_payload)
+                confidence_details = self._confidence_details_from_payload(prediction_payload)
+                confidence_rank = self._safe_float(
+                    confidence_details.get("confidence_rank") if confidence_details else None
+                )
                 weights = self._resolve_horizon_weights(resolved_horizon)
                 composite: float | None = None
 
@@ -257,12 +263,17 @@ class TrendFinder:
                     insight_metadata["prediction_payload"] = prediction_payload
                 else:
                     insight_metadata.pop("prediction_payload", None)
+                if confidence_details:
+                    insight_metadata["confidence"] = confidence_details
+                else:
+                    insight_metadata.pop("confidence", None)
 
                 insights.append(
                     TrendInsight(
                         ticker=ticker,
                         horizon=resolved_horizon,
                         composite_score=float(composite),
+                        confidence_rank=confidence_rank,
                         technical_score=technical_score,
                         fundamental_score=fundamental_score,
                         sentiment_score=sentiment_score,
@@ -278,8 +289,28 @@ class TrendFinder:
                             "Trend scan progress callback failed for %s", ticker, exc_info=True
                         )
 
-        insights.sort(key=lambda item: item.composite_score, reverse=True)
-        return insights[: max(0, int(limit))]
+        strong_insights = [
+            insight for insight in insights if self._is_strong_confluence(insight)
+        ]
+        ranked_insights = strong_insights or insights
+        ranked_insights.sort(
+            key=lambda item: (
+                self._safe_float(getattr(item, "confidence_rank", None))
+                if getattr(item, "confidence_rank", None) is not None
+                else -np.inf,
+                item.composite_score,
+            ),
+            reverse=True,
+        )
+
+        effective_limit = 10
+        if limit is not None:
+            try:
+                effective_limit = min(10, max(0, int(limit)))
+            except (TypeError, ValueError):
+                effective_limit = 10
+
+        return ranked_insights[:effective_limit]
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -406,6 +437,104 @@ class TrendFinder:
         if arr.size == 0:
             return None
         return float(np.mean(arr))
+
+    @staticmethod
+    def _confidence_details_from_payload(payload: Mapping[str, Any] | None) -> Mapping[str, Any]:
+        if not isinstance(payload, Mapping):
+            return {}
+
+        details: dict[str, Any] = {}
+
+        confluence_confidence = TrendFinder._safe_float(payload.get("confluence_confidence"))
+        if confluence_confidence is not None:
+            details["confluence_confidence"] = confluence_confidence
+
+        confluence_block = payload.get("signal_confluence")
+        confluence_score = None
+        confluence_passed = None
+        if isinstance(confluence_block, Mapping):
+            confluence_score = TrendFinder._safe_float(confluence_block.get("score"))
+            if confluence_score is not None:
+                details["signal_confluence_score"] = confluence_score
+            if "passed" in confluence_block:
+                confluence_passed = bool(confluence_block.get("passed"))
+                details["signal_confluence_passed"] = confluence_passed
+
+        dir_prob_up = TrendFinder._safe_float(payload.get("direction_probability_up"))
+        dir_prob_down = TrendFinder._safe_float(payload.get("direction_probability_down"))
+        if dir_prob_up is not None:
+            details["direction_probability_up"] = dir_prob_up
+        if dir_prob_down is not None:
+            details["direction_probability_down"] = dir_prob_down
+
+        components: list[float] = []
+        if confluence_confidence is not None:
+            components.append(float(np.clip(confluence_confidence, 0.0, 1.0)))
+        if confluence_score is not None:
+            components.append(float(np.clip(confluence_score, 0.0, 1.0)))
+
+        if dir_prob_up is not None or dir_prob_down is not None:
+            direction_strength_candidates = [
+                value
+                for value in (dir_prob_up, dir_prob_down)
+                if value is not None and np.isfinite(value)
+            ]
+            if direction_strength_candidates:
+                direction_strength = float(max(direction_strength_candidates))
+                details["direction_confidence"] = direction_strength
+                components.append(float(np.clip(direction_strength, 0.0, 1.0)))
+
+            if dir_prob_up is not None and dir_prob_down is not None:
+                edge = float(np.clip(dir_prob_up - dir_prob_down, -1.0, 1.0))
+                normalized_edge = 0.5 + 0.5 * edge
+                details["direction_edge"] = edge
+                components.append(float(np.clip(normalized_edge, 0.0, 1.0)))
+
+        if confluence_passed is False:
+            components = [value * 0.7 for value in components]
+
+        if components:
+            details["confidence_rank"] = float(np.mean(components))
+
+        return details
+
+    @staticmethod
+    def _is_strong_confluence(insight: TrendInsight | Mapping[str, Any]) -> bool:
+        if isinstance(insight, TrendInsight):
+            metadata = insight.metadata
+        elif isinstance(insight, Mapping):
+            metadata = insight
+        else:
+            return False
+
+        confidence_block = metadata.get("confidence") if isinstance(metadata, Mapping) else None
+        if not isinstance(confidence_block, Mapping):
+            prediction_payload = metadata.get("prediction_payload") if isinstance(metadata, Mapping) else None
+            confidence_block = TrendFinder._confidence_details_from_payload(prediction_payload)
+
+        if not confidence_block:
+            return False
+
+        threshold = 0.6
+        rank = TrendFinder._safe_float(confidence_block.get("confidence_rank"))
+        confluence_confidence = TrendFinder._safe_float(
+            confidence_block.get("confluence_confidence")
+        )
+        confluence_score = TrendFinder._safe_float(
+            confidence_block.get("signal_confluence_score")
+        )
+        passed = confidence_block.get("signal_confluence_passed")
+
+        if isinstance(passed, bool) and passed:
+            return True
+        if confluence_confidence is not None and confluence_confidence >= threshold:
+            return True
+        if confluence_score is not None and confluence_score >= threshold:
+            return True
+        if rank is not None and rank >= threshold:
+            return True
+
+        return False
 
     @staticmethod
     def _resolve_horizon_weights(horizon: int) -> Mapping[str, float]:
