@@ -21,6 +21,7 @@ from stock_predictor.providers.base import (
     PriceBar,
     ProviderFetchSummary,
     ProviderResult,
+    SentimentSignal,
 )
 from stock_predictor.providers.database import Database
 
@@ -235,3 +236,103 @@ def test_default_params_use_conservative_lookback_when_cache_empty(monkeypatch, 
 
     expected_start = (_FixedDate.today() - timedelta(days=PRICE_LOOKBACK_DAYS)).isoformat()
     assert params["start"] == expected_start
+
+
+def test_refresh_sentiment_overrides_placeholder_cache(monkeypatch, tmp_path) -> None:
+    db_file = tmp_path / "sentiment.db"
+    database = Database(f"sqlite:///{db_file}")
+    config = PredictorConfig(ticker="AAPL", data_dir=tmp_path)
+    etl = MarketDataETL(config, database)
+
+    placeholder_record = {
+        "Ticker": "AAPL",
+        "AsOf": datetime(2024, 1, 1, tzinfo=timezone.utc),
+        "Provider": "placeholder",
+        "SignalType": "news_sentiment",
+        "Score": 0.0,
+        "Magnitude": None,
+        "Payload": {"note": "placeholder"},
+    }
+    database.upsert_sentiment_signals([placeholder_record])
+
+    calls = {"count": 0}
+
+    def fake_fetch(self, dataset, params=None, *, providers=None):
+        if dataset != DatasetType.SENTIMENT:
+            return ProviderFetchSummary(results=[], failures=[])
+        calls["count"] += 1
+        record = SentimentSignal(
+            symbol="AAPL",
+            provider="mock_provider",
+            signal_type="news_sentiment",
+            as_of=datetime(2024, 1, 2, tzinfo=timezone.utc),
+            score=0.6,
+            magnitude=None,
+            payload={"articles": 3},
+        )
+        return ProviderFetchSummary(
+            results=[
+                ProviderResult(
+                    dataset_type=DatasetType.SENTIMENT, source="stub", records=[record]
+                )
+            ],
+            failures=[],
+        )
+
+    monkeypatch.setattr(MarketDataETL, "_fetch_dataset", fake_fetch)
+
+    result = etl.refresh_sentiment_signals(force=False)
+
+    assert calls["count"] == 1
+    assert result.downloaded is True
+    assert "mock_provider" in set(result.data["Provider"])
+
+
+def test_refresh_sentiment_rebuilds_from_zero_payload(monkeypatch, tmp_path) -> None:
+    db_file = tmp_path / "sentiment.db"
+    database = Database(f"sqlite:///{db_file}")
+    config = PredictorConfig(ticker="MSFT", data_dir=tmp_path)
+    etl = MarketDataETL(config, database)
+
+    zero_payload_record = {
+        "Ticker": "MSFT",
+        "AsOf": datetime(2024, 2, 1, tzinfo=timezone.utc),
+        "Provider": "vader",
+        "SignalType": "news_sentiment",
+        "Score": 0.0,
+        "Magnitude": None,
+        "Payload": {"articles": 0},
+    }
+    database.upsert_sentiment_signals([zero_payload_record])
+
+    calls = {"count": 0}
+
+    def fake_fetch(self, dataset, params=None, *, providers=None):
+        if dataset != DatasetType.SENTIMENT:
+            return ProviderFetchSummary(results=[], failures=[])
+        calls["count"] += 1
+        record = SentimentSignal(
+            symbol="MSFT",
+            provider="fresh_provider",
+            signal_type="news_sentiment",
+            as_of=datetime(2024, 2, 2, tzinfo=timezone.utc),
+            score=-0.4,
+            magnitude=None,
+            payload={"articles": 1},
+        )
+        return ProviderFetchSummary(
+            results=[
+                ProviderResult(
+                    dataset_type=DatasetType.SENTIMENT, source="stub", records=[record]
+                )
+            ],
+            failures=[],
+        )
+
+    monkeypatch.setattr(MarketDataETL, "_fetch_dataset", fake_fetch)
+
+    result = etl.refresh_sentiment_signals(force=False)
+
+    assert calls["count"] == 1
+    assert result.downloaded is True
+    assert "fresh_provider" in set(result.data["Provider"])

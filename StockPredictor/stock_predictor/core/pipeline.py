@@ -878,8 +878,34 @@ class MarketDataETL:
         return RefreshResult(refreshed, downloaded=downloaded)
 
     def refresh_sentiment_signals(self, force: bool = False) -> RefreshResult:
+        def _is_placeholder_only(frame: pd.DataFrame) -> bool:
+            def _is_zero_payload(payload: Any) -> bool:
+                if payload is None:
+                    return True
+                if isinstance(payload, dict):
+                    if not payload:
+                        return True
+                    if payload.get("articles") == 0:
+                        return True
+                    if set(payload.keys()) == {"note"}:
+                        return True
+                return False
+
+            if frame.empty:
+                return False
+
+            for row in frame.to_dict("records"):
+                provider = str(row.get("Provider", "")).casefold()
+                score = row.get("Score")
+                payload = row.get("Payload")
+                is_placeholder_provider = provider == "placeholder"
+                zero_payload = (score is None or score == 0) and _is_zero_payload(payload)
+                if not (is_placeholder_provider or zero_payload):
+                    return False
+            return True
+
         existing = self.database.get_sentiment_signals(self.config.ticker)
-        if not force and not existing.empty:
+        if not force and not existing.empty and not _is_placeholder_only(existing):
             self._record_source("sentiment", "database")
             return RefreshResult(existing, downloaded=False)
 
