@@ -282,7 +282,14 @@ class FeatureAssembler:
         merged = merged.replace([np.inf, -np.inf], np.nan)
         merged = merged.ffill().bfill()
         numeric_cols = merged.select_dtypes(include=[np.number]).columns
-        merged[numeric_cols] = merged[numeric_cols].fillna(0.0)
+
+        beta_columns = [
+            column
+            for column in numeric_cols
+            if feature_categories.get(column) == "macro_beta" or column.startswith("Beta_")
+        ]
+        fill_columns = [column for column in numeric_cols if column not in beta_columns]
+        merged[fill_columns] = merged[fill_columns].fillna(0.0)
 
         merged = merged.assign(Close_Current=merged["Close"])
 
@@ -895,7 +902,7 @@ def _build_cross_sectional_betas(
         frame[name] = series
 
     column_categories = {col: "macro_beta" for col in frame.columns if col != "Date"}
-    return FeatureBlock(frame.fillna(0.0), category="macro", column_categories=column_categories)
+    return FeatureBlock(frame, category="macro", column_categories=column_categories)
 
 
 def _extract_benchmark_series(

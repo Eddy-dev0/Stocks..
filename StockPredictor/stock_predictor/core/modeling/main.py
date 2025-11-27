@@ -2481,14 +2481,11 @@ class StockPredictorAI:
 
         beta_values: Dict[str, Dict[str, float]] = {}
         rationales: list[str] = []
+        missing_labels: set[str] = set()
 
         for column, value in feature_row.items():
             name = str(column)
             if not name.startswith("Beta_"):
-                continue
-
-            numeric_value = self._safe_float(value)
-            if numeric_value is None:
                 continue
 
             parts = name.split("_")
@@ -2496,6 +2493,11 @@ class StockPredictorAI:
                 continue
 
             benchmark_key = parts[1].lower()
+            label = self._format_beta_label(benchmark_key)
+            numeric_value = self._safe_float(value)
+            if numeric_value is None:
+                missing_labels.add(label)
+                continue
             try:
                 window = int(parts[2])
             except (TypeError, ValueError):
@@ -2529,6 +2531,9 @@ class StockPredictorAI:
                 rationales.append(
                     f"{label} beta at {numeric_value:.2f} (<0.7) points to a more defensive risk profile."
                 )
+
+        for label in sorted(missing_labels):
+            rationales.append(f"{label} beta unavailable due to missing benchmark data.")
 
         return beta_values, rationales
 
