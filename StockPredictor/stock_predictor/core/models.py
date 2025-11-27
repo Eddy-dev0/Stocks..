@@ -161,13 +161,27 @@ class ModelFactory:
 
             estimator = create_default_regression_ensemble(**params)
         elif self.model_type in {"lstm", "gru", "transformer"}:
-            from .deep_models import GRURegressor, LSTMRegressor, TransformerRegressor
+            from .deep_models import (
+                GRUClassifier,
+                GRURegressor,
+                LSTMClassifier,
+                LSTMRegressor,
+                TransformerRegressor,
+            )
 
-            model_cls = {
-                "lstm": LSTMRegressor,
-                "gru": GRURegressor,
-                "transformer": TransformerRegressor,
-            }[self.model_type]
+            if task == "classification":
+                model_cls = {
+                    "lstm": LSTMClassifier,
+                    "gru": GRUClassifier,
+                }.get(self.model_type)
+                if model_cls is None:
+                    raise ValueError("Transformer classifier is not implemented.")
+            else:
+                model_cls = {
+                    "lstm": LSTMRegressor,
+                    "gru": GRURegressor,
+                    "transformer": TransformerRegressor,
+                }[self.model_type]
             estimator = _instantiate(model_cls, params)
             needs_scaler = True
         else:
