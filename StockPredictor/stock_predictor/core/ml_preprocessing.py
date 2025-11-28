@@ -79,16 +79,21 @@ class DataFrameSimpleImputer(_BaseDataFrameTransformer):
         # Align stored feature names with the imputer's learned schema to avoid
         # mismatches during ``transform`` if the underlying estimator trims or
         # reorders inputs.
+        expected_features = getattr(
+            self.imputer, "feature_names_in_", frame.columns
+        )
         if hasattr(self.imputer, "get_feature_names_out"):
-            self._set_feature_names(self.imputer.get_feature_names_out())
-        else:
-            self._set_feature_names(frame.columns)
+            expected_features = self.imputer.get_feature_names_out()
+        self._set_feature_names(expected_features)
         return self
 
     def transform(self, X: pd.DataFrame):  # type: ignore[override]
-        frame = _ensure_dataframe(X, columns=self.feature_names_)
+        expected_features = getattr(self.imputer, "feature_names_in_", self.feature_names_)
+        frame = _ensure_dataframe(X, columns=expected_features)
         transformed = self.imputer.transform(frame)
-        return pd.DataFrame(transformed, columns=self.feature_names_, index=frame.index)
+        return pd.DataFrame(
+            transformed, columns=self.feature_names_, index=frame.index
+        )
 
 
 class OutlierClipper(_BaseDataFrameTransformer):
