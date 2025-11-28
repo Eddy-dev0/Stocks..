@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -29,6 +30,7 @@ from ..database import ExperimentTracker
 from ..features import FeatureAssembler
 from ..indicator_bundle import evaluate_signal_confluence
 from ..ml_preprocessing import (
+    DataFrameSimpleImputer,
     PreprocessingBuilder,
     get_feature_names_from_pipeline,
 )
@@ -676,6 +678,91 @@ class StockPredictorAI:
 
         Path(self.config.models_dir).mkdir(parents=True, exist_ok=True)
 
+    def _latest_raw_features(self, raw_feature_columns: Optional[Iterable[str]] = None) -> Optional[pd.DataFrame]:
+        """Return the most recent raw feature frame, respecting stored column order."""
+
+        latest_features = self.metadata.get("latest_features")
+        if not isinstance(latest_features, pd.DataFrame) or latest_features.empty:
+            return None
+
+        columns = list(raw_feature_columns) if raw_feature_columns is not None else list(
+            self.metadata.get("raw_feature_columns") or []
+        )
+        if columns:
+            missing = [col for col in columns if col not in latest_features.columns]
+            if not missing:
+                return latest_features[columns].copy()
+        return latest_features.copy()
+
+    @staticmethod
+    def _extract_imputer_from_pipeline(pipeline: Optional[Pipeline]) -> Optional[DataFrameSimpleImputer]:
+        if pipeline is None:
+            return None
+        for _, step in pipeline.steps:
+            if isinstance(step, DataFrameSimpleImputer):
+                return step
+        imputer = pipeline.named_steps.get("imputer") if hasattr(pipeline, "named_steps") else None
+        if isinstance(imputer, DataFrameSimpleImputer):
+            return imputer
+        return None
+
+    @staticmethod
+    def _imputer_is_fitted(imputer: DataFrameSimpleImputer) -> bool:
+        required_attrs = ("feature_names_", "valid_columns_", "valid_output_columns_")
+        return all(hasattr(imputer, attr) for attr in required_attrs)
+
+    def _ensure_preprocessor_fitted(
+        self,
+        pipeline: Optional[Pipeline],
+        target: str,
+        horizon: int,
+        *,
+        raw_features: Optional[pd.DataFrame] = None,
+        target_series: Optional[pd.Series] = None,
+    ) -> Optional[Pipeline]:
+        """Verify pipelines include a fitted imputer, refitting when necessary."""
+
+        if pipeline is None:
+            return None
+
+        imputer = self._extract_imputer_from_pipeline(pipeline)
+        if imputer is not None and self._imputer_is_fitted(imputer):
+            return pipeline
+
+        LOGGER.warning(
+            "Preprocessor for target '%s' horizon %s is missing fitted imputer state; attempting refit.",
+            target,
+            horizon,
+        )
+
+        raw_features = raw_features if raw_features is not None else self._latest_raw_features()
+        if raw_features is None or raw_features.empty:
+            raise RuntimeError(
+                "Preprocessor for target '%s' at horizon %s is not fitted and no feature data is available to refit. "
+                "Please retrain the model so a fitted preprocessor is saved."
+                % (target, horizon)
+            )
+
+        candidate = pipeline
+        try:
+            candidate.fit(raw_features, target_series)
+        except Exception:
+            template = self.preprocessor_templates.get(horizon)
+            if template is not None:
+                candidate = copy.deepcopy(template)
+            else:
+                builder = PreprocessingBuilder(**self.preprocess_options)
+                candidate = builder.create_pipeline()
+            candidate.fit(raw_features, target_series)
+
+        self.preprocessors[(target, horizon)] = candidate
+        feature_names = get_feature_names_from_pipeline(candidate)
+        if feature_names:
+            feature_map = self.metadata.setdefault("feature_columns_by_target", {})
+            feature_map[(target, horizon)] = feature_names
+            self.metadata["feature_columns"] = feature_names
+        return candidate
+
     def _get_model(self, target: str, horizon: Optional[int] = None) -> Any:
         resolved_horizon = self._resolve_horizon(horizon)
         key = (target, resolved_horizon)
@@ -698,7 +785,13 @@ class StockPredictorAI:
             LOGGER.warning("Failed to load preprocessor for %s horizon %s: %s", target, horizon, exc)
             return None
         self.preprocessors[key] = pipeline
-        feature_names = get_feature_names_from_pipeline(pipeline)
+        pipeline = self._ensure_preprocessor_fitted(
+            pipeline,
+            target,
+            horizon,
+            raw_features=self._latest_raw_features(),
+        )
+        feature_names = get_feature_names_from_pipeline(pipeline) if pipeline is not None else []
         if feature_names:
             feature_map = self.metadata.setdefault("feature_columns_by_target", {})
             feature_map[key] = feature_names
@@ -1750,6 +1843,12 @@ class StockPredictorAI:
                 pipeline = self._load_preprocessor(target, resolved_horizon)
             current_raw = latest_features[raw_feature_columns]
             if pipeline is not None:
+                pipeline = self._ensure_preprocessor_fitted(
+                    pipeline,
+                    target,
+                    resolved_horizon,
+                    raw_features=current_raw,
+                )
                 transformed_features = pipeline.transform(current_raw)
                 feature_names = get_feature_names_from_pipeline(pipeline)
                 if feature_names:
