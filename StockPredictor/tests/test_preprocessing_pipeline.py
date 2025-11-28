@@ -6,6 +6,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+import warnings
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -63,6 +64,26 @@ def test_dataframe_imputer_aligns_missing_columns():
     assert set(["Beta_SP500_21", "Beta_VIX_21", "Volume"]).issubset(
         set(transformed.columns)
     )
+
+
+def test_dataframe_imputer_skips_all_missing_columns_without_warning():
+    frame = pd.DataFrame(
+        {
+            "Beta_SP500_21": [np.nan, np.nan, np.nan],
+            "observed": [1.0, 2.0, 3.0],
+        }
+    )
+    imputer = DataFrameSimpleImputer(strategy="median")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("error")
+        imputer.fit(frame)
+        transformed = imputer.transform(frame)
+
+    assert not caught
+    assert set(transformed.columns) == set(frame.columns)
+    assert transformed["Beta_SP500_21"].isna().all()
+    assert transformed["observed"].notna().all()
 
 
 class _DummyFetcher:
