@@ -110,6 +110,19 @@ class DataFrameSimpleImputer(_BaseDataFrameTransformer):
             for column in self.valid_columns_:
                 frame[column] = imputed[column]
 
+        # Columns that never contained valid values during ``fit`` will still
+        # be filled with ``NaN``. Downstream transformers such as
+        # ``StandardScaler`` issue runtime warnings when encountering columns
+        # that are entirely non-finite, so we replace missing values with a
+        # neutral fallback to stabilise the pipeline.
+        if self.skipped_columns_:
+            frame[self.skipped_columns_] = 0.0
+
+        # As an additional guard, ensure no residual ``NaN`` values leak into
+        # later preprocessing steps.
+        if frame.isna().values.any():
+            frame = frame.fillna(0.0)
+
         return frame[self.feature_names_]
 
 
@@ -130,14 +143,38 @@ class OutlierClipper(_BaseDataFrameTransformer):
         frame = _ensure_dataframe(X)
         self._set_feature_names(frame.columns)
         numeric = frame.to_numpy(dtype=float)
-        self.lower_bounds_ = np.nanquantile(numeric, self.lower_quantile, axis=0)
-        self.upper_bounds_ = np.nanquantile(numeric, self.upper_quantile, axis=0)
+        self.valid_mask_ = np.isfinite(numeric).any(axis=0)
+        if not self.valid_mask_.any():
+            column_count = numeric.shape[1]
+            self.lower_bounds_ = np.zeros(column_count)
+            self.upper_bounds_ = np.zeros(column_count)
+            return self
+
+        self.lower_bounds_ = np.full(numeric.shape[1], np.nan)
+        self.upper_bounds_ = np.full(numeric.shape[1], np.nan)
+
+        valid_numeric = numeric[:, self.valid_mask_]
+        self.lower_bounds_[self.valid_mask_] = np.nanquantile(
+            valid_numeric, self.lower_quantile, axis=0
+        )
+        self.upper_bounds_[self.valid_mask_] = np.nanquantile(
+            valid_numeric, self.upper_quantile, axis=0
+        )
         return self
 
     def transform(self, X: pd.DataFrame):  # type: ignore[override]
         frame = _ensure_dataframe(X, columns=self.feature_names_)
         numeric = frame.to_numpy(dtype=float)
-        clipped = np.clip(numeric, self.lower_bounds_, self.upper_bounds_)
+        clipped = numeric.copy()
+
+        valid_mask = getattr(self, "valid_mask_", np.ones(numeric.shape[1], dtype=bool))
+        if valid_mask.any():
+            lower_bounds = np.asarray(getattr(self, "lower_bounds_", np.nan))
+            upper_bounds = np.asarray(getattr(self, "upper_bounds_", np.nan))
+            clipped[:, valid_mask] = np.clip(
+                numeric[:, valid_mask], lower_bounds[valid_mask], upper_bounds[valid_mask]
+            )
+
         return pd.DataFrame(clipped, columns=self.feature_names_, index=frame.index)
 
 
