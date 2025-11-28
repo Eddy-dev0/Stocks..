@@ -151,7 +151,25 @@ class FundamentalsClient:
 
     def _download_snapshot(self) -> FundamentalSnapshot:
         ticker = yf.Ticker(self.ticker)
-        info: Mapping[str, Any] = getattr(ticker, "info", {}) or {}
+        yf_logger = logging.getLogger("yfinance")
+        previous_level = yf_logger.level
+        # ``yfinance`` logs HTTP errors even when the library recovers by
+        # returning an empty payload. Suppress those noise-level errors while we
+        # handle failures gracefully ourselves.
+        yf_logger.setLevel(logging.CRITICAL)
+
+        try:
+            info_fetcher = getattr(ticker, "get_info", None)
+            if callable(info_fetcher):
+                info: Mapping[str, Any] = info_fetcher() or {}
+            else:
+                info = getattr(ticker, "info", {}) or {}
+        except Exception as exc:
+            LOGGER.info("Fundamentals request failed for %s: %s", self.ticker, exc)
+            info = {}
+        finally:
+            yf_logger.setLevel(previous_level)
+
         if not info:
             LOGGER.debug("No fundamentals returned for %s", self.ticker)
         return normalize_fundamentals_payload(self.ticker, info)
