@@ -11,7 +11,18 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from numbers import Real
-from typing import Any, Callable, DefaultDict, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import (
+    Any,
+    Callable,
+    DefaultDict,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 from zoneinfo import ZoneInfo
 
 import joblib
@@ -2268,15 +2279,18 @@ class StockPredictorAI:
         if not isinstance(features, pd.DataFrame):
             return features
 
-        def _expects_named_features(candidate: Any) -> bool:
-            return bool(candidate is not None and hasattr(candidate, "feature_names_in_"))
+        def _feature_names(candidate: Any) -> Sequence[str] | None:
+            if candidate is None:
+                return None
+            return getattr(candidate, "feature_names_in_", None)
 
         estimator = None
         if hasattr(model, "named_steps") and isinstance(model.named_steps, Mapping):
             estimator = model.named_steps.get("estimator")
 
-        if _expects_named_features(model) or _expects_named_features(estimator):
-            return features
+        expected_features = _feature_names(model) or _feature_names(estimator)
+        if expected_features is not None:
+            return features.reindex(columns=expected_features, fill_value=0)
 
         return features.to_numpy()
 
