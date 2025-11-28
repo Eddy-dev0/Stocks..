@@ -71,29 +71,46 @@ class DataFrameSimpleImputer(_BaseDataFrameTransformer):
     def __init__(self, strategy: str = "median") -> None:
         self.strategy = strategy
         self.imputer = SimpleImputer(strategy=strategy)
+        self.valid_columns_: list[str] = []
+        self.skipped_columns_: list[str] = []
+        self.valid_output_columns_: list[str] = []
 
     def fit(self, X: pd.DataFrame, y=None):  # type: ignore[override]
         frame = _ensure_dataframe(X)
         self.imputer.set_params(strategy=self.strategy)
-        self.imputer.fit(frame, y)
-        # Align stored feature names with the imputer's learned schema to avoid
-        # mismatches during ``transform`` if the underlying estimator trims or
-        # reorders inputs.
-        expected_features = getattr(
-            self.imputer, "feature_names_in_", frame.columns
-        )
-        if hasattr(self.imputer, "get_feature_names_out"):
-            expected_features = self.imputer.get_feature_names_out()
-        self._set_feature_names(expected_features)
+        self.valid_columns_ = [col for col in frame.columns if frame[col].notna().any()]
+        self.skipped_columns_ = [col for col in frame.columns if col not in self.valid_columns_]
+
+        if self.valid_columns_:
+            self.imputer.fit(frame[self.valid_columns_], y)
+            # Align stored feature names with the imputer's learned schema to avoid
+            # mismatches during ``transform`` if the underlying estimator trims or
+            # reorders inputs.
+            expected_features = getattr(
+                self.imputer, "feature_names_in_", self.valid_columns_
+            )
+            if hasattr(self.imputer, "get_feature_names_out"):
+                expected_features = self.imputer.get_feature_names_out()
+            self.valid_output_columns_ = list(expected_features)
+        else:
+            # No columns contain observed values; keep state minimal to allow transform
+            self.valid_output_columns_ = []
+
+        self._set_feature_names(frame.columns)
         return self
 
     def transform(self, X: pd.DataFrame):  # type: ignore[override]
-        expected_features = getattr(self.imputer, "feature_names_in_", self.feature_names_)
-        frame = _ensure_dataframe(X, columns=expected_features)
-        transformed = self.imputer.transform(frame)
-        return pd.DataFrame(
-            transformed, columns=self.feature_names_, index=frame.index
-        )
+        frame = _ensure_dataframe(X, columns=self.feature_names_)
+
+        if self.valid_columns_:
+            transformed = self.imputer.transform(frame[self.valid_columns_])
+            imputed = pd.DataFrame(
+                transformed, columns=self.valid_output_columns_, index=frame.index
+            )
+            for column in self.valid_columns_:
+                frame[column] = imputed[column]
+
+        return frame[self.feature_names_]
 
 
 class OutlierClipper(_BaseDataFrameTransformer):
