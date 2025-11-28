@@ -2288,7 +2288,9 @@ class StockPredictorAI:
         if hasattr(model, "named_steps") and isinstance(model.named_steps, Mapping):
             estimator = model.named_steps.get("estimator")
 
-        expected_features = _feature_names(model) or _feature_names(estimator)
+        model_features = _feature_names(model)
+        estimator_features = None if model_features is not None else _feature_names(estimator)
+        expected_features = model_features if model_features is not None else estimator_features
         if expected_features is not None:
             return features.reindex(columns=expected_features, fill_value=0)
 
