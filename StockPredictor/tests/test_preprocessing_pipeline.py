@@ -12,7 +12,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from stock_predictor.core import PredictorConfig, StockPredictorAI
-from stock_predictor.core.ml_preprocessing import PreprocessingBuilder
+from stock_predictor.core.ml_preprocessing import (
+    DataFrameSimpleImputer,
+    PreprocessingBuilder,
+)
 
 
 def test_preprocessing_pipeline_handles_non_finite_values():
@@ -42,6 +45,26 @@ def test_preprocessing_pipeline_reduces_dimensions_with_pca():
     assert transformed.shape[1] <= 2
 
 
+def test_dataframe_imputer_aligns_missing_columns():
+    original = pd.DataFrame(
+        {
+            "Beta_SP500_21": [0.1, 0.2],
+            "Beta_VIX_21": [0.05, 0.06],
+            "Volume": [1.0, 2.0],
+        }
+    )
+    imputer = DataFrameSimpleImputer(strategy="most_frequent")
+    imputer.fit(original)
+
+    # Simulate a fresh feature build missing previously seen beta columns.
+    refreshed = original.drop(columns=["Beta_SP500_21", "Beta_VIX_21"])
+    transformed = imputer.transform(refreshed)
+
+    assert set(["Beta_SP500_21", "Beta_VIX_21", "Volume"]).issubset(
+        set(transformed.columns)
+    )
+
+
 class _DummyFetcher:
     def __init__(self, price_df: pd.DataFrame, fundamentals_df: pd.DataFrame | None = None) -> None:
         self._price_df = price_df
@@ -57,6 +80,20 @@ class _DummyFetcher:
         if self._fundamentals_df is None:
             return pd.DataFrame()
         return self._fundamentals_df.copy()
+
+    def fetch_indicator_data(self, category: str = "macro") -> pd.DataFrame:
+        if category != "macro":
+            return pd.DataFrame()
+        dates = pd.to_datetime(self._price_df["Date"])
+        sp500 = np.linspace(3_800, 4_000, len(dates))
+        vix = np.linspace(18, 22, len(dates))
+        return pd.DataFrame(
+            {
+                "Date": list(dates) * 2,
+                "Indicator": ["macro:^GSPC"] * len(dates) + ["macro:^VIX"] * len(dates),
+                "Value": list(sp500) + list(vix),
+            }
+        )
 
     def get_data_sources(self) -> list[str]:
         return ["dummy"]
