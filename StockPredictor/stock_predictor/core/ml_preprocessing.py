@@ -77,6 +77,7 @@ class DataFrameSimpleImputer(_BaseDataFrameTransformer):
 
     def fit(self, X: pd.DataFrame, y=None):  # type: ignore[override]
         frame = _ensure_dataframe(X)
+        self._set_feature_names(frame.columns)
         self.imputer.set_params(strategy=self.strategy)
         self.valid_columns_ = [col for col in frame.columns if frame[col].notna().any()]
         self.skipped_columns_ = [col for col in frame.columns if col not in self.valid_columns_]
@@ -96,10 +97,15 @@ class DataFrameSimpleImputer(_BaseDataFrameTransformer):
             # No columns contain observed values; keep state minimal to allow transform
             self.valid_output_columns_ = []
 
-        self._set_feature_names(frame.columns)
         return self
 
     def transform(self, X: pd.DataFrame):  # type: ignore[override]
+        if not hasattr(self, "feature_names_"):
+            raise RuntimeError("DataFrameSimpleImputer must be fitted before transform().")
+
+        if not hasattr(self, "valid_columns_") or not hasattr(self, "valid_output_columns_"):
+            raise RuntimeError("DataFrameSimpleImputer must be fitted before transform().")
+
         frame = _ensure_dataframe(X, columns=self.feature_names_)
 
         if self.valid_columns_:
