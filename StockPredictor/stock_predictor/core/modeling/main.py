@@ -80,6 +80,8 @@ LOGGER = logging.getLogger(__name__)
 
 DEFAULT_EXPECTED_LOW_SIGMA = 1.0
 DEFAULT_STOP_LOSS_MULTIPLIER = 1.0
+DEFAULT_EXPECTED_LOW_MAX_VOLATILITY = 1.0
+DEFAULT_EXPECTED_LOW_FLOOR_WINDOW = 20
 
 
 LabelFunction = Callable[[pd.DataFrame, int, Any], pd.Series]
@@ -224,6 +226,55 @@ def _historical_drift_volatility(
     return float(log_returns.mean()), float(log_returns.std())
 
 
+def _max_drawdown_fraction(price_df: pd.DataFrame | None) -> float | None:
+    """Return the magnitude of the worst historical drawdown as a fraction."""
+
+    if price_df is None or price_df.empty:
+        return None
+
+    lower_columns = {column.lower(): column for column in price_df.columns}
+    close_column = lower_columns.get("close") or lower_columns.get("adj close")
+    if close_column is None:
+        return None
+
+    closes = pd.to_numeric(price_df[close_column], errors="coerce").dropna()
+    if closes.empty:
+        return None
+
+    running_max = closes.cummax()
+    drawdowns = closes / running_max - 1.0
+    if drawdowns.empty:
+        return None
+
+    worst_drawdown = float(drawdowns.min())
+    return abs(worst_drawdown)
+
+
+def _trailing_low(price_df: pd.DataFrame | None, window: int) -> float | None:
+    """Return the lowest recent price over the trailing *window* period."""
+
+    if price_df is None or price_df.empty or window <= 0:
+        return None
+
+    lower_columns = {column.lower(): column for column in price_df.columns}
+    low_column = (
+        lower_columns.get("low")
+        or lower_columns.get("l")
+        or lower_columns.get("close")
+        or lower_columns.get("adj close")
+    )
+    if low_column is None:
+        return None
+
+    lows = pd.to_numeric(price_df[low_column], errors="coerce").dropna()
+    if lows.empty:
+        return None
+
+    if len(lows) > window:
+        lows = lows.tail(window)
+    return float(lows.min())
+
+
 class ModelNotFoundError(FileNotFoundError):
     """Raised when a persisted model for a target/horizon cannot be located."""
 
@@ -350,6 +401,18 @@ class StockPredictorAI:
                 price_history = price_history.sort_values("Date").reset_index(drop=True)
             else:
                 price_history = price_history.sort_index().reset_index(drop=True)
+
+            trailing_window = getattr(
+                self.config, "expected_low_floor_window", DEFAULT_EXPECTED_LOW_FLOOR_WINDOW
+            )
+            trailing_low = _trailing_low(price_history, int(trailing_window))
+            if trailing_low is not None:
+                metadata["trailing_low"] = float(trailing_low)
+                metadata["trailing_low_window"] = int(trailing_window)
+
+            max_drawdown_fraction = _max_drawdown_fraction(price_history)
+            if max_drawdown_fraction is not None:
+                metadata["max_drawdown_fraction"] = float(max_drawdown_fraction)
 
             lower_map = {column.lower(): column for column in price_history.columns}
             close_column = lower_map.get("close")
@@ -2278,6 +2341,18 @@ class StockPredictorAI:
             "horizon": resolved_horizon,
             "target_date": _to_iso(target_date) or "",
         }
+        trailing_low_value = None
+        drawdown_fraction = None
+        if isinstance(getattr(self, "metadata", None), Mapping):
+            trailing_low_value = self._safe_float(self.metadata.get("trailing_low"))
+            drawdown_fraction = self._safe_float(self.metadata.get("max_drawdown_fraction"))
+        if trailing_low_value is not None:
+            result["trailing_low"] = trailing_low_value
+            trailing_window = getattr(self, "metadata", {}).get("trailing_low_window")
+            if trailing_window is not None:
+                result["trailing_low_window"] = trailing_window
+        if drawdown_fraction is not None:
+            result["max_drawdown_fraction"] = drawdown_fraction
         if confluence_block:
             result["signal_confluence"] = confluence_block
         if combined_confidence is not None:
@@ -2365,7 +2440,12 @@ class StockPredictorAI:
         prediction_intervals: Mapping[str, Dict[str, float]] | None,
         indicator_floor: float | None = None,
     ) -> Optional[float]:
-        """Estimate a conservative lower bound for the forecasted close."""
+        """Estimate a conservative lower bound for the forecasted close.
+
+        ``predicted_volatility`` is expected as a fractional value (e.g., ``0.02``
+        for 2%). Values outside ``[0, 1]`` will be interpreted defensively and
+        clipped to guard against percentage-scale inputs.
+        """
 
         def _extract_lower_bound(block: Mapping[str, Any] | None) -> Optional[float]:
             if not isinstance(block, Mapping):
@@ -2416,17 +2496,56 @@ class StockPredictorAI:
             if quantile_value is not None:
                 return quantile_value
 
+        floor_candidates: list[float] = []
         indicator_value = self._safe_float(indicator_floor)
         if indicator_value is not None and indicator_value > 0:
-            return float(indicator_value)
+            floor_candidates.append(indicator_value)
+        trailing_low = None
+        if isinstance(getattr(self, "metadata", None), Mapping):
+            trailing_low = self.metadata.get("trailing_low")
+        trailing_low_value = self._safe_float(trailing_low)
+        if trailing_low_value is not None and trailing_low_value > 0:
+            floor_candidates.append(trailing_low_value)
+        floor_value = max(floor_candidates) if floor_candidates else None
 
         numeric_close = self._safe_float(predicted_close)
         volatility_value = self._safe_float(predicted_volatility)
         if numeric_close is None:
-            return None
+            return floor_value
         if volatility_value is None:
-            return numeric_close
+            base_low = float(numeric_close)
+            if floor_value is not None:
+                base_low = max(base_low, floor_value)
+            return float(base_low)
+
         volatility_pct = abs(float(volatility_value))
+        if volatility_pct > 1.0 and volatility_pct <= 100:
+            LOGGER.warning(
+                "Predicted volatility %.4f interpreted as percentage; expected fractional (e.g., 0.02).",
+                volatility_pct,
+            )
+            volatility_pct /= 100.0
+
+        max_volatility = self._safe_float(
+            getattr(self.config, "expected_low_max_volatility", DEFAULT_EXPECTED_LOW_MAX_VOLATILITY)
+        )
+        if max_volatility is None or max_volatility <= 0:
+            max_volatility = DEFAULT_EXPECTED_LOW_MAX_VOLATILITY
+
+        historical_cap = None
+        if isinstance(getattr(self, "metadata", None), Mapping):
+            historical_cap = self._safe_float(self.metadata.get("max_drawdown_fraction"))
+        cap_candidates = [value for value in (max_volatility, historical_cap) if value and value > 0]
+        volatility_cap = min(cap_candidates) if cap_candidates else max_volatility
+
+        if volatility_pct > volatility_cap:
+            LOGGER.warning(
+                "Predicted volatility %.4f exceeds cap %.4f; clipping.",
+                volatility_pct,
+                volatility_cap,
+            )
+            volatility_pct = volatility_cap
+
         multiplier = getattr(self.config, "expected_low_sigma", DEFAULT_EXPECTED_LOW_SIGMA)
         try:
             multiplier_value = float(multiplier)
@@ -2438,7 +2557,10 @@ class StockPredictorAI:
         if not np.isfinite(delta):
             delta = 0.0
         expected_low = float(numeric_close - delta)
-        return float(max(0.0, expected_low))
+        expected_low = max(0.0, expected_low)
+        if floor_value is not None:
+            expected_low = max(expected_low, floor_value)
+        return float(expected_low)
 
     def _compute_stop_loss(
         self,

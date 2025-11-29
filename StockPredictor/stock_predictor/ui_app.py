@@ -468,6 +468,12 @@ class StockPredictorDesktopApp:
         self._suspend_expected_low_trace = False
         self.expected_low_multiplier_var = tk.DoubleVar(value=1.0)
         self.expected_low_multiplier = 1.0
+        self.expected_low_max_volatility = _safe_float(
+            getattr(self.config, "expected_low_max_volatility", 1.0)
+        ) or 1.0
+        self.expected_low_floor_window = int(
+            getattr(self.config, "expected_low_floor_window", 20)
+        )
         self.expected_low_multiplier_var.trace_add(
             "write", self._on_expected_low_multiplier_changed
         )
@@ -3131,6 +3137,41 @@ class StockPredictorDesktopApp:
                 return float(min(numeric_values))
             return None
 
+        def _max_drawdown_from_history(frame: pd.DataFrame | None) -> float | None:
+            if frame is None or frame.empty:
+                return None
+            lower_columns = {column.lower(): column for column in frame.columns}
+            close_column = lower_columns.get("close") or lower_columns.get("adj close")
+            if close_column is None:
+                return None
+            closes = pd.to_numeric(frame[close_column], errors="coerce").dropna()
+            if closes.empty:
+                return None
+            running_max = closes.cummax()
+            drawdowns = closes / running_max - 1.0
+            if drawdowns.empty:
+                return None
+            return float(abs(drawdowns.min()))
+
+        def _trailing_low_from_history(frame: pd.DataFrame | None, window: int) -> float | None:
+            if frame is None or frame.empty or window <= 0:
+                return None
+            lower_columns = {column.lower(): column for column in frame.columns}
+            low_column = (
+                lower_columns.get("low")
+                or lower_columns.get("l")
+                or lower_columns.get("close")
+                or lower_columns.get("adj close")
+            )
+            if low_column is None:
+                return None
+            lows = pd.to_numeric(frame[low_column], errors="coerce").dropna()
+            if lows.empty:
+                return None
+            if len(lows) > window:
+                lows = lows.tail(window)
+            return float(lows.min())
+
         intervals = prediction.get("prediction_intervals")
         if isinstance(intervals, Mapping):
             close_interval = intervals.get("close")
@@ -3158,16 +3199,47 @@ class StockPredictorDesktopApp:
         indicator_low = _safe_float(prediction.get("indicator_expected_low"))
         if indicator_low is None:
             indicator_low = self._indicator_expected_low_from_local_data()
+
+        trailing_window = int(
+            _safe_float(prediction.get("trailing_low_window"))
+            or self.expected_low_floor_window
+        )
+        trailing_low_prediction = _safe_float(prediction.get("trailing_low"))
+
+        frame_source: pd.DataFrame | None = None
+        price_history_converted = getattr(self, "price_history_converted", None)
+        if isinstance(price_history_converted, pd.DataFrame) and not price_history_converted.empty:
+            frame_source = price_history_converted
+        else:
+            price_history = getattr(self, "price_history", None)
+            if isinstance(price_history, pd.DataFrame) and not price_history.empty:
+                frame_source = price_history
+
+        trailing_low_history = _trailing_low_from_history(frame_source, trailing_window)
+        trailing_low_candidates = [
+            value
+            for value in (trailing_low_prediction, trailing_low_history)
+            if value is not None
+        ]
+        trailing_low_value = max(trailing_low_candidates) if trailing_low_candidates else None
+
+        floor_candidates: list[float] = []
         if indicator_low is not None and indicator_low > 0:
-            return float(indicator_low)
+            floor_candidates.append(indicator_low)
+        if trailing_low_value is not None and trailing_low_value > 0:
+            floor_candidates.append(trailing_low_value)
+        floor_value = max(floor_candidates) if floor_candidates else None
 
         predicted_close = _safe_float(prediction.get("predicted_close"))
         predicted_volatility = _safe_float(prediction.get("predicted_volatility"))
         fallback = _safe_float(prediction.get("expected_low"))
         if predicted_close is None:
-            return fallback
+            return floor_value if floor_value is not None else fallback
         if predicted_volatility is None:
-            return fallback if fallback is not None else predicted_close
+            base_low = fallback if fallback is not None else predicted_close
+            if floor_value is not None:
+                base_low = max(base_low, floor_value)
+            return float(base_low)
         scale = multiplier if multiplier is not None else self.expected_low_multiplier
         try:
             scale_value = float(scale)
@@ -3176,12 +3248,37 @@ class StockPredictorDesktopApp:
         if not np.isfinite(scale_value):
             scale_value = self.expected_low_multiplier
         scale_value = max(0.0, scale_value)
+
         volatility_pct = abs(float(predicted_volatility))
+        if volatility_pct > 1.0 and volatility_pct <= 100:
+            LOGGER.warning(
+                "Predicted volatility %.4f interpreted as percentage; expected fractional (e.g., 0.02).",
+                volatility_pct,
+            )
+            volatility_pct /= 100.0
+
+        max_volatility = self.expected_low_max_volatility if self.expected_low_max_volatility > 0 else 1.0
+        historical_cap = _safe_float(prediction.get("max_drawdown_fraction"))
+        if historical_cap is None:
+            historical_cap = _max_drawdown_from_history(frame_source)
+        cap_candidates = [value for value in (max_volatility, historical_cap) if value and value > 0]
+        volatility_cap = min(cap_candidates) if cap_candidates else max_volatility
+        if volatility_pct > volatility_cap:
+            LOGGER.warning(
+                "Predicted volatility %.4f exceeds cap %.4f; clipping.",
+                volatility_pct,
+                volatility_cap,
+            )
+            volatility_pct = volatility_cap
+
         delta = predicted_close * volatility_pct * scale_value
         if not np.isfinite(delta):
             delta = 0.0
         expected_low = predicted_close - delta
-        return float(max(0.0, expected_low))
+        expected_low = max(0.0, expected_low)
+        if floor_value is not None:
+            expected_low = max(expected_low, floor_value)
+        return float(expected_low)
 
     def _indicator_expected_low_from_local_data(self) -> float | None:
         frames: list[pd.DataFrame] = []
