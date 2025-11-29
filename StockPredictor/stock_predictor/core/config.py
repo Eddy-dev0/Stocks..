@@ -171,7 +171,7 @@ class PredictorConfig:
     sentiment_confidence_adjustment: bool = False
     sentiment_confidence_window: int = 7
     sentiment_confidence_weight: float = 0.2
-    monte_carlo_paths: int = 1_000
+    monte_carlo_paths: int = 500_000
     # Provide a local CSV file path to enable the CSVPriceLoader provider.
     csv_price_loader_path: Path | None = None
     # Provide a local Parquet file path to enable the ParquetPriceLoader provider.
@@ -310,7 +310,7 @@ class PredictorConfig:
         try:
             self.monte_carlo_paths = int(self.monte_carlo_paths)
         except (TypeError, ValueError):
-            self.monte_carlo_paths = 1_000
+            self.monte_carlo_paths = 500_000
         if self.monte_carlo_paths <= 0:
             raise ValueError("monte_carlo_paths must be a positive integer.")
         if isinstance(self.buy_zone, Mapping):
