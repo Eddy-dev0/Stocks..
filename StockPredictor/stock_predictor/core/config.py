@@ -190,6 +190,9 @@ class PredictorConfig:
     memory_cache_seconds: float | None = None
     market_timezone: str | None = None
     k_stop: float = 1.0
+    expected_low_sigma: float = 1.0
+    expected_low_max_volatility: float = 1.0
+    expected_low_floor_window: int = 20
     time_series_baselines: tuple[str, ...] = field(default_factory=tuple)
     time_series_params: dict[str, dict[str, Any]] = field(default_factory=dict)
     buy_zone: BuyZoneConfirmationSettings = field(
