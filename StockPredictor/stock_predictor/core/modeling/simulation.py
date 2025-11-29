@@ -12,7 +12,7 @@ def run_monte_carlo(
     drift: float,
     volatility: float,
     horizon: int,
-    paths: int = 10_000,
+    paths: int = 500_000,
     random_state: int | None = None,
 ) -> float:
     """Estimate the probability of hitting ``target_price`` within ``horizon`` steps.
