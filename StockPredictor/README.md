@@ -42,6 +42,9 @@ geometric Brownian motion with constant drift and volatility, normally distribut
 log-returns, and no jumps or regime shifts. Paths start from the latest observed
 price with drift/volatility inferred from recent log returns, and the reported
 probability reflects the share of simulated paths that hit the target at any step.
+By default the system simulates 1,000 scenarios to sharpen the probability
+estimate; set ``STOCK_PREDICTOR_MONTE_CARLO_PATHS`` to increase or decrease the
+computational depth as needed.
 
 ## Project layout
 
