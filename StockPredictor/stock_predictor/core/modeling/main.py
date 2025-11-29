@@ -59,7 +59,7 @@ from ..models import (
 )
 from ..sentiment import aggregate_daily_sentiment, attach_sentiment
 from ..time_series import evaluate_time_series_baselines
-from .simulation import run_monte_carlo
+from .simulation import run_monte_carlo, run_monte_carlo_adaptive
 
 
 def _simulate_direction_bootstrap(
@@ -2098,21 +2098,51 @@ class StockPredictorAI:
 
             if drift_value is not None and volatility_value is not None:
                 paths = int(self.config.monte_carlo_paths)
-                monte_carlo_target_probability = run_monte_carlo(
-                    current_price=float(latest_close),
-                    target_price=float(target_price_value),
-                    drift=float(drift_value),
-                    volatility=float(volatility_value),
-                    horizon=int(resolved_horizon),
-                    paths=paths,
-                )
+                precision_target = getattr(self.config, "monte_carlo_precision", None)
+                max_paths = getattr(self.config, "monte_carlo_max_paths", None)
+
+                if precision_target is not None and max_paths is not None:
+                    (
+                        monte_carlo_target_probability,
+                        used_paths,
+                        standard_error,
+                    ) = run_monte_carlo_adaptive(
+                        current_price=float(latest_close),
+                        target_price=float(target_price_value),
+                        drift=float(drift_value),
+                        volatility=float(volatility_value),
+                        horizon=int(resolved_horizon),
+                        initial_paths=paths,
+                        max_paths=int(max_paths),
+                        precision_target=float(precision_target),
+                    )
+                else:
+                    monte_carlo_target_probability = run_monte_carlo(
+                        current_price=float(latest_close),
+                        target_price=float(target_price_value),
+                        drift=float(drift_value),
+                        volatility=float(volatility_value),
+                        horizon=int(resolved_horizon),
+                        paths=paths,
+                    )
+                    used_paths = paths
+                    standard_error = None
+
                 event_probabilities["monte_carlo_target_hit"] = {
                     "probability": monte_carlo_target_probability,
-                    "paths": paths,
+                    "paths": used_paths,
                     "drift": float(drift_value),
                     "volatility": float(volatility_value),
                     "method": "geometric_brownian_motion",
                 }
+                if precision_target is not None:
+                    event_probabilities["monte_carlo_target_hit"][
+                        "precision_target"
+                    ] = float(precision_target)
+                if standard_error is not None:
+                    event_probabilities["monte_carlo_target_hit"][
+                        "standard_error"
+                    ] = float(standard_error)
 
         indicator_floor, indicator_components = self._indicator_support_floor()
         expected_low = self._compute_expected_low(

@@ -172,6 +172,8 @@ class PredictorConfig:
     sentiment_confidence_window: int = 7
     sentiment_confidence_weight: float = 0.2
     monte_carlo_paths: int = 500_000
+    monte_carlo_precision: float | None = None
+    monte_carlo_max_paths: int | None = None
     direction_bootstrap_enabled: bool = True
     direction_bootstrap_paths: int = 2_000_000
     direction_bootstrap_workers: int | None = None
@@ -317,6 +319,20 @@ class PredictorConfig:
             self.monte_carlo_paths = 500_000
         if self.monte_carlo_paths <= 0:
             raise ValueError("monte_carlo_paths must be a positive integer.")
+        if self.monte_carlo_precision is not None:
+            try:
+                self.monte_carlo_precision = float(self.monte_carlo_precision)
+            except (TypeError, ValueError):
+                self.monte_carlo_precision = None
+            if self.monte_carlo_precision is not None and self.monte_carlo_precision <= 0:
+                raise ValueError("monte_carlo_precision must be positive when set.")
+        if self.monte_carlo_max_paths is not None:
+            try:
+                self.monte_carlo_max_paths = int(self.monte_carlo_max_paths)
+            except (TypeError, ValueError):
+                self.monte_carlo_max_paths = None
+            if self.monte_carlo_max_paths is not None and self.monte_carlo_max_paths <= 0:
+                raise ValueError("monte_carlo_max_paths must be positive when set.")
         self.direction_bootstrap_enabled = bool(self.direction_bootstrap_enabled)
         try:
             self.direction_bootstrap_paths = int(self.direction_bootstrap_paths)
@@ -554,6 +570,8 @@ def build_config(
     evaluation_fee_bps: Optional[float] = None,
     evaluation_fixed_cost: Optional[float] = None,
     monte_carlo_paths: Optional[int] = None,
+    monte_carlo_precision: Optional[float] = None,
+    monte_carlo_max_paths: Optional[int] = None,
     direction_bootstrap_enabled: Optional[bool] = None,
     direction_bootstrap_paths: Optional[int] = None,
     direction_bootstrap_workers: Optional[int] = None,
@@ -617,6 +635,26 @@ def build_config(
             monte_carlo_paths_int = int(monte_carlo_paths_value)
         except (TypeError, ValueError):
             monte_carlo_paths_int = None
+
+    monte_carlo_precision_value = monte_carlo_precision or os.getenv(
+        "STOCK_PREDICTOR_MONTE_CARLO_PRECISION"
+    )
+    monte_carlo_precision_float: float | None = None
+    if monte_carlo_precision_value is not None:
+        try:
+            monte_carlo_precision_float = float(monte_carlo_precision_value)
+        except (TypeError, ValueError):
+            monte_carlo_precision_float = None
+
+    monte_carlo_max_paths_value = monte_carlo_max_paths or os.getenv(
+        "STOCK_PREDICTOR_MONTE_CARLO_MAX_PATHS"
+    )
+    monte_carlo_max_paths_int: int | None = None
+    if monte_carlo_max_paths_value is not None:
+        try:
+            monte_carlo_max_paths_int = int(monte_carlo_max_paths_value)
+        except (TypeError, ValueError):
+            monte_carlo_max_paths_int = None
 
     bootstrap_enabled_value = direction_bootstrap_enabled
     if bootstrap_enabled_value is None:
@@ -748,9 +786,13 @@ def build_config(
         "evaluation_fixed_cost": evaluation_fixed_cost
         if evaluation_fixed_cost is not None
         else 0.0,
-    } 
+    }
     if monte_carlo_paths_int is not None:
         config_kwargs["monte_carlo_paths"] = monte_carlo_paths_int
+    if monte_carlo_precision_float is not None:
+        config_kwargs["monte_carlo_precision"] = monte_carlo_precision_float
+    if monte_carlo_max_paths_int is not None:
+        config_kwargs["monte_carlo_max_paths"] = monte_carlo_max_paths_int
     if bootstrap_enabled_value is not None:
         config_kwargs["direction_bootstrap_enabled"] = bool(bootstrap_enabled_value)
     if bootstrap_paths_int is not None:
@@ -964,6 +1006,16 @@ def load_config_from_mapping(payload: Mapping[str, Any]) -> PredictorConfig:
             data["monte_carlo_paths"] = int(data["monte_carlo_paths"])
         except (TypeError, ValueError):
             data.pop("monte_carlo_paths")
+    if "monte_carlo_precision" in data:
+        try:
+            data["monte_carlo_precision"] = float(data["monte_carlo_precision"])
+        except (TypeError, ValueError):
+            data.pop("monte_carlo_precision")
+    if "monte_carlo_max_paths" in data:
+        try:
+            data["monte_carlo_max_paths"] = int(data["monte_carlo_max_paths"])
+        except (TypeError, ValueError):
+            data.pop("monte_carlo_max_paths")
     if "direction_bootstrap_enabled" in data:
         data["direction_bootstrap_enabled"] = _coerce_bool(
             data["direction_bootstrap_enabled"], default=True
