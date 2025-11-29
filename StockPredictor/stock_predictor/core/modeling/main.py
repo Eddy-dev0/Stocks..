@@ -306,6 +306,20 @@ class StockPredictorAI:
         self.preprocess_options: dict[str, Any] = {}
         self.metadata: Dict[str, Any] = {}
 
+    def _refresh_feature_assembler(self) -> None:
+        """Rebuild the feature assembler if the toggle state has changed."""
+
+        if self.feature_assembler is None:
+            self.feature_assembler = FeatureAssembler(
+                self.config.feature_toggles, self.config.prediction_horizons
+            )
+            return
+
+        if self.feature_assembler.feature_toggles != self.config.feature_toggles:
+            self.feature_assembler = FeatureAssembler(
+                self.config.feature_toggles, self.config.prediction_horizons
+            )
+
     # ------------------------------------------------------------------
     # Data acquisition
     # ------------------------------------------------------------------
@@ -327,6 +341,8 @@ class StockPredictorAI:
         *,
         force_live_price: bool = False,
     ) -> tuple[pd.DataFrame, dict[int, Dict[str, pd.Series]], dict[int, Pipeline]]:
+        self._refresh_feature_assembler()
+
         if price_df is None:
             price_df = self.fetcher.fetch_price_data()
         if news_df is None and self.config.sentiment:
