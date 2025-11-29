@@ -2079,17 +2079,18 @@ class StockPredictorAI:
                 volatility_value = float(predicted_volatility)
 
             if drift_value is not None and volatility_value is not None:
+                paths = int(self.config.monte_carlo_paths)
                 monte_carlo_target_probability = run_monte_carlo(
                     current_price=float(latest_close),
                     target_price=float(target_price_value),
                     drift=float(drift_value),
                     volatility=float(volatility_value),
                     horizon=int(resolved_horizon),
-                    paths=10_000,
+                    paths=paths,
                 )
                 event_probabilities["monte_carlo_target_hit"] = {
                     "probability": monte_carlo_target_probability,
-                    "paths": 10_000,
+                    "paths": paths,
                     "drift": float(drift_value),
                     "volatility": float(volatility_value),
                     "method": "geometric_brownian_motion",

@@ -171,6 +171,7 @@ class PredictorConfig:
     sentiment_confidence_adjustment: bool = False
     sentiment_confidence_window: int = 7
     sentiment_confidence_weight: float = 0.2
+    monte_carlo_paths: int = 1_000
     # Provide a local CSV file path to enable the CSVPriceLoader provider.
     csv_price_loader_path: Path | None = None
     # Provide a local Parquet file path to enable the ParquetPriceLoader provider.
@@ -306,6 +307,12 @@ class PredictorConfig:
             self.k_stop = 1.0
         if not math.isfinite(self.k_stop) or self.k_stop <= 0:
             self.k_stop = 1.0
+        try:
+            self.monte_carlo_paths = int(self.monte_carlo_paths)
+        except (TypeError, ValueError):
+            self.monte_carlo_paths = 1_000
+        if self.monte_carlo_paths <= 0:
+            raise ValueError("monte_carlo_paths must be a positive integer.")
         if isinstance(self.buy_zone, Mapping):
             self.buy_zone = BuyZoneConfirmationSettings.from_mapping(self.buy_zone)
         elif not isinstance(self.buy_zone, BuyZoneConfirmationSettings):
@@ -521,6 +528,7 @@ def build_config(
     evaluation_slippage_bps: Optional[float] = None,
     evaluation_fee_bps: Optional[float] = None,
     evaluation_fixed_cost: Optional[float] = None,
+    monte_carlo_paths: Optional[int] = None,
 ) -> PredictorConfig:
     """Build a :class:`PredictorConfig` instance from string parameters."""
 
@@ -570,6 +578,16 @@ def build_config(
             memory_cache_float = float(memory_cache_value)
         except (TypeError, ValueError):
             memory_cache_float = None
+
+    monte_carlo_paths_value = monte_carlo_paths or os.getenv(
+        "STOCK_PREDICTOR_MONTE_CARLO_PATHS"
+    )
+    monte_carlo_paths_int: int | None = None
+    if monte_carlo_paths_value is not None:
+        try:
+            monte_carlo_paths_int = int(monte_carlo_paths_value)
+        except (TypeError, ValueError):
+            monte_carlo_paths_int = None
 
     stop_loss_value = k_stop
     if stop_loss_value is None:
@@ -660,6 +678,8 @@ def build_config(
         if evaluation_fixed_cost is not None
         else 0.0,
     }
+    if monte_carlo_paths_int is not None:
+        config_kwargs["monte_carlo_paths"] = monte_carlo_paths_int
     if stop_loss_value is not None:
         config_kwargs["k_stop"] = stop_loss_value
 
@@ -860,6 +880,11 @@ def load_config_from_mapping(payload: Mapping[str, Any]) -> PredictorConfig:
             data["k_stop"] = float(data["k_stop"])
         except (TypeError, ValueError):
             data.pop("k_stop")
+    if "monte_carlo_paths" in data:
+        try:
+            data["monte_carlo_paths"] = int(data["monte_carlo_paths"])
+        except (TypeError, ValueError):
+            data.pop("monte_carlo_paths")
 
     config = PredictorConfig(**data)  # type: ignore[arg-type]
     config.ensure_directories()
