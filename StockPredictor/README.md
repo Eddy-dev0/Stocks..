@@ -44,7 +44,11 @@ price with drift/volatility inferred from recent log returns, and the reported
 probability reflects the share of simulated paths that hit the target at any step.
 By default the system simulates 500,000 scenarios to sharpen the probability
 estimate; set ``STOCK_PREDICTOR_MONTE_CARLO_PATHS`` to increase or decrease the
-computational depth as needed.
+computational depth as needed. For even tighter estimates, provide
+``STOCK_PREDICTOR_MONTE_CARLO_PRECISION`` alongside
+``STOCK_PREDICTOR_MONTE_CARLO_MAX_PATHS`` to enable adaptive batching that keeps
+running until the simulated hit probability's standard error drops below the
+requested precision (or the path budget is exhausted).
 
 ## Project layout
 
