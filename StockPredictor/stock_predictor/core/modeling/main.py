@@ -11,6 +11,7 @@ import os
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from itertools import repeat
 from pathlib import Path
 from numbers import Real
 from typing import (
@@ -57,8 +58,23 @@ from ..models import (
     regression_metrics,
 )
 from ..sentiment import aggregate_daily_sentiment, attach_sentiment
-from .simulation import run_monte_carlo
 from ..time_series import evaluate_time_series_baselines
+from .simulation import run_monte_carlo
+
+
+def _simulate_direction_bootstrap(
+    seed: int, size: int, mean_return: float, predicted_volatility: float
+) -> tuple[int, int]:
+    """Simulate bootstrapped returns for direction refinement."""
+
+    if size <= 0:
+        return 0, 0
+
+    rng = np.random.default_rng(seed)
+    returns = rng.normal(loc=mean_return, scale=predicted_volatility, size=size)
+    up = int(np.count_nonzero(returns > 0))
+    down = int(size - up)
+    return up, down
 
 LOGGER = logging.getLogger(__name__)
 
@@ -3175,17 +3191,11 @@ class StockPredictorAI:
         seed_seq = np.random.SeedSequence()
         seeds = seed_seq.generate_state(len(chunk_sizes)).tolist()
 
-        def _simulate(seed: int, size: int) -> tuple[int, int]:
-            if size <= 0:
-                return 0, 0
-            rng = np.random.default_rng(seed)
-            returns = rng.normal(loc=mean_return, scale=predicted_volatility, size=size)
-            up = int(np.count_nonzero(returns > 0))
-            down = int(size - up)
-            return up, down
-
         with mp.Pool(processes=workers) as pool:
-            results = pool.starmap(_simulate, zip(seeds, chunk_sizes))
+            results = pool.starmap(
+                _simulate_direction_bootstrap,
+                zip(seeds, chunk_sizes, repeat(mean_return), repeat(predicted_volatility)),
+            )
 
         total_up = sum(up for up, _ in results)
         total_down = sum(down for _, down in results)
