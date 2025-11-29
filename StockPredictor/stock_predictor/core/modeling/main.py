@@ -6,6 +6,8 @@ import copy
 import json
 import logging
 import math
+import multiprocessing as mp
+import os
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -2190,6 +2192,17 @@ class StockPredictorAI:
             direction_probability_down,
         )
 
+        (
+            direction_probability_up,
+            direction_probability_down,
+        ) = self._refine_direction_probability(
+            direction_probability_up,
+            direction_probability_down,
+            predicted_return,
+            predicted_volatility,
+            resolved_horizon,
+        )
+
         if sentiment_factor is not None and isinstance(probabilities.get("direction"), dict):
             probabilities["direction"] = {
                 "up": direction_probability_up,
@@ -3110,6 +3123,105 @@ class StockPredictorAI:
                 adjusted_down = float(adjusted_down_raw / total)
 
         return adjusted_confidence, adjusted_up, adjusted_down, sentiment_factor
+
+    def _refine_direction_probability(
+        self,
+        direction_probability_up: Optional[float],
+        direction_probability_down: Optional[float],
+        predicted_return: Optional[float],
+        predicted_volatility: Optional[float],
+        horizon: Optional[int],
+    ) -> tuple[Optional[float], Optional[float]]:
+        """Boost direction probabilities with CPU-intensive bootstrap sampling."""
+
+        if not getattr(self.config, "direction_bootstrap_enabled", True):
+            return direction_probability_up, direction_probability_down
+
+        try:
+            total_paths = int(getattr(self.config, "direction_bootstrap_paths", 0))
+        except (TypeError, ValueError):
+            return direction_probability_up, direction_probability_down
+
+        if total_paths <= 0:
+            return direction_probability_up, direction_probability_down
+
+        if predicted_volatility is None or not np.isfinite(predicted_volatility):
+            return direction_probability_up, direction_probability_down
+
+        cpu_count = os.cpu_count() or 1
+        workers_value = getattr(self.config, "direction_bootstrap_workers", None)
+        try:
+            workers = int(workers_value) if workers_value is not None else cpu_count
+        except (TypeError, ValueError):
+            workers = cpu_count
+        workers = max(1, min(workers, cpu_count))
+
+        chunk_sizes = [
+            total_paths // workers + (1 if idx < total_paths % workers else 0)
+            for idx in range(workers)
+        ]
+
+        if not any(chunk_sizes):
+            return direction_probability_up, direction_probability_down
+
+        mean_return = 0.0
+        if predicted_return is not None and np.isfinite(predicted_return):
+            try:
+                horizon_days = max(int(horizon or 1), 1)
+            except (TypeError, ValueError):
+                horizon_days = 1
+            mean_return = float(predicted_return) / float(horizon_days)
+
+        seed_seq = np.random.SeedSequence()
+        seeds = seed_seq.generate_state(len(chunk_sizes)).tolist()
+
+        def _simulate(seed: int, size: int) -> tuple[int, int]:
+            if size <= 0:
+                return 0, 0
+            rng = np.random.default_rng(seed)
+            returns = rng.normal(loc=mean_return, scale=predicted_volatility, size=size)
+            up = int(np.count_nonzero(returns > 0))
+            down = int(size - up)
+            return up, down
+
+        with mp.Pool(processes=workers) as pool:
+            results = pool.starmap(_simulate, zip(seeds, chunk_sizes))
+
+        total_up = sum(up for up, _ in results)
+        total_down = sum(down for _, down in results)
+        total_samples = total_up + total_down
+        if total_samples <= 0:
+            return direction_probability_up, direction_probability_down
+
+        refined_up = float(total_up / total_samples)
+        refined_down = float(total_down / total_samples)
+
+        try:
+            blend_weight = float(getattr(self.config, "direction_bootstrap_blend", 0.65))
+        except (TypeError, ValueError):
+            blend_weight = 0.65
+        blend_weight = max(0.0, min(1.0, blend_weight))
+
+        base_up = direction_probability_up
+        base_down = direction_probability_down
+
+        if base_up is None and base_down is None:
+            return refined_up, refined_down
+
+        if base_up is None:
+            return refined_up, refined_down
+
+        if base_down is None:
+            return refined_up, refined_down
+
+        adjusted_up = blend_weight * refined_up + (1 - blend_weight) * float(base_up)
+        adjusted_down = blend_weight * refined_down + (1 - blend_weight) * float(base_down)
+        total = adjusted_up + adjusted_down
+        if total > 0:
+            adjusted_up /= total
+            adjusted_down /= total
+
+        return float(adjusted_up), float(adjusted_down)
 
     def _apply_trend_alignment_adjustment(
         self, combined_confidence: Optional[float]
