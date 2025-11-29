@@ -2142,7 +2142,17 @@ class StockPredictorAI:
             if sentiment_error:
                 snapshot_meta["error"] = sentiment_error
 
+        indicator_floor, indicator_components = self._indicator_support_floor()
+        expected_low = self._compute_expected_low(
+            close_prediction,
+            predicted_volatility,
+            quantile_forecasts=quantile_forecasts,
+            prediction_intervals=prediction_intervals,
+            indicator_floor=indicator_floor,
+        )
+
         monte_carlo_target_probability = None
+        monte_carlo_iterations = None
         target_price_value = self.metadata.get("target_price")
         if (
             target_price_value is not None
@@ -2162,34 +2172,137 @@ class StockPredictorAI:
             if drift_value is not None and volatility_value is not None:
                 paths = int(self.config.monte_carlo_paths)
                 precision_target = getattr(self.config, "monte_carlo_precision", None)
-                max_paths = getattr(self.config, "monte_carlo_max_paths", None)
+                precision_value = float(precision_target) if precision_target is not None else 0.001
+                max_paths_config = getattr(self.config, "monte_carlo_max_paths", None)
+                max_paths_value = int(max_paths_config) if max_paths_config is not None else 2_000_000
+                min_paths_required = max(
+                    1_000_000, int(getattr(self.config, "monte_carlo_min_paths", 0) or 0)
+                )
+                max_paths_value = max(max_paths_value, min_paths_required)
 
-                if precision_target is not None and max_paths is not None:
+                recalibration_threshold = self._safe_float(
+                    getattr(self.config, "monte_carlo_recalibration_threshold", 0.01)
+                )
+                if recalibration_threshold is None or recalibration_threshold <= 0:
+                    recalibration_threshold = 0.01
+                max_iterations_config = getattr(self.config, "monte_carlo_max_iterations", None)
+                max_iterations = (
+                    int(max_iterations_config)
+                    if max_iterations_config is not None
+                    else None
+                )
+
+                cumulative_paths = 0
+                cumulative_hits = 0.0
+                standard_error = None
+                expected_close_value = self._safe_float(close_prediction)
+
+                def _material_shift(previous: float | None, updated: float | None) -> bool:
+                    if updated is None:
+                        return False
+                    if previous is None:
+                        return True
+                    baseline = expected_close_value or latest_close or 1.0
+                    baseline = abs(baseline) if baseline else 1.0
+                    return abs(updated - previous) / baseline >= recalibration_threshold
+
+                def _recalibrate_volatility(
+                    base_volatility: float,
+                    close_value: float | None,
+                    low_value: float | None,
+                    historical_vol: float | None,
+                ) -> float:
+                    candidates: list[float] = []
+                    if base_volatility is not None:
+                        candidates.append(float(base_volatility))
+                    if historical_vol is not None:
+                        candidates.append(float(historical_vol))
+                    if close_value is not None and low_value is not None and close_value != 0:
+                        implied_volatility = abs(close_value - low_value) / abs(close_value)
+                        candidates.append(float(implied_volatility))
+                    finite_candidates = [value for value in candidates if np.isfinite(value)]
+                    if not finite_candidates:
+                        return base_volatility
+                    return max(finite_candidates)
+
+                expected_low_value = expected_low
+                monte_carlo_iterations = 0
+
+                while cumulative_paths < max_paths_value and (
+                    max_iterations is None or monte_carlo_iterations < max_iterations
+                ):
+                    monte_carlo_iterations += 1
+                    remaining_budget = max_paths_value - cumulative_paths
+                    initial_paths = min(paths, remaining_budget)
                     (
-                        monte_carlo_target_probability,
+                        probability,
                         used_paths,
-                        standard_error,
+                        iteration_standard_error,
                     ) = run_monte_carlo_adaptive(
                         current_price=float(latest_close),
                         target_price=float(target_price_value),
                         drift=float(drift_value),
                         volatility=float(volatility_value),
                         horizon=int(resolved_horizon),
-                        initial_paths=paths,
-                        max_paths=int(max_paths),
-                        precision_target=float(precision_target),
+                        initial_paths=initial_paths,
+                        max_paths=remaining_budget,
+                        precision_target=float(precision_value),
                     )
-                else:
-                    monte_carlo_target_probability = run_monte_carlo(
-                        current_price=float(latest_close),
-                        target_price=float(target_price_value),
-                        drift=float(drift_value),
-                        volatility=float(volatility_value),
-                        horizon=int(resolved_horizon),
-                        paths=paths,
+
+                    cumulative_hits += probability * used_paths
+                    cumulative_paths += used_paths
+                    if cumulative_paths <= 0:
+                        break
+
+                    monte_carlo_target_probability = float(cumulative_hits) / float(
+                        cumulative_paths
                     )
-                    used_paths = paths
-                    standard_error = None
+                    standard_error = float(
+                        np.sqrt(
+                            monte_carlo_target_probability
+                            * (1 - monte_carlo_target_probability)
+                            / cumulative_paths
+                        )
+                    )
+
+                    updated_expected_low = self._compute_expected_low(
+                        close_prediction,
+                        volatility_value,
+                        quantile_forecasts=quantile_forecasts,
+                        prediction_intervals=prediction_intervals,
+                        indicator_floor=indicator_floor,
+                    )
+                    updated_expected_close = self._safe_float(predictions.get("close"))
+                    if updated_expected_close is not None:
+                        expected_close_value = updated_expected_close
+
+                    shift_detected = _material_shift(expected_low_value, updated_expected_low) or _material_shift(
+                        expected_close_value, updated_expected_close
+                    )
+                    if updated_expected_low is not None:
+                        expected_low_value = updated_expected_low
+
+                    if shift_detected:
+                        if expected_close_value is not None and resolved_horizon:
+                            drift_value = float(expected_close_value - latest_close) / float(
+                                resolved_horizon
+                            )
+                        volatility_value = _recalibrate_volatility(
+                            float(volatility_value),
+                            expected_close_value,
+                            expected_low_value,
+                            hist_vol,
+                        )
+
+                    precision_met = bool(
+                        standard_error is not None and standard_error <= float(precision_value)
+                    )
+                    min_paths_met = cumulative_paths >= min_paths_required
+                    if precision_met and min_paths_met and not shift_detected:
+                        break
+
+                used_paths = cumulative_paths
+                expected_low = expected_low_value
 
                 event_probabilities["monte_carlo_target_hit"] = {
                     "probability": monte_carlo_target_probability,
@@ -2197,24 +2310,22 @@ class StockPredictorAI:
                     "drift": float(drift_value),
                     "volatility": float(volatility_value),
                     "method": "geometric_brownian_motion",
+                    "iterations": monte_carlo_iterations,
                 }
-                if precision_target is not None:
-                    event_probabilities["monte_carlo_target_hit"][
-                        "precision_target"
-                    ] = float(precision_target)
+                event_probabilities["monte_carlo_target_hit"]["precision_target"] = float(
+                    precision_value
+                )
                 if standard_error is not None:
-                    event_probabilities["monte_carlo_target_hit"][
-                        "standard_error"
-                    ] = float(standard_error)
+                    event_probabilities["monte_carlo_target_hit"]["standard_error"] = float(
+                        standard_error
+                    )
+                event_probabilities["monte_carlo_target_hit"]["min_paths"] = int(
+                    min_paths_required
+                )
+                event_probabilities["monte_carlo_target_hit"][
+                    "stabilized_probability"
+                ] = monte_carlo_target_probability
 
-        indicator_floor, indicator_components = self._indicator_support_floor()
-        expected_low = self._compute_expected_low(
-            close_prediction,
-            predicted_volatility,
-            quantile_forecasts=quantile_forecasts,
-            prediction_intervals=prediction_intervals,
-            indicator_floor=indicator_floor,
-        )
         stop_loss = self._compute_stop_loss(
             close_prediction,
             predicted_volatility,
@@ -2336,6 +2447,8 @@ class StockPredictorAI:
             "direction_probability_down": direction_probability_down,
             "target_hit_probability": target_hit_probability,
             "monte_carlo_target_hit_probability": monte_carlo_target_probability,
+            "monte_carlo_stabilized_probability": monte_carlo_target_probability,
+            "monte_carlo_iterations": monte_carlo_iterations,
             "target_price": self.metadata.get("target_price"),
             "predictions": predictions,
             "horizon": resolved_horizon,
