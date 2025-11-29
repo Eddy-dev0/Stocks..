@@ -172,6 +172,10 @@ class PredictorConfig:
     sentiment_confidence_window: int = 7
     sentiment_confidence_weight: float = 0.2
     monte_carlo_paths: int = 500_000
+    direction_bootstrap_enabled: bool = True
+    direction_bootstrap_paths: int = 2_000_000
+    direction_bootstrap_workers: int | None = None
+    direction_bootstrap_blend: float = 0.65
     # Provide a local CSV file path to enable the CSVPriceLoader provider.
     csv_price_loader_path: Path | None = None
     # Provide a local Parquet file path to enable the ParquetPriceLoader provider.
@@ -313,6 +317,27 @@ class PredictorConfig:
             self.monte_carlo_paths = 500_000
         if self.monte_carlo_paths <= 0:
             raise ValueError("monte_carlo_paths must be a positive integer.")
+        self.direction_bootstrap_enabled = bool(self.direction_bootstrap_enabled)
+        try:
+            self.direction_bootstrap_paths = int(self.direction_bootstrap_paths)
+        except (TypeError, ValueError):
+            self.direction_bootstrap_paths = 2_000_000
+        if self.direction_bootstrap_paths <= 0:
+            raise ValueError("direction_bootstrap_paths must be a positive integer.")
+
+        if self.direction_bootstrap_workers is not None:
+            try:
+                self.direction_bootstrap_workers = int(self.direction_bootstrap_workers)
+            except (TypeError, ValueError):
+                self.direction_bootstrap_workers = None
+            if self.direction_bootstrap_workers is not None and self.direction_bootstrap_workers <= 0:
+                self.direction_bootstrap_workers = None
+
+        try:
+            self.direction_bootstrap_blend = float(self.direction_bootstrap_blend)
+        except (TypeError, ValueError):
+            self.direction_bootstrap_blend = 0.65
+        self.direction_bootstrap_blend = max(0.0, min(1.0, self.direction_bootstrap_blend))
         if isinstance(self.buy_zone, Mapping):
             self.buy_zone = BuyZoneConfirmationSettings.from_mapping(self.buy_zone)
         elif not isinstance(self.buy_zone, BuyZoneConfirmationSettings):
@@ -529,6 +554,10 @@ def build_config(
     evaluation_fee_bps: Optional[float] = None,
     evaluation_fixed_cost: Optional[float] = None,
     monte_carlo_paths: Optional[int] = None,
+    direction_bootstrap_enabled: Optional[bool] = None,
+    direction_bootstrap_paths: Optional[int] = None,
+    direction_bootstrap_workers: Optional[int] = None,
+    direction_bootstrap_blend: Optional[float] = None,
 ) -> PredictorConfig:
     """Build a :class:`PredictorConfig` instance from string parameters."""
 
@@ -588,6 +617,48 @@ def build_config(
             monte_carlo_paths_int = int(monte_carlo_paths_value)
         except (TypeError, ValueError):
             monte_carlo_paths_int = None
+
+    bootstrap_enabled_value = direction_bootstrap_enabled
+    if bootstrap_enabled_value is None:
+        bootstrap_enabled_env = os.getenv("STOCK_PREDICTOR_DIRECTION_BOOTSTRAP_ENABLED")
+        if isinstance(bootstrap_enabled_env, str):
+            bootstrap_enabled_value = bootstrap_enabled_env.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            }
+
+    bootstrap_paths_value = direction_bootstrap_paths or os.getenv(
+        "STOCK_PREDICTOR_DIRECTION_BOOTSTRAP_PATHS"
+    )
+    bootstrap_paths_int: int | None = None
+    if bootstrap_paths_value is not None:
+        try:
+            bootstrap_paths_int = int(bootstrap_paths_value)
+        except (TypeError, ValueError):
+            bootstrap_paths_int = None
+
+    bootstrap_workers_value = direction_bootstrap_workers or os.getenv(
+        "STOCK_PREDICTOR_DIRECTION_BOOTSTRAP_WORKERS"
+    )
+    bootstrap_workers_int: int | None = None
+    if bootstrap_workers_value is not None:
+        try:
+            bootstrap_workers_int = int(bootstrap_workers_value)
+        except (TypeError, ValueError):
+            bootstrap_workers_int = None
+
+    bootstrap_blend_value = direction_bootstrap_blend or os.getenv(
+        "STOCK_PREDICTOR_DIRECTION_BOOTSTRAP_BLEND"
+    )
+    bootstrap_blend_float: float | None = None
+    if bootstrap_blend_value is not None:
+        try:
+            bootstrap_blend_float = float(bootstrap_blend_value)
+        except (TypeError, ValueError):
+            bootstrap_blend_float = None
 
     stop_loss_value = k_stop
     if stop_loss_value is None:
@@ -677,9 +748,17 @@ def build_config(
         "evaluation_fixed_cost": evaluation_fixed_cost
         if evaluation_fixed_cost is not None
         else 0.0,
-    }
+    } 
     if monte_carlo_paths_int is not None:
         config_kwargs["monte_carlo_paths"] = monte_carlo_paths_int
+    if bootstrap_enabled_value is not None:
+        config_kwargs["direction_bootstrap_enabled"] = bool(bootstrap_enabled_value)
+    if bootstrap_paths_int is not None:
+        config_kwargs["direction_bootstrap_paths"] = bootstrap_paths_int
+    if bootstrap_workers_int is not None:
+        config_kwargs["direction_bootstrap_workers"] = bootstrap_workers_int
+    if bootstrap_blend_float is not None:
+        config_kwargs["direction_bootstrap_blend"] = bootstrap_blend_float
     if stop_loss_value is not None:
         config_kwargs["k_stop"] = stop_loss_value
 
@@ -885,6 +964,29 @@ def load_config_from_mapping(payload: Mapping[str, Any]) -> PredictorConfig:
             data["monte_carlo_paths"] = int(data["monte_carlo_paths"])
         except (TypeError, ValueError):
             data.pop("monte_carlo_paths")
+    if "direction_bootstrap_enabled" in data:
+        data["direction_bootstrap_enabled"] = _coerce_bool(
+            data["direction_bootstrap_enabled"], default=True
+        )
+    if "direction_bootstrap_paths" in data:
+        try:
+            data["direction_bootstrap_paths"] = int(data["direction_bootstrap_paths"])
+        except (TypeError, ValueError):
+            data.pop("direction_bootstrap_paths")
+    if "direction_bootstrap_workers" in data:
+        try:
+            workers_val = int(data["direction_bootstrap_workers"])
+            if workers_val > 0:
+                data["direction_bootstrap_workers"] = workers_val
+            else:
+                data.pop("direction_bootstrap_workers")
+        except (TypeError, ValueError):
+            data.pop("direction_bootstrap_workers")
+    if "direction_bootstrap_blend" in data:
+        try:
+            data["direction_bootstrap_blend"] = float(data["direction_bootstrap_blend"])
+        except (TypeError, ValueError):
+            data.pop("direction_bootstrap_blend")
 
     config = PredictorConfig(**data)  # type: ignore[arg-type]
     config.ensure_directories()
