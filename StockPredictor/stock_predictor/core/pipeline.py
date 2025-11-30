@@ -446,7 +446,10 @@ class MarketDataETL:
         LOGGER.info("Computing technical indicators for %s", self.config.ticker)
         enriched = compute_price_features(
             price_frame,
-            feature_toggles=self.config.price_feature_toggles,
+            feature_toggles={
+                **self.config.feature_toggles,
+                **self.config.price_feature_toggles,
+            },
             macro_symbols=self.config.macro_merge_symbols,
         )
         indicator_columns_attr = enriched.attrs.get("indicator_columns")
