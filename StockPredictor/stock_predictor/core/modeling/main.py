@@ -331,6 +331,22 @@ class StockPredictorAI:
         LOGGER.info("Data refresh completed for %s", self.config.ticker)
         return summary
 
+    def refresh_indicators(
+        self, price_frame: pd.DataFrame | None = None, *, force: bool = False
+    ) -> int:
+        """Refresh technical indicators through the ETL layer.
+
+        The UI rebuilds the pipeline when feature toggles change and expects a
+        ``refresh_indicators`` method to be available. Delegate to the
+        underlying ETL implementation when reachable, returning the number of
+        indicators inserted.
+        """
+
+        etl = getattr(self.fetcher, "etl", None)
+        if etl is None:
+            raise AttributeError("Indicator refresh not available on this fetcher")
+        return etl.refresh_indicators(price_frame, force=force)
+
     # ------------------------------------------------------------------
     # Feature engineering
     # ------------------------------------------------------------------
