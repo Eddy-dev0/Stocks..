@@ -98,3 +98,43 @@ def test_macro_series_are_merged_when_available():
 
     assert expected.issubset(features.columns)
     assert np.isclose(features.loc[1, "Macro_VIX_Close"], macro_df.loc[1, "Close_^VIX"])
+
+
+def test_group_level_feature_toggles_drive_price_features():
+    price_df = _base_price_frame()
+    macro_df = pd.DataFrame(
+        {
+            "Date": price_df["Date"],
+            "Close_^VIX": np.linspace(15.0, 18.0, len(price_df)),
+        }
+    )
+
+    disabled_features = compute_price_features(
+        price_df,
+        feature_toggles={"volume_liquidity": False, "macro": False},
+        macro_df=macro_df,
+    )
+
+    for column in [
+        "Volume_OBV",
+        "VWMomentum_5",
+        "Orderflow_Imbalance_5",
+        "Macro_VIX_Close",
+    ]:
+        assert column not in disabled_features.columns
+
+    enabled_features = compute_price_features(
+        price_df,
+        feature_toggles={"volume_liquidity": True, "macro": True},
+        macro_df=macro_df,
+    )
+
+    expected_columns = {
+        "Volume_OBV",
+        "VWMomentum_5",
+        "Orderflow_Imbalance_5",
+        "Macro_VIX_Close",
+        "Macro_VIX_Return",
+    }
+
+    assert expected_columns.issubset(enabled_features.columns)

@@ -38,6 +38,7 @@ from stock_predictor.core import (
 )
 from stock_predictor.core.pipeline import NoPriceDataError, resolve_market_timezone
 from stock_predictor.core.features import FEATURE_REGISTRY
+from stock_predictor.core.preprocessing import derive_price_feature_toggles
 from stock_predictor.core.support_levels import indicator_support_floor
 
 LOGGER = logging.getLogger(__name__)
@@ -2723,8 +2724,31 @@ class StockPredictorDesktopApp:
             else:
                 toggles[name] = bool(self.config.feature_toggles.get(name, False))
         self.config.feature_toggles = toggles
+        self.config.price_feature_toggles = derive_price_feature_toggles(toggles)
         self.application.pipeline = StockPredictorAI(self.config)
-        self._set_status("Feature toggles updated. Re-run prediction to apply changes.")
+        status_message = "Feature toggles updated."
+        self._set_busy(True, "Recomputing indicators for updated feature toggles…")
+        try:
+            indicators_built = self.application.pipeline.refresh_indicators(force=True)
+            indicators: pd.DataFrame | None = None
+            try:
+                indicators = self.application.pipeline.fetcher.fetch_indicator_data()
+            except Exception as exc:  # pragma: no cover - optional data source
+                LOGGER.debug("Indicator dataset unavailable after refresh: %s", exc)
+            self.indicator_history = indicators if isinstance(indicators, pd.DataFrame) else None
+            self.indicator_history_converted = None
+            self._indicator_selection_cache = set()
+            self._indicator_user_override = False
+            self._update_indicator_view()
+            if indicators_built:
+                status_message = f"Feature toggles updated. {indicators_built} indicators refreshed."
+            else:
+                status_message = "Feature toggles updated. No indicators available for this selection."
+        except Exception as exc:  # pragma: no cover - defensive UI update
+            LOGGER.exception("Failed to refresh indicators after toggling features: %s", exc)
+            status_message = "Feature toggles updated. Re-run prediction to apply changes."
+        finally:
+            self._set_busy(False, status_message)
 
     def _apply_ticker_change(self, raw_value: str | None) -> None:
         if self._busy:

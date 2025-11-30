@@ -57,32 +57,64 @@ PRICE_FEATURE_DEFAULTS: dict[str, bool] = {
 }
 
 
+# Map higher-level feature groups to the concrete price feature toggles they
+# control so UI and configuration changes can stay in sync.
+FEATURE_GROUP_PRICE_MAPPING: dict[str, tuple[str, ...]] = {
+    "volume_liquidity": ("obv", "volume_weighted_momentum", "orderflow"),
+    "macro": ("macro_merge",),
+}
+
+
 def default_price_feature_toggles() -> dict[str, bool]:
     return dict(PRICE_FEATURE_DEFAULTS)
+
+
+def _normalise_toggle_entries(
+    toggles: Mapping[str, object] | Iterable[str] | None,
+) -> list[tuple[str, object]]:
+    if toggles is None:
+        return []
+
+    if isinstance(toggles, Mapping):
+        source = toggles.items()
+    elif isinstance(toggles, str):
+        source = ((token, True) for token in toggles.split(","))
+    else:
+        source = ((token, True) for token in toggles)
+
+    entries: list[tuple[str, object]] = []
+    for key, value in source:
+        name = str(key).strip().lower()
+        if not name:
+            continue
+        entries.append((name, value))
+    return entries
+
+
+def derive_price_feature_toggles(
+    toggles: Mapping[str, object] | Iterable[str] | None,
+) -> dict[str, bool]:
+    """Expand group-level feature toggles into concrete price feature flags."""
+
+    defaults = default_price_feature_toggles()
+    entries = _normalise_toggle_entries(toggles)
+
+    for name, enabled in entries:
+        if name in FEATURE_GROUP_PRICE_MAPPING:
+            for feature_name in FEATURE_GROUP_PRICE_MAPPING[name]:
+                defaults[feature_name] = bool(enabled)
+
+    for name, enabled in entries:
+        if name in defaults:
+            defaults[name] = bool(enabled)
+
+    return defaults
 
 
 def _coerce_price_feature_toggles(
     toggles: Mapping[str, object] | Iterable[str] | None,
 ) -> dict[str, bool]:
-    defaults = default_price_feature_toggles()
-    if toggles is None:
-        return defaults
-
-    normalised: dict[str, bool] = {}
-    if isinstance(toggles, Mapping):
-        source = toggles.items()
-    else:
-        if isinstance(toggles, str):
-            source = ((token, True) for token in toggles.split(","))
-        else:
-            source = ((token, True) for token in toggles)
-    for key, enabled in source:
-        name = str(key).strip().lower()
-        if name in defaults:
-            normalised[name] = bool(enabled)
-
-    defaults.update(normalised)
-    return defaults
+    return derive_price_feature_toggles(toggles)
 
 
 def compute_price_features(
