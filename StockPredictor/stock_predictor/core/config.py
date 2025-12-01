@@ -724,6 +724,9 @@ def build_config(
             baseline_params = {}
     elif isinstance(params_value, Mapping):
         baseline_params = dict(params_value)
+    if price_feature_toggles is None and feature_toggles is not None:
+        price_feature_toggles = feature_toggles
+
     config_kwargs: dict[str, Any] = {
         "ticker": ticker.upper(),
         "start_date": start_dt,
