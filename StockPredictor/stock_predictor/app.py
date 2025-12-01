@@ -53,6 +53,8 @@ class StockPredictorApplication:
         """Create an application instance using environment variables and overrides."""
 
         load_environment()
+        if "feature_toggles" in overrides and "price_feature_toggles" not in overrides:
+            overrides["price_feature_toggles"] = overrides["feature_toggles"]
         overrides.setdefault(
             "ticker", os.getenv("STOCK_PREDICTOR_DEFAULT_TICKER", "AAPL")
         )

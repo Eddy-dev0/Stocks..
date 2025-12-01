@@ -58,6 +58,14 @@ class ForecastRequest(BaseModel):
         ge=1,
         description="Optional number of periods ahead to forecast.",
     )
+    feature_toggles: dict[str, bool] | None = Field(
+        default=None,
+        description=(
+            "Optional map of feature-group toggles keyed by registry name. "
+            "Supported keys: elliott, fundamental, macro, sentiment, technical, volume_liquidity."
+        ),
+        example={"technical": True, "macro": False},
+    )
 
 
 class BacktestRequest(BaseModel):
@@ -66,6 +74,14 @@ class BacktestRequest(BaseModel):
     targets: list[str] | None = Field(
         default=None,
         description="Optional list of targets to include in the backtest.",
+    )
+    feature_toggles: dict[str, bool] | None = Field(
+        default=None,
+        description=(
+            "Optional map of feature-group toggles keyed by registry name. "
+            "Supported keys: elliott, fundamental, macro, sentiment, technical, volume_liquidity."
+        ),
+        example={"technical": True, "macro": False},
     )
 
 
@@ -81,6 +97,14 @@ class TrainRequest(BaseModel):
         ge=1,
         description="Optional forecast horizon to train against.",
     )
+    feature_toggles: dict[str, bool] | None = Field(
+        default=None,
+        description=(
+            "Optional map of feature-group toggles keyed by registry name. "
+            "Supported keys: elliott, fundamental, macro, sentiment, technical, volume_liquidity."
+        ),
+        example={"technical": True, "macro": False},
+    )
 
 
 class BuyZoneRequest(BaseModel):
@@ -89,6 +113,14 @@ class BuyZoneRequest(BaseModel):
     refresh: bool = Field(
         default=True,
         description="Refresh underlying data sources before computing the buy zone.",
+    )
+    feature_toggles: dict[str, bool] | None = Field(
+        default=None,
+        description=(
+            "Optional map of feature-group toggles keyed by registry name. "
+            "Supported keys: elliott, fundamental, macro, sentiment, technical, volume_liquidity."
+        ),
+        example={"technical": True, "macro": False},
     )
 
 
@@ -231,7 +263,9 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
 
     @app.post("/forecasts/{ticker}", dependencies=[Depends(require_api_key)])
     async def forecast(ticker: str, request: ForecastRequest) -> Dict[str, Any]:
-        application = await _build_application(ticker, {})
+        application = await _build_application(
+            ticker, {"feature_toggles": request.feature_toggles}
+        )
         result = await _call_with_error_handling(
             application.predict,
             targets=request.targets,
@@ -242,13 +276,17 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
 
     @app.post("/backtests/{ticker}", dependencies=[Depends(require_api_key)])
     async def backtest(ticker: str, request: BacktestRequest) -> Dict[str, Any]:
-        application = await _build_application(ticker, {})
+        application = await _build_application(
+            ticker, {"feature_toggles": request.feature_toggles}
+        )
         result = await _call_with_error_handling(application.backtest, targets=request.targets)
         return {"status": "ok", "backtest": result}
 
     @app.post("/train/{ticker}", dependencies=[Depends(require_api_key)])
     async def retrain(ticker: str, request: TrainRequest) -> Dict[str, Any]:
-        application = await _build_application(ticker, {})
+        application = await _build_application(
+            ticker, {"feature_toggles": request.feature_toggles}
+        )
         refresh_result = await _call_with_error_handling(application.refresh_data, force=False)
         metrics = await _call_with_error_handling(
             application.train, targets=request.targets, horizon=request.horizon
@@ -261,7 +299,9 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
         response_model=BuyZoneEnvelope,
     )
     async def buy_zone(ticker: str, request: BuyZoneRequest) -> BuyZoneEnvelope:
-        application = await _build_application(ticker, {})
+        application = await _build_application(
+            ticker, {"feature_toggles": request.feature_toggles}
+        )
         result = await _call_with_error_handling(
             application.buy_zone,
             refresh=request.refresh,
