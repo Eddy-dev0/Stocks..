@@ -16,7 +16,7 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 from dotenv import load_dotenv
 
 from .features import FEATURE_REGISTRY, default_feature_toggles
-from .preprocessing import default_price_feature_toggles
+from .preprocessing import default_price_feature_toggles, derive_price_feature_toggles
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
@@ -859,25 +859,8 @@ def _coerce_price_feature_toggles(
     if value is None:
         return defaults
 
-    toggles: dict[str, bool] = {}
-    if isinstance(value, Mapping):
-        for key, enabled in value.items():
-            name = str(key).strip().lower()
-            if name in defaults:
-                toggles[name] = bool(enabled)
-    else:
-        if isinstance(value, str):
-            tokens = [part.strip() for part in value.split(",")]
-        else:
-            tokens = [str(item).strip() for item in value]
-        for token in tokens:
-            if not token:
-                continue
-            name = token.lower()
-            if name in defaults:
-                toggles[name] = True
-
-    defaults.update(toggles)
+    expanded = derive_price_feature_toggles(value)
+    defaults.update(expanded)
     return defaults
 
 
