@@ -28,6 +28,7 @@ for key, value in {
     "research_response": None,
     "buy_zone_response": None,
     "insights_response": None,
+    "live_price_response": None,
 }.items():
     st.session_state.setdefault(key, value)
 
@@ -95,6 +96,55 @@ def _coerce_dataframe(payload: Any) -> pd.DataFrame | None:
         if payload:
             return pd.DataFrame({"value": payload})
     return None
+
+
+def _format_currency(value: Any) -> str:
+    if value is None:
+        return "—"
+    try:
+        return f"${float(value):,.2f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _format_percentage(value: Any) -> str:
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value) * 100:.2f}%"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _build_live_price_table(snapshot: Dict[str, Any]) -> pd.DataFrame:
+    probabilities = snapshot.get("probabilities") or {}
+    rows = [
+        {"Metric": "Ticker", "Value": snapshot.get("ticker")},
+        {"Metric": "Market time", "Value": snapshot.get("market_time")},
+        {"Metric": "Last price", "Value": _format_currency(snapshot.get("last_price"))},
+        {
+            "Metric": "Predicted close",
+            "Value": _format_currency(snapshot.get("predicted_close")),
+        },
+        {
+            "Metric": "Expected change %",
+            "Value": _format_percentage(snapshot.get("expected_change_pct")),
+        },
+        {
+            "Metric": "Expected low",
+            "Value": _format_currency(snapshot.get("expected_low")),
+        },
+        {"Metric": "Stop-loss", "Value": _format_currency(snapshot.get("stop_loss"))},
+        {
+            "Metric": "Probability up",
+            "Value": _format_percentage(probabilities.get("up")),
+        },
+        {
+            "Metric": "Probability down",
+            "Value": _format_percentage(probabilities.get("down")),
+        },
+    ]
+    return pd.DataFrame(rows)
 
 
 def _beta_band_description(level: str) -> str:
@@ -459,6 +509,39 @@ with st.sidebar:
     if use_custom_horizon:
         horizon_value = st.number_input("Forecast horizon", min_value=1, max_value=365, value=5, step=1)
 
+    st.header("Live model inputs")
+    expected_change_pct_model = st.number_input(
+        "Expected change % (decimal)",
+        value=0.0,
+        step=0.001,
+        format="%.4f",
+        help="Model-predicted percentage change expressed as a decimal (e.g., 0.02 for +2%).",
+    )
+    expected_low_pct_model = st.number_input(
+        "Expected low % (decimal)",
+        value=-0.02,
+        step=0.001,
+        format="%.4f",
+        help="Expected downside move from the latest price (negative decimals allowed).",
+    )
+    stop_loss_pct = st.number_input(
+        "Stop-loss % (decimal)",
+        value=0.05,
+        min_value=0.0,
+        step=0.001,
+        format="%.4f",
+        help="Risk threshold relative to the latest price (e.g., 0.05 for 5% below).",
+    )
+    prob_up = st.number_input(
+        "Probability up (0-1)",
+        value=0.5,
+        min_value=0.0,
+        max_value=1.0,
+        step=0.01,
+        format="%.2f",
+        help="Directional probability from the model output.",
+    )
+
     st.header("Chart overlays")
     show_all_indicators = st.checkbox(
         "Show all indicators",
@@ -603,6 +686,36 @@ with st.sidebar:
 
 st.title("Stock Predictor Dashboard")
 st.caption("Explore model forecasts, historical indicators, and curated research notes.")
+
+st.subheader("Live price snapshot")
+col_live_action, col_live_table = st.columns([1, 3])
+with col_live_action:
+    if st.button("Refresh live snapshot", type="primary"):
+        with st.spinner("Fetching live pricing..."):
+            response = _request(
+                f"/live-price/{ticker}",
+                method="POST",
+                json_payload={
+                    "expected_change_pct_model": expected_change_pct_model,
+                    "expected_low_pct_model": expected_low_pct_model,
+                    "stop_loss_pct": stop_loss_pct,
+                    "prob_up": prob_up,
+                },
+            )
+            if response is not None:
+                st.session_state["live_price_response"] = response
+                st.success("Live snapshot updated")
+
+with col_live_table:
+    live_payload = (st.session_state.get("live_price_response") or {}).get("price")
+    if live_payload:
+        st.dataframe(
+            _build_live_price_table(live_payload),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.caption("Click 'Refresh live snapshot' to load the latest intraday metrics.")
 
 col_data, col_forecast = st.columns(2)
 
