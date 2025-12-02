@@ -133,6 +133,27 @@ process.
 
 Run `python main.py --help` for the full list of options and defaults.
 
+### Headless live analysis loop
+
+Keep predictions refreshed during the trading day without opening any user
+interfaces:
+
+```bash
+python main.py --mode live-loop --interval 10m
+```
+
+The interval defaults to 300 seconds (5 minutes) and accepts plain seconds or
+values suffixed with `s`/`m` (for example `45s`, `2m`). Each iteration refreshes
+data as needed, runs the live prediction pipeline and logs the timestamped
+results. To run the loop on a schedule with cron every 15 minutes during market
+hours, add an entry such as:
+
+```
+*/15 9-16 * * 1-5 cd /path/to/StockPredictor && /usr/bin/env python main.py --mode live-loop --interval 15m >> /var/log/stockpredictor-live.log 2>&1
+```
+
+Adjust the cron window and log path to suit your environment.
+
 ## Data Splitting
 
 Model evaluation defaults to a chronological holdout split: the earliest

@@ -8,12 +8,15 @@ import os
 import subprocess
 import sys
 import threading
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from stock_predictor.api_app import run_api
 from stock_predictor.dashboard_app import run_streamlit_app
 from stock_predictor import dashboard_app as dashboard_module
+from stock_predictor.app import StockPredictorApplication
 from stock_predictor.ui_app import run_tkinter_app
 
 
@@ -136,18 +139,43 @@ def _apply_ui_flags(*, no_train: bool, no_refresh: bool) -> None:
         os.environ["STOCK_PREDICTOR_UI_DISABLE_REFRESH"] = "1"
 
 
+def _parse_interval(raw_value: str) -> float:
+    """Parse an interval string supporting seconds or minutes suffixes."""
+
+    normalized = raw_value.strip().lower()
+    multiplier = 1.0
+    if normalized.endswith("m"):
+        multiplier = 60.0
+        normalized = normalized[:-1]
+    elif normalized.endswith("s"):
+        normalized = normalized[:-1]
+
+    try:
+        value = float(normalized)
+    except ValueError as exc:  # pragma: no cover - defensive user input guard
+        raise argparse.ArgumentTypeError(
+            "Interval must be a number optionally suffixed with 's' or 'm'."
+        ) from exc
+
+    if value <= 0:
+        raise argparse.ArgumentTypeError("Interval must be greater than zero.")
+
+    return value * multiplier
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Launch the Stock Predictor desktop UI, API server, or dashboard.",
     )
     parser.add_argument(
         "--mode",
-        choices=["tk", "dash", "api", "both", "full"],
+        choices=["tk", "dash", "api", "both", "full", "live-loop"],
         default="tk",
         help=(
             "Execution mode: 'tk' launches the desktop UI, 'dash' launches only the "
             "Streamlit dashboard, 'api' starts the FastAPI service, 'both' launches "
-            "the desktop UI together with the API, and 'full' launches all three."
+            "the desktop UI together with the API, 'full' launches all three, and "
+            "'live-loop' runs repeated live analyses without starting any UIs."
         ),
     )
     parser.add_argument(
@@ -181,6 +209,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-refresh",
         action="store_true",
         help="Disable refresh controls in the Tkinter UI (tk/both/full modes).",
+    )
+    parser.add_argument(
+        "--interval",
+        type=_parse_interval,
+        default=float(os.getenv("STOCK_PREDICTOR_LIVE_INTERVAL_SECONDS", "300")),
+        help=(
+            "Interval between live analyses when running in 'live-loop' mode. "
+            "Accepts seconds by default or a value suffixed with 's' or 'm' (e.g. '90s', '5m')."
+        ),
     )
     return parser
 
@@ -262,6 +299,40 @@ def _run_full_mode(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def _run_live_analysis(application: StockPredictorApplication) -> dict[str, Any]:
+    """Execute a single live prediction pass and return the payload."""
+
+    LOGGER.info("Running live analysis for ticker %s", application.config.ticker)
+    return application.predict(refresh=True)
+
+
+def _run_live_loop_mode(args: argparse.Namespace) -> int:
+    """Continuously run live analyses at a fixed interval without launching UIs."""
+
+    application = StockPredictorApplication.from_environment()
+    interval_seconds = args.interval
+
+    LOGGER.info(
+        "Starting live analysis loop for %s every %.0f seconds. Press Ctrl+C to stop.",
+        application.config.ticker,
+        interval_seconds,
+    )
+
+    try:
+        while True:
+            timestamp = datetime.now(timezone.utc)
+            try:
+                payload = _run_live_analysis(application)
+                LOGGER.info("Live analysis at %s: %s", timestamp.isoformat(), payload)
+            except Exception:  # pragma: no cover - runtime guard around long-running loop
+                LOGGER.exception("Live analysis failed at %s", timestamp.isoformat())
+
+            time.sleep(interval_seconds)
+    except KeyboardInterrupt:  # pragma: no cover - interactive exit
+        LOGGER.info("Stopping live analysis loop.")
+        return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     _configure_logging(args.log_level)
@@ -284,6 +355,8 @@ def main(argv: list[str] | None = None) -> int:
             return _run_both_mode(args)
         if mode == "full":
             return _run_full_mode(args)
+        if mode == "live-loop":
+            return _run_live_loop_mode(args)
     except KeyboardInterrupt:  # pragma: no cover - interactive exit
         LOGGER.info("Interrupted by user. Shutting down...")
         return 0
