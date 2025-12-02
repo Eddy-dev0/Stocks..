@@ -720,6 +720,8 @@ with st.sidebar:
     st.caption("Computed from visible market data")
     risk_metrics_placeholder = st.container()
 
+feature_toggles = (st.session_state.get("feature_toggles") or DEFAULT_FEATURE_TOGGLES).copy()
+
 st.title("Stock Predictor Dashboard")
 st.caption("Explore model forecasts, historical indicators, and curated research notes.")
 
@@ -777,9 +779,10 @@ with col_data:
             response = _request(
                 f"/buy-zone/{ticker}",
                 method="POST",
-                json_payload=_with_feature_toggles(
-                    {"refresh": bool(refresh_before_buy_zone)}
-                ),
+                json_payload={
+                    "refresh": bool(refresh_before_buy_zone),
+                    "feature_toggles": feature_toggles,
+                },
             )
             if response is not None:
                 st.session_state["buy_zone_response"] = response
@@ -923,9 +926,11 @@ with col_forecast:
             response = _request(
                 f"/train/{ticker}",
                 method="POST",
-                json_payload=_with_feature_toggles(
-                    {"targets": _parse_targets(targets_raw), "horizon": horizon_value}
-                ),
+                json_payload={
+                    "targets": _parse_targets(targets_raw),
+                    "horizon": horizon_value,
+                    "feature_toggles": feature_toggles,
+                },
             )
             if response is not None:
                 st.session_state["train_response"] = response
@@ -947,13 +952,12 @@ with col_forecast:
             response = _request(
                 f"/forecasts/{ticker}",
                 method="POST",
-                json_payload=_with_feature_toggles(
-                    {
-                        "targets": _parse_targets(targets_raw),
-                        "refresh": bool(refresh_before_forecast),
-                        "horizon": horizon_value,
-                    }
-                ),
+                json_payload={
+                    "targets": _parse_targets(targets_raw),
+                    "refresh": bool(refresh_before_forecast),
+                    "horizon": horizon_value,
+                    "feature_toggles": feature_toggles,
+                },
             )
             if response is not None:
                 st.session_state["forecast_response"] = response
@@ -1007,9 +1011,10 @@ with col_forecast:
             response = _request(
                 f"/backtests/{ticker}",
                 method="POST",
-                json_payload=_with_feature_toggles(
-                    {"targets": _parse_targets(targets_raw)}
-                ),
+                json_payload={
+                    "targets": _parse_targets(targets_raw),
+                    "feature_toggles": feature_toggles,
+                },
             )
             if response is not None:
                 st.session_state["backtest_response"] = response
