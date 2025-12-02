@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import os
 from functools import lru_cache
+from datetime import datetime
 from typing import Any, Dict
 
 import pandas as pd
@@ -171,6 +172,69 @@ class BuyZoneEnvelope(BaseModel):
     buy_zone: BuyZoneResponse
 
 
+class LivePriceRequest(BaseModel):
+    """Payload describing model-driven expectations for live price context."""
+
+    expected_change_pct_model: float | None = Field(
+        default=None,
+        description="Model-predicted percentage change from the latest price (as a decimal).",
+    )
+    expected_low_pct_model: float | None = Field(
+        default=None,
+        description="Model-predicted downside move from the latest price (as a decimal).",
+    )
+    stop_loss_pct: float | None = Field(
+        default=None,
+        description="Risk threshold for stop-loss placement relative to the latest price (decimal).",
+    )
+    prob_up: float | None = Field(
+        default=None,
+        description="Probability of upward direction from the model (0-1 range).",
+        ge=0,
+        le=1,
+    )
+
+
+class DirectionProbabilities(BaseModel):
+    """Directional probability summary for the live price snapshot."""
+
+    up: float | None = Field(None, description="Probability of an upward move.")
+    down: float | None = Field(None, description="Probability of a downward move.")
+
+
+class LivePriceResponse(BaseModel):
+    """Structured live price snapshot with model-derived context."""
+
+    ticker: str = Field(..., description="Ticker symbol for the snapshot.")
+    market_time: datetime | None = Field(
+        None, description="Timestamp of the latest price in the market timezone."
+    )
+    last_price: float | None = Field(None, description="Most recent traded price.")
+    predicted_close: float | None = Field(
+        None, description="Price adjusted by the model's expected percentage change."
+    )
+    expected_change_pct: float | None = Field(
+        None, description="Model-expected percentage change (decimal form)."
+    )
+    expected_low: float | None = Field(
+        None, description="Expected downside level derived from the model percentage."
+    )
+    stop_loss: float | None = Field(
+        None, description="Stop-loss level based on configured risk percentage or expected low."
+    )
+    probabilities: DirectionProbabilities = Field(
+        default_factory=DirectionProbabilities,
+        description="Directional probabilities from the model output.",
+    )
+
+
+class LivePriceEnvelope(BaseModel):
+    """Envelope for live price snapshots."""
+
+    status: str = Field("ok", description="Outcome of the request.")
+    price: LivePriceResponse
+
+
 def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
     """Create a configured FastAPI application for the Stock Predictor UI."""
 
@@ -307,6 +371,54 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
             refresh=request.refresh,
         )
         return BuyZoneEnvelope(status="ok", buy_zone=BuyZoneResponse(**result))
+
+    @app.post(
+        "/live-price/{ticker}",
+        dependencies=[Depends(require_api_key)],
+        response_model=LivePriceEnvelope,
+    )
+    async def live_price(ticker: str, request: LivePriceRequest) -> LivePriceEnvelope:
+        application = await _build_application(ticker, {})
+        last_price, timestamp = await _call_with_error_handling(
+            application.pipeline.fetcher.fetch_live_price, force=True
+        )
+
+        predicted_close = (
+            last_price * (1 + request.expected_change_pct_model)
+            if last_price is not None and request.expected_change_pct_model is not None
+            else None
+        )
+        expected_low = (
+            last_price * (1 + request.expected_low_pct_model)
+            if last_price is not None and request.expected_low_pct_model is not None
+            else None
+        )
+        stop_loss = (
+            last_price * (1 - request.stop_loss_pct)
+            if last_price is not None and request.stop_loss_pct is not None
+            else None
+        )
+        if stop_loss is None:
+            stop_loss = expected_low
+
+        prob_up = request.prob_up
+        prob_down = (1 - prob_up) if isinstance(prob_up, (int, float)) else None
+
+        market_time: datetime | None = None
+        if timestamp is not None:
+            market_time = timestamp.to_pydatetime()
+
+        snapshot = LivePriceResponse(
+            ticker=ticker.upper(),
+            market_time=market_time,
+            last_price=last_price,
+            predicted_close=predicted_close,
+            expected_change_pct=request.expected_change_pct_model,
+            expected_low=expected_low,
+            stop_loss=stop_loss,
+            probabilities=DirectionProbabilities(up=prob_up, down=prob_down),
+        )
+        return LivePriceEnvelope(status="ok", price=snapshot)
 
     @app.get("/research", dependencies=[Depends(require_api_key)])
     async def research_feed(
