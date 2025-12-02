@@ -42,14 +42,25 @@ class FeatureAssemblerRegistryTests(unittest.TestCase):
         result = assembler.build(self.price_df, None, sentiment_enabled=False)
 
         self.assertIn("Return_1d", result.features.columns)
+        self.assertIn("FG_Ticker", result.features.columns)
         groups = result.metadata["feature_groups"]
         self.assertTrue(groups["technical"]["executed"])
         self.assertIn("Return_1d", groups["technical"]["columns"])
         self.assertEqual(groups["technical"]["status"], "executed")
+        self.assertIn("fear_greed", groups["technical"]["categories"])
+        self.assertTrue(groups["volume_liquidity"]["executed"])
+        self.assertIn("OBV", groups["volume_liquidity"]["columns"])
 
     def test_disabling_technical_allows_macro_only(self) -> None:
         toggles = default_feature_toggles()
-        toggles.update({"technical": False, "macro": True, "sentiment": False})
+        toggles.update(
+            {
+                "technical": False,
+                "macro": True,
+                "sentiment": False,
+                "volume_liquidity": False,
+            }
+        )
         assembler = FeatureAssembler(toggles, horizons=(1,))
 
         result = assembler.build(self.price_df, None, sentiment_enabled=False)

@@ -15,6 +15,7 @@ from ..indicator_bundle import (
     compute_indicators,
     compute_multi_timeframe_trends,
 )
+from ..fear_greed import compute_fear_greed_features
 from ..sentiment import aggregate_daily_sentiment, attach_sentiment
 from .feature_registry import (
     FeatureBuildContext,
@@ -463,6 +464,9 @@ def _build_technical_features(
     indicator_frame = indicator_result.dataframe.reset_index(drop=True)
     metadata["indicator_columns"] = list(indicator_result.columns)
 
+    fear_greed_frame = compute_fear_greed_features(df).reset_index(drop=True)
+    fear_greed_frame.insert(0, "Date", df["Date"].reset_index(drop=True))
+
     trend_summary = compute_multi_timeframe_trends(df)
     if trend_summary:
         metadata["trend_summary"] = trend_summary
@@ -499,8 +503,24 @@ def _build_technical_features(
             feature_frame[f"Volume_ZScore_{window}"] = (volume - rolling_vol) / rolling_std.replace(0, np.nan)
         feature_frame["Volume_to_Price"] = _safe_divide(volume, close)
 
-    combined = pd.concat([feature_frame, indicator_frame], axis=1)
+    combined = pd.concat([feature_frame, indicator_frame, fear_greed_frame], axis=1)
     combined = combined.loc[:, ~combined.columns.duplicated()]
+
+    column_categories: dict[str, str] = {
+        column: "technical"
+        for column in combined.columns
+        if column != "Date"
+    }
+    column_categories.update(
+        {
+            column: "technical_indicator"
+            for column in indicator_frame.columns
+            if column != "Date"
+        }
+    )
+    column_categories.update(
+        {column: "fear_greed" for column in fear_greed_frame.columns if column != "Date"}
+    )
 
     for column in sorted(col for col in combined.columns if col.startswith("SMA_")):
         combined[f"Price_to_{column}"] = _safe_divide(close, combined[column])
@@ -508,7 +528,9 @@ def _build_technical_features(
     for column in sorted(col for col in combined.columns if col.startswith("EMA_")):
         combined[f"Price_to_{column}"] = _safe_divide(close, combined[column])
 
-    return FeatureBlock(combined, category="technical"), metadata
+    return FeatureBlock(
+        combined, category="technical", column_categories=column_categories
+    ), metadata
 
 
 def _get_numeric_series(df: pd.DataFrame, column: str, default: float = np.nan) -> pd.Series:
