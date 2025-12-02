@@ -15,6 +15,13 @@ import streamlit as st
 DEFAULT_API_URL = os.getenv("STOCK_PREDICTOR_API_URL", "http://localhost:8000")
 DEFAULT_TICKER = os.getenv("STOCK_PREDICTOR_DEFAULT_TICKER", "AAPL")
 DEFAULT_API_KEY = os.getenv("STOCK_PREDICTOR_UI_API_KEY", "")
+DEFAULT_FEATURE_TOGGLES = {
+    "technical": True,
+    "macro": True,
+    "sentiment": True,
+    "fundamental": True,
+    "volume_liquidity": True,
+}
 
 st.set_page_config(page_title="Stock Predictor Dashboard", layout="wide")
 
@@ -29,6 +36,7 @@ for key, value in {
     "buy_zone_response": None,
     "insights_response": None,
     "live_price_response": None,
+    "feature_toggles": DEFAULT_FEATURE_TOGGLES.copy(),
 }.items():
     st.session_state.setdefault(key, value)
 
@@ -542,6 +550,25 @@ with st.sidebar:
         help="Directional probability from the model output.",
     )
 
+    st.header("Feature groups")
+    feature_toggles = st.session_state.get("feature_toggles", {}).copy()
+    feature_toggles["technical"] = st.checkbox(
+        "Technical indicators", value=feature_toggles.get("technical", True)
+    )
+    feature_toggles["macro"] = st.checkbox(
+        "Macro signals", value=feature_toggles.get("macro", True)
+    )
+    feature_toggles["sentiment"] = st.checkbox(
+        "Sentiment features", value=feature_toggles.get("sentiment", True)
+    )
+    feature_toggles["fundamental"] = st.checkbox(
+        "Fundamental drivers", value=feature_toggles.get("fundamental", True)
+    )
+    feature_toggles["volume_liquidity"] = st.checkbox(
+        "Volume & liquidity", value=feature_toggles.get("volume_liquidity", True)
+    )
+    st.session_state["feature_toggles"] = feature_toggles
+
     st.header("Chart overlays")
     show_all_indicators = st.checkbox(
         "Show all indicators",
@@ -684,6 +711,8 @@ with st.sidebar:
     st.caption("Computed from visible market data")
     risk_metrics_placeholder = st.container()
 
+feature_toggles = (st.session_state.get("feature_toggles") or DEFAULT_FEATURE_TOGGLES).copy()
+
 st.title("Stock Predictor Dashboard")
 st.caption("Explore model forecasts, historical indicators, and curated research notes.")
 
@@ -741,7 +770,10 @@ with col_data:
             response = _request(
                 f"/buy-zone/{ticker}",
                 method="POST",
-                json_payload={"refresh": bool(refresh_before_buy_zone)},
+                json_payload={
+                    "refresh": bool(refresh_before_buy_zone),
+                    "feature_toggles": feature_toggles,
+                },
             )
             if response is not None:
                 st.session_state["buy_zone_response"] = response
@@ -885,7 +917,11 @@ with col_forecast:
             response = _request(
                 f"/train/{ticker}",
                 method="POST",
-                json_payload={"targets": _parse_targets(targets_raw), "horizon": horizon_value},
+                json_payload={
+                    "targets": _parse_targets(targets_raw),
+                    "horizon": horizon_value,
+                    "feature_toggles": feature_toggles,
+                },
             )
             if response is not None:
                 st.session_state["train_response"] = response
@@ -911,6 +947,7 @@ with col_forecast:
                     "targets": _parse_targets(targets_raw),
                     "refresh": bool(refresh_before_forecast),
                     "horizon": horizon_value,
+                    "feature_toggles": feature_toggles,
                 },
             )
             if response is not None:
@@ -965,7 +1002,10 @@ with col_forecast:
             response = _request(
                 f"/backtests/{ticker}",
                 method="POST",
-                json_payload={"targets": _parse_targets(targets_raw)},
+                json_payload={
+                    "targets": _parse_targets(targets_raw),
+                    "feature_toggles": feature_toggles,
+                },
             )
             if response is not None:
                 st.session_state["backtest_response"] = response
