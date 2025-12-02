@@ -76,6 +76,15 @@ def _request(
     return response.json()
 
 
+def _with_feature_toggles(payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Attach the active feature toggles from session state to a payload."""
+
+    updated = dict(payload or {})
+    toggles = st.session_state.get("feature_toggles") or DEFAULT_FEATURE_TOGGLES
+    updated["feature_toggles"] = dict(toggles)
+    return updated
+
+
 def _coerce_dataframe(payload: Any) -> pd.DataFrame | None:
     if payload is None:
         return None
