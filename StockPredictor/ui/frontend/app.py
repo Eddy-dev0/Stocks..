@@ -134,6 +134,60 @@ def _render_feature_toggle_summary(block: Mapping[str, Any] | None) -> None:
         st.table(pd.DataFrame(rows))
 
 
+def _extract_feature_usage(
+    forecast_block: Mapping[str, Any] | None,
+) -> dict[str, object]:
+    """Normalise feature usage details from a PredictionResult payload."""
+
+    feature_groups = []
+    indicators = []
+    summary_text = None
+
+    if isinstance(forecast_block, Mapping):
+        raw_groups = forecast_block.get("feature_groups_used")
+        if isinstance(raw_groups, (list, tuple, set)):
+            feature_groups = sorted({str(item) for item in raw_groups})
+
+        raw_indicators = forecast_block.get("indicators_used")
+        if isinstance(raw_indicators, (list, tuple, set)):
+            indicators = sorted({str(item) for item in raw_indicators})
+
+        summary_text = forecast_block.get("feature_usage_summary")
+
+    return {
+        "feature_groups": feature_groups,
+        "indicators": indicators,
+        "summary": summary_text,
+    }
+
+
+def _render_feature_usage(
+    forecast_block: Mapping[str, Any] | None,
+    *,
+    heading: str = "Features used in this prediction",
+) -> None:
+    """Render feature usage details from a PredictionResult block."""
+
+    usage = _extract_feature_usage(forecast_block)
+    feature_groups: list[str] = usage["feature_groups"]
+    indicators: list[str] = usage["indicators"]
+    summary_text = usage["summary"]
+
+    if not (feature_groups or indicators or summary_text):
+        return
+
+    st.markdown(f"**{heading}**")
+
+    if summary_text:
+        st.markdown(summary_text)
+
+    if feature_groups:
+        st.table(pd.DataFrame({"Feature group": feature_groups}))
+
+    if indicators:
+        st.table(pd.DataFrame({"Indicators": indicators}))
+
+
 def _coerce_dataframe(payload: Any) -> pd.DataFrame | None:
     if payload is None:
         return None
@@ -670,11 +724,8 @@ with st.sidebar:
                 st.session_state["insights_response"] = response
                 st.success("Insights updated")
 
-    probability_block = _extract_probabilities(st.session_state.get("forecast_response") or {})
+    probability_block = _extract_probabilities(forecast_response or {})
     monte_carlo_prob, model_pred_prob = probability_block
-    forecast_block = (st.session_state.get("forecast_response") or {}).get(
-        "forecasts", st.session_state.get("forecast_response") or {}
-    )
     risk_guidance = _extract_risk_guidance(forecast_block)
     beta_block = risk_guidance.get("beta") if isinstance(risk_guidance, dict) else None
     vol_value = risk_guidance.get("volatility") if isinstance(risk_guidance, dict) else None
@@ -768,6 +819,11 @@ feature_toggles = FeatureToggles.from_any(
     defaults=DEFAULT_FEATURE_TOGGLES.asdict(),
 )
 
+forecast_response = st.session_state.get("forecast_response") or {}
+forecast_block = forecast_response.get("forecasts", forecast_response)
+
+feature_usage = _extract_feature_usage(forecast_block)
+
 st.title("Stock Predictor Dashboard")
 st.caption("Explore model forecasts, historical indicators, and curated research notes.")
 
@@ -805,6 +861,9 @@ col_data, col_forecast = st.columns(2)
 
 with col_data:
     st.subheader("Market Data & Indicators")
+    if feature_usage.get("indicators"):
+        st.caption("Indicators used by the latest forecast run:")
+        st.table(pd.DataFrame({"Indicator": feature_usage["indicators"]}))
     if st.button("Fetch market data", type="primary"):
         with st.spinner("Loading market data..."):
             response = _request(
@@ -1009,10 +1068,8 @@ with col_forecast:
                 st.session_state["forecast_response"] = response
                 st.success("Forecasts updated")
 
-    forecast_response = st.session_state.get("forecast_response") or {}
     if forecast_response:
         st.write("**Forecast summary**")
-        forecast_block = forecast_response.get("forecasts", forecast_response)
         monte_carlo_prob = None
         if isinstance(forecast_block, dict):
             monte_carlo_prob = forecast_block.get("monte_carlo_target_hit_probability")
@@ -1044,8 +1101,8 @@ with col_forecast:
                 st.markdown("**Beta sensitivity**")
                 for summary in beta_summaries:
                     st.write(summary)
+        _render_feature_usage(forecast_block)
         _render_feature_toggle_summary(forecast_block)
-        st.json(forecast_block)
         _download_button(
             "Download forecast JSON",
             json.dumps(forecast_response, indent=2, default=str).encode("utf-8"),
