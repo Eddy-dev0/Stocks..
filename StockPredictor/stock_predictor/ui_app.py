@@ -449,10 +449,18 @@ class StockPredictorDesktopApp:
         self._indicator_extra_axes: list[Axes] = []
         self._indicator_family_colors: dict[str, str] = {}
         self.feature_group_detail_tree: ttk.Treeview | None = None
+        self.feature_usage_text: tk.Text | None = None
+        self.feature_group_summary_text: tk.Text | None = None
+        self.data_source_text: tk.Text | None = None
         self.feature_group_summary_var = tk.StringVar(value="Not available")
         self.feature_usage_summary_var = tk.StringVar(value="No features enabled.")
         self.feature_group_overview_var = tk.StringVar(value="Features used: —")
         self.data_source_detail_var = tk.StringVar(value="Not available")
+        self._latest_feature_groups: dict[str, Mapping[str, Any]] = {}
+        self._latest_feature_toggles: dict[str, bool] = {}
+        self._latest_data_sources: list[Any] = []
+        self._latest_feature_usage_entries: list[Any] = []
+        self._latest_indicator_report: list[str] = []
         self.feature_toggle_vars: dict[str, tk.BooleanVar] = {}
         self.forecast_date_var = tk.StringVar(value="Forecast date: —")
         self.current_forecast_date: pd.Timestamp | None = None
@@ -1139,6 +1147,29 @@ class StockPredictorDesktopApp:
         self.trend_placeholder.grid(row=0, column=0, sticky="nsew")
         self.trend_tree.grid_remove()
 
+    def _create_scrolling_text(
+        self, parent: tk.Widget, height: int = 5, wrap: str = tk.WORD
+    ) -> tuple[ttk.Frame, tk.Text]:
+        """Create a read-only text widget with a vertical scrollbar."""
+
+        container = ttk.Frame(parent)
+        container.grid_columnconfigure(0, weight=1)
+        text = tk.Text(container, height=height, wrap=wrap, state=tk.DISABLED)
+        text.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(container, orient=tk.VERTICAL, command=text.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        text.configure(yscrollcommand=scrollbar.set)
+        self.text_widgets.append(text)
+        return container, text
+
+    def _set_text_content(self, widget: tk.Text | None, content: str) -> None:
+        if widget is None:
+            return
+        widget.configure(state=tk.NORMAL)
+        widget.delete("1.0", tk.END)
+        widget.insert(tk.END, content or "—")
+        widget.configure(state=tk.DISABLED)
+
     def _build_indicators_tab(self) -> None:
         frame = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(frame, text="Indicators")
@@ -1242,28 +1273,25 @@ class StockPredictorDesktopApp:
         usage_box = ttk.LabelFrame(sidebar, text="Feature usage", padding=8)
         usage_box.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
         usage_box.grid_columnconfigure(0, weight=1)
-        ttk.Label(
-            usage_box,
-            textvariable=self.feature_usage_summary_var,
-            anchor=tk.W,
-            justify=tk.LEFT,
-            wraplength=260,
-        ).grid(row=0, column=0, sticky=tk.EW)
+        usage_box.grid_rowconfigure(0, weight=1)
+        usage_container, self.feature_usage_text = self._create_scrolling_text(
+            usage_box, height=6
+        )
+        usage_container.grid(row=0, column=0, sticky="nsew")
 
         model_inputs_box = ttk.LabelFrame(sidebar, text="Model inputs", padding=8)
         model_inputs_box.grid(row=3, column=0, sticky="nsew", pady=(12, 0))
         model_inputs_box.grid_columnconfigure(0, weight=1)
+        model_inputs_box.grid_rowconfigure(1, weight=1)
         model_inputs_box.grid_rowconfigure(3, weight=1)
+        model_inputs_box.grid_rowconfigure(5, weight=1)
         ttk.Label(model_inputs_box, text="Feature groups used:").grid(
             row=0, column=0, sticky=tk.W
         )
-        ttk.Label(
-            model_inputs_box,
-            textvariable=self.feature_group_summary_var,
-            justify=tk.LEFT,
-            anchor=tk.W,
-            wraplength=260,
-        ).grid(row=1, column=0, sticky=tk.EW, pady=(2, 8))
+        summary_container, self.feature_group_summary_text = self._create_scrolling_text(
+            model_inputs_box, height=6
+        )
+        summary_container.grid(row=1, column=0, sticky="nsew", pady=(2, 8))
         ttk.Label(model_inputs_box, text="Group breakdown:").grid(
             row=2, column=0, sticky=tk.W
         )
@@ -1296,13 +1324,23 @@ class StockPredictorDesktopApp:
         ttk.Label(model_inputs_box, text="Data sources:").grid(
             row=data_source_row, column=0, sticky=tk.W
         )
-        ttk.Label(
-            model_inputs_box,
-            textvariable=self.data_source_detail_var,
-            justify=tk.LEFT,
-            anchor=tk.W,
-            wraplength=260,
-        ).grid(row=data_source_row + 1, column=0, sticky=tk.EW, pady=(8, 0))
+        data_source_container, self.data_source_text = self._create_scrolling_text(
+            model_inputs_box, height=6
+        )
+        data_source_container.grid(
+            row=data_source_row + 1, column=0, sticky="nsew", pady=(8, 0)
+        )
+
+        details_button = ttk.Button(
+            model_inputs_box, text="Details…", command=self._open_feature_details_dialog
+        )
+        details_button.grid(row=data_source_row + 2, column=0, sticky=tk.E, pady=(12, 0))
+
+        self._set_text_content(self.feature_usage_text, self.feature_usage_summary_var.get())
+        self._set_text_content(
+            self.feature_group_summary_text, self.feature_group_summary_var.get()
+        )
+        self._set_text_content(self.data_source_text, self.data_source_detail_var.get())
 
     def _build_explanation_tab(self) -> None:
         frame = ttk.Frame(self.notebook, padding=12)
@@ -2084,17 +2122,23 @@ class StockPredictorDesktopApp:
 
         total: int | None = None
         usage_reported = False
+        indicator_report: list[str] = []
         indicators_used = prediction.get("indicators_used") if isinstance(prediction, Mapping) else None
         if isinstance(indicators_used, Iterable) and not isinstance(indicators_used, (str, bytes)):
-            unique_indicators = {
-                str(item).strip()
-                for item in indicators_used
-                if isinstance(item, str) or not isinstance(item, Mapping)
-            }
-            unique_indicators.discard("")
-            if unique_indicators:
+            for entry in indicators_used:
+                label: str | None = None
+                if isinstance(entry, Mapping):
+                    label = entry.get("name") or entry.get("id") or entry.get("indicator")
+                else:
+                    label = str(entry)
+                if label is None:
+                    continue
+                clean_label = str(label).strip()
+                if clean_label:
+                    indicator_report.append(clean_label)
+            if indicator_report:
                 usage_reported = True
-                total = len(unique_indicators)
+                total = len(set(indicator_report))
 
         if total is None:
             summary_entries = prediction.get("feature_usage_summary") if isinstance(prediction, Mapping) else None
@@ -2193,13 +2237,26 @@ class StockPredictorDesktopApp:
 
         self.indicator_info_vars["data_sources"].set(str(len(provider_ids)))
         self.data_source_detail_var.set(self._data_source_summary_text(source_entries))
+        self._latest_data_sources = list(source_entries)
+        self._latest_feature_groups = feature_groups or {}
+        self._latest_feature_toggles = feature_toggles or {}
+
+        raw_usage_summary = (
+            prediction.get("feature_usage_summary") if isinstance(prediction, Mapping) else None
+        )
+        if isinstance(raw_usage_summary, Iterable) and not isinstance(
+            raw_usage_summary, (str, bytes)
+        ):
+            self._latest_feature_usage_entries = list(raw_usage_summary)
+        else:
+            self._latest_feature_usage_entries = []
 
         self.feature_group_summary_var.set(
             self._feature_group_summary_text(feature_groups, feature_toggles)
         )
         self.feature_usage_summary_var.set(
             self._feature_usage_summary_text(
-                prediction.get("feature_usage_summary") if isinstance(prediction, Mapping) else None,
+                raw_usage_summary,
                 feature_toggles,
             )
         )
@@ -2209,10 +2266,115 @@ class StockPredictorDesktopApp:
                 feature_toggles,
             )
         )
+        if indicator_report:
+            self._latest_indicator_report = sorted(set(indicator_report))
+        else:
+            cleaned = [str(name).strip() for name in self._indicator_names if str(name).strip()]
+            self._latest_indicator_report = sorted(set(cleaned))
+
+        self._set_text_content(self.feature_usage_text, self.feature_usage_summary_var.get())
+        self._set_text_content(
+            self.feature_group_summary_text, self.feature_group_summary_var.get()
+        )
+        self._set_text_content(self.data_source_text, self.data_source_detail_var.get())
         self._refresh_feature_group_table(feature_groups, feature_toggles)
 
         confidence_display = self._compute_confidence_metric()
         self.indicator_info_vars["confidence"].set(confidence_display)
+
+    def _render_feature_details_text(self) -> str:
+        sections: list[str] = []
+
+        overview = self.feature_group_overview_var.get().strip()
+        if overview:
+            sections.append("Overview\n" + overview)
+
+        usage_text = self.feature_usage_summary_var.get().strip()
+        if usage_text:
+            sections.append("Feature usage\n" + usage_text)
+
+        feature_lines: list[str] = []
+        reported_groups: set[str] = set()
+        feature_groups = self._latest_feature_groups or {}
+        feature_toggles = self._latest_feature_toggles or {}
+        for name, summary in sorted(feature_groups.items()):
+            reported_groups.add(name)
+            status_label = self._feature_group_status_label(name, summary, feature_toggles)
+            configured = summary.get("configured")
+            highlights_count, highlights_preview = self._feature_group_highlights(summary)
+            description = summary.get("description") or summary.get("note")
+            categories = summary.get("categories")
+            detail_bits: list[str] = []
+            if configured is not None:
+                detail_bits.append("enabled" if configured else "disabled")
+            elif name in feature_toggles:
+                detail_bits.append("enabled" if feature_toggles[name] else "disabled")
+
+            raw_status = str(summary.get("status") or "").replace("_", " ").strip()
+            if raw_status and raw_status.lower() not in {status_label.lower()}:
+                detail_bits.append(raw_status)
+
+            if categories:
+                category_list = [str(item).strip() for item in categories if str(item).strip()]
+                if category_list:
+                    detail_bits.append("Categories: " + ", ".join(category_list))
+
+            if highlights_count is not None:
+                detail_bits.append(f"{highlights_count} series")
+            if highlights_preview:
+                detail_bits.append(f"Top features: {highlights_preview}")
+
+            line = f"• {name}: {status_label}"
+            if detail_bits:
+                line += " (" + "; ".join(detail_bits) + ")"
+            if description:
+                line += f"\n  {description}"
+            feature_lines.append(line)
+
+        for name, enabled in sorted(feature_toggles.items()):
+            if name in reported_groups:
+                continue
+            label = "Enabled" if enabled else "Disabled"
+            feature_lines.append(f"• {name}: {label} (no execution report)")
+
+        if feature_lines:
+            sections.append("Feature groups\n" + "\n".join(feature_lines))
+        else:
+            sections.append("Feature groups\nNo feature groups reported.")
+
+        indicator_lines = [f"• {name}" for name in self._latest_indicator_report] or [
+            "No indicator usage reported."
+        ]
+        sections.append("Indicators tracked\n" + "\n".join(indicator_lines))
+
+        data_sources_text = self._data_source_summary_text(self._latest_data_sources)
+        sections.append("Data sources\n" + data_sources_text)
+
+        return "\n\n".join(sections)
+
+    def _open_feature_details_dialog(self) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Model inputs and data sources")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.geometry("720x520")
+        dialog.grid_columnconfigure(0, weight=1)
+        dialog.grid_rowconfigure(0, weight=1)
+
+        frame = ttk.Frame(dialog, padding=12)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(0, weight=1)
+
+        container, text_widget = self._create_scrolling_text(frame, height=22)
+        container.grid(row=0, column=0, sticky="nsew")
+        self._set_text_content(text_widget, self._render_feature_details_text())
+
+        button_frame = ttk.Frame(frame)
+        button_frame.grid(row=1, column=0, sticky=tk.E, pady=(12, 0))
+        ttk.Button(button_frame, text="Close", command=dialog.destroy).grid(
+            row=0, column=0, sticky=tk.E
+        )
 
     def _normalise_feature_toggles(
         self, toggles: Mapping[str, Any] | None
