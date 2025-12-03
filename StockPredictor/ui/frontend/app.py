@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import date, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping
 
 import altair as alt
 import pandas as pd
@@ -83,6 +83,38 @@ def _with_feature_toggles(payload: Dict[str, Any] | None = None) -> Dict[str, An
     toggles = st.session_state.get("feature_toggles") or DEFAULT_FEATURE_TOGGLES
     updated["feature_toggles"] = dict(toggles)
     return updated
+
+
+def _render_feature_toggle_summary(block: Mapping[str, Any] | None) -> None:
+    """Display which feature groups were configured and executed for a run."""
+
+    if not isinstance(block, Mapping):
+        return
+
+    configured = block.get("feature_toggles")
+    executed = block.get("used_feature_groups") or block.get("executed_feature_groups")
+    if not configured and not executed:
+        return
+
+    rows: list[dict[str, object]] = []
+    if isinstance(configured, Mapping):
+        for name, enabled in sorted(configured.items()):
+            rows.append(
+                {
+                    "Feature group": name,
+                    "Configured": bool(enabled),
+                    "Executed": bool(executed and name in executed),
+                }
+            )
+    elif executed:
+        rows = [
+            {"Feature group": name, "Configured": None, "Executed": True}
+            for name in sorted(executed)
+        ]
+
+    if rows:
+        st.markdown("**Feature group usage**")
+        st.table(pd.DataFrame(rows))
 
 
 def _coerce_dataframe(payload: Any) -> pd.DataFrame | None:
@@ -998,6 +1030,7 @@ with col_forecast:
                 st.markdown("**Beta sensitivity**")
                 for summary in beta_summaries:
                     st.write(summary)
+        _render_feature_toggle_summary(forecast_block)
         st.json(forecast_block)
         _download_button(
             "Download forecast JSON",
