@@ -402,6 +402,7 @@ class StockPredictorAI:
         horizons = tuple(metadata.get("horizons", tuple(self.config.prediction_horizons)))
         metadata["horizons"] = horizons
         metadata["active_horizon"] = self.horizon
+        metadata.setdefault("feature_toggles", dict(self.config.feature_toggles))
 
         latest_close, latest_date = self._latest_settled_close(price_df)
         if latest_close is not None:
@@ -552,6 +553,18 @@ class StockPredictorAI:
         self.metadata = metadata
         self.preprocessor_templates = templates
         return features, feature_result.targets, templates
+
+    def get_used_feature_groups(self) -> list[str]:
+        """Return the feature groups that were executed in the last build."""
+
+        groups = self.metadata.get("feature_groups") if isinstance(self.metadata, Mapping) else {}
+        if not isinstance(groups, Mapping):
+            return []
+        return [
+            name
+            for name, summary in groups.items()
+            if isinstance(summary, Mapping) and summary.get("executed")
+        ]
 
     def _latest_settled_close(
         self, price_df: Optional[pd.DataFrame]
@@ -2461,6 +2474,14 @@ class StockPredictorAI:
                 "down": direction_probability_down,
             }
 
+        feature_groups_meta = None
+        executed_feature_groups = None
+        if isinstance(self.metadata, Mapping):
+            feature_groups_meta = self.metadata.get("feature_groups")
+            executed_feature_groups = self.metadata.get("executed_feature_groups")
+        if not executed_feature_groups:
+            executed_feature_groups = self.get_used_feature_groups()
+
         result = {
             "ticker": self.config.ticker,
             "as_of": _to_iso(market_data_as_of) or "",
@@ -2482,6 +2503,8 @@ class StockPredictorAI:
             "monte_carlo_stabilized_probability": monte_carlo_target_probability,
             "monte_carlo_iterations": monte_carlo_iterations,
             "target_price": self.metadata.get("target_price"),
+            "feature_toggles": dict(getattr(self.config, "feature_toggles", {})),
+            "used_feature_groups": executed_feature_groups,
             "predictions": predictions,
             "horizon": resolved_horizon,
             "target_date": _to_iso(target_date) or "",
@@ -2516,6 +2539,8 @@ class StockPredictorAI:
             result["indicator_support_components"] = indicator_components
         if confidences:
             result["confidence"] = confidences
+        if feature_groups_meta:
+            result["feature_groups"] = feature_groups_meta
         if probabilities:
             result["probabilities"] = probabilities
         if event_probabilities:
