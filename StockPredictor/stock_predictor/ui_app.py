@@ -447,6 +447,8 @@ class StockPredictorDesktopApp:
         self.indicator_secondary_ax: Axes | None = None
         self._indicator_extra_axes: list[Axes] = []
         self._indicator_family_colors: dict[str, str] = {}
+        self.feature_group_summary_var = tk.StringVar(value="Not available")
+        self.data_source_detail_var = tk.StringVar(value="Not available")
         self.feature_toggle_vars: dict[str, tk.BooleanVar] = {}
         self.forecast_date_var = tk.StringVar(value="Forecast date: —")
         self.current_forecast_date: pd.Timestamp | None = None
@@ -1148,6 +1150,7 @@ class StockPredictorDesktopApp:
         sidebar = ttk.Frame(frame, padding=(12, 0, 0, 0))
         sidebar.grid(row=0, column=1, sticky="nsew")
         sidebar.grid_rowconfigure(1, weight=1)
+        sidebar.grid_rowconfigure(2, weight=1)
         sidebar.grid_columnconfigure(0, weight=1)
 
         selector_box = ttk.LabelFrame(sidebar, text="Indicator visibility", padding=8)
@@ -1214,6 +1217,28 @@ class StockPredictorDesktopApp:
                 wraplength=260,
             )
             value.grid(row=row, column=1, sticky=tk.EW, pady=2)
+
+        model_inputs_box = ttk.LabelFrame(sidebar, text="Model inputs", padding=8)
+        model_inputs_box.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        model_inputs_box.grid_columnconfigure(0, weight=1)
+        ttk.Label(model_inputs_box, text="Feature groups used:").grid(
+            row=0, column=0, sticky=tk.W
+        )
+        ttk.Label(
+            model_inputs_box,
+            textvariable=self.feature_group_summary_var,
+            justify=tk.LEFT,
+            anchor=tk.W,
+            wraplength=260,
+        ).grid(row=1, column=0, sticky=tk.EW, pady=(2, 8))
+        ttk.Label(model_inputs_box, text="Data sources:").grid(row=2, column=0, sticky=tk.W)
+        ttk.Label(
+            model_inputs_box,
+            textvariable=self.data_source_detail_var,
+            justify=tk.LEFT,
+            anchor=tk.W,
+            wraplength=260,
+        ).grid(row=3, column=0, sticky=tk.EW, pady=(2, 0))
 
     def _build_explanation_tab(self) -> None:
         frame = ttk.Frame(self.notebook, padding=12)
@@ -1989,6 +2014,22 @@ class StockPredictorDesktopApp:
         total = len(indicator_names)
         self.indicator_info_vars["total_indicators"].set(str(total))
 
+        prediction = (
+            self.current_prediction if isinstance(self.current_prediction, Mapping) else {}
+        )
+        feature_groups = self._resolve_feature_groups()
+        feature_toggles: dict[str, bool] = {}
+        raw_toggles = prediction.get("feature_toggles") if isinstance(prediction, Mapping) else None
+        if isinstance(raw_toggles, Mapping):
+            feature_toggles = {str(name): bool(value) for name, value in raw_toggles.items()}
+        pipeline_meta = getattr(getattr(self.application, "pipeline", None), "metadata", None)
+        if not feature_toggles and isinstance(pipeline_meta, Mapping):
+            raw_toggles = pipeline_meta.get("feature_toggles")
+            if isinstance(raw_toggles, Mapping):
+                feature_toggles = {
+                    str(name): bool(value) for name, value in raw_toggles.items()
+                }
+
         pipeline = getattr(self.application, "pipeline", None)
         metadata = getattr(pipeline, "metadata", None)
         source_entries: list[Any] = []
@@ -2036,9 +2077,115 @@ class StockPredictorDesktopApp:
             provider_ids.update(fallback)
 
         self.indicator_info_vars["data_sources"].set(str(len(provider_ids)))
+        self.data_source_detail_var.set(self._data_source_summary_text(source_entries))
+
+        self.feature_group_summary_var.set(
+            self._feature_group_summary_text(feature_groups, feature_toggles)
+        )
 
         confidence_display = self._compute_confidence_metric()
         self.indicator_info_vars["confidence"].set(confidence_display)
+
+    def _resolve_feature_groups(self) -> dict[str, Mapping[str, Any]]:
+        """Return the feature group metadata from the latest prediction or pipeline."""
+
+        prediction = (
+            self.current_prediction if isinstance(self.current_prediction, Mapping) else {}
+        )
+        block = prediction.get("feature_groups") if isinstance(prediction, Mapping) else None
+        if isinstance(block, Mapping):
+            return dict(block)
+
+        pipeline = getattr(self.application, "pipeline", None)
+        metadata = getattr(pipeline, "metadata", None)
+        if isinstance(metadata, Mapping):
+            groups = metadata.get("feature_groups")
+            if isinstance(groups, Mapping):
+                return dict(groups)
+
+        return {}
+
+    def _feature_group_summary_text(
+        self,
+        feature_groups: Mapping[str, Mapping[str, Any]] | None,
+        feature_toggles: Mapping[str, bool] | None,
+    ) -> str:
+        """Render a human-readable summary of which feature groups were used."""
+
+        if not feature_groups:
+            if feature_toggles:
+                lines = []
+                for name, enabled in sorted(feature_toggles.items()):
+                    label = "enabled" if enabled else "disabled"
+                    lines.append(f"• {name}: {label} (no execution report)")
+                if lines:
+                    return "\n".join(lines)
+            return "Model did not report feature usage."
+
+        lines = []
+        for name, summary in sorted(feature_groups.items()):
+            executed = bool(summary.get("executed"))
+            configured = summary.get("configured")
+            status = str(summary.get("status") or ("executed" if executed else "skipped"))
+            status_label = status.replace("_", " ")
+            marker = "✅" if executed else "•"
+
+            detail_bits: list[str] = []
+            if configured is not None:
+                detail_bits.append("enabled" if configured else "disabled")
+            elif feature_toggles and name in feature_toggles:
+                detail_bits.append("enabled" if feature_toggles[name] else "disabled")
+
+            categories = summary.get("categories")
+            if categories:
+                category_list = list(categories)
+                trimmed = ", ".join(category_list[:3])
+                if len(category_list) > 3:
+                    trimmed += ", …"
+                detail_bits.append(trimmed)
+
+            description = summary.get("description")
+            detail_text = "; ".join(detail_bits)
+            label = f"{marker} {name}: {status_label}"
+            if detail_text:
+                label += f" ({detail_text})"
+            if description and executed:
+                label += f" – {description}"
+            lines.append(label)
+
+        return "\n".join(lines) if lines else "Model did not report feature usage."
+
+    def _data_source_summary_text(self, source_entries: Iterable[Any]) -> str:
+        """Render the list of external data providers used for the forecast."""
+
+        lines: list[str] = []
+        for entry in source_entries:
+            if isinstance(entry, Mapping):
+                provider = (
+                    entry.get("id")
+                    or entry.get("provider")
+                    or entry.get("provider_id")
+                    or "unknown"
+                )
+                description = entry.get("description")
+                datasets = entry.get("datasets")
+                detail_parts: list[str] = []
+                if datasets:
+                    dataset_list = [str(item) for item in datasets if item]
+                    if dataset_list:
+                        detail_parts.append(", ".join(dataset_list))
+                if description:
+                    detail_parts.append(str(description))
+                detail = " – ".join(detail_parts)
+                lines.append(f"• {provider}{(': ' + detail) if detail else ''}")
+            else:
+                value = str(entry).strip()
+                if value:
+                    lines.append(f"• {value}")
+
+        if not lines:
+            return "No external data sources reported."
+        return "\n".join(lines)
 
     def _compute_confidence_metric(self) -> str:
         prediction = self.current_prediction if isinstance(self.current_prediction, Mapping) else {}
