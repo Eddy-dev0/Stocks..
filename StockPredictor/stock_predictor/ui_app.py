@@ -450,6 +450,7 @@ class StockPredictorDesktopApp:
         self._indicator_family_colors: dict[str, str] = {}
         self.feature_group_detail_tree: ttk.Treeview | None = None
         self.feature_group_summary_var = tk.StringVar(value="Not available")
+        self.feature_usage_summary_var = tk.StringVar(value="No features enabled.")
         self.feature_group_overview_var = tk.StringVar(value="Features used: —")
         self.data_source_detail_var = tk.StringVar(value="Not available")
         self.feature_toggle_vars: dict[str, tk.BooleanVar] = {}
@@ -1170,7 +1171,7 @@ class StockPredictorDesktopApp:
         sidebar = ttk.Frame(frame, padding=(12, 0, 0, 0))
         sidebar.grid(row=0, column=1, sticky="nsew")
         sidebar.grid_rowconfigure(1, weight=1)
-        sidebar.grid_rowconfigure(2, weight=1)
+        sidebar.grid_rowconfigure(3, weight=1)
         sidebar.grid_columnconfigure(0, weight=1)
 
         selector_box = ttk.LabelFrame(sidebar, text="Indicator visibility", padding=8)
@@ -1238,8 +1239,19 @@ class StockPredictorDesktopApp:
             )
             value.grid(row=row, column=1, sticky=tk.EW, pady=2)
 
+        usage_box = ttk.LabelFrame(sidebar, text="Feature usage", padding=8)
+        usage_box.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        usage_box.grid_columnconfigure(0, weight=1)
+        ttk.Label(
+            usage_box,
+            textvariable=self.feature_usage_summary_var,
+            anchor=tk.W,
+            justify=tk.LEFT,
+            wraplength=260,
+        ).grid(row=0, column=0, sticky=tk.EW)
+
         model_inputs_box = ttk.LabelFrame(sidebar, text="Model inputs", padding=8)
-        model_inputs_box.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        model_inputs_box.grid(row=3, column=0, sticky="nsew", pady=(12, 0))
         model_inputs_box.grid_columnconfigure(0, weight=1)
         model_inputs_box.grid_rowconfigure(3, weight=1)
         ttk.Label(model_inputs_box, text="Feature groups used:").grid(
@@ -2133,6 +2145,12 @@ class StockPredictorDesktopApp:
         self.feature_group_summary_var.set(
             self._feature_group_summary_text(feature_groups, feature_toggles)
         )
+        self.feature_usage_summary_var.set(
+            self._feature_usage_summary_text(
+                prediction.get("feature_usage_summary") if isinstance(prediction, Mapping) else None,
+                feature_toggles,
+            )
+        )
         self.feature_group_overview_var.set(
             self._feature_group_overview_text(
                 self._resolve_executed_feature_groups(prediction, feature_groups),
@@ -2295,6 +2313,44 @@ class StockPredictorDesktopApp:
                 return "Features used: Baseline (no optional feature groups enabled)"
 
         return "Features used: not reported"
+
+    def _feature_usage_summary_text(
+        self,
+        usage_summary: Iterable[Any] | None,
+        feature_toggles: Mapping[str, bool] | None,
+    ) -> str:
+        lines: list[str] = []
+        if isinstance(usage_summary, Iterable) and not isinstance(
+            usage_summary, (str, bytes)
+        ):
+            for entry in usage_summary:
+                if isinstance(entry, Mapping):
+                    name = entry.get("group_name") or entry.get("name")
+                    count = entry.get("count")
+                else:
+                    name = getattr(entry, "group_name", None) or getattr(
+                        entry, "name", None
+                    )
+                    count = getattr(entry, "count", None)
+                label = str(name).strip() if name is not None else ""
+                if not label:
+                    continue
+                try:
+                    count_value = int(count)
+                except (TypeError, ValueError):
+                    count_value = 0
+                lines.append(f"• {label} ({count_value} signals)")
+
+        if lines:
+            return "\n".join(lines)
+
+        if feature_toggles is not None and not any(feature_toggles.values()):
+            return "No features enabled."
+
+        if usage_summary is not None:
+            return "No features enabled."
+
+        return "Feature usage not reported."
 
     def _feature_group_highlights(
         self, summary: Mapping[str, Any] | None

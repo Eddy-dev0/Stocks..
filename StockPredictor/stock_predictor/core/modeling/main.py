@@ -49,7 +49,7 @@ from ..ml_preprocessing import (
     get_feature_names_from_pipeline,
 )
 from ..pipeline import DEFAULT_MARKET_TIMEZONE, US_MARKET_CLOSE, resolve_market_timezone
-from .prediction_result import PredictionResult
+from .prediction_result import FeatureUsageSummary, PredictionResult
 from ..support_levels import indicator_support_floor
 from ..models import (
     ModelFactory,
@@ -2510,6 +2510,7 @@ class StockPredictorAI:
         feature_groups_meta: Mapping[str, Any] | None = None
         executed_feature_groups: list[str] | None = None
         feature_vectors_by_group: dict[str, list[str]] = {}
+        feature_usage_summary: list[FeatureUsageSummary] = []
         indicator_columns: list[str] = []
         if isinstance(self.metadata, Mapping):
             feature_groups_meta = self.metadata.get("feature_groups")
@@ -2535,6 +2536,16 @@ class StockPredictorAI:
                     columns = technical_summary.get("indicator_columns")
                     if isinstance(columns, (list, tuple, set)):
                         indicator_columns = [str(col) for col in columns]
+
+        if executed_feature_groups:
+            for name in executed_feature_groups:
+                columns = feature_vectors_by_group.get(name) or []
+                signal_count = len(columns)
+                if not signal_count and name == "technical" and indicator_columns:
+                    signal_count = len(indicator_columns)
+                feature_usage_summary.append(
+                    FeatureUsageSummary(name=str(name), count=int(signal_count))
+                )
 
         result = {
             "ticker": self.config.ticker,
@@ -2564,6 +2575,10 @@ class StockPredictorAI:
         }
         trailing_low_value = None
         drawdown_fraction = None
+        if feature_usage_summary:
+            result["feature_usage_summary"] = [
+                summary.to_dict() for summary in feature_usage_summary
+            ]
         if isinstance(getattr(self, "metadata", None), Mapping):
             trailing_low_value = self._safe_float(self.metadata.get("trailing_low"))
             drawdown_fraction = self._safe_float(self.metadata.get("max_drawdown_fraction"))
@@ -2641,6 +2656,7 @@ class StockPredictorAI:
             stop_loss=stop_loss,
             feature_groups_used=list(executed_feature_groups or []),
             indicators_used=indicator_columns,
+            feature_usage_summary=feature_usage_summary,
             meta=meta,
         )
 

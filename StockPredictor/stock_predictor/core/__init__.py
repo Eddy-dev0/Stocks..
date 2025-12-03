@@ -11,6 +11,7 @@ from stock_predictor.core.config import (
 from stock_predictor.core.buy_zone import BuyZoneAnalyzer, BuyZoneResult, IndicatorConfirmation
 from stock_predictor.core.data_pipeline import AsyncDataPipeline
 from stock_predictor.core.modeling import (
+    FeatureUsageSummary,
     PredictionResult,
     StockPredictorAI,
     TargetSpec,
@@ -36,6 +37,7 @@ __all__ = [
     "StockPredictorAI",
     "TargetSpec",
     "make_volatility_label",
+    "FeatureUsageSummary",
     "PredictionResult",
     "BuyZoneAnalyzer",
     "BuyZoneResult",
