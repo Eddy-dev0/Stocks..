@@ -447,7 +447,9 @@ class StockPredictorDesktopApp:
         self.indicator_secondary_ax: Axes | None = None
         self._indicator_extra_axes: list[Axes] = []
         self._indicator_family_colors: dict[str, str] = {}
+        self.feature_group_detail_tree: ttk.Treeview | None = None
         self.feature_group_summary_var = tk.StringVar(value="Not available")
+        self.feature_group_overview_var = tk.StringVar(value="Feature groups: —")
         self.data_source_detail_var = tk.StringVar(value="Not available")
         self.feature_toggle_vars: dict[str, tk.BooleanVar] = {}
         self.forecast_date_var = tk.StringVar(value="Forecast date: —")
@@ -1010,6 +1012,23 @@ class StockPredictorDesktopApp:
         }
         self.pnl_label.grid(**self._pnl_grid_options)
 
+        feature_group_overview_row = self._pnl_grid_options["row"] + 1
+        self._feature_group_overview_grid_options = {
+            "row": feature_group_overview_row,
+            "column": 0,
+            "columnspan": 4,
+            "sticky": tk.W,
+            "pady": (6, 0),
+        }
+        self.feature_group_overview_label = ttk.Label(
+            summary_frame,
+            textvariable=self.feature_group_overview_var,
+            anchor=tk.W,
+            justify=tk.LEFT,
+            wraplength=520,
+        )
+        self.feature_group_overview_label.grid(**self._feature_group_overview_grid_options)
+
         chart_container.grid_rowconfigure(0, weight=1)
         chart_container.grid_columnconfigure(0, weight=1)
         chart_frame = ttk.LabelFrame(chart_container, text="Price history", padding=8)
@@ -1221,6 +1240,7 @@ class StockPredictorDesktopApp:
         model_inputs_box = ttk.LabelFrame(sidebar, text="Model inputs", padding=8)
         model_inputs_box.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
         model_inputs_box.grid_columnconfigure(0, weight=1)
+        model_inputs_box.grid_rowconfigure(3, weight=1)
         ttk.Label(model_inputs_box, text="Feature groups used:").grid(
             row=0, column=0, sticky=tk.W
         )
@@ -1231,14 +1251,45 @@ class StockPredictorDesktopApp:
             anchor=tk.W,
             wraplength=260,
         ).grid(row=1, column=0, sticky=tk.EW, pady=(2, 8))
-        ttk.Label(model_inputs_box, text="Data sources:").grid(row=2, column=0, sticky=tk.W)
+        ttk.Label(model_inputs_box, text="Group breakdown:").grid(
+            row=2, column=0, sticky=tk.W
+        )
+        feature_tree_frame = ttk.Frame(model_inputs_box)
+        feature_tree_frame.grid(row=3, column=0, sticky="nsew")
+        feature_tree_frame.grid_columnconfigure(0, weight=1)
+        self.feature_group_detail_tree = ttk.Treeview(
+            feature_tree_frame,
+            columns=("group", "status", "count", "highlights"),
+            show="headings",
+            height=6,
+        )
+        self.feature_group_detail_tree.heading("group", text="Group")
+        self.feature_group_detail_tree.heading("status", text="Status")
+        self.feature_group_detail_tree.heading("count", text="# series")
+        self.feature_group_detail_tree.heading("highlights", text="Top features")
+        self.feature_group_detail_tree.column("group", width=90, anchor=tk.W)
+        self.feature_group_detail_tree.column("status", width=90, anchor=tk.W)
+        self.feature_group_detail_tree.column("count", width=70, anchor=tk.CENTER)
+        self.feature_group_detail_tree.column("highlights", width=180, anchor=tk.W)
+        self.feature_group_detail_tree.grid(row=0, column=0, sticky="nsew")
+        feature_tree_scroll = ttk.Scrollbar(
+            feature_tree_frame,
+            orient=tk.VERTICAL,
+            command=self.feature_group_detail_tree.yview,
+        )
+        feature_tree_scroll.grid(row=0, column=1, sticky="ns")
+        self.feature_group_detail_tree.configure(yscrollcommand=feature_tree_scroll.set)
+        data_source_row = 4
+        ttk.Label(model_inputs_box, text="Data sources:").grid(
+            row=data_source_row, column=0, sticky=tk.W
+        )
         ttk.Label(
             model_inputs_box,
             textvariable=self.data_source_detail_var,
             justify=tk.LEFT,
             anchor=tk.W,
             wraplength=260,
-        ).grid(row=3, column=0, sticky=tk.EW, pady=(2, 0))
+        ).grid(row=data_source_row + 1, column=0, sticky=tk.EW, pady=(8, 0))
 
     def _build_explanation_tab(self) -> None:
         frame = ttk.Frame(self.notebook, padding=12)
@@ -2018,17 +2069,13 @@ class StockPredictorDesktopApp:
             self.current_prediction if isinstance(self.current_prediction, Mapping) else {}
         )
         feature_groups = self._resolve_feature_groups()
-        feature_toggles: dict[str, bool] = {}
-        raw_toggles = prediction.get("feature_toggles") if isinstance(prediction, Mapping) else None
-        if isinstance(raw_toggles, Mapping):
-            feature_toggles = {str(name): bool(value) for name, value in raw_toggles.items()}
+        feature_toggles = self._normalise_feature_toggles(
+            prediction.get("feature_toggles") if isinstance(prediction, Mapping) else None
+        )
         pipeline_meta = getattr(getattr(self.application, "pipeline", None), "metadata", None)
         if not feature_toggles and isinstance(pipeline_meta, Mapping):
             raw_toggles = pipeline_meta.get("feature_toggles")
-            if isinstance(raw_toggles, Mapping):
-                feature_toggles = {
-                    str(name): bool(value) for name, value in raw_toggles.items()
-                }
+            feature_toggles = self._normalise_feature_toggles(raw_toggles)
 
         pipeline = getattr(self.application, "pipeline", None)
         metadata = getattr(pipeline, "metadata", None)
@@ -2082,9 +2129,26 @@ class StockPredictorDesktopApp:
         self.feature_group_summary_var.set(
             self._feature_group_summary_text(feature_groups, feature_toggles)
         )
+        self.feature_group_overview_var.set(
+            self._feature_group_overview_text(feature_groups, feature_toggles)
+        )
+        self._refresh_feature_group_table(feature_groups, feature_toggles)
 
         confidence_display = self._compute_confidence_metric()
         self.indicator_info_vars["confidence"].set(confidence_display)
+
+    def _normalise_feature_toggles(
+        self, toggles: Mapping[str, Any] | None
+    ) -> dict[str, bool]:
+        if not isinstance(toggles, Mapping):
+            return {}
+        normalised: dict[str, bool] = {}
+        for name, value in toggles.items():
+            key = str(name).strip()
+            if not key:
+                continue
+            normalised[key] = bool(value)
+        return normalised
 
     def _resolve_feature_groups(self) -> dict[str, Mapping[str, Any]]:
         """Return the feature group metadata from the latest prediction or pipeline."""
@@ -2154,6 +2218,127 @@ class StockPredictorDesktopApp:
             lines.append(label)
 
         return "\n".join(lines) if lines else "Model did not report feature usage."
+
+    def _feature_group_overview_text(
+        self,
+        feature_groups: Mapping[str, Mapping[str, Any]] | None,
+        feature_toggles: Mapping[str, bool] | None,
+    ) -> str:
+        if feature_groups:
+            active_labels: list[str] = []
+            inactive_labels: list[str] = []
+            for name, summary in sorted(feature_groups.items()):
+                executed = bool(summary.get("executed"))
+                configured = summary.get("configured")
+                columns = summary.get("columns")
+                if isinstance(columns, Mapping):
+                    columns = list(columns.keys())
+                if isinstance(columns, (str, bytes)):
+                    columns = [columns]
+                column_count = (
+                    len(columns)
+                    if isinstance(columns, Iterable) and not isinstance(columns, (str, bytes))
+                    else 0
+                )
+                label = f"{name} ({column_count})" if column_count else name
+                if executed:
+                    active_labels.append(label)
+                elif configured is False or (
+                    feature_toggles and name in feature_toggles and not feature_toggles[name]
+                ):
+                    inactive_labels.append(f"{name} (disabled)")
+                else:
+                    inactive_labels.append(label)
+
+            parts: list[str] = []
+            if active_labels:
+                parts.append("Active: " + ", ".join(active_labels))
+            if inactive_labels:
+                parts.append("Inactive: " + ", ".join(inactive_labels))
+            if not parts:
+                parts.append("No feature groups executed.")
+            return "Feature groups: " + "; ".join(parts)
+
+        if feature_toggles:
+            enabled = [name for name, flag in sorted(feature_toggles.items()) if flag]
+            disabled = [name for name, flag in sorted(feature_toggles.items()) if not flag]
+            parts = []
+            if enabled:
+                parts.append("Enabled: " + ", ".join(enabled))
+            if disabled:
+                parts.append("Disabled: " + ", ".join(disabled))
+            if parts:
+                return "Feature groups: " + "; ".join(parts) + " (no execution report)"
+
+        return "Feature groups: not reported"
+
+    def _feature_group_highlights(
+        self, summary: Mapping[str, Any] | None
+    ) -> tuple[int | None, str]:
+        if not isinstance(summary, Mapping):
+            return None, ""
+        columns = summary.get("top_features") or summary.get("columns") or []
+        if isinstance(columns, Mapping):
+            columns = list(columns.keys())
+        if isinstance(columns, (str, bytes)):
+            columns = [columns]
+        if not isinstance(columns, Iterable) or isinstance(columns, (str, bytes)):
+            columns = [] if not isinstance(columns, list) else columns
+        column_names = [str(col).strip() for col in columns if str(col).strip()]
+        column_count = len(column_names)
+        preview_items = column_names[:3]
+        preview = ", ".join(preview_items)
+        if column_count > len(preview_items):
+            preview = f"{preview}, …" if preview else "…"
+        return column_count, preview
+
+    def _feature_group_status_label(
+        self,
+        name: str,
+        summary: Mapping[str, Any] | None,
+        feature_toggles: Mapping[str, bool] | None,
+    ) -> str:
+        if not isinstance(summary, Mapping):
+            return "—"
+        executed = bool(summary.get("executed"))
+        if executed:
+            return "Active"
+        configured = summary.get("configured")
+        if configured is False or (
+            feature_toggles and name in feature_toggles and not feature_toggles[name]
+        ):
+            return "Disabled"
+        status = str(summary.get("status") or "").replace("_", " ").strip()
+        return status or "Skipped"
+
+    def _refresh_feature_group_table(
+        self,
+        feature_groups: Mapping[str, Mapping[str, Any]] | None,
+        feature_toggles: Mapping[str, bool] | None,
+    ) -> None:
+        tree = getattr(self, "feature_group_detail_tree", None)
+        if tree is None:
+            return
+        for item in tree.get_children():
+            tree.delete(item)
+
+        rows: list[tuple[str, str, str, str]] = []
+        if isinstance(feature_groups, Mapping) and feature_groups:
+            for name, summary in sorted(feature_groups.items()):
+                status = self._feature_group_status_label(name, summary, feature_toggles)
+                column_count, preview = self._feature_group_highlights(summary)
+                count_display = "—" if column_count is None else str(column_count)
+                rows.append((name, status, count_display, preview or "—"))
+        elif feature_toggles:
+            for name, enabled in sorted(feature_toggles.items()):
+                status = "Enabled" if enabled else "Disabled"
+                rows.append((name, status + " (no report)", "—", "—"))
+
+        if not rows:
+            rows.append(("—", "No feature data", "—", "—"))
+
+        for values in rows:
+            tree.insert("", tk.END, values=values)
 
     def _data_source_summary_text(self, source_entries: Iterable[Any]) -> str:
         """Render the list of external data providers used for the forecast."""
