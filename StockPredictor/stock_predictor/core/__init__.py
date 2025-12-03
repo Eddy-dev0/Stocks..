@@ -10,7 +10,12 @@ from stock_predictor.core.config import (
 )
 from stock_predictor.core.buy_zone import BuyZoneAnalyzer, BuyZoneResult, IndicatorConfirmation
 from stock_predictor.core.data_pipeline import AsyncDataPipeline
-from stock_predictor.core.modeling import StockPredictorAI, TargetSpec, make_volatility_label
+from stock_predictor.core.modeling import (
+    PredictionResult,
+    StockPredictorAI,
+    TargetSpec,
+    make_volatility_label,
+)
 from stock_predictor.core.trend_finder import (
     DEFAULT_TREND_UNIVERSE,
     TrendFinder,
@@ -31,6 +36,7 @@ __all__ = [
     "StockPredictorAI",
     "TargetSpec",
     "make_volatility_label",
+    "PredictionResult",
     "BuyZoneAnalyzer",
     "BuyZoneResult",
     "IndicatorConfirmation",

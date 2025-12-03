@@ -14,6 +14,7 @@ from typing import Any, Iterable
 from stock_predictor.api_app import run_api
 from stock_predictor.core import (
     PredictorConfig,
+    PredictionResult,
     StockPredictorAI,
     BuyZoneAnalyzer,
     build_config,
@@ -83,7 +84,7 @@ class StockPredictorApplication:
         targets: Iterable[str] | None = None,
         refresh: bool = False,
         horizon: int | None = None,
-    ) -> dict[str, Any]:
+    ) -> PredictionResult:
         """Generate predictions for the configured ticker."""
 
         LOGGER.info("Generating predictions (refresh=%s)", refresh)

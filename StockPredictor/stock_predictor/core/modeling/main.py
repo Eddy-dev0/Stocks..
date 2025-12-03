@@ -49,6 +49,7 @@ from ..ml_preprocessing import (
     get_feature_names_from_pipeline,
 )
 from ..pipeline import DEFAULT_MARKET_TIMEZONE, US_MARKET_CLOSE, resolve_market_timezone
+from .prediction_result import PredictionResult
 from ..support_levels import indicator_support_floor
 from ..models import (
     ModelFactory,
@@ -1888,7 +1889,7 @@ class StockPredictorAI:
         refresh_data: bool = False,
         targets: Optional[Iterable[str]] = None,
         horizon: Optional[int] = None,
-    ) -> Dict[str, Any]:
+    ) -> PredictionResult:
         resolved_horizon = self._resolve_horizon(horizon)
         self.horizon = resolved_horizon
         if refresh_data:
@@ -2506,13 +2507,34 @@ class StockPredictorAI:
                 "down": direction_probability_down,
             }
 
-        feature_groups_meta = None
-        executed_feature_groups = None
+        feature_groups_meta: Mapping[str, Any] | None = None
+        executed_feature_groups: list[str] | None = None
+        feature_vectors_by_group: dict[str, list[str]] = {}
+        indicator_columns: list[str] = []
         if isinstance(self.metadata, Mapping):
             feature_groups_meta = self.metadata.get("feature_groups")
             executed_feature_groups = self.metadata.get("executed_feature_groups")
+            indicator_source = self.metadata.get("indicator_columns")
+            if isinstance(indicator_source, (list, tuple, set)):
+                indicator_columns = [str(name) for name in indicator_source]
+
         if not executed_feature_groups:
             executed_feature_groups = self.get_used_feature_groups()
+
+        if isinstance(feature_groups_meta, Mapping):
+            for name, summary in feature_groups_meta.items():
+                if not isinstance(summary, Mapping):
+                    continue
+                columns = summary.get("columns")
+                if isinstance(columns, (list, tuple, set)):
+                    feature_vectors_by_group[name] = [str(col) for col in columns]
+
+            if not indicator_columns:
+                technical_summary = feature_groups_meta.get("technical")
+                if isinstance(technical_summary, Mapping):
+                    columns = technical_summary.get("indicator_columns")
+                    if isinstance(columns, (list, tuple, set)):
+                        indicator_columns = [str(col) for col in columns]
 
         result = {
             "ticker": self.config.ticker,
@@ -2536,7 +2558,6 @@ class StockPredictorAI:
             "monte_carlo_iterations": monte_carlo_iterations,
             "target_price": self.metadata.get("target_price"),
             "feature_toggles": dict(getattr(self.config, "feature_toggles", {})),
-            "used_feature_groups": executed_feature_groups,
             "predictions": predictions,
             "horizon": resolved_horizon,
             "target_date": _to_iso(target_date) or "",
@@ -2573,6 +2594,12 @@ class StockPredictorAI:
             result["confidence"] = confidences
         if feature_groups_meta:
             result["feature_groups"] = feature_groups_meta
+        if feature_vectors_by_group:
+            result["feature_vectors_by_group"] = feature_vectors_by_group
+        if executed_feature_groups:
+            result["executed_feature_groups"] = list(executed_feature_groups)
+        if indicator_columns:
+            result["indicator_columns"] = indicator_columns
         if probabilities:
             result["probabilities"] = probabilities
         if event_probabilities:
@@ -2606,7 +2633,16 @@ class StockPredictorAI:
         recommendation = self._generate_recommendation(result)
         if recommendation:
             result["recommendation"] = recommendation
-        return result
+        meta = dict(result)
+        meta.pop("used_feature_groups", None)
+        return PredictionResult(
+            predicted_close=close_prediction,
+            expected_low=expected_low,
+            stop_loss=stop_loss,
+            feature_groups_used=list(executed_feature_groups or []),
+            indicators_used=indicator_columns,
+            meta=meta,
+        )
 
     def _prepare_features_for_model(
         self, model: Any, features: pd.DataFrame | np.ndarray

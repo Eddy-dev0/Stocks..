@@ -32,6 +32,7 @@ from matplotlib.patches import Rectangle
 from stock_predictor.app import StockPredictorApplication
 from stock_predictor.core import (
     DEFAULT_PREDICTION_HORIZONS,
+    PredictionResult,
     StockPredictorAI,
     TrendFinder,
     TrendInsight,
@@ -2065,9 +2066,12 @@ class StockPredictorDesktopApp:
         total = len(indicator_names)
         self.indicator_info_vars["total_indicators"].set(str(total))
 
-        prediction = (
-            self.current_prediction if isinstance(self.current_prediction, Mapping) else {}
-        )
+        if isinstance(self.current_prediction, PredictionResult):
+            prediction = self.current_prediction.to_dict()
+        elif isinstance(self.current_prediction, Mapping):
+            prediction = self.current_prediction
+        else:
+            prediction = {}
         feature_groups = self._resolve_feature_groups()
         feature_toggles = self._normalise_feature_toggles(
             prediction.get("feature_toggles") if isinstance(prediction, Mapping) else None
@@ -2153,10 +2157,18 @@ class StockPredictorDesktopApp:
     def _resolve_feature_groups(self) -> dict[str, Mapping[str, Any]]:
         """Return the feature group metadata from the latest prediction or pipeline."""
 
-        prediction = (
-            self.current_prediction if isinstance(self.current_prediction, Mapping) else {}
+        if isinstance(self.current_prediction, PredictionResult):
+            prediction_meta: Mapping[str, Any] = self.current_prediction.meta
+        elif isinstance(self.current_prediction, Mapping):
+            prediction_meta = self.current_prediction
+        else:
+            prediction_meta = {}
+
+        block = (
+            prediction_meta.get("feature_groups")
+            if isinstance(prediction_meta, Mapping)
+            else None
         )
-        block = prediction.get("feature_groups") if isinstance(prediction, Mapping) else None
         if isinstance(block, Mapping):
             return dict(block)
 
@@ -3141,7 +3153,10 @@ class StockPredictorDesktopApp:
             horizon_arg = self.selected_horizon_offset
         self._sync_stop_loss_multiplier()
         prediction = self.application.predict(horizon=horizon_arg, refresh=refresh)
-        metadata = self.application.pipeline.metadata
+        prediction_meta: Mapping[str, Any] | None = None
+        if isinstance(prediction, PredictionResult):
+            prediction_meta = prediction.meta
+        metadata = prediction_meta or self.application.pipeline.metadata
         snapshot = metadata.get("latest_features") if isinstance(metadata, Mapping) else None
         horizon_values: Iterable[Any] | None = None
         if isinstance(metadata, Mapping):
@@ -3216,9 +3231,10 @@ class StockPredictorDesktopApp:
         price_history = payload.get("price_history")
         indicator_history = payload.get("indicator_history")
 
-        self.current_prediction = prediction if isinstance(prediction, Mapping) else {}
+        is_prediction_mapping = isinstance(prediction, (Mapping, PredictionResult))
+        self.current_prediction = prediction if is_prediction_mapping else {}
         prediction_timestamp = None
-        if isinstance(self.current_prediction, Mapping):
+        if isinstance(self.current_prediction, (Mapping, PredictionResult)):
             prediction_timestamp = self._localize_market_timestamp(
                 self.current_prediction.get("market_data_as_of")
                 or self.current_prediction.get("as_of")
