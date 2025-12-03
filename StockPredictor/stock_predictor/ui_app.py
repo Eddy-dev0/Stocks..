@@ -2083,6 +2083,7 @@ class StockPredictorDesktopApp:
             prediction = {}
 
         total: int | None = None
+        usage_reported = False
         indicators_used = prediction.get("indicators_used") if isinstance(prediction, Mapping) else None
         if isinstance(indicators_used, Iterable) and not isinstance(indicators_used, (str, bytes)):
             unique_indicators = {
@@ -2092,6 +2093,7 @@ class StockPredictorDesktopApp:
             }
             unique_indicators.discard("")
             if unique_indicators:
+                usage_reported = True
                 total = len(unique_indicators)
 
         if total is None:
@@ -2107,12 +2109,13 @@ class StockPredictorDesktopApp:
                     except (TypeError, ValueError):
                         continue
                 if counts:
+                    usage_reported = True
                     total = sum(counts)
 
-        if total is None:
-            total = len(indicator_names)
-
-        self.indicator_info_vars["total_indicators"].set(str(total))
+        if total is None and not usage_reported:
+            self.indicator_info_vars["total_indicators"].set("Not reported")
+        else:
+            self.indicator_info_vars["total_indicators"].set(str(total or 0))
         feature_groups = self._resolve_feature_groups()
         feature_toggles = self._normalise_feature_toggles(
             prediction.get("feature_toggles") if isinstance(prediction, Mapping) else None
