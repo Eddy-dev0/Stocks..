@@ -12,7 +12,11 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from stock_predictor.core.features import FEATURE_REGISTRY, default_feature_toggles
+from stock_predictor.core.features import (
+    FEATURE_REGISTRY,
+    FeatureToggles,
+    default_feature_toggles,
+)
 
 DEFAULT_API_URL = os.getenv("STOCK_PREDICTOR_API_URL", "http://localhost:8000")
 DEFAULT_TICKER = os.getenv("STOCK_PREDICTOR_DEFAULT_TICKER", "AAPL")
@@ -20,11 +24,14 @@ DEFAULT_API_KEY = os.getenv("STOCK_PREDICTOR_UI_API_KEY", "")
 IMPLEMENTED_FEATURE_GROUPS = {
     name for name, spec in FEATURE_REGISTRY.items() if getattr(spec, "implemented", False)
 }
-DEFAULT_FEATURE_TOGGLES = {
-    name: enabled
-    for name, enabled in default_feature_toggles().items()
-    if name in IMPLEMENTED_FEATURE_GROUPS
-}
+DEFAULT_FEATURE_TOGGLES = FeatureToggles.from_any(
+    {
+        name: enabled
+        for name, enabled in default_feature_toggles().items()
+        if name in IMPLEMENTED_FEATURE_GROUPS
+    },
+    defaults={name: False for name in IMPLEMENTED_FEATURE_GROUPS},
+)
 
 st.set_page_config(page_title="Stock Predictor Dashboard", layout="wide")
 
@@ -84,7 +91,10 @@ def _with_feature_toggles(payload: Dict[str, Any] | None = None) -> Dict[str, An
 
     updated = dict(payload or {})
     toggles = st.session_state.get("feature_toggles") or DEFAULT_FEATURE_TOGGLES
-    updated["feature_toggles"] = dict(toggles)
+    if isinstance(toggles, FeatureToggles):
+        updated["feature_toggles"] = toggles.asdict()
+    else:
+        updated["feature_toggles"] = dict(toggles)
     return updated
 
 
@@ -595,7 +605,10 @@ with st.sidebar:
     )
 
     st.header("Feature groups")
-    feature_toggles = (st.session_state.get("feature_toggles") or DEFAULT_FEATURE_TOGGLES).copy()
+    feature_toggles = FeatureToggles.from_any(
+        st.session_state.get("feature_toggles") or DEFAULT_FEATURE_TOGGLES,
+        defaults=DEFAULT_FEATURE_TOGGLES.asdict(),
+    )
     for name in sorted(IMPLEMENTED_FEATURE_GROUPS):
         label = name.replace("_", " ").title()
         default_value = DEFAULT_FEATURE_TOGGLES.get(name, True)
@@ -746,7 +759,10 @@ with st.sidebar:
     st.caption("Computed from visible market data")
     risk_metrics_placeholder = st.container()
 
-feature_toggles = (st.session_state.get("feature_toggles") or DEFAULT_FEATURE_TOGGLES).copy()
+feature_toggles = FeatureToggles.from_any(
+    st.session_state.get("feature_toggles") or DEFAULT_FEATURE_TOGGLES,
+    defaults=DEFAULT_FEATURE_TOGGLES.asdict(),
+)
 
 st.title("Stock Predictor Dashboard")
 st.caption("Explore model forecasts, historical indicators, and curated research notes.")
@@ -807,7 +823,7 @@ with col_data:
                 method="POST",
                 json_payload={
                     "refresh": bool(refresh_before_buy_zone),
-                    "feature_toggles": feature_toggles,
+                    "feature_toggles": feature_toggles.asdict(),
                 },
             )
             if response is not None:
@@ -955,7 +971,7 @@ with col_forecast:
                 json_payload={
                     "targets": _parse_targets(targets_raw),
                     "horizon": horizon_value,
-                    "feature_toggles": feature_toggles,
+                    "feature_toggles": feature_toggles.asdict(),
                 },
             )
             if response is not None:
@@ -982,7 +998,7 @@ with col_forecast:
                     "targets": _parse_targets(targets_raw),
                     "refresh": bool(refresh_before_forecast),
                     "horizon": horizon_value,
-                    "feature_toggles": feature_toggles,
+                    "feature_toggles": feature_toggles.asdict(),
                 },
             )
             if response is not None:
@@ -1040,7 +1056,7 @@ with col_forecast:
                 method="POST",
                 json_payload={
                     "targets": _parse_targets(targets_raw),
-                    "feature_toggles": feature_toggles,
+                    "feature_toggles": feature_toggles.asdict(),
                 },
             )
             if response is not None:

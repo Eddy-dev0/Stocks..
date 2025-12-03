@@ -424,7 +424,7 @@ class StockPredictorAI:
         horizons = tuple(metadata.get("horizons", tuple(self.config.prediction_horizons)))
         metadata["horizons"] = horizons
         metadata["active_horizon"] = self.horizon
-        metadata.setdefault("feature_toggles", dict(self.config.feature_toggles))
+        metadata.setdefault("feature_toggles", self.config.feature_toggles.asdict())
         metadata.setdefault(
             "executed_feature_groups",
             [
