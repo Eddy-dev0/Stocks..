@@ -406,11 +406,11 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
             if last_price is not None and request.expected_change_pct_model is not None
             else None
         )
-        expected_low = (
-            last_price * (1 + request.expected_low_pct_model)
-            if last_price is not None and request.expected_low_pct_model is not None
-            else None
-        )
+        expected_low = None
+        if last_price is not None and request.expected_low_pct_model is not None:
+            downside = max(0.0, request.expected_low_pct_model)
+            expected_low = last_price * (1 - downside)
+            expected_low = max(0.0, min(expected_low, last_price))
         stop_loss = (
             last_price * (1 - request.stop_loss_pct)
             if last_price is not None and request.stop_loss_pct is not None
