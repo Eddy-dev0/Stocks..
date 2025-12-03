@@ -328,7 +328,11 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
     @app.post("/forecasts/{ticker}", dependencies=[Depends(require_api_key)])
     async def forecast(ticker: str, request: ForecastRequest) -> Dict[str, Any]:
         application = await _build_application(
-            ticker, {"feature_toggles": request.feature_toggles}
+            ticker,
+            {
+                "feature_toggles": request.feature_toggles,
+                "price_feature_toggles": request.feature_toggles,
+            },
         )
         result = await _call_with_error_handling(
             application.predict,
@@ -341,7 +345,11 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
     @app.post("/backtests/{ticker}", dependencies=[Depends(require_api_key)])
     async def backtest(ticker: str, request: BacktestRequest) -> Dict[str, Any]:
         application = await _build_application(
-            ticker, {"feature_toggles": request.feature_toggles}
+            ticker,
+            {
+                "feature_toggles": request.feature_toggles,
+                "price_feature_toggles": request.feature_toggles,
+            },
         )
         result = await _call_with_error_handling(application.backtest, targets=request.targets)
         return {"status": "ok", "backtest": result}
@@ -349,7 +357,11 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
     @app.post("/train/{ticker}", dependencies=[Depends(require_api_key)])
     async def retrain(ticker: str, request: TrainRequest) -> Dict[str, Any]:
         application = await _build_application(
-            ticker, {"feature_toggles": request.feature_toggles}
+            ticker,
+            {
+                "feature_toggles": request.feature_toggles,
+                "price_feature_toggles": request.feature_toggles,
+            },
         )
         refresh_result = await _call_with_error_handling(application.refresh_data, force=False)
         metrics = await _call_with_error_handling(
@@ -364,7 +376,11 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
     )
     async def buy_zone(ticker: str, request: BuyZoneRequest) -> BuyZoneEnvelope:
         application = await _build_application(
-            ticker, {"feature_toggles": request.feature_toggles}
+            ticker,
+            {
+                "feature_toggles": request.feature_toggles,
+                "price_feature_toggles": request.feature_toggles,
+            },
         )
         result = await _call_with_error_handling(
             application.buy_zone,
