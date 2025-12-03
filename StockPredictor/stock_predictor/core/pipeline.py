@@ -447,7 +447,7 @@ class MarketDataETL:
         enriched = compute_price_features(
             price_frame,
             feature_toggles={
-                **self.config.feature_toggles,
+                **self.config.feature_toggles.asdict(),
                 **self.config.price_feature_toggles,
             },
             macro_symbols=self.config.macro_merge_symbols,

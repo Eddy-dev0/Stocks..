@@ -26,6 +26,7 @@ from .feature_registry import (
     build_feature_registry,
     default_feature_toggles,
 )
+from .toggles import FeatureToggles
 
 
 logger = logging.getLogger(__name__)
@@ -144,7 +145,7 @@ class FeatureAssembler:
 
     def __init__(
         self,
-        feature_toggles: Mapping[str, bool] | Iterable[str] | None,
+        feature_toggles: FeatureToggles | Mapping[str, bool] | Iterable[str] | None,
         horizons: Iterable[int] | None = None,
         *,
         registry: Mapping[str, FeatureGroupSpec] | None = None,
@@ -210,7 +211,7 @@ class FeatureAssembler:
         metadata: Dict[str, object] = {}
         feature_categories: Dict[str, str] = {}
 
-        metadata["feature_toggles"] = dict(self.feature_toggles)
+        metadata["feature_toggles"] = self.feature_toggles.asdict()
         metadata["enabled_feature_groups"] = list(self.enabled_groups)
 
         group_metadata: dict[str, dict[str, object]] = {
@@ -343,32 +344,10 @@ class FeatureAssembler:
     # ------------------------------------------------------------------
     def _normalise_toggles(
         self,
-        toggles: Mapping[str, bool] | Iterable[str] | None,
-    ) -> dict[str, bool]:
+        toggles: FeatureToggles | Mapping[str, bool] | Iterable[str] | None,
+    ) -> FeatureToggles:
         defaults = default_feature_toggles(self.registry)
-        if toggles is None:
-            return defaults
-
-        normalised: dict[str, bool] = {}
-        if isinstance(toggles, Mapping):
-            for key, value in toggles.items():
-                name = str(key).strip().lower()
-                if name in defaults:
-                    normalised[name] = bool(value)
-        else:
-            if isinstance(toggles, str):
-                tokens = [part.strip() for part in toggles.split(",")]
-            else:
-                tokens = [str(item).strip() for item in toggles]
-            for token in tokens:
-                if not token:
-                    continue
-                name = token.lower()
-                if name in defaults:
-                    normalised[name] = True
-
-        defaults.update(normalised)
-        return defaults
+        return FeatureToggles.from_any(toggles, defaults=defaults.asdict())
 
     @staticmethod
     def _build_indicator_config(

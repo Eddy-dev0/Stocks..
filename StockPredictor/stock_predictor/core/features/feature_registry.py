@@ -8,6 +8,7 @@ from typing import Callable, Dict, Mapping, Sequence, TYPE_CHECKING
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     import pandas as pd
     from . import FeatureBlock
+from .toggles import FeatureToggles
 
 
 FeatureGroupBuilder = Callable[["FeatureBuildContext"], "FeatureBuildOutput"]
@@ -149,15 +150,18 @@ def build_feature_registry(**builders: FeatureGroupBuilder) -> dict[str, Feature
 
 def default_feature_toggles(
     registry: Mapping[str, FeatureGroupSpec] | None = None,
-) -> dict[str, bool]:
+) -> FeatureToggles:
     """Return the default toggle map for all known feature groups."""
 
+    defaults: dict[str, bool]
     if registry is not None:
-        return {name: spec.default_enabled for name, spec in registry.items()}
-    return {
-        name: bool(blueprint.get("default_enabled", False))
-        for name, blueprint in REGISTRY_BLUEPRINT.items()
-    }
+        defaults = {name: spec.default_enabled for name, spec in registry.items()}
+    else:
+        defaults = {
+            name: bool(blueprint.get("default_enabled", False))
+            for name, blueprint in REGISTRY_BLUEPRINT.items()
+        }
+    return FeatureToggles.from_any(defaults)
 
 
 __all__ = [

@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from .fear_greed import compute_fear_greed_features
+from .features.toggles import FeatureToggles
 from .indicator_bundle import compute_indicators
 from .sentiment import aggregate_daily_sentiment, attach_sentiment
 
@@ -70,7 +71,7 @@ def default_price_feature_toggles() -> dict[str, bool]:
 
 
 def _normalise_toggle_entries(
-    toggles: Mapping[str, object] | Iterable[str] | None,
+    toggles: FeatureToggles | Mapping[str, object] | Iterable[str] | None,
 ) -> list[tuple[str, object]]:
     if toggles is None:
         return []
@@ -92,7 +93,7 @@ def _normalise_toggle_entries(
 
 
 def derive_price_feature_toggles(
-    toggles: Mapping[str, object] | Iterable[str] | None,
+    toggles: FeatureToggles | Mapping[str, object] | Iterable[str] | None,
 ) -> dict[str, bool]:
     """Expand group-level feature toggles into concrete price feature flags."""
 
@@ -112,7 +113,7 @@ def derive_price_feature_toggles(
 
 
 def _coerce_price_feature_toggles(
-    toggles: Mapping[str, object] | Iterable[str] | None,
+    toggles: FeatureToggles | Mapping[str, object] | Iterable[str] | None,
 ) -> dict[str, bool]:
     return derive_price_feature_toggles(toggles)
 
@@ -120,7 +121,7 @@ def _coerce_price_feature_toggles(
 def compute_price_features(
     price_df: pd.DataFrame,
     *,
-    feature_toggles: Mapping[str, object] | Iterable[str] | None = None,
+    feature_toggles: FeatureToggles | Mapping[str, object] | Iterable[str] | None = None,
     macro_df: pd.DataFrame | None = None,
     macro_symbols: Iterable[str] | None = None,
 ) -> pd.DataFrame:

@@ -15,7 +15,7 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from dotenv import load_dotenv
 
-from .features import FEATURE_REGISTRY, default_feature_toggles
+from .features import FEATURE_REGISTRY, FeatureToggles, default_feature_toggles
 from .preprocessing import default_price_feature_toggles, derive_price_feature_toggles
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -134,7 +134,7 @@ class PredictorConfig:
     news_limit: int = 50
     sentiment: bool = True
     database_url: str = field(default_factory=_default_database_url)
-    feature_toggles: dict[str, bool] = field(default_factory=default_feature_toggles)
+    feature_toggles: FeatureToggles = field(default_factory=default_feature_toggles)
     price_feature_toggles: dict[str, bool] = field(
         default_factory=default_price_feature_toggles
     )
@@ -548,7 +548,7 @@ def build_config(
     sentiment: bool = True,
     database_url: Optional[str] = None,
     feature_sets: Optional[Mapping[str, Any] | Iterable[str] | str] = None,
-    feature_toggles: Optional[Mapping[str, Any] | Iterable[str] | str] = None,
+    feature_toggles: Optional[FeatureToggles | Mapping[str, Any] | Iterable[str] | str] = None,
     price_feature_toggles: Optional[Mapping[str, Any] | Iterable[str] | str] = None,
     macro_merge_symbols: Optional[Iterable[str] | str] = None,
     prediction_targets: Optional[Iterable[str] | str] = None,
@@ -816,39 +816,23 @@ def build_config(
 
 
 def _coerce_feature_toggles(
-    value: Optional[Mapping[str, Any] | Iterable[str] | str],
-    default: Optional[Mapping[str, bool]] = None,
-) -> dict[str, bool]:
-    defaults = dict(default or default_feature_toggles())
-    if value is None:
-        return defaults
-
-    toggles: dict[str, bool] = {}
-    if isinstance(value, Mapping):
-        for key, enabled in value.items():
-            name = str(key).strip().lower()
-            if name in defaults:
-                toggles[name] = bool(enabled)
+    value: Optional[FeatureToggles | Mapping[str, Any] | Iterable[str] | str],
+    default: Optional[FeatureToggles | Mapping[str, bool]] = None,
+) -> FeatureToggles:
+    default_map: dict[str, bool]
+    if isinstance(default, FeatureToggles):
+        default_map = default.asdict()
     else:
-        if isinstance(value, str):
-            tokens = [part.strip() for part in value.split(",")]
-        else:
-            tokens = [str(item).strip() for item in value]
-        for token in tokens:
-            if not token:
-                continue
-            name = token.lower()
-            if name in defaults:
-                toggles[name] = True
+        default_map = dict(default or default_feature_toggles().asdict())
 
-    defaults.update(toggles)
+    toggles = FeatureToggles.from_any(value, defaults=default_map)
 
     implemented = {name for name, spec in FEATURE_REGISTRY.items() if spec.implemented}
-    for name in list(defaults):
+    for name in list(toggles):
         if name not in implemented:
-            defaults[name] = False
+            toggles[name] = False
 
-    return defaults
+    return toggles
 
 
 def _coerce_price_feature_toggles(
