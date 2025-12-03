@@ -2075,15 +2075,44 @@ class StockPredictorDesktopApp:
         )
 
     def _update_indicator_info_panel(self, indicator_names: list[str]) -> None:
-        total = len(indicator_names)
-        self.indicator_info_vars["total_indicators"].set(str(total))
-
         if isinstance(self.current_prediction, PredictionResult):
             prediction = self.current_prediction.to_dict()
         elif isinstance(self.current_prediction, Mapping):
             prediction = self.current_prediction
         else:
             prediction = {}
+
+        total: int | None = None
+        indicators_used = prediction.get("indicators_used") if isinstance(prediction, Mapping) else None
+        if isinstance(indicators_used, Iterable) and not isinstance(indicators_used, (str, bytes)):
+            unique_indicators = {
+                str(item).strip()
+                for item in indicators_used
+                if isinstance(item, str) or not isinstance(item, Mapping)
+            }
+            unique_indicators.discard("")
+            if unique_indicators:
+                total = len(unique_indicators)
+
+        if total is None:
+            summary_entries = prediction.get("feature_usage_summary") if isinstance(prediction, Mapping) else None
+            if isinstance(summary_entries, Iterable) and not isinstance(
+                summary_entries, (str, bytes)
+            ):
+                counts: list[int] = []
+                for entry in summary_entries:
+                    value = entry.get("count") if isinstance(entry, Mapping) else getattr(entry, "count", None)
+                    try:
+                        counts.append(int(value))
+                    except (TypeError, ValueError):
+                        continue
+                if counts:
+                    total = sum(counts)
+
+        if total is None:
+            total = len(indicator_names)
+
+        self.indicator_info_vars["total_indicators"].set(str(total))
         feature_groups = self._resolve_feature_groups()
         feature_toggles = self._normalise_feature_toggles(
             prediction.get("feature_toggles") if isinstance(prediction, Mapping) else None
@@ -2093,20 +2122,40 @@ class StockPredictorDesktopApp:
             raw_toggles = pipeline_meta.get("feature_toggles")
             feature_toggles = self._normalise_feature_toggles(raw_toggles)
 
+        def _extend_sources(candidate: Any) -> None:
+            if candidate is None:
+                return
+            if isinstance(candidate, Mapping):
+                values = list(candidate.values()) if candidate else []
+                if values:
+                    source_entries.extend(values)
+                else:
+                    source_entries.extend(list(candidate))
+                return
+            if isinstance(candidate, Iterable) and not isinstance(candidate, (str, bytes)):
+                source_entries.extend(list(candidate))
+                return
+            source_entries.append(candidate)
+
+        source_entries: list[Any] = []
+        if isinstance(prediction, Mapping):
+            for key in ("data_sources", "sources", "data_providers"):
+                raw_sources = prediction.get(key)
+                if raw_sources:
+                    _extend_sources(raw_sources)
+                    break
+
         pipeline = getattr(self.application, "pipeline", None)
         metadata = getattr(pipeline, "metadata", None)
-        source_entries: list[Any] = []
-        if isinstance(metadata, Mapping):
-            raw_sources = metadata.get("data_sources")
-            if isinstance(raw_sources, Iterable) and not isinstance(raw_sources, (str, bytes)):
-                source_entries.extend(list(raw_sources))
+        if not source_entries and isinstance(metadata, Mapping):
+            _extend_sources(metadata.get("data_sources"))
+
         if not source_entries and getattr(getattr(pipeline, "fetcher", None), "get_data_sources", None):
             try:
                 fetched = pipeline.fetcher.get_data_sources()
             except Exception:  # pragma: no cover - defensive network call
                 fetched = []
-            if isinstance(fetched, Iterable) and not isinstance(fetched, (str, bytes)):
-                source_entries.extend(list(fetched))
+            _extend_sources(fetched)
 
         provider_ids: set[str] = set()
         for entry in source_entries:
