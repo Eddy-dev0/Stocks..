@@ -105,7 +105,11 @@ def _render_feature_toggle_summary(block: Mapping[str, Any] | None) -> None:
         return
 
     configured = block.get("feature_toggles")
-    executed = block.get("used_feature_groups") or block.get("executed_feature_groups")
+    executed = (
+        block.get("feature_groups_used")
+        or block.get("executed_feature_groups")
+        or block.get("used_feature_groups")
+    )
     if not configured and not executed:
         return
 

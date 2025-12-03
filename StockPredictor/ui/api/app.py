@@ -16,6 +16,7 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 from stock_predictor.app import StockPredictorApplication
+from stock_predictor.core import PredictionResult
 from stock_predictor.research import ResearchService
 
 
@@ -340,7 +341,8 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
             refresh=request.refresh,
             horizon=request.horizon,
         )
-        return {"status": "ok", "forecasts": result}
+        forecasts = result.to_dict() if isinstance(result, PredictionResult) else result
+        return {"status": "ok", "forecasts": forecasts}
 
     @app.post("/backtests/{ticker}", dependencies=[Depends(require_api_key)])
     async def backtest(ticker: str, request: BacktestRequest) -> Dict[str, Any]:
