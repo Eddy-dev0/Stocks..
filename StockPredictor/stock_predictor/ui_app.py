@@ -450,7 +450,7 @@ class StockPredictorDesktopApp:
         self._indicator_family_colors: dict[str, str] = {}
         self.feature_group_detail_tree: ttk.Treeview | None = None
         self.feature_group_summary_var = tk.StringVar(value="Not available")
-        self.feature_group_overview_var = tk.StringVar(value="Feature groups: —")
+        self.feature_group_overview_var = tk.StringVar(value="Features used: —")
         self.data_source_detail_var = tk.StringVar(value="Not available")
         self.feature_toggle_vars: dict[str, tk.BooleanVar] = {}
         self.forecast_date_var = tk.StringVar(value="Forecast date: —")
@@ -2134,7 +2134,10 @@ class StockPredictorDesktopApp:
             self._feature_group_summary_text(feature_groups, feature_toggles)
         )
         self.feature_group_overview_var.set(
-            self._feature_group_overview_text(feature_groups, feature_toggles)
+            self._feature_group_overview_text(
+                self._resolve_executed_feature_groups(prediction, feature_groups),
+                feature_toggles,
+            )
         )
         self._refresh_feature_group_table(feature_groups, feature_toggles)
 
@@ -2180,6 +2183,44 @@ class StockPredictorDesktopApp:
                 return dict(groups)
 
         return {}
+
+    def _resolve_executed_feature_groups(
+        self,
+        prediction: Mapping[str, Any] | None,
+        feature_groups: Mapping[str, Mapping[str, Any]] | None,
+    ) -> list[str]:
+        """Return the executed feature groups for the active prediction."""
+
+        raw_candidates: Iterable[Any] | None = None
+        if isinstance(prediction, Mapping):
+            raw_candidates = (
+                prediction.get("feature_groups_used")
+                or prediction.get("executed_feature_groups")
+                or prediction.get("used_feature_groups")
+            )
+
+        candidates: list[str] = []
+        seen: set[str] = set()
+        if isinstance(raw_candidates, Mapping):
+            raw_candidates = raw_candidates.keys()
+        if isinstance(raw_candidates, Iterable) and not isinstance(
+            raw_candidates, (str, bytes)
+        ):
+            for name in raw_candidates:
+                label = str(name).strip()
+                if label and label not in seen:
+                    seen.add(label)
+                    candidates.append(label)
+
+        if not candidates and isinstance(feature_groups, Mapping):
+            for name, summary in feature_groups.items():
+                if isinstance(summary, Mapping) and summary.get("executed"):
+                    label = str(name).strip()
+                    if label and label not in seen:
+                        seen.add(label)
+                        candidates.append(label)
+
+        return candidates
 
     def _feature_group_summary_text(
         self,
@@ -2233,56 +2274,27 @@ class StockPredictorDesktopApp:
 
     def _feature_group_overview_text(
         self,
-        feature_groups: Mapping[str, Mapping[str, Any]] | None,
+        executed_feature_groups: Iterable[Any] | None,
         feature_toggles: Mapping[str, bool] | None,
     ) -> str:
-        if feature_groups:
-            active_labels: list[str] = []
-            inactive_labels: list[str] = []
-            for name, summary in sorted(feature_groups.items()):
-                executed = bool(summary.get("executed"))
-                configured = summary.get("configured")
-                columns = summary.get("columns")
-                if isinstance(columns, Mapping):
-                    columns = list(columns.keys())
-                if isinstance(columns, (str, bytes)):
-                    columns = [columns]
-                column_count = (
-                    len(columns)
-                    if isinstance(columns, Iterable) and not isinstance(columns, (str, bytes))
-                    else 0
-                )
-                label = f"{name} ({column_count})" if column_count else name
-                if executed:
-                    active_labels.append(label)
-                elif configured is False or (
-                    feature_toggles and name in feature_toggles and not feature_toggles[name]
-                ):
-                    inactive_labels.append(f"{name} (disabled)")
-                else:
-                    inactive_labels.append(label)
+        labels: list[str] = []
+        seen: set[str] = set()
+        if executed_feature_groups:
+            for name in executed_feature_groups:
+                label = str(name).strip()
+                if label and label not in seen:
+                    seen.add(label)
+                    labels.append(label)
 
-            parts: list[str] = []
-            if active_labels:
-                parts.append("Active: " + ", ".join(active_labels))
-            if inactive_labels:
-                parts.append("Inactive: " + ", ".join(inactive_labels))
-            if not parts:
-                parts.append("No feature groups executed.")
-            return "Feature groups: " + "; ".join(parts)
+        if labels:
+            return "Features used: " + ", ".join(labels)
 
-        if feature_toggles:
-            enabled = [name for name, flag in sorted(feature_toggles.items()) if flag]
-            disabled = [name for name, flag in sorted(feature_toggles.items()) if not flag]
-            parts = []
-            if enabled:
-                parts.append("Enabled: " + ", ".join(enabled))
-            if disabled:
-                parts.append("Disabled: " + ", ".join(disabled))
-            if parts:
-                return "Feature groups: " + "; ".join(parts) + " (no execution report)"
+        if feature_toggles is not None:
+            flags = [bool(flag) for _, flag in feature_toggles.items()]
+            if not flags or not any(flags):
+                return "Features used: Baseline (no optional feature groups enabled)"
 
-        return "Feature groups: not reported"
+        return "Features used: not reported"
 
     def _feature_group_highlights(
         self, summary: Mapping[str, Any] | None
