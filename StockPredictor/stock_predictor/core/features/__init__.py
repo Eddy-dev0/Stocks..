@@ -210,6 +210,9 @@ class FeatureAssembler:
         metadata: Dict[str, object] = {}
         feature_categories: Dict[str, str] = {}
 
+        metadata["feature_toggles"] = dict(self.feature_toggles)
+        metadata["enabled_feature_groups"] = list(self.enabled_groups)
+
         group_metadata: dict[str, dict[str, object]] = {
             name: {
                 "configured": bool(self.feature_toggles.get(name, False)),
@@ -328,6 +331,9 @@ class FeatureAssembler:
         metadata["feature_groups"] = {
             name: summary for name, summary in group_metadata.items()
         }
+        metadata["executed_feature_groups"] = [
+            name for name, summary in group_metadata.items() if summary.get("executed")
+        ]
 
         features = merged[feature_columns]
         return FeatureResult(features=features, targets=targets, metadata=metadata)
