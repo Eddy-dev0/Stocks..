@@ -359,30 +359,46 @@ class StockPredictorAI:
     ) -> tuple[pd.DataFrame, dict[int, Dict[str, pd.Series]], dict[int, Pipeline]]:
         self._refresh_feature_assembler()
 
+        feature_toggles = self.config.feature_toggles
+        sentiment_enabled = bool(
+            self.config.sentiment and feature_toggles.get("sentiment", False)
+        )
+        macro_enabled = bool(feature_toggles.get("macro", False))
+        fundamentals_enabled = bool(feature_toggles.get("fundamental", False))
+
         if price_df is None:
             price_df = self.fetcher.fetch_price_data()
-        if news_df is None and self.config.sentiment:
+        if news_df is None and sentiment_enabled:
             news_df = self.fetcher.fetch_news_data()
         elif news_df is None:
             news_df = pd.DataFrame()
 
-        macro_frame = self._load_macro_indicators()
-        merged_price_df = self._merge_macro_columns(price_df, macro_frame)
-        fundamentals_df: pd.DataFrame | None
+        macro_frame = pd.DataFrame()
+        if macro_enabled:
+            macro_frame = self._load_macro_indicators()
+        merged_price_df = (
+            self._merge_macro_columns(price_df, macro_frame)
+            if macro_enabled and not macro_frame.empty
+            else price_df
+        )
+        fundamentals_df: pd.DataFrame | None = pd.DataFrame()
         fetch_fundamentals = getattr(self.fetcher, "fetch_fundamentals", None)
-        if callable(fetch_fundamentals):
+        if fundamentals_enabled and callable(fetch_fundamentals):
             fundamentals_df = fetch_fundamentals()
-        else:
-            fundamentals_df = pd.DataFrame()
 
         feature_result = self.feature_assembler.build(
             merged_price_df,
             news_df,
-            self.config.sentiment,
+            sentiment_enabled,
             fundamentals_df=fundamentals_df,
-            macro_df=macro_frame if not macro_frame.empty else None,
+            macro_df=macro_frame if macro_enabled and not macro_frame.empty else None,
         )
         metadata = dict(feature_result.metadata)
+        data_availability = {
+            "sentiment": sentiment_enabled,
+            "fundamental": fundamentals_enabled,
+            "macro": macro_enabled,
+        }
         snapshot_fetcher = getattr(self.fetcher, "fetch_fundamental_snapshot", None)
         if callable(snapshot_fetcher):
             try:
@@ -397,12 +413,28 @@ class StockPredictorAI:
         metadata["raw_feature_columns"] = raw_feature_columns
         metadata.setdefault("sentiment_daily", pd.DataFrame(columns=["Date", "sentiment"]))
         metadata.setdefault("feature_groups", {})
+        feature_groups = metadata.get("feature_groups")
+        if isinstance(feature_groups, dict):
+            for name, available in data_availability.items():
+                if name in feature_groups and isinstance(feature_groups[name], Mapping):
+                    feature_groups[name]["available"] = available
+        metadata["available_feature_groups"] = dict(data_availability)
         metadata["data_sources"] = self.fetcher.get_data_sources()
         metadata.setdefault("target_dates", {})
         horizons = tuple(metadata.get("horizons", tuple(self.config.prediction_horizons)))
         metadata["horizons"] = horizons
         metadata["active_horizon"] = self.horizon
         metadata.setdefault("feature_toggles", dict(self.config.feature_toggles))
+        metadata.setdefault(
+            "executed_feature_groups",
+            [
+                name
+                for name, summary in feature_groups.items()
+                if summary.get("executed")
+            ]
+            if isinstance(feature_groups, Mapping)
+            else [],
+        )
 
         latest_close, latest_date = self._latest_settled_close(price_df)
         if latest_close is not None:
