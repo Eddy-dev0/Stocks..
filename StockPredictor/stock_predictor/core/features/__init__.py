@@ -1019,22 +1019,21 @@ def _generate_targets(merged: pd.DataFrame, horizons: Iterable[int]) -> Dict[int
     merged = merged.copy()
     pct_returns = merged["Close"].pct_change(fill_method=None)
     merged["Daily_Return"] = pct_returns
-    daily_log_returns = np.log(merged["Close"]).diff()
 
     targets_by_horizon: Dict[int, Dict[str, pd.Series]] = {}
     for horizon in horizons:
         future_close = merged["Close"].shift(-horizon)
-        future_return = pct_returns.shift(-horizon)
-        log_return = daily_log_returns.shift(-horizon)
-        direction = (future_return > 0).astype(float)
-        direction[future_return.isna()] = np.nan
+        cumulative_return = _safe_divide(future_close, merged["Close"]) - 1.0
+        log_return = np.log1p(cumulative_return)
+        direction = (cumulative_return > 0).astype(float)
+        direction[cumulative_return.isna()] = np.nan
         volatility = (
             merged["Daily_Return"].rolling(window=horizon, min_periods=1).std().shift(-horizon)
         )
 
         horizon_targets: Dict[str, pd.Series] = {
             "close": future_close,
-            "return": future_return,
+            "return": cumulative_return,
             "log_return": log_return,
             "direction": direction,
             "volatility": volatility,
