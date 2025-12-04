@@ -2119,13 +2119,30 @@ class StockPredictorAI:
         trend_alignment_note = None
         confidence_notes: list[str] = []
 
-        close_prediction = predictions.get("close")
+        anchor_price = self._safe_float(last_price_value)
         latest_close = float(self.metadata.get("latest_close", np.nan))
+        if anchor_price is None:
+            anchor_price = self._safe_float(latest_close)
+
+        close_prediction_raw = predictions.get("close")
+        close_prediction = self._safe_float(close_prediction_raw)
+        close_from_return = None
+        if predicted_return is not None and anchor_price is not None:
+            close_from_return = float(anchor_price * (1 + predicted_return))
+        if close_prediction is None:
+            close_prediction = close_from_return
+        elif close_from_return is not None:
+            close_prediction = float(np.nanmean([close_prediction, close_from_return]))
+
         expected_change = None
         pct_change = None
-        if close_prediction is not None and np.isfinite(latest_close):
-            expected_change = close_prediction - latest_close
-            pct_change = expected_change / latest_close if latest_close else 0.0
+        if close_prediction is not None and anchor_price is not None:
+            expected_change = close_prediction - anchor_price
+            pct_change = expected_change / anchor_price if anchor_price else 0.0
+        elif predicted_return is not None:
+            pct_change = predicted_return
+            if anchor_price is not None:
+                expected_change = anchor_price * predicted_return
 
         historical_confidence, historical_note = self._historical_confidence_score(
             expected_change=expected_change, horizon=resolved_horizon
@@ -2221,12 +2238,15 @@ class StockPredictorAI:
                 snapshot_meta["error"] = sentiment_error
 
         indicator_floor, indicator_components = self._indicator_support_floor()
+        residual_error = self._residual_error_scale(resolved_horizon)
         expected_low = self._compute_expected_low(
             close_prediction,
             predicted_volatility,
             quantile_forecasts=quantile_forecasts,
             prediction_intervals=prediction_intervals,
             indicator_floor=indicator_floor,
+            residual_error=residual_error,
+            anchor_price=anchor_price,
         )
 
         monte_carlo_target_probability = None
@@ -2349,6 +2369,8 @@ class StockPredictorAI:
                         quantile_forecasts=quantile_forecasts,
                         prediction_intervals=prediction_intervals,
                         indicator_floor=indicator_floor,
+                        residual_error=residual_error,
+                        anchor_price=anchor_price,
                     )
                     updated_expected_close = self._safe_float(predictions.get("close"))
                     if updated_expected_close is not None:
@@ -2408,6 +2430,23 @@ class StockPredictorAI:
             close_prediction,
             predicted_volatility,
             expected_low=expected_low,
+            residual_error=residual_error,
+            anchor_price=anchor_price,
+        )
+
+        if expected_low is not None and close_prediction is not None:
+            expected_low = min(float(expected_low), float(close_prediction))
+        if stop_loss is not None and close_prediction is not None:
+            stop_loss = min(float(stop_loss), float(close_prediction))
+
+        self._validate_prediction_ranges(
+            predicted_return=predicted_return,
+            expected_change_pct=pct_change,
+            predicted_close=close_prediction,
+            expected_low=expected_low,
+            stop_loss=stop_loss,
+            anchor_price=anchor_price,
+            horizon=resolved_horizon,
         )
 
         beta_metrics, beta_notes = self._beta_context()
@@ -2547,6 +2586,16 @@ class StockPredictorAI:
                     FeatureUsageSummary(name=str(name), count=int(signal_count))
                 )
 
+        latest_features_snapshot: list[dict[str, Any]] | None = None
+        if isinstance(getattr(self, "metadata", None), Mapping):
+            raw_snapshot = self.metadata.get("latest_features")
+            if isinstance(raw_snapshot, pd.DataFrame) and not raw_snapshot.empty:
+                latest_features_snapshot = raw_snapshot.head(1).to_dict(orient="records")
+
+        source_descriptions = self._render_source_descriptions(
+            getattr(self, "metadata", {}).get("data_sources")
+        )
+
         result = {
             "ticker": self.config.ticker,
             "as_of": _to_iso(market_data_as_of) or "",
@@ -2573,6 +2622,14 @@ class StockPredictorAI:
             "horizon": resolved_horizon,
             "target_date": _to_iso(target_date) or "",
         }
+        if latest_features_snapshot:
+            result["latest_features_snapshot"] = latest_features_snapshot
+        if source_descriptions:
+            result["data_sources"] = source_descriptions
+        if isinstance(getattr(self, "metadata", None), Mapping):
+            validation_block = self.metadata.get("target_validation")
+            if validation_block:
+                result["target_validation"] = validation_block
         trailing_low_value = None
         drawdown_fraction = None
         if feature_usage_summary:
@@ -2685,6 +2742,25 @@ class StockPredictorAI:
 
         return features.to_numpy()
 
+    def _residual_error_scale(self, horizon: Optional[int]) -> Optional[float]:
+        """Return a typical absolute error scale derived from backtests.
+
+        The method prefers RMSE, falling back to MAE, and ignores non-positive
+        values so downstream consumers can bail out gracefully when no
+        historical evaluation is available.
+        """
+
+        metrics = self._validation_metrics("close", horizon)
+        if not metrics:
+            return None
+
+        for key in ("rmse", "mae"):
+            value = self._safe_float(metrics.get(key))
+            if value is not None and value > 0:
+                return float(value)
+
+        return None
+
     def _compute_expected_low(
         self,
         predicted_close: Any,
@@ -2693,6 +2769,9 @@ class StockPredictorAI:
         quantile_forecasts: Mapping[str, Dict[str, float]] | None,
         prediction_intervals: Mapping[str, Dict[str, float]] | None,
         indicator_floor: float | None = None,
+        residual_error: float | None = None,
+        anchor_price: float | None = None,
+        pct_hint: float | None = None,
     ) -> Optional[float]:
         """Estimate a conservative lower bound for the forecasted close.
 
@@ -2762,15 +2841,38 @@ class StockPredictorAI:
             floor_candidates.append(trailing_low_value)
         floor_value = max(floor_candidates) if floor_candidates else None
 
+        anchor_value = self._safe_float(anchor_price)
         numeric_close = self._safe_float(predicted_close)
+        if numeric_close is None:
+            numeric_close = anchor_value
         volatility_value = self._safe_float(predicted_volatility)
+
         if numeric_close is None:
             return floor_value
+
+        if residual_error is not None:
+            error_mag = abs(float(residual_error))
+            if anchor_value is not None and anchor_value > 0:
+                error_mag = min(error_mag, float(anchor_value) * 0.3)
+            candidate = max(0.0, float(numeric_close) - error_mag)
+            if floor_value is not None:
+                candidate = max(candidate, floor_value)
+            return float(min(candidate, numeric_close))
+
+        pct_hint_value = self._safe_float(pct_hint)
+        if pct_hint_value is not None and anchor_value is not None:
+            drop_fraction = abs(float(pct_hint_value))
+            candidate = float(anchor_value * (1 - drop_fraction))
+            candidate = max(0.0, candidate)
+            if floor_value is not None:
+                candidate = max(candidate, floor_value)
+            return float(min(candidate, numeric_close))
+
         if volatility_value is None:
             base_low = float(numeric_close)
             if floor_value is not None:
                 base_low = max(base_low, floor_value)
-            return float(base_low)
+            return float(min(base_low, numeric_close))
 
         volatility_pct = abs(float(volatility_value))
         if volatility_pct > 1.0 and volatility_pct <= 100:
@@ -2814,7 +2916,7 @@ class StockPredictorAI:
         expected_low = max(0.0, expected_low)
         if floor_value is not None:
             expected_low = max(expected_low, floor_value)
-        return float(expected_low)
+        return float(min(expected_low, numeric_close))
 
     def _compute_stop_loss(
         self,
@@ -2822,13 +2924,36 @@ class StockPredictorAI:
         predicted_volatility: Any,
         *,
         expected_low: Any = None,
+        residual_error: float | None = None,
+        anchor_price: float | None = None,
+        pct_hint: float | None = None,
     ) -> Optional[float]:
         """Derive a stop-loss level using the forecasted volatility."""
 
+        anchor_value = self._safe_float(anchor_price)
         numeric_close = self._safe_float(predicted_close)
+        if numeric_close is None:
+            numeric_close = anchor_value
         fallback_low = self._safe_float(expected_low)
         if numeric_close is None:
             return fallback_low
+
+        if residual_error is not None:
+            delta = abs(float(residual_error)) * 1.5
+            if anchor_value is not None and anchor_value > 0:
+                delta = min(delta, float(anchor_value) * 0.45)
+            stop_loss = float(numeric_close - delta)
+            stop_loss = max(0.0, stop_loss)
+            if fallback_low is not None:
+                stop_loss = min(stop_loss, float(fallback_low))
+            return float(min(stop_loss, numeric_close))
+
+        pct_hint_value = self._safe_float(pct_hint)
+        if pct_hint_value is not None and anchor_value is not None:
+            stop_loss = max(0.0, float(anchor_value * (1 - abs(float(pct_hint_value)))))
+            if fallback_low is not None:
+                stop_loss = min(stop_loss, float(fallback_low))
+            return float(min(stop_loss, numeric_close))
 
         volatility_pct = self._safe_float(predicted_volatility)
         if volatility_pct is None:
@@ -2851,6 +2976,8 @@ class StockPredictorAI:
 
         stop_loss = float(numeric_close - delta)
         stop_loss = max(0.0, min(float(numeric_close), stop_loss))
+        if fallback_low is not None:
+            stop_loss = min(stop_loss, float(fallback_low))
         return float(stop_loss)
 
     def _indicator_support_floor(self) -> tuple[Optional[float], Dict[str, float]]:
@@ -2872,6 +2999,114 @@ class StockPredictorAI:
         if resolved_floor is None and cleaned_components:
             resolved_floor = min(cleaned_components.values())
         return resolved_floor, cleaned_components
+
+    def _validate_prediction_ranges(
+        self,
+        *,
+        predicted_return: float | None,
+        expected_change_pct: float | None,
+        predicted_close: float | None,
+        expected_low: float | None,
+        stop_loss: float | None,
+        anchor_price: float | None,
+        horizon: int,
+    ) -> None:
+        """Raise if forecast magnitudes fall outside sensible intraday bounds."""
+
+        horizon_days = max(1, int(horizon))
+        max_move = 0.5 * math.sqrt(horizon_days)
+
+        for label, value in (
+            ("predicted_return", predicted_return),
+            ("expected_change_pct", expected_change_pct),
+        ):
+            numeric = self._safe_float(value)
+            if numeric is not None and abs(numeric) > max_move:
+                raise ValueError(
+                    f"{label}={numeric:+.3f} exceeds plausible +/-{max_move:.2f} range for {horizon_days}-day horizon"
+                )
+
+        anchor_value = self._safe_float(anchor_price)
+        if predicted_close is not None and predicted_close < 0:
+            raise ValueError("Predicted close cannot be negative.")
+        if anchor_value is not None and predicted_close is not None:
+            band_floor = anchor_value * 0.01
+            if predicted_close < band_floor:
+                raise ValueError("Predicted close unrealistically small relative to anchor price.")
+
+        for label, value in (("expected_low", expected_low), ("stop_loss", stop_loss)):
+            numeric = self._safe_float(value)
+            if numeric is None:
+                continue
+            if numeric < 0:
+                raise ValueError(f"{label} cannot be negative.")
+            if predicted_close is not None and numeric - predicted_close > 1e-6:
+                raise ValueError(f"{label} must not exceed the predicted close.")
+
+    def live_price_snapshot(
+        self,
+        *,
+        expected_change_pct_model: float | None,
+        expected_low_pct_model: float | None,
+        stop_loss_pct: float | None,
+        prob_up: float | None,
+    ) -> Dict[str, Any]:
+        """Compose a live snapshot using model expectations and residual bands."""
+
+        last_price, timestamp = self.fetcher.fetch_live_price(force=True)
+        anchor_price = self._safe_float(last_price)
+        pct_change = self._safe_float(expected_change_pct_model)
+        predicted_close = None
+        if anchor_price is not None and pct_change is not None:
+            predicted_close = float(anchor_price * (1 + pct_change))
+
+        residual_error = self._residual_error_scale(self.horizon)
+        expected_low = self._compute_expected_low(
+            predicted_close,
+            None,
+            quantile_forecasts=None,
+            prediction_intervals=None,
+            indicator_floor=None,
+            residual_error=residual_error,
+            anchor_price=anchor_price,
+            pct_hint=expected_low_pct_model,
+        )
+        stop_loss = self._compute_stop_loss(
+            predicted_close,
+            None,
+            expected_low=expected_low,
+            residual_error=residual_error,
+            anchor_price=anchor_price,
+            pct_hint=stop_loss_pct,
+        )
+
+        if expected_low is not None and predicted_close is not None:
+            expected_low = min(expected_low, predicted_close)
+        if stop_loss is not None and predicted_close is not None:
+            stop_loss = min(stop_loss, predicted_close)
+
+        self._validate_prediction_ranges(
+            predicted_return=pct_change,
+            expected_change_pct=pct_change,
+            predicted_close=predicted_close,
+            expected_low=expected_low,
+            stop_loss=stop_loss,
+            anchor_price=anchor_price,
+            horizon=self.horizon or 1,
+        )
+
+        prob_down = (1 - prob_up) if isinstance(prob_up, (int, float)) else None
+
+        return {
+            "ticker": self.config.ticker,
+            "market_time": timestamp.to_pydatetime() if timestamp is not None else None,
+            "last_price": last_price,
+            "predicted_close": predicted_close,
+            "expected_change_pct": pct_change,
+            "expected_low": expected_low,
+            "stop_loss": stop_loss,
+            "probabilities": {"up": prob_up, "down": prob_down},
+        }
 
     def _estimate_prediction_uncertainty(
         self,

@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from stock_predictor.core.features import _generate_targets
+from stock_predictor.core.features import _generate_targets, _validate_target_alignment
 
 
 class TargetGenerationTests(unittest.TestCase):
@@ -42,6 +42,18 @@ class TargetGenerationTests(unittest.TestCase):
         expected_cumulative = (close.shift(-2) / close) - 1.0
         self.assertLess(expected_cumulative.iloc[0], 0)
         self.assertEqual(horizon_targets["direction"].iloc[0], 0.0)
+
+    def test_target_validation_flags_alignment(self) -> None:
+        dates = pd.date_range("2024-03-01", periods=4, freq="B")
+        close = pd.Series([100.0, 101.0, 102.5, 103.0])
+        merged = pd.DataFrame({"Date": dates, "Close": close})
+
+        targets = _generate_targets(merged, horizons=(1,))
+        validation = _validate_target_alignment(merged, targets, (1,))
+
+        self.assertIn(1, validation)
+        self.assertTrue(validation[1]["close_aligned"])
+        self.assertTrue(validation[1]["return_aligned"])
 
 
 if __name__ == "__main__":  # pragma: no cover - test harness

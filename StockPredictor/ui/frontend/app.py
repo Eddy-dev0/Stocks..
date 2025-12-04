@@ -188,6 +188,65 @@ def _render_feature_usage(
         st.table(pd.DataFrame({"Indicators": indicators}))
 
 
+def _render_model_input_details(forecast_block: Mapping[str, Any] | None) -> None:
+    """Show feature groups, latest feature snapshot, and data sources."""
+
+    if not isinstance(forecast_block, Mapping):
+        return
+
+    snapshot = forecast_block.get("latest_features_snapshot")
+    feature_groups = forecast_block.get("feature_groups")
+    target_validation = forecast_block.get("target_validation")
+    data_sources = forecast_block.get("data_sources") or forecast_block.get("sources")
+
+    with st.expander("Model inputs & data sources", expanded=False):
+        if snapshot:
+            st.caption("Latest feature vector sent to the model (scroll to view all inputs).")
+            st.dataframe(
+                pd.DataFrame(snapshot).T,
+                use_container_width=True,
+                height=320,
+            )
+
+        if feature_groups:
+            rows: list[dict[str, object]] = []
+            for name, details in sorted(feature_groups.items()):
+                if not isinstance(details, Mapping):
+                    continue
+                rows.append(
+                    {
+                        "Feature group": name,
+                        "Executed": details.get("executed"),
+                        "Status": details.get("status"),
+                        "Columns": len(details.get("columns", [])) if isinstance(details.get("columns"), (list, tuple, set)) else None,
+                    }
+                )
+            if rows:
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, height=220)
+
+        if target_validation:
+            validation_rows: list[dict[str, object]] = []
+            if isinstance(target_validation, Mapping):
+                for horizon, details in sorted(target_validation.items()):
+                    if not isinstance(details, Mapping):
+                        continue
+                    validation_rows.append(
+                        {
+                            "Horizon": horizon,
+                            "Close aligned": details.get("close_aligned"),
+                            "Close max error": details.get("close_alignment_error"),
+                            "Return aligned": details.get("return_aligned"),
+                            "Return max error": details.get("return_alignment_error"),
+                        }
+                    )
+            if validation_rows:
+                st.dataframe(pd.DataFrame(validation_rows), use_container_width=True, height=200)
+
+        if data_sources:
+            sources = data_sources if isinstance(data_sources, list) else [data_sources]
+            st.table(pd.DataFrame({"Data source": sources}))
+
+
 def _coerce_dataframe(payload: Any) -> pd.DataFrame | None:
     if payload is None:
         return None
@@ -864,6 +923,7 @@ with col_data:
     if feature_usage.get("indicators"):
         st.caption("Indicators used by the latest forecast run:")
         st.table(pd.DataFrame({"Indicator": feature_usage["indicators"]}))
+    _render_model_input_details(forecast_block)
     if st.button("Fetch market data", type="primary"):
         with st.spinner("Loading market data..."):
             response = _request(

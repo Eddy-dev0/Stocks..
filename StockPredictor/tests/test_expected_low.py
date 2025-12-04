@@ -187,3 +187,35 @@ def test_model_expected_low_clips_to_drawdown_cap() -> None:
     )
 
     assert expected_low == pytest.approx(97.0)
+
+
+def test_model_expected_low_uses_residual_band() -> None:
+    predictor = StockPredictorAI.__new__(StockPredictorAI)
+    predictor.config = _ConfigStub()
+    predictor.metadata = {}
+
+    expected_low = predictor._compute_expected_low(  # type: ignore[attr-defined]
+        100.0,
+        None,
+        quantile_forecasts=None,
+        prediction_intervals=None,
+        residual_error=3.0,
+        anchor_price=100.0,
+    )
+
+    assert expected_low == pytest.approx(97.0)
+
+
+def test_model_stop_loss_uses_residual_band() -> None:
+    predictor = StockPredictorAI.__new__(StockPredictorAI)
+    predictor.config = _ConfigStub()
+
+    stop_loss = predictor._compute_stop_loss(  # type: ignore[attr-defined]
+        100.0,
+        None,
+        expected_low=96.0,
+        residual_error=2.0,
+        anchor_price=100.0,
+    )
+
+    assert stop_loss == pytest.approx(96.0)

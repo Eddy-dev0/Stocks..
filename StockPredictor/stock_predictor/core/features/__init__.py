@@ -303,6 +303,9 @@ class FeatureAssembler:
         merged = merged.assign(Close_Current=merged["Close"])
 
         targets = _generate_targets(merged, self.horizons)
+        metadata["target_validation"] = _validate_target_alignment(
+            merged, targets, self.horizons
+        )
 
         feature_columns = [col for col in merged.columns if col not in {"Date", "Close"}]
         metadata.update(
@@ -1049,6 +1052,48 @@ def _generate_targets(merged: pd.DataFrame, horizons: Iterable[int]) -> Dict[int
             targets_by_horizon[horizon] = valid_targets
 
     return targets_by_horizon
+
+
+def _validate_target_alignment(
+    merged: pd.DataFrame, targets: Mapping[int, Mapping[str, pd.Series]], horizons: Iterable[int]
+) -> Dict[int, Dict[str, object]]:
+    """Validate that generated targets line up with expected future shifts.
+
+    For each requested horizon this checks whether the close and return targets
+    resemble a simple shift of the underlying price series. The resulting
+    summary is stored in metadata so downstream components (UI, tests) can
+    confirm that the model trains on the intended labels.
+    """
+
+    base_close = pd.to_numeric(merged["Close"], errors="coerce")
+    summary: Dict[int, Dict[str, object]] = {}
+
+    for horizon in horizons:
+        horizon_int = int(horizon)
+        record: Dict[str, object] = {"horizon": horizon_int}
+        block = targets.get(horizon_int, {}) if isinstance(targets, Mapping) else {}
+
+        shifted_close = base_close.shift(-horizon_int)
+
+        close_series = block.get("close") if isinstance(block, Mapping) else None
+        if close_series is not None:
+            aligned = pd.to_numeric(close_series, errors="coerce")
+            diff = (aligned - shifted_close).abs().dropna()
+            max_error = float(diff.max()) if not diff.empty else None
+            record["close_alignment_error"] = max_error
+            record["close_aligned"] = bool(max_error is not None and max_error < 1e-6)
+
+        return_series = block.get("return") if isinstance(block, Mapping) else None
+        if return_series is not None:
+            expected_return = _safe_divide(shifted_close, base_close) - 1.0
+            diff = (pd.to_numeric(return_series, errors="coerce") - expected_return).abs().dropna()
+            max_error = float(diff.max()) if not diff.empty else None
+            record["return_alignment_error"] = max_error
+            record["return_aligned"] = bool(max_error is not None and max_error < 1e-6)
+
+        summary[horizon_int] = record
+
+    return summary
 
 
 def _estimate_target_dates(dates: pd.Series, horizons: Iterable[int]) -> Dict[int, pd.Timestamp]:

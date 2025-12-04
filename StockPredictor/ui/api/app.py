@@ -397,45 +397,15 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
     )
     async def live_price(ticker: str, request: LivePriceRequest) -> LivePriceEnvelope:
         application = await _build_application(ticker, {})
-        last_price, timestamp = await _call_with_error_handling(
-            application.pipeline.fetcher.fetch_live_price, force=True
+        snapshot_payload = await _call_with_error_handling(
+            application.pipeline.live_price_snapshot,
+            expected_change_pct_model=request.expected_change_pct_model,
+            expected_low_pct_model=request.expected_low_pct_model,
+            stop_loss_pct=request.stop_loss_pct,
+            prob_up=request.prob_up,
         )
 
-        predicted_close = (
-            last_price * (1 + request.expected_change_pct_model)
-            if last_price is not None and request.expected_change_pct_model is not None
-            else None
-        )
-        expected_low = None
-        if last_price is not None and request.expected_low_pct_model is not None:
-            downside = max(0.0, request.expected_low_pct_model)
-            expected_low = last_price * (1 - downside)
-            expected_low = max(0.0, min(expected_low, last_price))
-        stop_loss = (
-            last_price * (1 - request.stop_loss_pct)
-            if last_price is not None and request.stop_loss_pct is not None
-            else None
-        )
-        if stop_loss is None:
-            stop_loss = expected_low
-
-        prob_up = request.prob_up
-        prob_down = (1 - prob_up) if isinstance(prob_up, (int, float)) else None
-
-        market_time: datetime | None = None
-        if timestamp is not None:
-            market_time = timestamp.to_pydatetime()
-
-        snapshot = LivePriceResponse(
-            ticker=ticker.upper(),
-            market_time=market_time,
-            last_price=last_price,
-            predicted_close=predicted_close,
-            expected_change_pct=request.expected_change_pct_model,
-            expected_low=expected_low,
-            stop_loss=stop_loss,
-            probabilities=DirectionProbabilities(up=prob_up, down=prob_down),
-        )
+        snapshot = LivePriceResponse(**snapshot_payload)
         return LivePriceEnvelope(status="ok", price=snapshot)
 
     @app.get("/research", dependencies=[Depends(require_api_key)])
