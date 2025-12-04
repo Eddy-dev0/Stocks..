@@ -2119,6 +2119,9 @@ class StockPredictorAI:
         trend_alignment_note = None
         confidence_notes: list[str] = []
 
+        predicted_return = self._safe_float(predictions.get("return"))
+        predicted_volatility = self._safe_float(predictions.get("volatility"))
+
         latest_close = float(self.metadata.get("latest_close", np.nan))
         last_price_value = self._safe_float(self.metadata.get("latest_price"))
         if last_price_value is None:
@@ -2199,8 +2202,6 @@ class StockPredictorAI:
         else:
             target_date = target_timestamp
 
-        predicted_return = self._safe_float(predictions.get("return"))
-        predicted_volatility = self._safe_float(predictions.get("volatility"))
         dir_prob = probabilities.get("direction") if isinstance(probabilities, dict) else None
         direction_probability_up = None
         direction_probability_down = None
