@@ -41,7 +41,7 @@ from ..backtesting import Backtester
 from ..config import PredictorConfig
 from ..data_fetcher import DataFetcher
 from ..database import ExperimentTracker
-from ..features import FeatureAssembler
+from ..features import FeatureAssembler, FeatureToggles
 from ..indicator_bundle import evaluate_signal_confluence
 from ..ml_preprocessing import (
     DataFrameSimpleImputer,
@@ -2566,6 +2566,7 @@ class StockPredictorAI:
 
         feature_groups_meta: Mapping[str, Any] | None = None
         executed_feature_groups: list[str] | None = None
+        feature_toggle_flags: Mapping[str, bool] | None = None
         feature_vectors_by_group: dict[str, list[str]] = {}
         feature_usage_summary: list[FeatureUsageSummary] = []
         indicator_columns: list[str] = []
@@ -2575,6 +2576,16 @@ class StockPredictorAI:
             indicator_source = self.metadata.get("indicator_columns")
             if isinstance(indicator_source, (list, tuple, set)):
                 indicator_columns = [str(name) for name in indicator_source]
+
+        feature_toggle_source = getattr(self.config, "feature_toggles", None)
+        if isinstance(feature_toggle_source, FeatureToggles):
+            feature_toggle_flags = feature_toggle_source.asdict()
+        elif isinstance(feature_toggle_source, Mapping):
+            feature_toggle_flags = {
+                str(name): bool(value)
+                for name, value in feature_toggle_source.items()
+                if str(name).strip()
+            }
 
         if not executed_feature_groups:
             executed_feature_groups = self.get_used_feature_groups()
@@ -2603,6 +2614,23 @@ class StockPredictorAI:
                 feature_usage_summary.append(
                     FeatureUsageSummary(name=str(name), count=int(signal_count))
                 )
+
+        executed_set = {
+            str(name).strip() for name in executed_feature_groups or [] if str(name).strip()
+        }
+        if feature_toggle_flags is not None:
+            for name, enabled in feature_toggle_flags.items():
+                label = str(name).strip()
+                if not label:
+                    continue
+                if enabled and label not in executed_set:
+                    prediction_warnings.append(
+                        f"Feature group '{label}' was enabled but not reported in executed_feature_groups."
+                    )
+                if not enabled and label in executed_set:
+                    prediction_warnings.append(
+                        f"Feature group '{label}' executed despite being disabled via feature_toggles."
+                    )
 
         latest_features_snapshot: list[dict[str, Any]] | None = None
         if isinstance(getattr(self, "metadata", None), Mapping):
