@@ -38,7 +38,7 @@ from stock_predictor.core import (
     TrendInsight,
 )
 from stock_predictor.core.pipeline import NoPriceDataError, resolve_market_timezone
-from stock_predictor.core.features import FEATURE_REGISTRY
+from stock_predictor.core.features import FEATURE_REGISTRY, FeatureToggles
 from stock_predictor.core.preprocessing import derive_price_feature_toggles
 from stock_predictor.core.support_levels import indicator_support_floor
 
@@ -3349,8 +3349,9 @@ class StockPredictorDesktopApp:
                 toggles[name] = bool(self.feature_toggle_vars[name].get())
             else:
                 toggles[name] = bool(self.config.feature_toggles.get(name, False))
-        self.config.feature_toggles = toggles
-        self.config.price_feature_toggles = derive_price_feature_toggles(toggles)
+        toggles_obj = FeatureToggles.from_any(toggles, defaults=self.config.feature_toggles)
+        self.config.feature_toggles = toggles_obj
+        self.config.price_feature_toggles = derive_price_feature_toggles(toggles_obj)
         self.application.pipeline = StockPredictorAI(self.config)
         status_message = "Feature toggles updated."
         self._set_busy(True, "Recomputing indicators for updated feature toggles…")
