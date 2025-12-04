@@ -83,6 +83,7 @@ DEFAULT_EXPECTED_LOW_SIGMA = 1.0
 DEFAULT_STOP_LOSS_MULTIPLIER = 1.0
 DEFAULT_EXPECTED_LOW_MAX_VOLATILITY = 1.0
 DEFAULT_EXPECTED_LOW_FLOOR_WINDOW = 20
+DEFAULT_PLAUSIBILITY_SIGMA_MULTIPLIER = 3.0
 
 
 LabelFunction = Callable[[pd.DataFrame, int, Any], pd.Series]
@@ -486,6 +487,13 @@ class StockPredictorAI:
                 price_history["return"] = pd.to_numeric(
                     price_history[close_column], errors="coerce"
                 ).pct_change()
+
+                recent_returns = price_history["return"].dropna()
+                if not recent_returns.empty:
+                    recent_window = recent_returns.tail(int(window))
+                    return_std = float(recent_window.std())
+                    metadata["recent_return_std"] = return_std
+                    metadata["recent_return_mean"] = float(recent_window.mean())
 
             for horizon_value in horizons:
                 try:
@@ -2441,7 +2449,13 @@ class StockPredictorAI:
         if stop_loss is not None and close_prediction is not None:
             stop_loss = min(float(stop_loss), float(close_prediction))
 
-        self._validate_prediction_ranges(
+        (
+            predicted_return,
+            pct_change,
+            close_prediction,
+            expected_low,
+            stop_loss,
+        ) = self._validate_prediction_ranges(
             predicted_return=predicted_return,
             expected_change_pct=pct_change,
             predicted_close=close_prediction,
@@ -2449,6 +2463,8 @@ class StockPredictorAI:
             stop_loss=stop_loss,
             anchor_price=anchor_price,
             horizon=resolved_horizon,
+            residual_error=residual_error,
+            prediction_warnings=prediction_warnings,
         )
 
         beta_metrics, beta_notes = self._beta_context()
@@ -3012,38 +3028,116 @@ class StockPredictorAI:
         stop_loss: float | None,
         anchor_price: float | None,
         horizon: int,
-    ) -> None:
-        """Raise if forecast magnitudes fall outside sensible intraday bounds."""
+        residual_error: float | None = None,
+        prediction_warnings: Optional[list[str]] = None,
+    ) -> tuple[float | None, float | None, float | None, float | None, float | None]:
+        """Clamp predictions to a volatility-aware band and surface warnings.
 
+        The maximum allowed move scales with the forecast horizon and is
+        derived from recent realised volatility (``recent_return_std``) or
+        backtest residual error. When a warning sink is provided, extreme
+        values are clamped into the plausible band and a warning is recorded so
+        the UI can flag discarded forecasts. Without a warning sink, a
+        ``ValueError`` is raised to avoid silent distortion.
+        """
+
+        anchor_value = self._safe_float(anchor_price)
         horizon_days = max(1, int(horizon))
-        max_move = 0.5 * math.sqrt(horizon_days)
+
+        sigma_candidates: list[float] = []
+        if isinstance(getattr(self, "metadata", None), Mapping):
+            sigma_candidates.append(self._safe_float(self.metadata.get("recent_return_std")) or 0.0)
+
+        residual_pct = None
+        if residual_error is not None and anchor_value is not None and anchor_value > 0:
+            residual_pct = abs(float(residual_error)) / float(anchor_value)
+            sigma_candidates.append(residual_pct)
+
+        sigma_values = [value for value in sigma_candidates if value and value > 0]
+        sigma_multiplier = getattr(
+            self.config, "plausibility_sigma_multiplier", DEFAULT_PLAUSIBILITY_SIGMA_MULTIPLIER
+        )
+        sigma_multiplier_value = self._safe_float(sigma_multiplier) or DEFAULT_PLAUSIBILITY_SIGMA_MULTIPLIER
+        if sigma_multiplier_value <= 0:
+            sigma_multiplier_value = DEFAULT_PLAUSIBILITY_SIGMA_MULTIPLIER
+
+        dynamic_band = None
+        if sigma_values:
+            dynamic_band = max(sigma_values) * sigma_multiplier_value * math.sqrt(horizon_days)
+
+        max_move = dynamic_band if dynamic_band is not None else 0.5 * math.sqrt(horizon_days)
+
+        warning_sink = prediction_warnings if isinstance(prediction_warnings, list) else None
+
+        def _add_warning(message: str) -> None:
+            if warning_sink is None:
+                return
+            if message not in warning_sink:
+                warning_sink.append(message)
+
+        validated_return = predicted_return
+        validated_change_pct = expected_change_pct
 
         for label, value in (
             ("predicted_return", predicted_return),
             ("expected_change_pct", expected_change_pct),
         ):
             numeric = self._safe_float(value)
-            if numeric is not None and abs(numeric) > max_move:
-                raise ValueError(
-                    f"{label}={numeric:+.3f} exceeds plausible +/-{max_move:.2f} range for {horizon_days}-day horizon"
+            if numeric is None:
+                continue
+            if abs(numeric) > max_move:
+                warning_message = (
+                    f"{label}={numeric:+.3f} exceeds volatility band +/-{max_move:.3f} for {horizon_days}-day horizon"
                 )
+                if warning_sink is None:
+                    raise ValueError(warning_message)
+                _add_warning(warning_message)
+                numeric = math.copysign(max_move, numeric)
+                if label == "predicted_return":
+                    validated_return = numeric
+                else:
+                    validated_change_pct = numeric
 
-        anchor_value = self._safe_float(anchor_price)
-        if predicted_close is not None and predicted_close < 0:
+        validated_close = predicted_close
+        if anchor_value is not None and validated_change_pct is not None:
+            validated_close = float(anchor_value * (1 + validated_change_pct))
+        elif anchor_value is not None and validated_close is None:
+            validated_close = anchor_value
+
+        if validated_close is not None and validated_close < 0:
             raise ValueError("Predicted close cannot be negative.")
-        if anchor_value is not None and predicted_close is not None:
+        if anchor_value is not None and validated_close is not None:
             band_floor = anchor_value * 0.01
-            if predicted_close < band_floor:
+            if validated_close < band_floor:
                 raise ValueError("Predicted close unrealistically small relative to anchor price.")
 
+        validated_expected_low = expected_low
+        validated_stop_loss = stop_loss
         for label, value in (("expected_low", expected_low), ("stop_loss", stop_loss)):
             numeric = self._safe_float(value)
             if numeric is None:
                 continue
             if numeric < 0:
                 raise ValueError(f"{label} cannot be negative.")
-            if predicted_close is not None and numeric - predicted_close > 1e-6:
+            if validated_close is not None and numeric - validated_close > 1e-6:
                 raise ValueError(f"{label} must not exceed the predicted close.")
+            if label == "expected_low":
+                validated_expected_low = numeric
+            else:
+                validated_stop_loss = numeric
+
+        if validated_expected_low is not None and validated_close is not None:
+            validated_expected_low = min(validated_expected_low, validated_close)
+        if validated_stop_loss is not None and validated_close is not None:
+            validated_stop_loss = min(validated_stop_loss, validated_close)
+
+        return (
+            None if validated_return is None else float(validated_return),
+            None if validated_change_pct is None else float(validated_change_pct),
+            None if validated_close is None else float(validated_close),
+            None if validated_expected_low is None else float(validated_expected_low),
+            None if validated_stop_loss is None else float(validated_stop_loss),
+        )
 
     def live_price_snapshot(
         self,
@@ -3087,7 +3181,14 @@ class StockPredictorAI:
         if stop_loss is not None and predicted_close is not None:
             stop_loss = min(stop_loss, predicted_close)
 
-        self._validate_prediction_ranges(
+        snapshot_warnings: list[str] = []
+        (
+            _,
+            pct_change,
+            predicted_close,
+            expected_low,
+            stop_loss,
+        ) = self._validate_prediction_ranges(
             predicted_return=pct_change,
             expected_change_pct=pct_change,
             predicted_close=predicted_close,
@@ -3095,6 +3196,8 @@ class StockPredictorAI:
             stop_loss=stop_loss,
             anchor_price=anchor_price,
             horizon=self.horizon or 1,
+            residual_error=residual_error,
+            prediction_warnings=snapshot_warnings,
         )
 
         prob_down = (1 - prob_up) if isinstance(prob_up, (int, float)) else None
@@ -3108,6 +3211,7 @@ class StockPredictorAI:
             "expected_low": expected_low,
             "stop_loss": stop_loss,
             "probabilities": {"up": prob_up, "down": prob_down},
+            "warnings": snapshot_warnings or None,
         }
 
     def _estimate_prediction_uncertainty(
