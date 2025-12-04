@@ -2119,8 +2119,12 @@ class StockPredictorAI:
         trend_alignment_note = None
         confidence_notes: list[str] = []
 
-        anchor_price = self._safe_float(last_price_value)
         latest_close = float(self.metadata.get("latest_close", np.nan))
+        last_price_value = self._safe_float(self.metadata.get("latest_price"))
+        if last_price_value is None:
+            last_price_value = latest_close
+
+        anchor_price = self._safe_float(last_price_value)
         if anchor_price is None:
             anchor_price = self._safe_float(latest_close)
 
@@ -2182,9 +2186,6 @@ class StockPredictorAI:
         )
 
         market_data_as_of = self.metadata.get("market_data_as_of") or latest_date
-        last_price_value = self._safe_float(self.metadata.get("latest_price"))
-        if last_price_value is None:
-            last_price_value = latest_close
 
         if latest_timestamp is not None:
             if target_timestamp is None or target_timestamp <= latest_timestamp:
