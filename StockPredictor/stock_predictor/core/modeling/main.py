@@ -2214,6 +2214,15 @@ class StockPredictorAI:
                     raw_latest, target_timezone=self.market_timezone
                 )
 
+        historical_drift: float | None = None
+        historical_volatility: float | None = None
+        if price_df is not None and not price_df.empty:
+            historical_drift, historical_volatility = _historical_drift_volatility(price_df)
+            if historical_drift is not None:
+                self.metadata["historical_drift"] = historical_drift
+            if historical_volatility is not None:
+                self.metadata["historical_volatility"] = historical_volatility
+
         if latest_price_timestamp is not None:
             if metadata_latest_timestamp is None or latest_price_timestamp > metadata_latest_timestamp:
                 if not needs_feature_refresh:
@@ -2420,7 +2429,18 @@ class StockPredictorAI:
             quantile_forecasts.get("return"),
             prediction_intervals.get("return"),
         )
+        if predicted_return is None and historical_drift is not None and resolved_horizon:
+            predicted_return = float(historical_drift) * float(resolved_horizon)
+            prediction_warnings.append(
+                "Return model unavailable or produced NaN; falling back to historical drift."
+            )
+
         predicted_volatility = self._safe_float(predictions.get("volatility"))
+        if predicted_volatility is None and historical_volatility is not None:
+            predicted_volatility = float(abs(historical_volatility))
+            prediction_warnings.append(
+                "Volatility model unavailable or produced NaN; using realised historical volatility."
+            )
 
         latest_close = float(self.metadata.get("latest_close", np.nan))
         last_price_value = self._safe_float(self.metadata.get("latest_price"))
@@ -2440,6 +2460,11 @@ class StockPredictorAI:
             close_prediction = close_from_return
         elif close_from_return is not None:
             close_prediction = float(np.nanmean([close_prediction, close_from_return]))
+        if close_prediction is None and anchor_price is not None and historical_drift is not None:
+            close_prediction = float(anchor_price * (1 + historical_drift * float(resolved_horizon or 1)))
+            prediction_warnings.append(
+                "Close model unavailable or produced NaN; reverting to drift-adjusted anchor price."
+            )
         close_prediction = self._clamp_with_uncertainty(
             close_prediction,
             quantile_forecasts.get("close"),
