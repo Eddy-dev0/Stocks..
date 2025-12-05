@@ -34,6 +34,38 @@ scenarios.
 - FastAPI backend (`ui/api`) secured with API keys and a Streamlit dashboard (`ui/frontend`) for
   interactive exploration of data, forecasts, backtests and research artefacts.
 
+### Model configuration
+
+Model-specific overrides live under `model_params` and can be supplied either via
+the Python API or environment variables that JSON-encode the mapping. Useful
+keys include:
+
+- `ensemble.enabled`: train multiple estimators per target/horizon and blend
+  their forecasts. Configure `ensemble.members` (list of model types such as
+  `random_forest`, `hist_gb`, `mlp`, `transformer`) plus optional
+  `ensemble.weights`, `ensemble.quantiles` or `ensemble.interval_alpha`.
+- `calibration.enabled` / `calibration.residuals`: fit a post-hoc linear
+  regression on validation residuals to debias close/return forecasts and carry
+  the residual error band into downstream guardrails.
+
+Example:
+
+```python
+config = build_config(
+    ticker="AAPL",
+    model_params={
+        "global": {
+            "ensemble": {
+                "enabled": True,
+                "members": ["random_forest", "hist_gb", "mlp"],
+                "weights": {"random_forest": 1.2, "mlp": 0.8},
+            },
+            "calibration": {"enabled": True},
+        }
+    },
+)
+```
+
 ## Monte Carlo target-hit simulation
 
 The predictor reports a Monte Carlo estimate of the probability that the configured

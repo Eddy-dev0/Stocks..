@@ -33,6 +33,7 @@ import numpy as np
 import pandas as pd
 from sklearn.base import clone
 from sklearn.calibration import calibration_curve
+from sklearn.linear_model import LinearRegression
 from sklearn.metrics import brier_score_loss, r2_score
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
@@ -51,6 +52,7 @@ from ..ml_preprocessing import (
 from ..pipeline import DEFAULT_MARKET_TIMEZONE, US_MARKET_CLOSE, resolve_market_timezone
 from .prediction_result import FeatureUsageSummary, PredictionResult
 from ..support_levels import indicator_support_floor
+from .ensembles import EnsembleMember
 from ..models import (
     ModelFactory,
     classification_metrics,
@@ -1142,9 +1144,20 @@ class StockPredictorAI:
             self._log_target_distribution(target, resolved_horizon, y_clean)
             self._validate_no_nans(target, resolved_horizon, aligned_X, y_clean)
 
-            model_params = self.config.model_params.get(target, {})
-            global_params = self.config.model_params.get("global", {})
-            factory = ModelFactory(model_type, {**global_params, **model_params})
+            model_params = dict(self.config.model_params.get(target, {}))
+            global_params = dict(self.config.model_params.get("global", {}))
+            ensemble_config = self._resolve_ensemble_config(
+                target, task, params=self.config.model_params
+            )
+            calibration_params: dict[str, Any] = {}
+            for scope in (global_params.get("calibration"), model_params.get("calibration")):
+                if isinstance(scope, Mapping):
+                    calibration_params.update(scope)
+            calibration_enabled = bool(
+                calibration_params.get("enabled", False)
+                or calibration_params.get("residuals", False)
+                or calibration_params.get("residual_calibration", False)
+            )
 
             calibrate_override = model_params.get("calibrate")
             if calibrate_override is None:
@@ -1153,6 +1166,24 @@ class StockPredictorAI:
                 calibrate_flag = task == "classification"
             else:
                 calibrate_flag = bool(calibrate_override)
+
+            if ensemble_config.get("enabled"):
+                members = self._build_ensemble_members(
+                    ensemble_config["members"],
+                    task,
+                    global_params=global_params,
+                    model_params=model_params,
+                    calibrate_flag=calibrate_flag,
+                    weights=ensemble_config.get("weights", {}),
+                )
+                if members:
+                    model_params["members"] = members
+                if ensemble_config.get("quantiles"):
+                    model_params["quantiles"] = ensemble_config["quantiles"]
+                model_params["interval_alpha"] = ensemble_config.get("interval_alpha", 0.2)
+                model_type = "ensemble"
+
+            factory = ModelFactory(model_type, {**global_params, **model_params})
 
             template = self.preprocessor_templates.get(resolved_horizon)
             evaluation = self._evaluate_model(
@@ -1163,6 +1194,7 @@ class StockPredictorAI:
                 target,
                 calibrate_flag,
                 template,
+                collect_predictions=calibration_enabled,
             )
             LOGGER.info(
                 "Evaluation summary for target '%s' (horizon %s, strategy %s): %s",
@@ -1194,6 +1226,22 @@ class StockPredictorAI:
 
             final_model = factory.create(task, calibrate=calibrate_flag)
             final_model.fit(transformed_X, y_clean)
+            calibrator = None
+            calibration_stats = None
+            validation_block = evaluation.get("validation") if calibration_enabled else None
+            if (
+                calibration_enabled
+                and isinstance(validation_block, Mapping)
+                and validation_block.get("y_true")
+                and validation_block.get("y_pred")
+            ):
+                calibrator, calibration_stats = self._fit_residual_calibrator(
+                    validation_block.get("y_true", []), validation_block.get("y_pred", [])
+                )
+                if calibrator is not None:
+                    setattr(final_model, "residual_calibrator_", calibrator)
+                    if calibration_stats:
+                        setattr(final_model, "residual_calibration_", calibration_stats)
             distribution_summary = self._estimate_prediction_uncertainty(
                 target, final_model, transformed_X
             )
@@ -1203,6 +1251,8 @@ class StockPredictorAI:
             metrics["test_rows"] = int(evaluation.get("evaluation_rows", 0))
             metrics["horizon"] = resolved_horizon
             metrics["evaluation_strategy"] = evaluation["strategy"]
+            if calibration_stats:
+                metrics["residual_calibration"] = calibration_stats
             metrics["evaluation"] = {
                 "strategy": evaluation["strategy"],
                 "splits": evaluation["splits"],
@@ -1361,6 +1411,94 @@ class StockPredictorAI:
                 stats,
             )
 
+    def _resolve_ensemble_config(
+        self, target: str, task: str, *, params: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        target_params = params.get(target, {}) if isinstance(params, Mapping) else {}
+        global_params = params.get("global", {}) if isinstance(params, Mapping) else {}
+        resolved: dict[str, Any] = {}
+        ensemble_blocks = [
+            block
+            for block in (global_params.get("ensemble"), target_params.get("ensemble"))
+            if isinstance(block, Mapping)
+        ]
+        for block in ensemble_blocks:
+            resolved.update(block)
+
+        enabled = bool(resolved.get("enabled", False)) and task == "regression"
+        if not enabled:
+            return {"enabled": False}
+
+        members = resolved.get("members") or resolved.get("models")
+        member_list = [
+            str(name).strip().lower()
+            for name in (members or [])
+            if str(name).strip()
+        ]
+        if not member_list:
+            # Default to a diverse blend around the configured base model
+            member_list = [
+                self.config.model_type,
+                "random_forest",
+                "hist_gb",
+                "mlp",
+                "transformer",
+            ]
+
+        weights = resolved.get("weights", {}) if isinstance(resolved.get("weights"), Mapping) else {}
+        return {
+            "enabled": True,
+            "members": member_list,
+            "weights": {str(k).strip().lower(): float(v) for k, v in weights.items()},
+            "quantiles": resolved.get("quantiles"),
+            "interval_alpha": resolved.get("interval_alpha", 0.2),
+            "blender": resolved.get("blender", "ridge"),
+        }
+
+    def _build_ensemble_members(
+        self,
+        member_types: Sequence[str],
+        task: str,
+        *,
+        global_params: Mapping[str, Any],
+        model_params: Mapping[str, Any],
+        calibrate_flag: bool,
+        weights: Mapping[str, float],
+    ) -> list[EnsembleMember]:
+        members: list[EnsembleMember] = []
+        for name in member_types:
+            if not name:
+                continue
+            overrides = {**global_params, **model_params}
+            weight = float(weights.get(name, 1.0))
+            factory = ModelFactory(name, overrides)
+            estimator = factory.create(task, calibrate=calibrate_flag)
+            members.append(EnsembleMember(name=name, estimator=estimator, weight=weight))
+        return members
+
+    def _fit_residual_calibrator(
+        self, y_true: Sequence[float] | np.ndarray, y_pred: Sequence[float] | np.ndarray
+    ) -> tuple[LinearRegression, dict[str, float]] | tuple[None, None]:
+        if y_true is None or y_pred is None:
+            return None, None
+
+        y_true_arr = np.asarray(y_true, dtype=float)
+        y_pred_arr = np.asarray(y_pred, dtype=float)
+        if y_true_arr.size == 0 or y_true_arr.shape != y_pred_arr.shape:
+            return None, None
+
+        residuals = y_pred_arr - y_true_arr
+        if residuals.size < 5 or not np.isfinite(residuals).any():
+            return None, None
+
+        calibrator = LinearRegression()
+        calibrator.fit(y_pred_arr.reshape(-1, 1), residuals.reshape(-1, 1))
+        stats = {
+            "residual_std": float(np.nanstd(residuals)),
+            "residual_bias": float(np.nanmean(residuals)),
+        }
+        return calibrator, stats
+
     def _validate_no_nans(
         self,
         target: str,
@@ -1442,6 +1580,8 @@ class StockPredictorAI:
         target_name: str,
         calibrate_flag: bool,
         preprocessor: Optional[Pipeline] = None,
+        *,
+        collect_predictions: bool = False,
     ) -> Dict[str, Any]:
         strategy = self.config.evaluation_strategy
         evaluation_rows = 0
@@ -1449,6 +1589,8 @@ class StockPredictorAI:
         splits: List[Dict[str, Any]] = []
         baseline_records: DefaultDict[str, List[Dict[str, Any]]] = defaultdict(list)
         baseline_splits: List[Dict[str, Any]] = []
+        validation_true: list[float] = []
+        validation_pred: list[float] = []
 
         def _record_baselines(
             split_label: int, train_series: pd.Series, test_series: pd.Series
@@ -1507,6 +1649,9 @@ class StockPredictorAI:
                 proba,
                 getattr(estimator, "classes_", None),
             )
+            if collect_predictions:
+                validation_true.extend([float(y) for y in y_test.to_numpy()])
+                validation_pred.extend([float(p) for p in np.ravel(y_pred)])
             metrics.update(
                 {
                     "split": 1,
@@ -1561,6 +1706,9 @@ class StockPredictorAI:
                     proba,
                     getattr(estimator, "classes_", None),
                 )
+                if collect_predictions:
+                    validation_true.extend([float(y) for y in y_test.to_numpy()])
+                    validation_pred.extend([float(p) for p in np.ravel(y_pred)])
                 metrics.update(
                     {
                         "fold": fold,
@@ -1617,7 +1765,7 @@ class StockPredictorAI:
             else {}
         )
 
-        return {
+        payload: Dict[str, Any] = {
             "strategy": strategy,
             "splits": splits,
             "aggregate": aggregate,
@@ -1626,6 +1774,12 @@ class StockPredictorAI:
             "baseline_splits": baseline_splits,
             "baseline_aggregate": baseline_aggregate,
         }
+        if collect_predictions and validation_true and validation_pred:
+            payload["validation"] = {
+                "y_true": validation_true,
+                "y_pred": validation_pred,
+            }
+        return payload
 
     def _compute_evaluation_metrics(
         self,
@@ -2041,6 +2195,7 @@ class StockPredictorAI:
 
             model_input = self._prepare_features_for_model(model, transformed_features)
             pred_value = model.predict(model_input)[0]
+            pred_value = self._apply_residual_correction(model, float(pred_value))
             predictions[target] = float(pred_value)
 
             uncertainty = self._estimate_prediction_uncertainty(
@@ -2128,6 +2283,11 @@ class StockPredictorAI:
         confidence_notes: list[str] = []
 
         predicted_return = self._safe_float(predictions.get("return"))
+        predicted_return = self._clamp_with_uncertainty(
+            predicted_return,
+            quantile_forecasts.get("return"),
+            prediction_intervals.get("return"),
+        )
         predicted_volatility = self._safe_float(predictions.get("volatility"))
 
         latest_close = float(self.metadata.get("latest_close", np.nan))
@@ -2148,6 +2308,11 @@ class StockPredictorAI:
             close_prediction = close_from_return
         elif close_from_return is not None:
             close_prediction = float(np.nanmean([close_prediction, close_from_return]))
+        close_prediction = self._clamp_with_uncertainty(
+            close_prediction,
+            quantile_forecasts.get("close"),
+            prediction_intervals.get("close"),
+        )
 
         expected_change = None
         pct_change = None
@@ -2800,12 +2965,91 @@ class StockPredictorAI:
         if not metrics:
             return None
 
+        calibration_block = metrics.get("residual_calibration")
+        if isinstance(calibration_block, Mapping):
+            band = self._safe_float(calibration_block.get("residual_std"))
+            if band is not None and band > 0:
+                return band
+
         for key in ("rmse", "mae"):
             value = self._safe_float(metrics.get(key))
             if value is not None and value > 0:
                 return float(value)
 
         return None
+
+    def _apply_residual_correction(self, model: Any, prediction: float) -> float:
+        calibrator = getattr(model, "residual_calibrator_", None)
+        if calibrator is None:
+            return prediction
+
+        try:
+            correction = calibrator.predict(np.asarray([[prediction]], dtype=float))
+        except Exception:  # pragma: no cover - defensive
+            return prediction
+
+        try:
+            correction_value = float(np.ravel(correction)[0])
+        except Exception:
+            correction_value = 0.0
+        return float(prediction - correction_value)
+
+    @staticmethod
+    def _clamp_with_uncertainty(
+        value: Optional[float],
+        quantiles: Mapping[str, float] | None,
+        intervals: Mapping[str, float] | None,
+    ) -> Optional[float]:
+        if value is None:
+            return None
+
+        lower_bounds: list[float] = []
+        upper_bounds: list[float] = []
+
+        if isinstance(quantiles, Mapping):
+            for key, raw in quantiles.items():
+                numeric = None
+                try:
+                    numeric = float(key)
+                except (TypeError, ValueError):
+                    if isinstance(key, str) and key.lower().startswith("q"):
+                        try:
+                            numeric = float(key[1:]) / 100 if "%" not in key else None
+                        except (TypeError, ValueError):
+                            numeric = None
+                value_float = None
+                try:
+                    value_float = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                if numeric is None:
+                    continue
+                if numeric <= 0.5:
+                    lower_bounds.append(value_float)
+                if numeric >= 0.5:
+                    upper_bounds.append(value_float)
+
+        if isinstance(intervals, Mapping):
+            for key, raw in intervals.items():
+                try:
+                    numeric = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                key_lower = str(key).lower()
+                if any(token in key_lower for token in ["lower", "low", "min"]):
+                    lower_bounds.append(numeric)
+                if any(token in key_lower for token in ["upper", "high", "max"]):
+                    upper_bounds.append(numeric)
+
+        lower = max(lower_bounds) if lower_bounds else None
+        upper = min(upper_bounds) if upper_bounds else None
+
+        clamped = value
+        if lower is not None:
+            clamped = max(clamped, lower)
+        if upper is not None:
+            clamped = min(clamped, upper)
+        return clamped
 
     def _compute_expected_low(
         self,
