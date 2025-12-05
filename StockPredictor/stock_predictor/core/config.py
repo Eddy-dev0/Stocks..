@@ -155,13 +155,18 @@ class PredictorConfig:
     backtest_slippage_bps: float = 1.0
     backtest_fee_bps: float = 1.0
     backtest_neutral_threshold: float = 0.001
-    evaluation_strategy: str = "holdout"
+    evaluation_strategy: str = "time_series"
     evaluation_folds: int = 5
     evaluation_window: int = DEFAULT_BACKTEST_WINDOW
     evaluation_step: int = DEFAULT_BACKTEST_STEP
     evaluation_slippage_bps: float = 0.0
     evaluation_fee_bps: float = 0.0
     evaluation_fixed_cost: float = 0.0
+    tuning_enabled: bool = True
+    tuning_method: str = "random"
+    tuning_iterations: int = 10
+    tuning_folds: int | None = None
+    tuning_n_jobs: int | None = None
     direction_confidence_threshold: float = 0.5
     volatility_window: int = DEFAULT_VOLATILITY_WINDOW
     target_gain_pct: float = DEFAULT_TARGET_GAIN_PCT
@@ -214,7 +219,7 @@ class PredictorConfig:
         self.backtest_strategy = (
             str(self.backtest_strategy).strip().lower() or DEFAULT_BACKTEST_STRATEGY
         )
-        self.evaluation_strategy = str(self.evaluation_strategy).strip().lower() or "holdout"
+        self.evaluation_strategy = str(self.evaluation_strategy).strip().lower() or "time_series"
         if not self.sentiment:
             self.feature_toggles["sentiment"] = False
         self.price_feature_toggles = _coerce_price_feature_toggles(
@@ -247,6 +252,29 @@ class PredictorConfig:
         self.evaluation_slippage_bps = max(0.0, float(self.evaluation_slippage_bps))
         self.evaluation_fee_bps = max(0.0, float(self.evaluation_fee_bps))
         self.evaluation_fixed_cost = max(0.0, float(self.evaluation_fixed_cost))
+        self.tuning_enabled = bool(self.tuning_enabled)
+        self.tuning_method = str(self.tuning_method or "random").strip().lower()
+        if self.tuning_method not in {"random", "optuna", "none"}:
+            raise ValueError("tuning_method must be one of 'random', 'optuna', or 'none'.")
+        try:
+            self.tuning_iterations = int(self.tuning_iterations)
+        except (TypeError, ValueError):
+            self.tuning_iterations = 10
+        self.tuning_iterations = max(1, self.tuning_iterations)
+        if self.tuning_folds is not None:
+            try:
+                self.tuning_folds = int(self.tuning_folds)
+            except (TypeError, ValueError):
+                self.tuning_folds = None
+            if self.tuning_folds is not None and self.tuning_folds <= 1:
+                raise ValueError("tuning_folds must be greater than 1 when provided.")
+        if self.tuning_n_jobs is not None:
+            try:
+                self.tuning_n_jobs = int(self.tuning_n_jobs)
+            except (TypeError, ValueError):
+                self.tuning_n_jobs = None
+            if self.tuning_n_jobs == 0:
+                self.tuning_n_jobs = None
         if not 0.5 <= float(self.direction_confidence_threshold) < 1:
             raise ValueError("direction_confidence_threshold must be between 0.5 and 1.0.")
         if int(self.volatility_window) <= 0:
@@ -569,9 +597,16 @@ def build_config(
     time_series_baselines: Optional[Iterable[str] | str] = None,
     time_series_params: Optional[Mapping[str, Mapping[str, Any]] | str] = None,
     buy_zone: Optional[Mapping[str, Any]] = None,
+    evaluation_strategy: Optional[str] = None,
+    evaluation_folds: Optional[int] = None,
     evaluation_slippage_bps: Optional[float] = None,
     evaluation_fee_bps: Optional[float] = None,
     evaluation_fixed_cost: Optional[float] = None,
+    tuning_enabled: Optional[bool] = None,
+    tuning_method: Optional[str] = None,
+    tuning_iterations: Optional[int] = None,
+    tuning_folds: Optional[int] = None,
+    tuning_n_jobs: Optional[int] = None,
     monte_carlo_paths: Optional[int] = None,
     monte_carlo_precision: Optional[float] = None,
     monte_carlo_max_paths: Optional[int] = None,
@@ -771,6 +806,8 @@ def build_config(
         "backtest_step": backtest_step if backtest_step is not None else DEFAULT_BACKTEST_STEP,
         "volatility_window":
         volatility_window if volatility_window is not None else DEFAULT_VOLATILITY_WINDOW,
+        "evaluation_strategy": (evaluation_strategy or "time_series"),
+        "evaluation_folds": evaluation_folds if evaluation_folds is not None else 5,
         "research_api_keys": _coerce_iterable(
             research_keys_value,
             (),
@@ -792,6 +829,11 @@ def build_config(
         "evaluation_fixed_cost": evaluation_fixed_cost
         if evaluation_fixed_cost is not None
         else 0.0,
+        "tuning_enabled": _coerce_bool(tuning_enabled, default=True),
+        "tuning_method": tuning_method or "random",
+        "tuning_iterations": tuning_iterations if tuning_iterations is not None else 10,
+        "tuning_folds": tuning_folds,
+        "tuning_n_jobs": tuning_n_jobs,
     }
     if monte_carlo_paths_int is not None:
         config_kwargs["monte_carlo_paths"] = monte_carlo_paths_int

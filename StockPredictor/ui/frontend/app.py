@@ -688,6 +688,30 @@ with st.sidebar:
     if use_custom_horizon:
         horizon_value = st.number_input("Forecast horizon", min_value=1, max_value=365, value=5, step=1)
 
+    st.header("Validation & tuning")
+    evaluation_strategy = st.selectbox(
+        "Evaluation strategy",
+        options=["time_series", "rolling", "holdout"],
+        index=0,
+        help="Use time-series aware cross-validation by default to avoid leakage.",
+    )
+    evaluation_folds = st.number_input(
+        "Cross-validation folds",
+        min_value=2,
+        max_value=10,
+        value=5,
+        step=1,
+        help="Number of rolling folds for time-series evaluation.",
+    )
+    tuning_enabled = st.checkbox("Enable hyperparameter tuning", value=True)
+    tuning_iterations = st.slider(
+        "Tuning iterations",
+        min_value=1,
+        max_value=50,
+        value=10,
+        help="Randomly sample parameter sets before final training.",
+    )
+
     st.header("Live model inputs")
     expected_change_pct_model = st.number_input(
         "Expected change % (decimal)",
@@ -1095,6 +1119,10 @@ with col_forecast:
                     "targets": _parse_targets(targets_raw),
                     "horizon": horizon_value,
                     "feature_toggles": feature_toggles.asdict(),
+                    "evaluation_strategy": evaluation_strategy,
+                    "evaluation_folds": int(evaluation_folds) if evaluation_strategy == "time_series" else None,
+                    "tuning_enabled": bool(tuning_enabled),
+                    "tuning_iterations": int(tuning_iterations),
                 },
             )
             if response is not None:

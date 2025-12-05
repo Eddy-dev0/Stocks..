@@ -107,6 +107,24 @@ class TrainRequest(BaseModel):
         ),
         example={"technical": True, "macro": False},
     )
+    evaluation_strategy: str | None = Field(
+        default=None,
+        description="Evaluation strategy: holdout, time_series, or rolling.",
+    )
+    evaluation_folds: int | None = Field(
+        default=None,
+        ge=2,
+        description="Number of folds to use for time-series cross validation.",
+    )
+    tuning_enabled: bool | None = Field(
+        default=None,
+        description="Whether to run hyperparameter tuning before fitting final models.",
+    )
+    tuning_iterations: int | None = Field(
+        default=None,
+        ge=1,
+        description="Number of parameter samples to explore during tuning.",
+    )
 
 
 class BuyZoneRequest(BaseModel):
@@ -363,6 +381,10 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
             {
                 "feature_toggles": request.feature_toggles,
                 "price_feature_toggles": request.feature_toggles,
+                "evaluation_strategy": request.evaluation_strategy,
+                "evaluation_folds": request.evaluation_folds,
+                "tuning_enabled": request.tuning_enabled,
+                "tuning_iterations": request.tuning_iterations,
             },
         )
         refresh_result = await _call_with_error_handling(application.refresh_data, force=False)

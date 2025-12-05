@@ -35,7 +35,7 @@ from sklearn.base import clone
 from sklearn.calibration import calibration_curve
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import brier_score_loss, r2_score
-from sklearn.model_selection import TimeSeriesSplit
+from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 
 from ..backtesting import Backtester
@@ -1184,6 +1184,24 @@ class StockPredictorAI:
                 model_type = "ensemble"
 
             factory = ModelFactory(model_type, {**global_params, **model_params})
+            tuning_summary = self._tune_model(
+                factory,
+                aligned_X,
+                y_clean,
+                task,
+                preprocessor=template,
+                calibrate_flag=calibrate_flag,
+            )
+            tuned_params = tuning_summary.get("best_params") if isinstance(tuning_summary, Mapping) else None
+            if tuned_params:
+                model_params.update(tuned_params)
+                factory = ModelFactory(model_type, {**global_params, **model_params})
+                tuning_store = self.metadata.setdefault("tuning", {})
+                tuning_store[(target, resolved_horizon)] = {
+                    "best_params": tuned_params,
+                    "best_score": tuning_summary.get("best_score"),
+                    "folds": int(self.config.tuning_folds or self.config.evaluation_folds),
+                }
 
             template = self.preprocessor_templates.get(resolved_horizon)
             evaluation = self._evaluate_model(
@@ -1253,6 +1271,12 @@ class StockPredictorAI:
             metrics["evaluation_strategy"] = evaluation["strategy"]
             if calibration_stats:
                 metrics["residual_calibration"] = calibration_stats
+            if tuning_summary:
+                metrics["tuning"] = {
+                    "enabled": bool(self.config.tuning_enabled),
+                    "best_params": tuning_summary.get("best_params"),
+                    "best_score": tuning_summary.get("best_score"),
+                }
             metrics["evaluation"] = {
                 "strategy": evaluation["strategy"],
                 "splits": evaluation["splits"],
@@ -1260,6 +1284,9 @@ class StockPredictorAI:
                 "parameters": evaluation.get("parameters", {}),
                 "samples": int(evaluation.get("evaluation_rows", 0)),
             }
+            metrics["cv_metrics"] = evaluation["aggregate"]
+            if tuning_summary:
+                metrics["evaluation"]["tuning"] = tuning_summary
             if evaluation.get("baseline_aggregate"):
                 metrics["baselines"] = evaluation["baseline_aggregate"]
                 metrics["evaluation"]["baselines"] = evaluation["baseline_aggregate"]
@@ -1570,6 +1597,111 @@ class StockPredictorAI:
                     summary[key] = float(np.mean(values))
             aggregate[model_name] = summary
         return aggregate
+
+    def _combine_pipelines(
+        self, preprocessor: Pipeline | None, model: Pipeline
+    ) -> Pipeline:
+        steps: list[tuple[str, Any]] = []
+        if preprocessor is not None:
+            steps.extend(clone(preprocessor).steps)
+        steps.extend(clone(model).steps)
+        return Pipeline(steps=steps)
+
+    def _hyperparameter_search_space(self, model_type: str, task: str) -> Dict[str, List[Any]]:
+        search_spaces: Dict[str, Dict[str, List[Any]]] = {
+            "random_forest": {
+                "estimator__n_estimators": [100, 200, 400, 800],
+                "estimator__max_depth": [None, 5, 10, 20],
+                "estimator__min_samples_split": [2, 5, 10],
+                "estimator__min_samples_leaf": [1, 2, 4],
+                "estimator__max_features": ["auto", "sqrt", "log2", 0.5],
+            },
+            "logistic": {
+                "estimator__C": [0.1, 0.5, 1.0, 2.0, 5.0],
+                "estimator__penalty": ["l2", "none"],
+                "estimator__solver": ["lbfgs", "saga"],
+            },
+            "mlp": {
+                "estimator__hidden_layer_sizes": [(64,), (128,), (128, 64)],
+                "estimator__activation": ["relu", "tanh"],
+                "estimator__alpha": [1e-5, 1e-4, 1e-3],
+                "estimator__learning_rate_init": [1e-3, 5e-4, 1e-4],
+            },
+            "hist_gb": {
+                "estimator__max_depth": [3, 5, 8],
+                "estimator__learning_rate": [0.01, 0.05, 0.1],
+                "estimator__max_iter": [200, 400, 800],
+                "estimator__min_samples_leaf": [20, 50, 100],
+            },
+        }
+        if task == "classification":
+            search_spaces["random_forest"]["estimator__class_weight"] = [None, "balanced"]
+        return search_spaces.get(model_type, {})
+
+    def _tune_model(
+        self,
+        factory: ModelFactory,
+        features: pd.DataFrame,
+        target_series: pd.Series,
+        task: str,
+        *,
+        preprocessor: Pipeline | None,
+        calibrate_flag: bool,
+    ) -> Dict[str, Any]:
+        if not self.config.tuning_enabled or self.config.tuning_method == "none":
+            return {}
+        search_space = self._hyperparameter_search_space(factory.model_type, task)
+        if not search_space:
+            return {}
+
+        try:
+            base_model = factory.create(task, calibrate=calibrate_flag)
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("Skipping tuning for %s due to model construction failure: %s", factory.model_type, exc)
+            return {}
+
+        pipeline = self._combine_pipelines(preprocessor, base_model)
+        folds = self.config.tuning_folds or self.config.evaluation_folds
+        if folds <= 1:
+            return {}
+        if len(features) <= folds:
+            LOGGER.warning(
+                "Insufficient samples (%s) for %s-fold tuning; skipping.",
+                len(features),
+                folds,
+            )
+            return {}
+
+        splitter = TimeSeriesSplit(n_splits=folds)
+        scoring = "f1_weighted" if task == "classification" else "neg_mean_absolute_error"
+        search = RandomizedSearchCV(
+            pipeline,
+            search_space,
+            n_iter=int(self.config.tuning_iterations),
+            cv=splitter,
+            random_state=42,
+            n_jobs=self.config.tuning_n_jobs,
+            scoring=scoring,
+            refit=False,
+        )
+        try:
+            search.fit(features, target_series)
+        except ValueError as exc:  # pragma: no cover - defensive
+            LOGGER.warning("Hyperparameter search failed; continuing with defaults: %s", exc)
+            return {}
+
+        best_params = search.best_params_ or {}
+        trimmed_params = {
+            key.split("estimator__", 1)[-1]: value
+            for key, value in best_params.items()
+            if key.startswith("estimator__")
+        }
+
+        return {
+            "best_params": trimmed_params,
+            "cv_results": search.cv_results_,
+            "best_score": float(search.best_score_),
+        }
 
     def _evaluate_model(
         self,
