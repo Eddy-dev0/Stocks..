@@ -206,7 +206,7 @@ SUPPORTED_TARGETS = frozenset(TARGET_SPECS)
 def _historical_drift_volatility(
     price_df: pd.DataFrame, window: int = 90
 ) -> tuple[float | None, float | None]:
-    """Return mean/log-return drift and volatility from price history."""
+    """Return mean log-return drift (per step) and volatility from price history."""
 
     if price_df is None or price_df.empty:
         return None, None
@@ -2219,9 +2219,15 @@ class StockPredictorAI:
         if price_df is not None and not price_df.empty:
             historical_drift, historical_volatility = _historical_drift_volatility(price_df)
             if historical_drift is not None:
+                # Drift is stored as a per-step log-return so downstream consumers can
+                # convert to cumulative growth consistently.
                 self.metadata["historical_drift"] = historical_drift
             if historical_volatility is not None:
                 self.metadata["historical_volatility"] = historical_volatility
+
+        drift_per_step = float(historical_drift) if historical_drift is not None else None
+        drift_growth_factor: float | None = None
+        drift_horizon = float(resolved_horizon) if resolved_horizon else None
 
         if latest_price_timestamp is not None:
             if metadata_latest_timestamp is None or latest_price_timestamp > metadata_latest_timestamp:
@@ -2429,8 +2435,10 @@ class StockPredictorAI:
             quantile_forecasts.get("return"),
             prediction_intervals.get("return"),
         )
-        if predicted_return is None and historical_drift is not None and resolved_horizon:
-            predicted_return = float(historical_drift) * float(resolved_horizon)
+        if predicted_return is None and drift_per_step is not None and drift_horizon is not None:
+            predicted_return, drift_growth_factor = self._compound_log_drift(
+                drift_per_step, drift_horizon
+            )
             prediction_warnings.append(
                 "Return model unavailable or produced NaN; falling back to historical drift."
             )
@@ -2460,8 +2468,11 @@ class StockPredictorAI:
             close_prediction = close_from_return
         elif close_from_return is not None:
             close_prediction = float(np.nanmean([close_prediction, close_from_return]))
-        if close_prediction is None and anchor_price is not None and historical_drift is not None:
-            close_prediction = float(anchor_price * (1 + historical_drift * float(resolved_horizon or 1)))
+        if close_prediction is None and anchor_price is not None and drift_per_step is not None:
+            _, drift_growth_factor = self._compound_log_drift(
+                drift_per_step, drift_horizon if drift_horizon is not None else 1.0
+            )
+            close_prediction = float(anchor_price * drift_growth_factor)
             prediction_warnings.append(
                 "Close model unavailable or produced NaN; reverting to drift-adjusted anchor price."
             )
@@ -3150,6 +3161,15 @@ class StockPredictorAI:
         except Exception:
             correction_value = 0.0
         return float(prediction - correction_value)
+
+    @staticmethod
+    def _compound_log_drift(drift_per_step: float, horizon: float) -> tuple[float, float]:
+        """Convert per-step log drift into compounded return and growth factor."""
+
+        drift_exponent = drift_per_step * horizon
+        compounded_return = math.expm1(drift_exponent)
+        growth_factor = math.exp(drift_exponent)
+        return compounded_return, growth_factor
 
     @staticmethod
     def _clamp_with_uncertainty(
