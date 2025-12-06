@@ -230,6 +230,33 @@ def _historical_drift_volatility(
     return float(log_returns.mean()), float(log_returns.std())
 
 
+def _recalibrated_log_drift(
+    expected_close: float | None, latest_close: float | None, horizon: int | float | None
+) -> float | None:
+    """Return per-step log drift for Monte Carlo recalibration."""
+
+    if expected_close is None or latest_close is None or horizon is None:
+        return None
+
+    horizon_value = float(horizon)
+    if horizon_value <= 0:
+        return None
+
+    close_now = float(latest_close)
+    target_close = float(expected_close)
+
+    if not np.isfinite(close_now) or not np.isfinite(target_close):
+        return None
+    if close_now <= 0 or target_close <= 0:
+        return None
+
+    price_ratio = target_close / close_now
+    if price_ratio <= 0:
+        return None
+
+    return float(math.log(price_ratio) / horizon_value)
+
+
 def _max_drawdown_fraction(price_df: pd.DataFrame | None) -> float | None:
     """Return the magnitude of the worst historical drawdown as a fraction."""
 
@@ -2726,10 +2753,11 @@ class StockPredictorAI:
                         expected_low_value = updated_expected_low
 
                     if shift_detected:
-                        if expected_close_value is not None and resolved_horizon:
-                            drift_value = float(expected_close_value - latest_close) / float(
-                                resolved_horizon
-                            )
+                        updated_drift = _recalibrated_log_drift(
+                            expected_close_value, latest_close, resolved_horizon
+                        )
+                        if updated_drift is not None:
+                            drift_value = updated_drift
                         volatility_value = _recalibrate_volatility(
                             float(volatility_value),
                             expected_close_value,
