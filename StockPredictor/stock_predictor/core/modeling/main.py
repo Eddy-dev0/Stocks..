@@ -44,6 +44,7 @@ from ..data_fetcher import DataFetcher
 from ..database import ExperimentTracker
 from ..features import FeatureAssembler, FeatureToggles
 from ..indicator_bundle import evaluate_signal_confluence
+from ..training_data import TrainingDatasetBuilder
 from ..ml_preprocessing import (
     DataFrameSimpleImputer,
     PreprocessingBuilder,
@@ -329,6 +330,9 @@ class StockPredictorAI:
         self.feature_assembler = FeatureAssembler(
             config.feature_toggles, config.prediction_horizons
         )
+        self.training_builder = TrainingDatasetBuilder(
+            config, database=getattr(self.fetcher, "database", None)
+        )
         self.market_timezone: ZoneInfo | None = resolve_market_timezone(self.config)
         self.tracker = ExperimentTracker(config)
         self.models: dict[Tuple[str, int], Any] = {}
@@ -387,8 +391,22 @@ class StockPredictorAI:
         news_df: Optional[pd.DataFrame] = None,
         *,
         force_live_price: bool = False,
+        use_cached_dataset: bool | None = None,
     ) -> tuple[pd.DataFrame, dict[int, Dict[str, pd.Series]], dict[int, Pipeline]]:
         self._refresh_feature_assembler()
+
+        dataset_flag = (
+            self.config.use_cached_training_data if use_cached_dataset is None else use_cached_dataset
+        )
+        if dataset_flag:
+            self.training_builder = TrainingDatasetBuilder(
+                self.config, database=getattr(self.fetcher, "database", None)
+            )
+            dataset = self.training_builder.build(force=force_live_price)
+            self.metadata = dataset.metadata
+            self.preprocessor_templates = dataset.preprocessors
+            self.metadata.setdefault("active_horizon", self.horizon)
+            return dataset.features, dataset.targets, dataset.preprocessors
 
         feature_toggles = self.config.feature_toggles
         sentiment_enabled = bool(

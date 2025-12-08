@@ -183,6 +183,11 @@ class PredictorConfig:
     direction_bootstrap_paths: int = 2_000_000
     direction_bootstrap_workers: int | None = None
     direction_bootstrap_blend: float = 0.65
+    price_backfill_page_days: int = 365
+    price_backfill_page_size: int | None = None
+    training_cache_dir: Path | None = None
+    use_cached_training_data: bool = True
+    min_samples_per_horizon: int = 500_000
     # Provide a local CSV file path to enable the CSVPriceLoader provider.
     csv_price_loader_path: Path | None = None
     # Provide a local Parquet file path to enable the ParquetPriceLoader provider.
@@ -385,6 +390,23 @@ class PredictorConfig:
         except (TypeError, ValueError):
             self.direction_bootstrap_blend = 0.65
         self.direction_bootstrap_blend = max(0.0, min(1.0, self.direction_bootstrap_blend))
+        try:
+            self.price_backfill_page_days = max(1, int(self.price_backfill_page_days))
+        except (TypeError, ValueError):
+            self.price_backfill_page_days = 365
+        if self.price_backfill_page_size is not None:
+            try:
+                self.price_backfill_page_size = int(self.price_backfill_page_size)
+            except (TypeError, ValueError):
+                self.price_backfill_page_size = None
+            if self.price_backfill_page_size is not None and self.price_backfill_page_size <= 0:
+                self.price_backfill_page_size = None
+        try:
+            self.min_samples_per_horizon = int(self.min_samples_per_horizon)
+        except (TypeError, ValueError):
+            self.min_samples_per_horizon = 500_000
+        self.min_samples_per_horizon = max(1, self.min_samples_per_horizon)
+        self.use_cached_training_data = bool(self.use_cached_training_data)
         if isinstance(self.buy_zone, Mapping):
             self.buy_zone = BuyZoneConfirmationSettings.from_mapping(self.buy_zone)
         elif not isinstance(self.buy_zone, BuyZoneConfirmationSettings):
@@ -415,6 +437,18 @@ class PredictorConfig:
     @property
     def metrics_path(self) -> Path:
         return self.metrics_path_for("close")
+
+    @property
+    def training_cache_path(self) -> Path:
+        root = self.training_cache_dir or (self.data_dir / "training_cache")
+        root.mkdir(parents=True, exist_ok=True)
+        return root / f"{self.ticker}_{self.interval}_training.parquet"
+
+    @property
+    def training_metadata_path(self) -> Path:
+        root = self.training_cache_dir or (self.data_dir / "training_cache")
+        root.mkdir(parents=True, exist_ok=True)
+        return root / f"{self.ticker}_{self.interval}_training.json"
 
     @property
     def database_path(self) -> Path:
