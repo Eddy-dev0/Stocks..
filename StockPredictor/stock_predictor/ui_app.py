@@ -1102,7 +1102,7 @@ class StockPredictorDesktopApp:
             "confidence",
             "score",
             "technical",
-            "fundamental",
+            "macro",
             "sentiment",
         )
         self.trend_tree = ttk.Treeview(
@@ -1118,7 +1118,7 @@ class StockPredictorDesktopApp:
             "confidence": "Confidence",
             "score": "Composite",
             "technical": "Technical",
-            "fundamental": "Fundamental",
+            "macro": "Macro",
             "sentiment": "Sentiment",
         }
         for column, title in headings.items():
@@ -1697,7 +1697,7 @@ class StockPredictorDesktopApp:
                 confidence_display,
                 self._format_trend_score(insight.composite_score),
                 self._format_trend_score(insight.technical_score),
-                self._format_trend_score(insight.fundamental_score),
+                self._format_trend_score(getattr(insight, "macro_score", None)),
                 self._format_trend_score(insight.sentiment_score),
             )
             self.trend_tree.insert("", tk.END, values=values)

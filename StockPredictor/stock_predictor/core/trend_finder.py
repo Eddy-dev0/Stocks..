@@ -41,16 +41,17 @@ DEFAULT_TREND_UNIVERSE: tuple[str, ...] = (
 
 
 _DEFAULT_WEIGHTING: dict[str, float] = {
-    "prediction": 0.5,
-    "sentiment": 0.25,
-    "fundamental": 0.25,
+    "prediction": 0.4,
+    "technical": 0.3,
+    "macro": 0.2,
+    "sentiment": 0.1,
 }
 
 _HORIZON_WEIGHTINGS: dict[int, dict[str, float]] = {
-    1: {"prediction": 0.6, "sentiment": 0.25, "fundamental": 0.15},
-    5: {"prediction": 0.55, "sentiment": 0.25, "fundamental": 0.2},
-    21: {"prediction": 0.5, "sentiment": 0.2, "fundamental": 0.3},
-    63: {"prediction": 0.45, "sentiment": 0.15, "fundamental": 0.4},
+    1: {"prediction": 0.45, "technical": 0.3, "macro": 0.15, "sentiment": 0.1},
+    5: {"prediction": 0.4, "technical": 0.3, "macro": 0.2, "sentiment": 0.1},
+    21: {"prediction": 0.35, "technical": 0.3, "macro": 0.25, "sentiment": 0.1},
+    63: {"prediction": 0.3, "technical": 0.35, "macro": 0.25, "sentiment": 0.1},
 }
 
 
@@ -61,16 +62,15 @@ _TECHNICAL_TOKENS = {
     "momentum",
     "oscillator",
     "volatility",
+}
+_MACRO_TOKENS = {
+    "macro",
     "macro_trend",
     "macro_benchmark",
-}
-_FUNDAMENTAL_TOKENS = {
-    "fundamental",
-    "valuation",
-    "macro",
-    "quality",
-    "growth",
     "macro_beta",
+    "inflation",
+    "gdp",
+    "employment",
 }
 _SENTIMENT_TOKENS = {
     "sentiment",
@@ -89,7 +89,7 @@ class TrendInsight:
     composite_score: float
     confidence_rank: float | None = None
     technical_score: float | None = None
-    fundamental_score: float | None = None
+    macro_score: float | None = None
     sentiment_score: float | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -102,7 +102,7 @@ class TrendInsight:
             "composite_score": self.composite_score,
             "confidence_rank": self.confidence_rank,
             "technical_score": self.technical_score,
-            "fundamental_score": self.fundamental_score,
+            "macro_score": self.macro_score,
             "sentiment_score": self.sentiment_score,
         }
 
@@ -192,8 +192,8 @@ class TrendFinder:
                 technical_score = self._aggregate_score(
                     latest_row, category_map, _TECHNICAL_TOKENS
                 )
-                fundamental_score = self._aggregate_score(
-                    latest_row, category_map, _FUNDAMENTAL_TOKENS
+                macro_score = self._aggregate_score(
+                    latest_row, category_map, _MACRO_TOKENS
                 )
                 sentiment_score = self._aggregate_score(
                     latest_row, category_map, _SENTIMENT_TOKENS
@@ -222,15 +222,17 @@ class TrendFinder:
 
                 if prediction_score is not None:
                     weighted_components: dict[str, float] = {"prediction": prediction_score}
-                    if fundamental_score is not None:
-                        weighted_components["fundamental"] = fundamental_score
+                    if technical_score is not None:
+                        weighted_components["technical"] = technical_score
+                    if macro_score is not None:
+                        weighted_components["macro"] = macro_score
                     if sentiment_score is not None:
                         weighted_components["sentiment"] = sentiment_score
                     composite = self._weighted_composite(weighted_components, weights)
                 else:
                     components = [
                         value
-                        for value in (technical_score, fundamental_score, sentiment_score)
+                        for value in (technical_score, macro_score, sentiment_score)
                         if value is not None
                     ]
                     if not components:
@@ -251,10 +253,14 @@ class TrendFinder:
                     component_scores = {}
                 component_scores.update(
                     {
-                        "prediction": prediction_score,
-                        "technical": technical_score,
-                        "fundamental": fundamental_score,
-                        "sentiment": sentiment_score,
+                        key: value
+                        for key, value in {
+                            "prediction": prediction_score,
+                            "technical": technical_score,
+                            "macro": macro_score,
+                            "sentiment": sentiment_score,
+                        }.items()
+                        if value is not None
                     }
                 )
                 insight_metadata["component_scores"] = component_scores
@@ -275,7 +281,7 @@ class TrendFinder:
                         composite_score=float(composite),
                         confidence_rank=confidence_rank,
                         technical_score=technical_score,
-                        fundamental_score=fundamental_score,
+                        macro_score=macro_score,
                         sentiment_score=sentiment_score,
                         metadata=insight_metadata,
                     )
@@ -563,7 +569,7 @@ class TrendFinder:
             return False
 
         indicator_scores: dict[str, float | None] = {}
-        for key in ("technical", "fundamental", "sentiment"):
+        for key in ("technical", "macro", "sentiment"):
             value = None
             if isinstance(insight, TrendInsight):
                 value = getattr(insight, f"{key}_score", None)
@@ -574,10 +580,10 @@ class TrendFinder:
             indicator_scores[key] = TrendFinder._safe_float(value)
 
         indicator_threshold = 0.5
-        if not all(
-            score is not None and score > indicator_threshold
-            for score in indicator_scores.values()
-        ):
+        available_scores = [score for score in indicator_scores.values() if score is not None]
+        if not available_scores:
+            return False
+        if not all(score > indicator_threshold for score in available_scores):
             return False
 
         confidence_block = metadata.get("confidence") if isinstance(metadata, Mapping) else None
