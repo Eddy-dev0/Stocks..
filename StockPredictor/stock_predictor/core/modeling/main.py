@@ -45,6 +45,7 @@ from ..database import ExperimentTracker
 from ..features import FeatureAssembler, FeatureToggles
 from ..indicator_bundle import evaluate_signal_confluence
 from ..training_data import TrainingDatasetBuilder
+from .multi_horizon_engine import MultiHorizonModelingEngine
 from ..ml_preprocessing import (
     DataFrameSimpleImputer,
     PreprocessingBuilder,
@@ -340,6 +341,9 @@ class StockPredictorAI:
         self.preprocessor_templates: dict[int, Pipeline] = {}
         self.preprocess_options: dict[str, Any] = {}
         self.metadata: Dict[str, Any] = {}
+        self.nextgen_engine = MultiHorizonModelingEngine(
+            config, fetcher=self.fetcher, feature_assembler=self.feature_assembler
+        )
 
     def _refresh_feature_assembler(self) -> None:
         """Rebuild the feature assembler if the toggle state has changed."""
@@ -1088,6 +1092,15 @@ class StockPredictorAI:
         *,
         force: bool = False,
     ) -> Dict[str, Any]:
+        resolved_horizon = self._resolve_horizon(horizon)
+        self.horizon = resolved_horizon
+        modern_report = self.nextgen_engine.train(
+            targets=list(targets) if targets else None,
+            horizon=resolved_horizon,
+            force=force,
+        )
+        self.metadata = modern_report.get("metadata", {})
+        return modern_report
         resolved_horizon = self._resolve_horizon(horizon)
         self.horizon = resolved_horizon
         X, targets_by_horizon, _ = self.prepare_features()
@@ -2213,6 +2226,37 @@ class StockPredictorAI:
         targets: Optional[Iterable[str]] = None,
         horizon: Optional[int] = None,
     ) -> PredictionResult:
+        resolved_horizon = self._resolve_horizon(horizon)
+        self.horizon = resolved_horizon
+        modern_predictions = self.nextgen_engine.predict_latest(
+            targets=list(targets) if targets else None,
+            horizon=resolved_horizon,
+        )
+        preds = modern_predictions.get("predictions", {})
+        predicted_close = preds.get("close_h") if preds else None
+        expected_low = None
+        if predicted_close is not None:
+            # Derive a conservative expected low based on predicted return magnitude when available.
+            predicted_return = preds.get("return_h")
+            if predicted_return is not None:
+                expected_low = float(predicted_close * (1 - abs(predicted_return)))
+        stop_loss = expected_low
+        meta = {
+            "horizon": modern_predictions.get("horizon", resolved_horizon),
+            "targets": list(preds.keys()),
+            "sample_counts": modern_predictions.get("sample_counts", {}),
+            "metrics": modern_predictions.get("metrics", {}),
+            "feature_columns": modern_predictions.get("feature_columns", []),
+        }
+        return PredictionResult(
+            predicted_close=predicted_close,
+            expected_low=expected_low,
+            stop_loss=stop_loss,
+            feature_groups_used=[],
+            indicators_used=[],
+            feature_usage_summary=[],
+            meta=meta,
+        )
         resolved_horizon = self._resolve_horizon(horizon)
         self.horizon = resolved_horizon
         if refresh_data:
