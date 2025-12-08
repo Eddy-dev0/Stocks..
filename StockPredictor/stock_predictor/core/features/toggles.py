@@ -11,7 +11,6 @@ _FEATURE_FIELDS = (
     "elliott",
     "macro",
     "technical",
-    "fundamental",
     "sentiment",
     "volume_liquidity",
 )
@@ -31,7 +30,6 @@ class FeatureToggles(MutableMapping[str, bool]):
     elliott: bool = True
     macro: bool = True
     technical: bool = True
-    fundamental: bool = True
     sentiment: bool = True
     volume_liquidity: bool = True
     extras: dict[str, bool] = field(default_factory=dict)

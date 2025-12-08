@@ -413,7 +413,6 @@ class StockPredictorAI:
             self.config.sentiment and feature_toggles.get("sentiment", False)
         )
         macro_enabled = bool(feature_toggles.get("macro", False))
-        fundamentals_enabled = bool(feature_toggles.get("fundamental", False))
 
         if price_df is None:
             price_df = self.fetcher.fetch_price_data()
@@ -430,22 +429,16 @@ class StockPredictorAI:
             if macro_enabled and not macro_frame.empty
             else price_df
         )
-        fundamentals_df: pd.DataFrame | None = pd.DataFrame()
-        fetch_fundamentals = getattr(self.fetcher, "fetch_fundamentals", None)
-        if fundamentals_enabled and callable(fetch_fundamentals):
-            fundamentals_df = fetch_fundamentals()
 
         feature_result = self.feature_assembler.build(
             merged_price_df,
             news_df,
             sentiment_enabled,
-            fundamentals_df=fundamentals_df,
             macro_df=macro_frame if macro_enabled and not macro_frame.empty else None,
         )
         metadata = dict(feature_result.metadata)
         data_availability = {
             "sentiment": sentiment_enabled,
-            "fundamental": fundamentals_enabled,
             "macro": macro_enabled,
         }
         raw_feature_columns = list(feature_result.features.columns)
