@@ -64,7 +64,7 @@ class ForecastRequest(BaseModel):
         default=None,
         description=(
             "Optional map of feature-group toggles keyed by registry name. "
-            "Supported keys: elliott, fundamental, macro, sentiment, technical, volume_liquidity."
+            "Supported keys: elliott, macro, sentiment, technical, volume_liquidity."
         ),
         example={"technical": True, "macro": False},
     )
@@ -81,7 +81,7 @@ class BacktestRequest(BaseModel):
         default=None,
         description=(
             "Optional map of feature-group toggles keyed by registry name. "
-            "Supported keys: elliott, fundamental, macro, sentiment, technical, volume_liquidity."
+            "Supported keys: elliott, macro, sentiment, technical, volume_liquidity."
         ),
         example={"technical": True, "macro": False},
     )
@@ -103,7 +103,7 @@ class TrainRequest(BaseModel):
         default=None,
         description=(
             "Optional map of feature-group toggles keyed by registry name. "
-            "Supported keys: elliott, fundamental, macro, sentiment, technical, volume_liquidity."
+            "Supported keys: elliott, macro, sentiment, technical, volume_liquidity."
         ),
         example={"technical": True, "macro": False},
     )
@@ -138,7 +138,7 @@ class BuyZoneRequest(BaseModel):
         default=None,
         description=(
             "Optional map of feature-group toggles keyed by registry name. "
-            "Supported keys: elliott, fundamental, macro, sentiment, technical, volume_liquidity."
+            "Supported keys: elliott, macro, sentiment, technical, volume_liquidity."
         ),
         example={"technical": True, "macro": False},
     )
@@ -320,12 +320,9 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
     @app.get("/insights/{ticker}", dependencies=[Depends(require_api_key)])
     async def get_insights(
         ticker: str,
-        refresh: bool = Query(False, description="Refresh fundamentals and sentiment."),
+        refresh: bool = Query(False, description="Refresh sentiment signals."),
     ) -> Dict[str, Any]:
         application = await _build_application(ticker, {})
-        snapshot = await _call_with_error_handling(
-            application.pipeline.fetcher.fetch_fundamental_snapshot, force=refresh
-        )
         sentiment_df: pd.DataFrame | None = None
         try:
             sentiment_df = await _call_with_error_handling(
@@ -342,7 +339,7 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
                 if candidate in latest and pd.notna(latest[candidate]):
                     sentiment_payload["latest_score"] = float(latest[candidate])
                     break
-        return {"status": "ok", "fundamentals": snapshot or {}, "sentiment": sentiment_payload}
+        return {"status": "ok", "sentiment": sentiment_payload}
 
     @app.post("/forecasts/{ticker}", dependencies=[Depends(require_api_key)])
     async def forecast(ticker: str, request: ForecastRequest) -> Dict[str, Any]:

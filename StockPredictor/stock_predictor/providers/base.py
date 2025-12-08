@@ -783,6 +783,7 @@ def build_default_registry(
         PolygonProvider,
         QuandlProvider,
         RedditProvider,
+        StablePriceStoreProvider,
         StooqProvider,
         TiingoProvider,
         TwitterProvider,
@@ -868,6 +869,7 @@ def build_default_registry(
         yahoo_kwargs["rate_limit_per_sec"] = yahoo_rate_limit
     if yahoo_cooldown is not None:
         yahoo_kwargs["cooldown_seconds"] = yahoo_cooldown
+    registry.register(StablePriceStoreProvider())
     registry.register(YahooFinanceProvider(**yahoo_kwargs))
     _try_register(AlphaVantageProvider)
     _try_register(FinnhubProvider)
