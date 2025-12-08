@@ -42,6 +42,7 @@ from ..backtesting import Backtester
 from ..config import PredictorConfig
 from ..data_fetcher import DataFetcher
 from ..database import ExperimentTracker
+from ..directional import DirectionalStats, evaluate_directional_predictions
 from ..features import FeatureAssembler, FeatureToggles
 from ..indicator_bundle import evaluate_signal_confluence
 from ..training_data import TrainingDatasetBuilder
@@ -1255,6 +1256,7 @@ class StockPredictorAI:
                 calibrate_flag,
                 template,
                 collect_predictions=calibration_enabled,
+                horizon=resolved_horizon,
             )
             LOGGER.info(
                 "Evaluation summary for target '%s' (horizon %s, strategy %s): %s",
@@ -1326,6 +1328,13 @@ class StockPredictorAI:
                 "parameters": evaluation.get("parameters", {}),
                 "samples": int(evaluation.get("evaluation_rows", 0)),
             }
+            directional_block = evaluation.get("directional")
+            if isinstance(directional_block, Mapping):
+                metrics["directional"] = directional_block
+                metrics["evaluation"]["directional"] = directional_block
+                self.metadata.setdefault("directional_metrics", {})[
+                    (target, resolved_horizon)
+                ] = directional_block
             metrics["cv_metrics"] = evaluation["aggregate"]
             if tuning_summary:
                 metrics["evaluation"]["tuning"] = tuning_summary
@@ -1756,6 +1765,7 @@ class StockPredictorAI:
         preprocessor: Optional[Pipeline] = None,
         *,
         collect_predictions: bool = False,
+        horizon: Optional[int] = None,
     ) -> Dict[str, Any]:
         strategy = self.config.evaluation_strategy
         evaluation_rows = 0
@@ -1765,6 +1775,8 @@ class StockPredictorAI:
         baseline_splits: List[Dict[str, Any]] = []
         validation_true: list[float] = []
         validation_pred: list[float] = []
+        directional_totals = DirectionalStats()
+        directional_summary: Dict[str, Any] = {}
 
         def _record_baselines(
             split_label: int, train_series: pd.Series, test_series: pd.Series
@@ -1823,6 +1835,11 @@ class StockPredictorAI:
                 proba,
                 getattr(estimator, "classes_", None),
             )
+            directional_totals.merge(
+                evaluate_directional_predictions(
+                    task, target_name, y_test, y_pred, raw_features=X_test
+                )
+            )
             if collect_predictions:
                 validation_true.extend([float(y) for y in y_test.to_numpy()])
                 validation_pred.extend([float(p) for p in np.ravel(y_pred)])
@@ -1880,6 +1897,11 @@ class StockPredictorAI:
                     proba,
                     getattr(estimator, "classes_", None),
                 )
+                directional_totals.merge(
+                    evaluate_directional_predictions(
+                        task, target_name, y_test, y_pred, raw_features=X_test
+                    )
+                )
                 if collect_predictions:
                     validation_true.extend([float(y) for y in y_test.to_numpy()])
                     validation_pred.extend([float(p) for p in np.ravel(y_pred)])
@@ -1912,10 +1934,12 @@ class StockPredictorAI:
                 target_name,
                 preprocessor_template=preprocessor,
                 target_kind=self.metadata.get("target_kind"),
+                horizon=horizon,
             )
             splits = result.splits
             aggregate = result.aggregate
             evaluation_rows = int(aggregate.get("test_rows", 0))
+            directional_summary = dict(result.directional)
             parameters = {
                 "window": int(self.config.evaluation_window),
                 "step": int(self.config.evaluation_step),
@@ -1948,6 +1972,11 @@ class StockPredictorAI:
             "baseline_splits": baseline_splits,
             "baseline_aggregate": baseline_aggregate,
         }
+        if strategy != "rolling":
+            directional_summary = directional_totals.as_summary(horizon=horizon)
+            aggregate.update(directional_summary)
+        if directional_summary.get("n_predictions_h", 0) or directional_summary.get("acc_h"):
+            payload["directional"] = directional_summary
         if collect_predictions and validation_true and validation_pred:
             payload["validation"] = {
                 "y_true": validation_true,
@@ -5026,6 +5055,12 @@ class StockPredictorAI:
                     numeric = self._safe_float(value)
                     if numeric is not None:
                         metrics[key] = numeric
+            directional_block = evaluation.get("directional")
+            if isinstance(directional_block, dict):
+                for key, value in directional_block.items():
+                    numeric = self._safe_float(value)
+                    if numeric is not None:
+                        metrics[key] = numeric
 
         for key in ("rmse", "mae", "mape", "directional_accuracy", "r2"):
             if key in metrics:
@@ -5203,12 +5238,14 @@ class StockPredictorAI:
                 preprocessor_template=template,
                 auxiliary_targets=auxiliary_df,
                 target_kind=self.metadata.get("target_kind"),
+                horizon=resolved_horizon,
             )
             results[target] = {
                 "target_kind": result.target_kind,
                 "aggregate": result.aggregate,
                 "splits": result.splits,
                 "feature_importance": result.feature_importance,
+                "directional": result.directional,
             }
             self.tracker.log_run(
                 target=target,
