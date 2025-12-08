@@ -25,7 +25,9 @@ from stock_predictor.providers.base import (
 from stock_predictor.providers.database import Database
 
 LOGGER = logging.getLogger(__name__)
-PRICE_LOOKBACK_DAYS = 90
+DEFAULT_PRICE_BACKFILL_DAYS = 365
+# Backwards compatibility constant retained for existing imports/tests.
+PRICE_LOOKBACK_DAYS = DEFAULT_PRICE_BACKFILL_DAYS
 
 
 class PipelineResult:
@@ -104,8 +106,10 @@ class AsyncDataPipeline:
             params = dict(self._default_params(dataset))
             if request_overrides and dataset in request_overrides:
                 params.update(request_overrides[dataset])
-            request = ProviderRequest(dataset_type=dataset, symbol=self.config.ticker, params=params)
-            tasks.append(self.registry.fetch_all(request))
+            batched_params = [params]
+            if dataset == DatasetType.PRICES:
+                batched_params = self._price_param_batches(params)
+            tasks.append(self._fetch_dataset(dataset, batched_params))
 
         provider_results = await asyncio.gather(*tasks)
         summary: dict[DatasetType, PipelineResult] = {}
@@ -114,20 +118,21 @@ class AsyncDataPipeline:
             summary[dataset] = PipelineResult(dataset, frame, persisted, counts)
         return summary
 
+    async def _fetch_dataset(
+        self, dataset: DatasetType, batched_params: Sequence[Mapping[str, object]]
+    ) -> list[ProviderResult]:
+        payload: list[ProviderResult] = []
+        for params in batched_params:
+            request = ProviderRequest(
+                dataset_type=dataset, symbol=self.config.ticker, params=dict(params)
+            )
+            results = await self.registry.fetch_all(request)
+            payload.extend(results)
+        return payload
+
     def _default_params(self, dataset: DatasetType) -> Mapping[str, object]:
         if dataset == DatasetType.PRICES:
-            params: dict[str, object] = {
-                "interval": self.config.interval,
-            }
-            start_date = self._price_request_start()
-            if start_date:
-                params["start"] = start_date.isoformat()
-            if self.config.end_date:
-                params["end"] = self.config.end_date.isoformat()
-            loader_path = self._price_loader_path()
-            if loader_path:
-                params.setdefault("path", loader_path)
-            return params
+            return self._price_params()
         if dataset == DatasetType.NEWS:
             return {"query": self.config.ticker, "limit": 50}
         if dataset == DatasetType.MACRO:
@@ -165,6 +170,55 @@ class AsyncDataPipeline:
         LOGGER.info("No persistence strategy for dataset %s", dataset)
         return None, 0, source_counts
 
+    def _price_params(self) -> dict[str, object]:
+        params: dict[str, object] = {
+            "interval": self.config.interval,
+        }
+        start_date = self._price_request_start()
+        if start_date:
+            params["start"] = start_date.isoformat()
+        if self.config.end_date:
+            params["end"] = self.config.end_date.isoformat()
+        backfill_limit = getattr(self.config, "price_backfill_page_size", None)
+        if backfill_limit:
+            params["limit"] = int(backfill_limit)
+        loader_path = self._price_loader_path()
+        if loader_path:
+            params.setdefault("path", loader_path)
+        return params
+
+    def _price_param_batches(self, base_params: Mapping[str, object]) -> list[Mapping[str, object]]:
+        """Slice price fetches into paging-friendly windows."""
+
+        start_str = base_params.get("start")
+        if start_str is None:
+            return [base_params]
+
+        start_date = date.fromisoformat(str(start_str))
+        end_param = base_params.get("end")
+        if end_param:
+            end_date = date.fromisoformat(str(end_param))
+        else:
+            end_date = date.today()
+
+        window_days = getattr(self.config, "price_backfill_page_days", DEFAULT_PRICE_BACKFILL_DAYS)
+        try:
+            window_days = int(window_days)
+        except (TypeError, ValueError):  # pragma: no cover - defensive coercion
+            window_days = DEFAULT_PRICE_BACKFILL_DAYS
+        window_days = max(1, window_days)
+
+        batches: list[Mapping[str, object]] = []
+        cursor = start_date
+        while cursor <= end_date:
+            window_end = min(end_date, cursor + timedelta(days=window_days - 1))
+            window_params = dict(base_params)
+            window_params["start"] = cursor.isoformat()
+            window_params["end"] = window_end.isoformat()
+            batches.append(window_params)
+            cursor = window_end + timedelta(days=1)
+        return batches
+
     def _price_request_start(self) -> date:
         """Determine the earliest date to request from price providers."""
 
@@ -176,9 +230,10 @@ class AsyncDataPipeline:
         if self._latest_price_date:
             return self._latest_price_date + timedelta(days=1)
 
-        conservative_start = date.today() - timedelta(days=PRICE_LOOKBACK_DAYS)
         if self.config.start_date:
-            return max(self.config.start_date, conservative_start)
+            return self.config.start_date
+
+        conservative_start = date.today() - timedelta(days=DEFAULT_PRICE_BACKFILL_DAYS)
         return conservative_start
 
     def _price_loader_path(self) -> str | None:

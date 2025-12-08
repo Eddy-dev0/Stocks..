@@ -17,6 +17,7 @@ from stock_predictor.core.modeling import (
     TargetSpec,
     make_volatility_label,
 )
+from stock_predictor.core.training_data import TrainingDatasetBuilder
 from stock_predictor.core.trend_finder import (
     DEFAULT_TREND_UNIVERSE,
     TrendFinder,
@@ -37,6 +38,7 @@ __all__ = [
     "StockPredictorAI",
     "TargetSpec",
     "make_volatility_label",
+    "TrainingDatasetBuilder",
     "FeatureUsageSummary",
     "PredictionResult",
     "BuyZoneAnalyzer",

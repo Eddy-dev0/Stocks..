@@ -234,8 +234,27 @@ def test_default_params_use_conservative_lookback_when_cache_empty(monkeypatch, 
 
     params = pipeline._default_params(DatasetType.PRICES)
 
-    expected_start = (_FixedDate.today() - timedelta(days=PRICE_LOOKBACK_DAYS)).isoformat()
-    assert params["start"] == expected_start
+    assert params["start"] == config.start_date.isoformat()
+
+
+def test_price_params_paginate_backfill(tmp_path) -> None:
+    db_file = tmp_path / "prices.db"
+    database = Database(f"sqlite:///{db_file}")
+
+    config = PredictorConfig(
+        ticker="MSFT",
+        start_date=date(2020, 1, 1),
+        end_date=date(2020, 2, 15),
+        price_backfill_page_days=10,
+    )
+
+    pipeline = AsyncDataPipeline(config, registry=_NullRegistry(), database=database)
+    params = pipeline._default_params(DatasetType.PRICES)
+    batches = pipeline._price_param_batches(params)
+
+    assert len(batches) == 5
+    assert batches[0]["start"] == date(2020, 1, 1).isoformat()
+    assert batches[-1]["end"] == config.end_date.isoformat()
 
 
 def test_refresh_sentiment_overrides_placeholder_cache(monkeypatch, tmp_path) -> None:
