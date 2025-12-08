@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -17,22 +18,43 @@ class IndicatorDataStore:
     """Fetch and persist indicator-oriented datasets for downstream modules."""
 
     config: PredictorConfig
-    cache_name: str = "indicators.parquet"
+    cache_name: str = "indicators.pkl"
 
     def __post_init__(self) -> None:
         self.fetcher = DataFetcher(self.config)
         self.cache_path: Path = self.config.data_dir / self.cache_name
+        # Keep the legacy parquet file name for backward compatibility.
+        self.parquet_cache_path: Path = self.config.data_dir / "indicators.parquet"
+        self.logger = logging.getLogger(__name__)
+
+    def _safe_read_parquet(self, path: Path) -> Optional[pd.DataFrame]:
+        try:
+            return pd.read_parquet(path)
+        except ImportError:
+            self.logger.info("Parquet engine unavailable; skipping cached parquet file at %s", path)
+            return None
 
     def fetch(self, *, force: bool = False) -> pd.DataFrame:
         """Retrieve the indicator dataset, refreshing the cache when requested."""
 
-        if self.cache_path.exists() and not force:
-            return pd.read_parquet(self.cache_path)
+        if not force:
+            for cache_path, reader in (
+                (self.cache_path, pd.read_pickle),
+                (self.parquet_cache_path, self._safe_read_parquet),
+            ):
+                if cache_path.exists():
+                    cached_frame = reader(cache_path)
+                    if cached_frame is not None:
+                        return cached_frame
 
         indicator_df = self.fetcher.fetch_indicator_data()
         if not indicator_df.empty:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-            indicator_df.to_parquet(self.cache_path)
+            indicator_df.to_pickle(self.cache_path)
+            try:
+                indicator_df.to_parquet(self.parquet_cache_path)
+            except ImportError:
+                self.logger.info("Parquet engine unavailable; cached data saved as pickle only at %s", self.cache_path)
         return indicator_df
 
     def last_price(self, indicator_df: Optional[pd.DataFrame] = None) -> float | None:
