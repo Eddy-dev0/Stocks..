@@ -37,6 +37,19 @@ def _ensure_dataframe(
         columns = [f"feature_{idx}" for idx in range(array.shape[1])]
     if index is None:
         index = range(array.shape[0])
+
+    # When the caller provides column labels that include values absent from the
+    # input array (for example, when transforming inference-time features that
+    # dropped all observations for certain fields), pad the array with ``NaN``
+    # columns so the constructed ``DataFrame`` retains the expected schema.
+    column_count = len(columns)
+    if array.shape[1] < column_count:
+        missing = column_count - array.shape[1]
+        padding = np.full((array.shape[0], missing), np.nan)
+        array = np.concatenate([array, padding], axis=1)
+    elif array.shape[1] > column_count:
+        array = array[:, :column_count]
+
     return pd.DataFrame(array, columns=list(columns), index=index)
 
 
@@ -121,13 +134,19 @@ class DataFrameSimpleImputer(_BaseDataFrameTransformer):
         # ``StandardScaler`` issue runtime warnings when encountering columns
         # that are entirely non-finite, so we replace missing values with a
         # neutral fallback to stabilise the pipeline.
-        if self.skipped_columns_:
-            frame[self.skipped_columns_] = 0.0
+        # Preserve columns that never contained valid data during ``fit`` so
+        # downstream consumers can decide how to handle them (e.g. drop, mask, or
+        # impute with a domain-specific default).
+        skipped_columns = list(self.skipped_columns_)
 
         # As an additional guard, ensure no residual ``NaN`` values leak into
-        # later preprocessing steps.
+        # later preprocessing steps, while respecting fully-missing columns.
         if frame.isna().values.any():
-            frame = frame.fillna(0.0)
+            if skipped_columns:
+                remaining = [col for col in frame.columns if col not in skipped_columns]
+                frame[remaining] = frame[remaining].fillna(0.0)
+            else:
+                frame = frame.fillna(0.0)
 
         return frame[self.feature_names_]
 
