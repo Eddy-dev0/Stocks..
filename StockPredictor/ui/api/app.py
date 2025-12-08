@@ -16,8 +16,8 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 from stock_predictor.app import StockPredictorApplication
-from stock_predictor.core import PredictionResult
 from stock_predictor.research import ResearchService
+from stock_predictor.ui.api import ui_adapter
 
 
 api_key_scheme = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -316,11 +316,16 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
         end_date: str | None = Query(None, description="Optional ISO end date override."),
         interval: str | None = Query(None, description="Historical data interval override."),
     ) -> Dict[str, Any]:
-        application = await _build_application(
+        data = await _call_with_error_handling(
+            ui_adapter.refresh_data,
             ticker,
-            {"start_date": start_date, "end_date": end_date, "interval": interval},
+            refresh=refresh,
+            overrides={
+                "start_date": start_date,
+                "end_date": end_date,
+                "interval": interval,
+            },
         )
-        data = await _call_with_error_handling(application.refresh_data, force=refresh)
         return {"status": "ok", "data": data}
 
     @app.get("/insights/{ticker}", dependencies=[Depends(require_api_key)])
@@ -349,50 +354,51 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
 
     @app.post("/forecasts/{ticker}", dependencies=[Depends(require_api_key)])
     async def forecast(ticker: str, request: ForecastRequest) -> Dict[str, Any]:
-        application = await _build_application(
+        result = await _call_with_error_handling(
+            ui_adapter.get_prediction,
             ticker,
-            {
+            request.horizon,
+            refresh=request.refresh,
+            targets=request.targets,
+            overrides={
                 "feature_toggles": request.feature_toggles,
                 "price_feature_toggles": request.feature_toggles,
             },
         )
-        result = await _call_with_error_handling(
-            application.predict,
-            targets=request.targets,
-            refresh=request.refresh,
-            horizon=request.horizon,
-        )
-        forecasts = result.to_dict() if isinstance(result, PredictionResult) else result
-        return {"status": "ok", "forecasts": forecasts}
+        return {"status": "ok", "forecasts": result}
 
     @app.post("/backtests/{ticker}", dependencies=[Depends(require_api_key)])
     async def backtest(ticker: str, request: BacktestRequest) -> Dict[str, Any]:
-        application = await _build_application(
+        result = await _call_with_error_handling(
+            ui_adapter.run_backtest,
             ticker,
-            {
+            targets=request.targets,
+            overrides={
                 "feature_toggles": request.feature_toggles,
                 "price_feature_toggles": request.feature_toggles,
             },
         )
-        result = await _call_with_error_handling(application.backtest, targets=request.targets)
         return {"status": "ok", "backtest": result}
 
     @app.post("/train/{ticker}", dependencies=[Depends(require_api_key)])
     async def retrain(ticker: str, request: TrainRequest) -> Dict[str, Any]:
-        application = await _build_application(
-            ticker,
-            {
-                "feature_toggles": request.feature_toggles,
-                "price_feature_toggles": request.feature_toggles,
-                "evaluation_strategy": request.evaluation_strategy,
-                "evaluation_folds": request.evaluation_folds,
-                "tuning_enabled": request.tuning_enabled,
-                "tuning_iterations": request.tuning_iterations,
-            },
+        overrides = {
+            "feature_toggles": request.feature_toggles,
+            "price_feature_toggles": request.feature_toggles,
+            "evaluation_strategy": request.evaluation_strategy,
+            "evaluation_folds": request.evaluation_folds,
+            "tuning_enabled": request.tuning_enabled,
+            "tuning_iterations": request.tuning_iterations,
+        }
+        refresh_result = await _call_with_error_handling(
+            ui_adapter.refresh_data, ticker, refresh=False, overrides=overrides
         )
-        refresh_result = await _call_with_error_handling(application.refresh_data, force=False)
         metrics = await _call_with_error_handling(
-            application.train, targets=request.targets, horizon=request.horizon
+            ui_adapter.train_models,
+            ticker,
+            targets=request.targets,
+            horizon=request.horizon,
+            overrides=overrides,
         )
         return {"status": "ok", "refresh": refresh_result, "metrics": metrics}
 
@@ -438,8 +444,9 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
     async def accuracy(
         ticker: str, horizon: int | None = Query(None, ge=1, description="Prediction horizon to filter runs.")
     ) -> AccuracyEnvelope:
-        application = await _build_application(ticker, {})
-        summary = await _call_with_error_handling(application.accuracy, horizon=horizon)
+        summary = await _call_with_error_handling(
+            ui_adapter.get_accuracy, ticker, horizon=horizon
+        )
         return AccuracyEnvelope(status="ok", accuracy=AccuracyResponse(**summary))
 
     @app.get("/research", dependencies=[Depends(require_api_key)])

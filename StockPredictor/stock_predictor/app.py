@@ -15,11 +15,14 @@ from stock_predictor.api_app import run_api
 from stock_predictor.core import (
     PredictorConfig,
     PredictionResult,
-    StockPredictorAI,
     BuyZoneAnalyzer,
     build_config,
     load_environment,
 )
+from stock_predictor.data.indicator_store import IndicatorDataStore
+from stock_predictor.features.engineer import IndicatorFeatureEngineer
+from stock_predictor.models.trainer import HorizonModelTrainer
+from stock_predictor.evaluation.backtester import Backtester
 from stock_predictor.dashboard_app import run_streamlit_app
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -47,7 +50,11 @@ class StockPredictorApplication:
 
     def __init__(self, config: PredictorConfig) -> None:
         self.config = config
-        self.pipeline = StockPredictorAI(config)
+        self.indicator_store = IndicatorDataStore(config)
+        self.feature_engineer = IndicatorFeatureEngineer(self.indicator_store)
+        self.model_trainer = HorizonModelTrainer(config, self.feature_engineer)
+        self.evaluator = Backtester(config, self.model_trainer)
+        self.pipeline = self.model_trainer.pipeline
 
     @classmethod
     def from_environment(cls, **overrides: Any) -> "StockPredictorApplication":
@@ -70,13 +77,20 @@ class StockPredictorApplication:
         """Refresh cached datasets via the provider layer."""
 
         LOGGER.info("Refreshing market data (force=%s)", force)
-        return self.pipeline.download_data(force=force)
+        indicator_df = self.indicator_store.fetch(force=force)
+        summary = {"indicator_rows": len(indicator_df.index)}
+        try:
+            pipeline_summary = self.pipeline.download_data(force=force)
+            summary.update(pipeline_summary)
+        except Exception as exc:
+            LOGGER.debug("Pipeline refresh failed: %s", exc)
+        return summary
 
     def train(self, *, targets: Iterable[str] | None = None, horizon: int | None = None) -> dict[str, Any]:
         """Train configured models and return evaluation metrics."""
 
         LOGGER.info("Training models for ticker %s", self.config.ticker)
-        return self.pipeline.train_model(targets=targets, horizon=horizon)
+        return self.model_trainer.train(targets=targets, horizon=horizon)
 
     def predict(
         self,
@@ -88,7 +102,9 @@ class StockPredictorApplication:
         """Generate predictions for the configured ticker."""
 
         LOGGER.info("Generating predictions (refresh=%s)", refresh)
-        return self.pipeline.predict(targets=targets, refresh_data=refresh, horizon=horizon)
+        return self.model_trainer.predict(
+            targets=targets, refresh=refresh, horizon=horizon
+        )
 
     def update_ticker(self, ticker: str) -> None:
         """Update the active ticker and rebuild dependent components."""
@@ -102,14 +118,18 @@ class StockPredictorApplication:
         updated_config = replace(self.config, ticker=new_ticker)
         updated_config.ensure_directories()
         self.config = updated_config
-        self.pipeline = StockPredictorAI(updated_config)
+        self.indicator_store = IndicatorDataStore(updated_config)
+        self.feature_engineer = IndicatorFeatureEngineer(self.indicator_store)
+        self.model_trainer = HorizonModelTrainer(updated_config, self.feature_engineer)
+        self.evaluator = Backtester(updated_config, self.model_trainer)
+        self.pipeline = self.model_trainer.pipeline
         LOGGER.info("Switched application context to ticker %s", new_ticker)
 
     def backtest(self, *, targets: Iterable[str] | None = None) -> dict[str, Any]:
         """Run historical simulations to evaluate the active models."""
 
         LOGGER.info("Running backtest for ticker %s", self.config.ticker)
-        return self.pipeline.run_backtest(targets=targets)
+        return self.evaluator.run(targets=targets)
 
     def accuracy(self, *, horizon: int | None = None) -> dict[str, Any]:
         """Summarise stored prediction accuracy for the configured ticker."""
@@ -135,7 +155,7 @@ class StockPredictorApplication:
         """List persisted models available to the application."""
 
         LOGGER.debug("Listing available models from %s", self.config.models_dir)
-        return self.pipeline.list_available_models()
+        return self.model_trainer.list_models()
 
     def run(self, mode: str, **kwargs: Any) -> RunResult:
         """Dispatch execution based on the requested mode."""
