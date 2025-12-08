@@ -281,7 +281,7 @@ class MultiHorizonModelingEngine:
 
             artefacts[horizon_value] = HorizonArtifacts(
                 horizon=horizon_value,
-                preprocessor=preprocessor,
+                preprocessor=fitted_pre,
                 models=trained_models,
                 metrics=target_metrics,
                 sample_counts=target_sample_counts,
@@ -290,9 +290,9 @@ class MultiHorizonModelingEngine:
             # Persist artefacts
             horizon_dir = self.models_dir / f"horizon_{horizon_value}"
             horizon_dir.mkdir(parents=True, exist_ok=True)
-            joblib.dump(preprocessor, horizon_dir / "preprocessor.joblib")
+            joblib.dump(fitted_pre, horizon_dir / "preprocessor.joblib")
             with open(horizon_dir / "feature_names.json", "w", encoding="utf-8") as handle:
-                json.dump(get_feature_names_from_pipeline(preprocessor), handle, indent=2)
+                json.dump(get_feature_names_from_pipeline(fitted_pre), handle, indent=2)
             for target_name, model in trained_models.items():
                 joblib.dump(model, horizon_dir / f"{target_name}_model.joblib")
             with open(horizon_dir / "metrics.json", "w", encoding="utf-8") as handle:
