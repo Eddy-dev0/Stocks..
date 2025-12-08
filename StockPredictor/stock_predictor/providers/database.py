@@ -1169,6 +1169,32 @@ class Database:
         except (TypeError, ValueError):
             return str(value)
 
+    # ------------------------------------------------------------------
+    # Experiment helpers
+    # ------------------------------------------------------------------
+    def get_experiment_runs(
+        self,
+        *,
+        ticker: str,
+        run_type: str | None = None,
+        target: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return experiment runs filtered by ticker, run type, and target."""
+
+        stmt = select(ExperimentLog).where(ExperimentLog.ticker == ticker)
+        if run_type:
+            stmt = stmt.where(ExperimentLog.run_type == run_type)
+        if target:
+            stmt = stmt.where(ExperimentLog.target == target)
+        stmt = stmt.order_by(ExperimentLog.created_at.desc())
+        if limit:
+            stmt = stmt.limit(int(limit))
+
+        with self.session() as session:
+            rows = session.execute(stmt).scalars().all()
+            return [row.to_dict() for row in rows]
+
 
 @dataclass(slots=True)
 class ExperimentTracker:
@@ -1208,6 +1234,22 @@ class ExperimentTracker:
         if payload is None:
             return None
         return json.dumps(payload, default=str)
+
+    def load_runs(
+        self,
+        *,
+        run_type: str | None = None,
+        target: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Load experiment runs for the configured ticker."""
+
+        if self.database is None:  # pragma: no cover - defensive guard
+            raise RuntimeError("ExperimentTracker is not initialised with a database instance.")
+
+        return self.database.get_experiment_runs(
+            ticker=self.config.ticker, run_type=run_type, target=target, limit=limit
+        )
 
 
 __all__ = [
