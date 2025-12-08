@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
-import re
 from typing import Dict, Iterable, Iterator, Mapping, Optional, Sequence
 
 import numpy as np
@@ -79,17 +78,6 @@ def _elliott_group_builder(context: FeatureBuildContext) -> FeatureBuildOutput:
     status = "executed" if blocks else "skipped_no_data"
     return FeatureBuildOutput(blocks=blocks, status=status)
 
-
-def _fundamental_group_builder(context: FeatureBuildContext) -> FeatureBuildOutput:
-    blocks = [
-        block
-        for block in _build_fundamental_blocks(context.price_df, context.fundamentals_df)
-        if block is not None
-    ]
-    status = "executed" if blocks else "skipped_no_data"
-    return FeatureBuildOutput(blocks=blocks, status=status)
-
-
 def _macro_group_builder(context: FeatureBuildContext) -> FeatureBuildOutput:
     blocks = [
         block
@@ -130,7 +118,6 @@ def _sentiment_group_builder(context: FeatureBuildContext) -> FeatureBuildOutput
 FEATURE_REGISTRY: Dict[str, FeatureGroupSpec] = build_feature_registry(
     technical=_technical_group_builder,
     elliott=_elliott_group_builder,
-    fundamental=_fundamental_group_builder,
     macro=_macro_group_builder,
     sentiment=_sentiment_group_builder,
     identification=_not_implemented_group_builder("identification"),
@@ -181,7 +168,6 @@ class FeatureAssembler:
         news_df: pd.DataFrame | None,
         sentiment_enabled: bool,
         *,
-        fundamentals_df: pd.DataFrame | None = None,
         macro_df: pd.DataFrame | None = None,
     ) -> FeatureResult:
         if price_df.empty:
@@ -191,9 +177,6 @@ class FeatureAssembler:
         context_news = None
         if news_df is not None:
             context_news = news_df.copy()
-        context_fundamentals = None
-        if fundamentals_df is not None:
-            context_fundamentals = fundamentals_df.copy()
         context_macro = None
         if macro_df is not None:
             context_macro = macro_df.copy()
@@ -201,7 +184,6 @@ class FeatureAssembler:
         context = FeatureBuildContext(
             price_df=processed,
             news_df=context_news,
-            fundamentals_df=context_fundamentals,
             macro_df=context_macro,
             sentiment_enabled=sentiment_enabled,
             technical_indicator_config=self.technical_indicator_config,
@@ -660,144 +642,6 @@ def _build_elliott_wave_descriptors(price_df: pd.DataFrame) -> FeatureBlock | No
     }
 
     return FeatureBlock(df[columns], category="elliott", column_categories=column_categories)
-
-
-def _build_fundamental_blocks(
-    price_df: pd.DataFrame, fundamentals_df: pd.DataFrame | None
-) -> list[FeatureBlock | None]:
-    return [
-        _build_fundamental_metrics(price_df, fundamentals_df),
-    ]
-
-
-def _build_fundamental_metrics(
-    price_df: pd.DataFrame, fundamentals_df: pd.DataFrame | None
-) -> FeatureBlock | None:
-    if fundamentals_df is None or fundamentals_df.empty:
-        return None
-
-    aligned = _align_fundamentals_to_price(price_df, fundamentals_df)
-    if aligned is None or aligned.empty:
-        return None
-
-    column_data: Dict[str, pd.Series] = {"Date": aligned["Date"]}
-    column_categories: Dict[str, str] = {}
-
-    value_columns = [column for column in aligned.columns if column != "Date"]
-    for column in value_columns:
-        series = pd.to_numeric(aligned[column], errors="coerce")
-        if series.dropna().empty:
-            continue
-        base_name = _sanitize_metric_name(column)
-        latest_col = f"Fundamental_{base_name}_Latest"
-        filled = series.ffill()
-        column_data[latest_col] = filled
-        column_categories[latest_col] = "fundamental"
-
-        pct_change_col = f"Fundamental_{base_name}_PctChange_63"
-        column_data[pct_change_col] = filled.pct_change(periods=63, fill_method=None)
-        column_categories[pct_change_col] = "fundamental_trend"
-
-        zscore_col = f"Fundamental_{base_name}_ZScore_252"
-        rolling_mean = filled.rolling(window=252, min_periods=5).mean()
-        rolling_std = filled.rolling(window=252, min_periods=5).std()
-        column_data[zscore_col] = (filled - rolling_mean) / rolling_std.replace(0, np.nan)
-        column_categories[zscore_col] = "fundamental_trend"
-
-    metrics = pd.DataFrame(column_data).fillna(0.0)
-    if len(metrics.columns) <= 1:
-        return None
-    return FeatureBlock(metrics, category="fundamental", column_categories=column_categories)
-
-
-def _align_fundamentals_to_price(
-    price_df: pd.DataFrame, fundamentals_df: pd.DataFrame
-) -> pd.DataFrame | None:
-    prepared = _normalize_fundamentals_frame(fundamentals_df)
-    if prepared.empty:
-        return None
-
-    pivot = (
-        prepared.pivot_table(index="AsOf", columns="MetricName", values="Value", aggfunc="last")
-        .sort_index()
-        .ffill()
-    )
-    if pivot.empty:
-        return None
-    pivot = pivot.reset_index().rename(columns={"AsOf": "Date"})
-
-    price_dates = pd.DataFrame({"Date": pd.to_datetime(price_df["Date"], errors="coerce")})
-    price_dates = price_dates.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
-    pivot["Date"] = pd.to_datetime(pivot["Date"], errors="coerce")
-    pivot = pivot.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
-    if price_dates.empty or pivot.empty:
-        return None
-
-    aligned = pd.merge_asof(
-        price_dates,
-        pivot,
-        on="Date",
-        direction="backward",
-        allow_exact_matches=True,
-    )
-    aligned = aligned.ffill()
-    return aligned
-
-
-def _normalize_fundamentals_frame(fundamentals_df: pd.DataFrame) -> pd.DataFrame:
-    df = fundamentals_df.copy()
-    date_column = None
-    for candidate in ("AsOf", "Date", "date", "as_of"):
-        if candidate in df.columns:
-            date_column = candidate
-            break
-    if date_column is None:
-        return pd.DataFrame(columns=["AsOf", "MetricName", "Value"])
-    metric_column = None
-    for candidate in ("Metric", "metric", "Name", "name"):
-        if candidate in df.columns:
-            metric_column = candidate
-            break
-    if metric_column is None:
-        return pd.DataFrame(columns=["AsOf", "MetricName", "Value"])
-    value_column = None
-    for candidate in ("Value", "value"):
-        if candidate in df.columns:
-            value_column = candidate
-            break
-    if value_column is None:
-        return pd.DataFrame(columns=["AsOf", "MetricName", "Value"])
-
-    df["AsOf"] = pd.to_datetime(df[date_column], errors="coerce")
-    df = df.dropna(subset=["AsOf"])
-    df["MetricName"] = df.apply(_compose_metric_label(metric_column), axis=1)
-    df["MetricName"] = df["MetricName"].astype(str).str.strip()
-    df["Value"] = pd.to_numeric(df[value_column], errors="coerce")
-    df = df.dropna(subset=["MetricName", "Value"])
-    return df[["AsOf", "MetricName", "Value"]]
-
-
-def _compose_metric_label(metric_column: str):
-    def _builder(row: pd.Series) -> str:
-        metric_value = str(row.get(metric_column, "")).strip()
-        statement = str(row.get("Statement", "")).strip()
-        period = str(row.get("Period", "")).strip()
-        parts = [part for part in (statement, period, metric_value) if part]
-        if not parts:
-            return "Metric"
-        return "_".join(parts)
-
-    return _builder
-
-
-def _sanitize_metric_name(metric: str) -> str:
-    token = re.sub(r"[^0-9a-zA-Z]+", "_", str(metric).strip())
-    token = token.strip("_")
-    if not token:
-        return "Metric"
-    if token[0].isdigit():
-        token = f"M{token}"
-    return token
 
 
 def _build_macro_blocks(

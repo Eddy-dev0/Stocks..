@@ -503,17 +503,6 @@ class MarketDataETL:
             self._record_source("indicators", "local")
         return inserted
 
-    def refresh_fundamentals(self, force: bool = False) -> int:
-        existing = self.database.get_fundamentals(self.config.ticker)
-        if not force and not existing.empty:
-            return 0
-
-        LOGGER.info(
-            "Skipping fundamentals download for %s; fundamentals providers are disabled.",
-            self.config.ticker,
-        )
-        return 0
-
     def refresh_macro(self, force: bool = False) -> int:
         existing = self.database.get_indicators(
             ticker=self.config.ticker,

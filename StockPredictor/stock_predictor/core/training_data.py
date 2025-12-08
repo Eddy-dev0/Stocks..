@@ -60,15 +60,11 @@ class TrainingDatasetBuilder:
             macro_df = self.database.get_indicators(
                 ticker=self.config.ticker, interval=self.config.interval, category="macro"
             )
-        fundamentals_df = pd.DataFrame()
-        if self.config.feature_toggles.fundamental:
-            fundamentals_df = self.database.get_fundamentals(self.config.ticker)
 
         feature_result = self.feature_assembler.build(
             price_df,
             news_df,
             sentiment_enabled,
-            fundamentals_df=fundamentals_df if not fundamentals_df.empty else None,
             macro_df=macro_df if not macro_df.empty else None,
         )
 

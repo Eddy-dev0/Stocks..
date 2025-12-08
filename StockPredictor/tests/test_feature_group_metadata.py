@@ -107,7 +107,6 @@ def test_prediction_respects_feature_toggle_configuration(tmp_path: Path) -> Non
             "technical": True,
             "sentiment": False,
             "macro": False,
-            "fundamental": False,
             "volume_liquidity": False,
             "elliott": False,
         }
@@ -146,7 +145,6 @@ def test_prediction_warns_on_feature_toggle_mismatch(tmp_path: Path) -> None:
             "technical": False,
             "macro": True,
             "sentiment": False,
-            "fundamental": False,
             "volume_liquidity": False,
             "elliott": False,
         }
