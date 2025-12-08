@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -11,6 +11,7 @@ import pandas as pd
 from sklearn.base import clone
 from sklearn.pipeline import Pipeline
 
+from .directional import DirectionalStats, evaluate_directional_predictions
 from .ml_preprocessing import get_feature_names_from_pipeline
 from .models import (
     ModelFactory,
@@ -30,6 +31,7 @@ class BacktestResult:
     aggregate: Dict[str, float]
     feature_importance: Dict[str, float]
     decision_thresholds: Dict[str, float]
+    directional: Dict[str, float] = field(default_factory=dict)
 
 
 class Backtester:
@@ -68,12 +70,14 @@ class Backtester:
         preprocessor_template: Optional[Pipeline] = None,
         auxiliary_targets: Optional[pd.DataFrame] = None,
         target_kind: str | None = None,
+        horizon: int | None = None,
     ) -> BacktestResult:
         task = "classification" if target == "direction" else "regression"
         splits = list(self._generate_splits(len(X)))
         split_metrics: list[Dict[str, float]] = []
         feature_totals: Dict[str, float] = {}
         feature_counts: Dict[str, int] = {}
+        directional_totals = DirectionalStats()
 
         for index, (train_slice, test_slice) in enumerate(splits, start=1):
             X_train, y_train = X.iloc[train_slice], y.iloc[train_slice]
@@ -112,6 +116,10 @@ class Backtester:
                 y_proba=y_proba,
                 classes=classes,
             )
+            directional_stats = evaluate_directional_predictions(
+                task, target, y_test, y_pred, raw_features=X_test
+            )
+            directional_totals.merge(directional_stats)
             auxiliary_test = (
                 auxiliary_targets.iloc[test_slice]
                 if auxiliary_targets is not None
@@ -142,6 +150,8 @@ class Backtester:
             raise RuntimeError("Backtest did not produce any splits. Check dataset size or window configuration.")
 
         aggregate = self._aggregate_metrics(split_metrics)
+        directional_summary = directional_totals.as_summary(horizon=horizon)
+        aggregate.update(directional_summary)
         aggregated_importance = self._normalise_feature_importance(feature_totals, feature_counts)
         threshold_summary = {
             key: value
@@ -156,6 +166,7 @@ class Backtester:
             aggregate=aggregate,
             feature_importance=aggregated_importance,
             decision_thresholds=threshold_summary,
+            directional=directional_summary,
         )
 
     def _score_predictions(
