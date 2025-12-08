@@ -341,7 +341,15 @@ class MultiHorizonModelingEngine:
         horizon: int | None = None,
     ) -> dict[str, Any]:
         resolved_horizon = int(horizon or min(self.config.prediction_horizons))
-        artefacts = self._load_horizon_artefacts(resolved_horizon)
+        try:
+            artefacts = self._load_horizon_artefacts(resolved_horizon)
+        except FileNotFoundError:
+            LOGGER.info(
+                "No persisted artefacts found for horizon %s; triggering training run.",
+                resolved_horizon,
+            )
+            self.train(horizon=resolved_horizon, force=True)
+            artefacts = self._load_horizon_artefacts(resolved_horizon)
 
         price_df = self.fetcher.fetch_price_data()
         news_df = self.fetcher.fetch_news_data() if self.config.sentiment else pd.DataFrame()
