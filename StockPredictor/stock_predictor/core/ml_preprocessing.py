@@ -134,19 +134,19 @@ class DataFrameSimpleImputer(_BaseDataFrameTransformer):
         # ``StandardScaler`` issue runtime warnings when encountering columns
         # that are entirely non-finite, so we replace missing values with a
         # neutral fallback to stabilise the pipeline.
-        # Preserve columns that never contained valid data during ``fit`` so
-        # downstream consumers can decide how to handle them (e.g. drop, mask, or
-        # impute with a domain-specific default).
+        # Preserve the knowledge of fully-missing columns so downstream
+        # consumers can decide how to handle them (e.g. drop, mask, or impute
+        # with a domain-specific default), while still replacing the values
+        # themselves to avoid numerical warnings.
         skipped_columns = list(self.skipped_columns_)
 
         # As an additional guard, ensure no residual ``NaN`` values leak into
-        # later preprocessing steps, while respecting fully-missing columns.
+        # later preprocessing steps. Apply a neutral fill to every column,
+        # including those that were entirely missing during ``fit``; the
+        # ``skipped_columns`` attribute retains the original status for
+        # downstream consumers.
         if frame.isna().values.any():
-            if skipped_columns:
-                remaining = [col for col in frame.columns if col not in skipped_columns]
-                frame[remaining] = frame[remaining].fillna(0.0)
-            else:
-                frame = frame.fillna(0.0)
+            frame = frame.fillna(0.0)
 
         return frame[self.feature_names_]
 
