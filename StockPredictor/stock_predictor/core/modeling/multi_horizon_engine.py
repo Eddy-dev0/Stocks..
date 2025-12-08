@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -362,15 +363,44 @@ class MultiHorizonModelingEngine:
 
         requested_targets = set(targets) if targets else set(artefacts.models.keys())
         predictions: dict[str, Any] = {}
+        probabilities: dict[str, dict[str, float]] = {}
+        quantile_forecasts: dict[str, dict[str, float]] = {}
         for target_name, model in artefacts.models.items():
             if target_name not in requested_targets:
                 continue
             y_hat = model.predict(transformed)
             predictions[target_name] = float(y_hat[0])
 
+            estimator = model.named_steps.get("estimator") if hasattr(model, "named_steps") else model
+
+            if hasattr(estimator, "predict_proba"):
+                try:
+                    proba = estimator.predict_proba(transformed)[0]
+                    classes = getattr(estimator, "classes_", range(len(proba)))
+                    probabilities[target_name] = {
+                        str(label): float(prob)
+                        for label, prob in zip(classes, proba)
+                    }
+                except Exception:  # pragma: no cover - defensive against model quirks
+                    probabilities[target_name] = {}
+
+            if hasattr(estimator, "predict_quantiles"):
+                try:
+                    quantiles = estimator.predict_quantiles(transformed)
+                except Exception:  # pragma: no cover - estimator specific
+                    quantiles = {}
+                if isinstance(quantiles, dict):
+                    quantile_forecasts[target_name] = {
+                        str(key): float(np.nanmean(value)) if hasattr(value, "__iter__") else float(value)
+                        for key, value in quantiles.items()
+                        if value is not None and not (isinstance(value, float) and math.isnan(value))
+                    }
+
         return {
             "horizon": resolved_horizon,
             "predictions": predictions,
+            "probabilities": probabilities,
+            "quantile_forecasts": quantile_forecasts,
             "feature_columns": get_feature_names_from_pipeline(artefacts.preprocessor),
             "sample_counts": artefacts.sample_counts,
             "metrics": artefacts.metrics,

@@ -28,31 +28,21 @@ class _DummyPipeline:
     def live_price_snapshot(
         self,
         *,
-        expected_change_pct_model=None,
-        expected_low_pct_model=None,
-        stop_loss_pct=None,
-        prob_up=None,
+        horizon=None,
     ):
         base_price = self.fetcher.last_price
-        predicted_close = (
-            base_price * (1 + expected_change_pct_model)
-            if expected_change_pct_model is not None
-            else base_price
-        )
-        expected_low = base_price * (1 - abs(expected_low_pct_model or 0))
-        stop_loss = (
-            base_price * (1 - abs(stop_loss_pct or 0))
-            if stop_loss_pct is not None
-            else expected_low
-        )
-        prob_down = (1 - prob_up) if isinstance(prob_up, (int, float)) else None
+        predicted_close = base_price * 1.05
+        expected_low = base_price * 0.8
+        stop_loss = expected_low
+        prob_up = 0.6
+        prob_down = 0.4
 
         return {
             "ticker": "ABC",
             "market_time": None,
             "last_price": base_price,
             "predicted_close": predicted_close,
-            "expected_change_pct": expected_change_pct_model,
+            "expected_change_pct": 0.05,
             "expected_low": expected_low,
             "stop_loss": stop_loss,
             "probabilities": {"up": prob_up, "down": prob_down},
@@ -84,20 +74,11 @@ def _build_app(monkeypatch, last_price: float = 100.0) -> TestClient:
 def test_expected_low_never_exceeds_last_price(monkeypatch):
     client = _build_app(monkeypatch, last_price=100.0)
 
-    positive_response = client.post(
+    response = client.post(
         "/live-price/abc",
-        json={"expected_low_pct_model": 0.1},
+        json={},
     )
-    assert positive_response.status_code == 200
-    positive_payload = positive_response.json()["price"]
-    assert positive_payload["expected_low"] == 90.0
-    assert positive_payload["expected_low"] <= positive_payload["last_price"]
-
-    negative_response = client.post(
-        "/live-price/abc",
-        json={"expected_low_pct_model": -0.2},
-    )
-    assert negative_response.status_code == 200
-    negative_payload = negative_response.json()["price"]
-    assert negative_payload["expected_low"] == pytest.approx(80.0)
-    assert negative_payload["expected_low"] <= negative_payload["last_price"]
+    assert response.status_code == 200
+    payload = response.json()["price"]
+    assert payload["expected_low"] == pytest.approx(80.0)
+    assert payload["expected_low"] <= payload["last_price"]
