@@ -111,6 +111,12 @@ class StockPredictorApplication:
         LOGGER.info("Running backtest for ticker %s", self.config.ticker)
         return self.pipeline.run_backtest(targets=targets)
 
+    def accuracy(self, *, horizon: int | None = None) -> dict[str, Any]:
+        """Summarise stored prediction accuracy for the configured ticker."""
+
+        LOGGER.info("Summarising accuracy for ticker %s", self.config.ticker)
+        return self.pipeline.accuracy_summary(horizon=horizon)
+
     def buy_zone(self, *, refresh: bool = False) -> dict[str, Any]:
         """Compute a tactical buy zone for the configured ticker."""
 

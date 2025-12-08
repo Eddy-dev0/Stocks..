@@ -46,6 +46,7 @@ for key, value in {
     "buy_zone_response": None,
     "insights_response": None,
     "live_price_response": None,
+    "accuracy_response": None,
     "feature_toggles": DEFAULT_FEATURE_TOGGLES.copy(),
 }.items():
     st.session_state.setdefault(key, value)
@@ -1174,6 +1175,53 @@ with col_forecast:
             file_name=f"{ticker}_forecast.json",
             mime="application/json",
         )
+
+    accuracy_cols = st.columns([1, 3])
+    with accuracy_cols[0]:
+        if st.button("Load accuracy summary"):
+            with st.spinner("Retrieving accuracy metrics..."):
+                params: Dict[str, Any] = {}
+                if horizon_value:
+                    params["horizon"] = int(horizon_value)
+                response = _request(f"/accuracy/{ticker}", params=params)
+                if response is not None:
+                    st.session_state["accuracy_response"] = response
+                    st.success("Accuracy summary refreshed")
+
+    with accuracy_cols[1]:
+        accuracy_response = st.session_state.get("accuracy_response") or {}
+        accuracy_payload = (
+            accuracy_response.get("accuracy")
+            if isinstance(accuracy_response, Mapping)
+            else None
+        )
+        if accuracy_payload:
+            st.markdown("**Directional accuracy**")
+            correct_pct = accuracy_payload.get("correct_pct")
+            incorrect_pct = accuracy_payload.get("incorrect_pct")
+            total_predictions = accuracy_payload.get("total_predictions")
+            runs_considered = accuracy_payload.get("runs_considered")
+            stats_cols = st.columns(3)
+            stats_cols[0].metric(
+                "Correct",
+                f"{float(correct_pct) * 100:.1f}%" if correct_pct is not None else "—",
+                help="Share of predictions that matched actual direction across stored runs.",
+            )
+            stats_cols[1].metric(
+                "Incorrect",
+                f"{float(incorrect_pct) * 100:.1f}%" if incorrect_pct is not None else "—",
+                help="Share of predictions that missed the observed direction.",
+            )
+            stats_cols[2].metric(
+                "Total predictions",
+                f"{int(total_predictions):,}" if isinstance(total_predictions, (int, float)) else "—",
+                help="Combined out-of-sample predictions evaluated in backtests.",
+            )
+            st.caption(
+                f"Runs considered: {runs_considered or 0} | Horizon: {accuracy_payload.get('horizon') or 'active'}"
+            )
+        else:
+            st.info("Run a backtest and refresh accuracy to see directional hit rates.")
 
     if st.button("Run backtest"):
         with st.spinner("Running backtest..."):

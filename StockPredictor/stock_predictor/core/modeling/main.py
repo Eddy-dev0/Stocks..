@@ -5355,3 +5355,92 @@ class StockPredictorAI:
         self.metadata["active_horizon"] = resolved_horizon
         return results
 
+    # ------------------------------------------------------------------
+    # Evaluation summaries
+    # ------------------------------------------------------------------
+    def accuracy_summary(self, *, horizon: Optional[int] = None) -> Dict[str, Any]:
+        """Aggregate directional accuracy across stored backtest runs."""
+
+        resolved_horizon = self._resolve_horizon(horizon)
+        runs = self.tracker.load_runs(run_type="backtest")
+
+        total_predictions = 0
+        correct_predictions = 0.0
+        runs_considered = 0
+
+        for run in runs:
+            context = run.get("context") or {}
+            run_horizon = context.get("horizon")
+            if resolved_horizon is not None and run_horizon is not None:
+                try:
+                    if int(run_horizon) != int(resolved_horizon):
+                        continue
+                except (TypeError, ValueError):
+                    LOGGER.debug("Skipping run with unparsable horizon: %s", run_horizon)
+                    continue
+
+            splits = [entry for entry in context.get("splits", []) if isinstance(entry, Mapping)]
+            split_total, split_correct = self._summarise_splits(splits)
+
+            metrics = run.get("metrics") or {}
+            if split_total == 0:
+                aggregate_total, aggregate_correct = self._summarise_aggregate(metrics)
+                split_total = aggregate_total
+                split_correct = aggregate_correct
+
+            if split_total > 0:
+                total_predictions += split_total
+                correct_predictions += split_correct
+                runs_considered += 1
+
+        correct_count = int(round(correct_predictions))
+        correct_count = min(correct_count, total_predictions)
+        incorrect_count = max(total_predictions - correct_count, 0)
+        correct_pct = (correct_predictions / total_predictions) if total_predictions else 0.0
+        incorrect_pct = (incorrect_count / total_predictions) if total_predictions else 0.0
+
+        return {
+            "horizon": resolved_horizon,
+            "runs_considered": runs_considered,
+            "total_predictions": total_predictions,
+            "correct": correct_count,
+            "incorrect": incorrect_count,
+            "correct_pct": correct_pct,
+            "incorrect_pct": incorrect_pct,
+        }
+
+    @staticmethod
+    def _coerce_accuracy(payload: Mapping[str, Any]) -> float | None:
+        for key in ("directional_accuracy", "accuracy"):
+            value = payload.get(key)
+            if isinstance(value, Real) and math.isfinite(value):
+                return float(value)
+        return None
+
+    def _summarise_splits(self, splits: Iterable[Mapping[str, Any]]) -> tuple[int, float]:
+        total = 0
+        correct = 0.0
+        for split in splits:
+            test_size = split.get("test_size")
+            accuracy = self._coerce_accuracy(split)
+            if not isinstance(test_size, (int, float)) or accuracy is None:
+                continue
+            if not math.isfinite(test_size):
+                continue
+            total += int(test_size)
+            correct += float(accuracy) * int(test_size)
+        return total, correct
+
+    def _summarise_aggregate(self, metrics: Mapping[str, Any]) -> tuple[int, float]:
+        total = 0
+        correct = 0.0
+        if not isinstance(metrics, Mapping):
+            return total, correct
+
+        test_rows = metrics.get("test_rows")
+        accuracy = self._coerce_accuracy(metrics)
+        if isinstance(test_rows, (int, float)) and accuracy is not None and math.isfinite(test_rows):
+            total = int(test_rows)
+            correct = float(accuracy) * total
+        return total, correct
+

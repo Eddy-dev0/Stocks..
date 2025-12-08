@@ -241,6 +241,25 @@ class LivePriceEnvelope(BaseModel):
     price: LivePriceResponse
 
 
+class AccuracyResponse(BaseModel):
+    """Aggregated accuracy details derived from experiment logs."""
+
+    horizon: int | None = Field(None, description="Prediction horizon the metrics relate to.")
+    runs_considered: int = Field(..., description="Number of backtest runs included in the summary.")
+    total_predictions: int = Field(..., description="Total number of predictions evaluated.")
+    correct: int = Field(..., description="Number of correct predictions.")
+    incorrect: int = Field(..., description="Number of incorrect predictions.")
+    correct_pct: float = Field(..., description="Fraction of predictions that were correct.")
+    incorrect_pct: float = Field(..., description="Fraction of predictions that were incorrect.")
+
+
+class AccuracyEnvelope(BaseModel):
+    """Envelope for accuracy summaries."""
+
+    status: str = Field("ok", description="Outcome of the request.")
+    accuracy: AccuracyResponse
+
+
 def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
     """Create a configured FastAPI application for the Stock Predictor UI."""
 
@@ -410,6 +429,18 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
 
         snapshot = LivePriceResponse(**snapshot_payload)
         return LivePriceEnvelope(status="ok", price=snapshot)
+
+    @app.get(
+        "/accuracy/{ticker}",
+        dependencies=[Depends(require_api_key)],
+        response_model=AccuracyEnvelope,
+    )
+    async def accuracy(
+        ticker: str, horizon: int | None = Query(None, ge=1, description="Prediction horizon to filter runs.")
+    ) -> AccuracyEnvelope:
+        application = await _build_application(ticker, {})
+        summary = await _call_with_error_handling(application.accuracy, horizon=horizon)
+        return AccuracyEnvelope(status="ok", accuracy=AccuracyResponse(**summary))
 
     @app.get("/research", dependencies=[Depends(require_api_key)])
     async def research_feed(
