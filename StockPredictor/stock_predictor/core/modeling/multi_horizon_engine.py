@@ -22,6 +22,7 @@ from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.metrics import accuracy_score, mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
+from sklearn.exceptions import NotFittedError
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
@@ -367,7 +368,16 @@ class MultiHorizonModelingEngine:
         latest_features = feature_result.features.copy()
         latest_features["ticker"] = self.config.ticker
         latest_row = latest_features.iloc[[-1]]
-        transformed = artefacts.preprocessor.transform(latest_row)
+        try:
+            transformed = artefacts.preprocessor.transform(latest_row)
+        except NotFittedError:
+            LOGGER.warning(
+                "Preprocessor for horizon %s is not fitted; retraining before inference.",
+                resolved_horizon,
+            )
+            self.train(horizon=resolved_horizon, force=True)
+            artefacts = self._load_horizon_artefacts(resolved_horizon)
+            transformed = artefacts.preprocessor.transform(latest_row)
 
         requested_targets = set(targets) if targets else set(artefacts.models.keys())
         predictions: dict[str, Any] = {}
