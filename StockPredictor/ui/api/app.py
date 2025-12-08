@@ -192,25 +192,12 @@ class BuyZoneEnvelope(BaseModel):
 
 
 class LivePriceRequest(BaseModel):
-    """Payload describing model-driven expectations for live price context."""
+    """Payload describing live price context options."""
 
-    expected_change_pct_model: float | None = Field(
+    horizon: int | None = Field(
         default=None,
-        description="Model-predicted percentage change from the latest price (as a decimal).",
-    )
-    expected_low_pct_model: float | None = Field(
-        default=None,
-        description="Model-predicted downside move from the latest price (as a decimal).",
-    )
-    stop_loss_pct: float | None = Field(
-        default=None,
-        description="Risk threshold for stop-loss placement relative to the latest price (decimal).",
-    )
-    prob_up: float | None = Field(
-        default=None,
-        description="Probability of upward direction from the model (0-1 range).",
-        ge=0,
-        le=1,
+        description="Optional override for the forecast horizon to evaluate.",
+        ge=1,
     )
 
 
@@ -418,10 +405,7 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
         application = await _build_application(ticker, {})
         snapshot_payload = await _call_with_error_handling(
             application.pipeline.live_price_snapshot,
-            expected_change_pct_model=request.expected_change_pct_model,
-            expected_low_pct_model=request.expected_low_pct_model,
-            stop_loss_pct=request.stop_loss_pct,
-            prob_up=request.prob_up,
+            horizon=request.horizon,
         )
 
         snapshot = LivePriceResponse(**snapshot_payload)

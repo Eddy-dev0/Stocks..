@@ -3691,41 +3691,106 @@ class StockPredictorAI:
             None if validated_stop_loss is None else float(validated_stop_loss),
         )
 
-    def live_price_snapshot(
-        self,
-        *,
-        expected_change_pct_model: float | None,
-        expected_low_pct_model: float | None,
-        stop_loss_pct: float | None,
-        prob_up: float | None,
-    ) -> Dict[str, Any]:
-        """Compose a live snapshot using model expectations and residual bands."""
+    def live_price_snapshot(self, *, horizon: int | None = None) -> Dict[str, Any]:
+        """Compose a live snapshot using fresh model predictions."""
+
+        resolved_horizon = self._resolve_horizon(horizon)
+        self.horizon = resolved_horizon
 
         last_price, timestamp = self.fetcher.fetch_live_price(force=True)
         anchor_price = self._safe_float(last_price)
-        pct_change = self._safe_float(expected_change_pct_model)
-        predicted_close = None
-        if anchor_price is not None and pct_change is not None:
-            predicted_close = float(anchor_price * (1 + pct_change))
 
-        residual_error = self._residual_error_scale(self.horizon)
+        prediction_output = self.nextgen_engine.predict_latest(
+            horizon=resolved_horizon,
+        )
+        preds = prediction_output.get("predictions", {}) if isinstance(prediction_output, dict) else {}
+        quantiles = (
+            prediction_output.get("quantile_forecasts", {})
+            if isinstance(prediction_output, dict)
+            else {}
+        )
+        prob_block = (
+            prediction_output.get("probabilities", {})
+            if isinstance(prediction_output, dict)
+            else {}
+        )
+
+        predicted_close = self._safe_float(preds.get("close_h"))
+        predicted_return = self._safe_float(preds.get("return_h"))
+        predicted_volatility = None
+
+        def _extract_quantile(block: Mapping[str, Any] | None) -> tuple[Optional[float], Optional[float]]:
+            if not isinstance(block, Mapping):
+                return None, None
+            numeric_block: dict[str, float] = {}
+            for key, value in block.items():
+                numeric = self._safe_float(value)
+                if numeric is not None:
+                    numeric_block[str(key)] = float(numeric)
+            preferred_keys = ("0.1", "0.10", "p10", "10%", "10", "quantile_0.1", "lower")
+            lower_quantile = None
+            for key in preferred_keys:
+                if key in numeric_block:
+                    lower_quantile = numeric_block[key]
+                    break
+            if lower_quantile is None and numeric_block:
+                lower_quantile = min(numeric_block.values())
+            median_value = numeric_block.get("0.5") or numeric_block.get("0.50") or numeric_block.get("median")
+            return lower_quantile, median_value
+
+        return_quantiles = quantiles.get("return_h") or quantiles.get("return")
+        return_lower, return_median = _extract_quantile(return_quantiles)
+        close_quantiles = quantiles.get("close_h") or quantiles.get("close")
+        close_lower, close_median = _extract_quantile(close_quantiles)
+
+        quantile_forecasts: dict[str, Dict[str, float]] = {}
+        if isinstance(return_quantiles, Mapping):
+            quantile_forecasts["return"] = {
+                str(key): float(value)
+                for key, value in return_quantiles.items()
+                if self._safe_float(value) is not None
+            }
+        if isinstance(close_quantiles, Mapping):
+            quantile_forecasts["close"] = {
+                str(key): float(value)
+                for key, value in close_quantiles.items()
+                if self._safe_float(value) is not None
+            }
+
+        if predicted_close is None and anchor_price is not None and predicted_return is not None:
+            predicted_close = float(anchor_price * (1 + predicted_return))
+        if predicted_close is None and anchor_price is not None and close_median is not None:
+            predicted_close = float(close_median)
+
+        expected_change_pct = None
+        if predicted_close is not None and anchor_price is not None and anchor_price != 0:
+            expected_change_pct = (float(predicted_close) - float(anchor_price)) / float(anchor_price)
+        elif predicted_return is not None:
+            expected_change_pct = float(predicted_return)
+
+        if predicted_return is not None and return_lower is not None:
+            predicted_volatility = abs(float(predicted_return) - float(return_lower))
+        elif predicted_close is not None and close_lower is not None and predicted_close != 0:
+            predicted_volatility = abs(float(predicted_close) - float(close_lower)) / float(predicted_close)
+
+        residual_error = self._residual_error_scale(resolved_horizon)
         expected_low = self._compute_expected_low(
             predicted_close,
-            None,
-            quantile_forecasts=None,
+            predicted_volatility,
+            quantile_forecasts=quantile_forecasts or None,
             prediction_intervals=None,
             indicator_floor=None,
             residual_error=residual_error,
             anchor_price=anchor_price,
-            pct_hint=expected_low_pct_model,
+            pct_hint=None,
         )
         stop_loss = self._compute_stop_loss(
             predicted_close,
-            None,
+            predicted_volatility,
             expected_low=expected_low,
             residual_error=residual_error,
             anchor_price=anchor_price,
-            pct_hint=stop_loss_pct,
+            pct_hint=None,
         )
 
         if expected_low is not None and predicted_close is not None:
@@ -3736,30 +3801,51 @@ class StockPredictorAI:
         snapshot_warnings: list[str] = []
         (
             _,
-            pct_change,
+            expected_change_pct,
             predicted_close,
             expected_low,
             stop_loss,
         ) = self._validate_prediction_ranges(
-            predicted_return=pct_change,
-            expected_change_pct=pct_change,
+            predicted_return=expected_change_pct,
+            expected_change_pct=expected_change_pct,
             predicted_close=predicted_close,
             expected_low=expected_low,
             stop_loss=stop_loss,
             anchor_price=anchor_price,
-            horizon=self.horizon or 1,
+            horizon=resolved_horizon or 1,
             residual_error=residual_error,
             prediction_warnings=snapshot_warnings,
         )
 
-        prob_down = (1 - prob_up) if isinstance(prob_up, (int, float)) else None
+        direction_probabilities = prob_block.get("direction_h") or prob_block.get("direction") or {}
+        prob_up = None
+        prob_down = None
+        if isinstance(direction_probabilities, Mapping):
+            up_candidates = [
+                direction_probabilities.get(key)
+                for key in (1, "1", True, "up", "UP")
+            ]
+            down_candidates = [
+                direction_probabilities.get(key)
+                for key in (-1, "-1", False, "down", "DOWN")
+            ]
+            up_candidates = [self._safe_float(value) for value in up_candidates if value is not None]
+            down_candidates = [self._safe_float(value) for value in down_candidates if value is not None]
+            if up_candidates:
+                prob_up = float(max(up_candidates))
+            if down_candidates:
+                prob_down = float(max(down_candidates))
+            if prob_up is None and prob_down is not None:
+                prob_up = float(max(0.0, 1 - prob_down))
+            if prob_down is None and prob_up is not None:
+                prob_down = float(max(0.0, 1 - prob_up))
 
         return {
             "ticker": self.config.ticker,
             "market_time": timestamp.to_pydatetime() if timestamp is not None else None,
             "last_price": last_price,
             "predicted_close": predicted_close,
-            "expected_change_pct": pct_change,
+            "expected_change_pct": expected_change_pct,
             "expected_low": expected_low,
             "stop_loss": stop_loss,
             "probabilities": {"up": prob_up, "down": prob_down},
