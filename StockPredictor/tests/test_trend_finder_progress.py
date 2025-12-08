@@ -26,9 +26,9 @@ class SimpleAI:
         features = pd.DataFrame(
             [
                 {
-                    "tech_indicator": 0.5,
-                    "fundamental_metric": 0.25,
-                    "sentiment_signal": 0.1,
+                    "tech_indicator": 7.5,
+                    "macro_metric": 6.5,
+                    "sentiment_signal": 5.5,
                 }
             ]
         )
@@ -36,14 +36,20 @@ class SimpleAI:
             "latest_features": features,
             "feature_categories": {
                 "tech_indicator": "technical indicator",
-                "fundamental_metric": "fundamental metric",
+                "macro_metric": "macro trend",
                 "sentiment_signal": "sentiment gauge",
             },
         }
         return features, {}, {}
 
     def predict(self, horizon: int | None = None):
-        return {"expected_change_pct": 0.02}
+        return {
+            "expected_change_pct": 0.03,
+            "direction_probability_up": 0.97,
+            "direction_probability_down": 0.01,
+            "confluence_confidence": 0.96,
+            "signal_confluence": {"score": 0.96, "passed": True},
+        }
 
 
 def test_trend_finder_reports_progress(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

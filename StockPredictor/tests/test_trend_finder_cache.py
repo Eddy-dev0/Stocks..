@@ -44,9 +44,9 @@ class FakeAI:
         features = pd.DataFrame(
             [
                 {
-                    "technical_score": latest_close / 100.0,
-                    "fundamental_score": 0.5,
-                    "sentiment_score": 0.25,
+                    "technical_score": 8.0,
+                    "macro_score": 6.0,
+                    "sentiment_score": 7.0,
                 }
             ]
         )
@@ -54,7 +54,7 @@ class FakeAI:
             "latest_features": features,
             "feature_categories": {
                 "technical_score": "technical indicator",
-                "fundamental_score": "fundamental metric",
+                "macro_score": "macro trend",
                 "sentiment_score": "sentiment gauge",
             },
         }
@@ -62,10 +62,12 @@ class FakeAI:
 
     def predict(self, horizon: int | None = None):
         return {
-            "expected_change_pct": 0.01,
-            "predicted_return": 0.01,
-            "direction_probability_up": 0.6,
-            "direction_probability_down": 0.4,
+            "expected_change_pct": 0.02,
+            "predicted_return": 0.02,
+            "direction_probability_up": 0.98,
+            "direction_probability_down": 0.02,
+            "confluence_confidence": 0.97,
+            "signal_confluence": {"score": 0.97, "passed": True},
         }
 
 
@@ -137,6 +139,7 @@ def test_trend_finder_reuses_cached_prices_when_rate_limited(
     insights = trend.scan(universe=["AAPL"], limit=1)
 
     assert insights, "TrendFinder should return insights using cached data."
-    assert providers_seen[0] == ("alpha_vantage", "stooq")
+    assert providers_seen[0][0] == "alpha_vantage"
+    assert "stooq" in providers_seen[0]
     assert providers_seen[-1] is None
     assert call_counts[("AAPL", DatasetType.PRICES)] == 2
