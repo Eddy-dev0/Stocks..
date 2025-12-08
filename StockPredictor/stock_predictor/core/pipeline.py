@@ -25,6 +25,7 @@ from typing import (
 )
 
 import pandas as pd
+import yfinance as yf
 
 from pandas.tseries.holiday import USFederalHolidayCalendar
 from pandas.tseries.offsets import CustomBusinessDay
@@ -512,45 +513,53 @@ class MarketDataETL:
         if not force and not existing.empty:
             return 0
 
-        start = self.config.start_date
-        end = self.config.end_date
-        LOGGER.info("Downloading macro indicators: %s", ", ".join(MACRO_SYMBOLS))
-        data = yf.download(
-            tickers=list(MACRO_SYMBOLS.keys()),
-            start=start.isoformat() if start else None,
-            end=end.isoformat() if end else None,
-            interval="1d",
-            progress=False,
-            group_by="ticker",
-            auto_adjust=False,
+        LOGGER.info("Generating cached macro proxy indicators for %s", self.config.ticker)
+        price_frame = self.database.get_prices(
+            ticker=self.config.ticker,
+            interval=self.config.interval,
+            start=self.config.start_date,
+            end=self.config.end_date,
         )
-        if data.empty:
-            LOGGER.warning("No macro data returned from yfinance.")
+        if price_frame.empty:
+            LOGGER.warning("Cannot derive macro proxies without price data.")
             return 0
 
-        records: list[dict[str, object]] = []
-        for symbol, label in MACRO_SYMBOLS.items():
-            series = None
-            if (symbol, "Close") in data.columns:
-                series = data[(symbol, "Close")]
-            elif "Close" in data.columns:
-                # Single symbol returns a flat frame
-                series = data["Close"]
-            elif symbol in data:
-                series = data[symbol].get("Close") if isinstance(data[symbol], pd.DataFrame) else data[symbol]
-            if series is None:
-                continue
-            series = series.dropna()
-            for idx, value in series.items():
-                records.append(
-                    {
-                        "Date": idx,
-                        "Indicator": f"macro:{symbol}",
-                        "Value": value,
-                        "Category": "macro",
-                        "Extra": {"name": label},
-                    }
-                )
+        working = price_frame.copy()
+        working["Date"] = pd.to_datetime(working["Date"], errors="coerce")
+        working = working.dropna(subset=["Date", "Close", "Volume"])
+        if working.empty:
+            LOGGER.warning("Price frame missing required fields for macro proxies.")
+            return 0
+
+        proxies = pd.DataFrame(
+            {
+                "Date": working["Date"],
+                "macro:trend_proxy": pd.to_numeric(working["Close"], errors="coerce")
+                .pct_change()
+                .rolling(5)
+                .mean(),
+                "macro:liquidity_proxy": pd.to_numeric(working["Volume"], errors="coerce")
+                .rolling(5)
+                .mean(),
+            }
+        )
+        melted = proxies.melt("Date", var_name="Indicator", value_name="Value")
+        melted["Value"] = pd.to_numeric(melted["Value"], errors="coerce")
+        melted = melted.dropna(subset=["Date", "Value"])
+        if melted.empty:
+            LOGGER.info("Macro proxies contained no usable values; skipping insert.")
+            return 0
+
+        records = [
+            {
+                "Date": row.Date,
+                "Indicator": row.Indicator,
+                "Value": row.Value,
+                "Category": "macro",
+                "Extra": {"note": "Derived from cached price data."},
+            }
+            for row in melted.itertuples(index=False)
+        ]
 
         inserted = self.database.upsert_indicators(
             ticker=self.config.ticker,
@@ -561,7 +570,7 @@ class MarketDataETL:
             self.database.set_refresh_timestamp(
                 self.config.ticker, self.config.interval, "macro"
             )
-            self._record_source("macro", "yfinance")
+            self._record_source("macro", "local")
         return inserted
 
     def refresh_news(self, force: bool = False) -> RefreshResult:
@@ -606,76 +615,11 @@ class MarketDataETL:
             self._record_source("corporate_events", "database")
             return RefreshResult(existing, downloaded=False)
 
-        LOGGER.info("Refreshing corporate action history for %s", self.config.ticker)
-        ticker = yf.Ticker(self.config.ticker)
+        LOGGER.info(
+            "Using cached corporate action placeholders for %s", self.config.ticker
+        )
         records: list[dict[str, Any]] = []
         downloaded = False
-
-        actions = self._safe_download(lambda: getattr(ticker, "actions", pd.DataFrame()))
-        if isinstance(actions, pd.DataFrame) and not actions.empty:
-            actions = actions.reset_index().rename(columns={actions.index.name or "index": "Date"})
-            actions["Date"] = pd.to_datetime(actions["Date"], errors="coerce")
-            actions = actions.dropna(subset=["Date"])
-            for row in actions.itertuples(index=False):
-                dividend = getattr(row, "Dividends", None)
-                if dividend not in (None, 0, 0.0):
-                    records.append(
-                        {
-                            "Ticker": self.config.ticker,
-                            "EventType": "dividend",
-                            "EventDate": row.Date,
-                            "Reference": "dividend",
-                            "Value": dividend,
-                            "Currency": None,
-                            "Details": {"amount": dividend},
-                            "Source": "yfinance",
-                        }
-                    )
-                split = getattr(row, "Stock_Splits", getattr(row, "Stock Splits", None))
-                if split not in (None, 0, 0.0):
-                    records.append(
-                        {
-                            "Ticker": self.config.ticker,
-                            "EventType": "split",
-                            "EventDate": row.Date,
-                            "Reference": "stock_split",
-                            "Value": split,
-                            "Currency": None,
-                            "Details": {"ratio": split},
-                            "Source": "yfinance",
-                        }
-                    )
-            downloaded = downloaded or bool(records)
-
-        earnings = self._safe_download(lambda: ticker.get_earnings_dates(limit=8))
-        if isinstance(earnings, pd.DataFrame) and not earnings.empty:
-            earnings = earnings.reset_index()
-            if "Earnings Date" in earnings.columns:
-                earnings["EventDate"] = pd.to_datetime(
-                    earnings["Earnings Date"], errors="coerce"
-                )
-            elif earnings.columns[0] != "EventDate":
-                earnings["EventDate"] = pd.to_datetime(
-                    earnings[earnings.columns[0]], errors="coerce"
-                )
-            earnings = earnings.dropna(subset=["EventDate"])
-            for row in earnings.itertuples(index=False):
-                details = row._asdict()
-                details.pop("EventDate", None)
-                reference = str(details.get("Symbol") or details.get("Company") or "earnings")
-                records.append(
-                    {
-                        "Ticker": self.config.ticker,
-                        "EventType": "earnings",
-                        "EventDate": row.EventDate,
-                        "Reference": reference,
-                        "Value": self._safe_float(details.get("EPS Estimate")),
-                        "Currency": None,
-                        "Details": details,
-                        "Source": "yfinance",
-                    }
-                )
-            downloaded = True
 
         if not records:
             records.append(
@@ -698,7 +642,7 @@ class MarketDataETL:
             self.database.set_refresh_timestamp(
                 self.config.ticker, "global", "corporate_events"
             )
-            provider = "yfinance" if downloaded else "placeholder"
+            provider = "placeholder"
             self._record_source("corporate_events", provider)
         refreshed = self.database.get_corporate_events(self.config.ticker)
         return RefreshResult(refreshed, downloaded=downloaded)
@@ -956,32 +900,10 @@ class MarketDataETL:
             self._record_source("esg_metrics", "database")
             return RefreshResult(existing, downloaded=False)
 
-        LOGGER.info("Refreshing ESG metrics for %s", self.config.ticker)
-        ticker = yf.Ticker(self.config.ticker)
+        LOGGER.info("Using cached ESG placeholder metrics for %s", self.config.ticker)
         records: list[dict[str, Any]] = []
         downloaded = False
         today = datetime.utcnow().date()
-
-        sustainability = self._safe_download(lambda: getattr(ticker, "sustainability", None))
-        if isinstance(sustainability, pd.DataFrame) and not sustainability.empty:
-            frame = sustainability.reset_index()
-            frame.columns = ["Metric", "Value"] if frame.shape[1] >= 2 else ["Metric"]
-            for row in frame.itertuples(index=False):
-                metric = getattr(row, "Metric", None)
-                if metric is None:
-                    continue
-                value = getattr(row, "Value", None)
-                records.append(
-                    {
-                        "Ticker": self.config.ticker,
-                        "AsOf": today,
-                        "Provider": "yfinance",
-                        "Metric": str(metric),
-                        "Value": self._safe_float(value),
-                        "Raw": row._asdict(),
-                    }
-                )
-            downloaded = bool(records)
 
         if not records:
             records.append(
@@ -1002,7 +924,7 @@ class MarketDataETL:
             self.database.set_refresh_timestamp(
                 self.config.ticker, "global", "esg"
             )
-            provider = "yfinance" if downloaded else "placeholder"
+            provider = "placeholder"
             self._record_source("esg_metrics", provider)
         refreshed = self.database.get_esg_metrics(self.config.ticker)
         return RefreshResult(refreshed, downloaded=downloaded)
