@@ -794,12 +794,12 @@ with st.sidebar:
     show_volume = overlay_flags["show_volume"]
 
     st.header("Insights & Risk Panel")
-    st.caption("Aggregated probabilities, beta, volatility, fundamentals, and sentiment.")
+    st.caption("Aggregated probabilities, beta, volatility, and sentiment signals.")
     insights_refresh = st.checkbox(
-        "Refresh fundamentals & sentiment", value=False, key="insights_refresh_toggle"
+        "Refresh sentiment", value=False, key="insights_refresh_toggle"
     )
     if st.button("Load insights", type="secondary"):
-        with st.spinner("Fetching fundamentals and sentiment..."):
+        with st.spinner("Fetching sentiment insights..."):
             response = _request(
                 f"/insights/{ticker}", params={"refresh": bool(insights_refresh)}
             )
@@ -860,29 +860,6 @@ with st.sidebar:
                 delta_color="normal" if sentiment_state == "positive" else "inverse" if sentiment_state == "negative" else "off",
                 help="Rolling news polarity; positive skews bullish, negative hints at downside risk.",
             )
-
-    fundamentals_block = insights_payload.get("fundamentals", {})
-    if fundamentals_block:
-        with st.expander("Fundamental snapshot", expanded=False):
-            keys_of_interest = [
-                "trailing_pe",
-                "forward_pe",
-                "peg_ratio",
-                "dividend_yield",
-                "profit_margin",
-                "return_on_equity",
-            ]
-            available = {k: fundamentals_block.get(k) for k in keys_of_interest if k in fundamentals_block}
-            if available:
-                cols = st.columns(2)
-                items = list(available.items())
-                for idx, (label, value) in enumerate(items):
-                    cols[idx % 2].metric(
-                        label.replace("_", " ").title(),
-                        f"{value:.2f}" if isinstance(value, (int, float)) else str(value),
-                    )
-            else:
-                st.write(fundamentals_block)
 
     with st.expander("How to interpret these metrics"):
         st.markdown(

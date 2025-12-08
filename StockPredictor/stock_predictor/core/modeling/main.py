@@ -430,15 +430,6 @@ class StockPredictorAI:
             "fundamental": fundamentals_enabled,
             "macro": macro_enabled,
         }
-        snapshot_fetcher = getattr(self.fetcher, "fetch_fundamental_snapshot", None)
-        if callable(snapshot_fetcher):
-            try:
-                snapshot = snapshot_fetcher()
-            except Exception as exc:  # pragma: no cover - optional metadata path
-                LOGGER.debug("Failed to fetch headline fundamentals: %s", exc)
-            else:
-                if snapshot:
-                    metadata["fundamental_snapshot"] = snapshot
         raw_feature_columns = list(feature_result.features.columns)
         metadata.setdefault("feature_columns", raw_feature_columns)
         metadata["raw_feature_columns"] = raw_feature_columns

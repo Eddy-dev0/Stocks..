@@ -11,7 +11,6 @@ import pandas as pd
 from .config import PredictorConfig
 from .database import Database
 from .etl import MarketDataETL
-from .fundamentals import FundamentalsClient
 
 LOGGER = logging.getLogger(__name__)
 
@@ -23,7 +22,6 @@ class DataFetcher:
         self.config = config
         self.database = Database(config.database_url)
         self.etl = MarketDataETL(config, database=self.database)
-        self._fundamentals = FundamentalsClient(config.ticker)
         self._sources: dict[str, str] = {
             "prices": "database",
             "news": "database",
@@ -32,7 +30,6 @@ class DataFetcher:
             "sentiment_signals": "database",
             "esg_metrics": "database",
             "ownership_flows": "database",
-            "fundamentals": "database",
         }
 
     # ------------------------------------------------------------------
@@ -65,13 +62,6 @@ class DataFetcher:
         """Fetch cached fundamentals for the configured ticker."""
 
         return self.database.get_fundamentals(self.config.ticker)
-
-    def fetch_fundamental_snapshot(self, force: bool = False) -> dict[str, object]:
-        """Return headline fundamental metrics using the async provider."""
-
-        snapshot = self._fundamentals.fetch_sync(force=force)
-        self._set_source("fundamentals", force or bool(snapshot))
-        return snapshot
 
     def fetch_corporate_events(self, force: bool = False) -> pd.DataFrame:
         """Fetch corporate action events, refreshing the cache if necessary."""

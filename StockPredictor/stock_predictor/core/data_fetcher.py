@@ -42,9 +42,6 @@ except Exception as exc:  # pragma: no cover - defensive import guard
         def fetch_fundamentals(self, *args: Any, **kwargs: Any) -> pd.DataFrame:
             self._raise("fetch_fundamentals")
 
-        def fetch_fundamental_snapshot(self, *args: Any, **kwargs: Any) -> dict[str, object]:
-            self._raise("fetch_fundamental_snapshot")
-
         def fetch_corporate_events(self, *args: Any, **kwargs: Any) -> pd.DataFrame:
             self._raise("fetch_corporate_events")
 
@@ -122,9 +119,6 @@ class DataFetcher:  # pragma: no cover - thin delegation layer
 
     def fetch_fundamentals(self, *args: Any, **kwargs: Any) -> pd.DataFrame:
         return self._delegate.fetch_fundamentals(*args, **kwargs)
-
-    def fetch_fundamental_snapshot(self, *args: Any, **kwargs: Any) -> dict[str, object]:
-        return self._delegate.fetch_fundamental_snapshot(*args, **kwargs)
 
     def fetch_corporate_events(self, *args: Any, **kwargs: Any) -> pd.DataFrame:
         return self._delegate.fetch_corporate_events(*args, **kwargs)

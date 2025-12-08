@@ -25,7 +25,6 @@ from typing import (
 )
 
 import pandas as pd
-import yfinance as yf
 
 from pandas.tseries.holiday import USFederalHolidayCalendar
 from pandas.tseries.offsets import CustomBusinessDay
@@ -509,75 +508,11 @@ class MarketDataETL:
         if not force and not existing.empty:
             return 0
 
-        LOGGER.info("Downloading fundamentals for %s", self.config.ticker)
-
-        records: list[dict[str, object]] = []
-        summary = self._fetch_dataset(DatasetType.FUNDAMENTALS)
-        if summary.failures:
-            self._log_provider_failures(
-                "fundamentals", summary.failures, bool(summary.results)
-            )
-        provider_results = summary.results
-        provider_names = self._collect_providers(provider_results)
-        records.extend(self._coalesce_fundamental_results(provider_results))
-
-        ticker = yf.Ticker(self.config.ticker)
-
-        statement_sources: Dict[str, Tuple[str, pd.DataFrame | None]] = {
-            "income_statement_annual": ("annual", getattr(ticker, "financials", None)),
-            "income_statement_quarterly": (
-                "quarterly",
-                getattr(ticker, "quarterly_financials", None),
-            ),
-            "balance_sheet_annual": ("annual", getattr(ticker, "balance_sheet", None)),
-            "balance_sheet_quarterly": (
-                "quarterly",
-                getattr(ticker, "quarterly_balance_sheet", None),
-            ),
-            "cashflow_annual": ("annual", getattr(ticker, "cashflow", None)),
-            "cashflow_quarterly": (
-                "quarterly",
-                getattr(ticker, "quarterly_cashflow", None),
-            ),
-        }
-
-        used_yfinance = False
-
-        for statement_name, (period, frame) in statement_sources.items():
-            normalized = self._normalize_statement(frame, statement_name, period)
-            records.extend(normalized)
-            if normalized:
-                used_yfinance = True
-
-        info = getattr(ticker, "info", {}) or {}
-        if info:
-            as_of = datetime.utcnow().date()
-            for key, value in info.items():
-                record = {
-                    "Ticker": self.config.ticker,
-                    "Statement": "company_profile",
-                    "Period": "latest",
-                    "AsOf": as_of,
-                    "Metric": key,
-                    "Value": value if isinstance(value, (int, float)) else None,
-                    "Raw": value if not isinstance(value, (int, float)) else None,
-                }
-                records.append(record)
-            used_yfinance = True
-
-        inserted = self.database.upsert_fundamentals(records)
-        if inserted:
-            self.database.set_refresh_timestamp(
-                self.config.ticker, "global", "fundamentals"
-            )
-            if provider_names:
-                for provider in provider_names:
-                    self._record_source("fundamentals", provider)
-            if used_yfinance:
-                self._record_source("fundamentals", "yfinance")
-            if not provider_names and not used_yfinance:
-                self._record_source("fundamentals", "unknown")
-        return inserted
+        LOGGER.info(
+            "Skipping fundamentals download for %s; fundamentals providers are disabled.",
+            self.config.ticker,
+        )
+        return 0
 
     def refresh_macro(self, force: bool = False) -> int:
         existing = self.database.get_indicators(
@@ -1268,7 +1203,6 @@ class MarketDataETL:
     def refresh_all(self, force: bool = False) -> dict[str, int]:
         prices_result = self.refresh_prices(force=force)
         indicators_count = self.refresh_indicators(prices_result.data, force=force)
-        fundamentals_count = self.refresh_fundamentals(force=force)
         macro_count = self.refresh_macro(force=force)
         news_result = self.refresh_news(force=force if self.config.sentiment else False)
         corporate_events = self.refresh_corporate_events(force=force)
@@ -1291,7 +1225,6 @@ class MarketDataETL:
         return {
             "prices": int(len(prices_result.data)),
             "indicators": int(indicators_count),
-            "fundamentals": int(fundamentals_count),
             "macro_indicators": int(macro_count),
             "news": int(len(news_result.data)),
             "corporate_events": int(len(corporate_events.data)),
@@ -1330,6 +1263,9 @@ class MarketDataETL:
             loader_path = self._price_loader_path()
             if loader_path and "path" not in request_params:
                 request_params["path"] = loader_path
+            cache_path = self.config.price_cache_path
+            if cache_path and "local_store_path" not in request_params:
+                request_params["local_store_path"] = str(cache_path)
         request = ProviderRequest(
             dataset_type=dataset,
             symbol=self.config.ticker,
@@ -1672,93 +1608,6 @@ class MarketDataETL:
         )
         return frame.reset_index(drop=True)
 
-    def _coalesce_fundamental_results(
-        self, results: Sequence[ProviderResult]
-    ) -> list[dict[str, object]]:
-        records: list[dict[str, object]] = []
-        for result in results:
-            for record in result.records:
-                raw: Mapping[str, Any]
-                if hasattr(record, "model_dump"):
-                    raw = record.model_dump()  # type: ignore[assignment]
-                elif isinstance(record, Mapping):
-                    raw = dict(record)
-                else:
-                    raw = {
-                        key: value
-                        for key, value in vars(record).items()
-                        if not key.startswith("_")
-                    }
-                if not isinstance(raw, Mapping):
-                    continue
-                metrics_payload = raw.get("metrics")
-                if isinstance(metrics_payload, Mapping):
-                    as_of = self._normalize_date(
-                        raw.get("AsOf")
-                        or raw.get("as_of")
-                        or raw.get("date")
-                        or raw.get("Date")
-                    ) or datetime.utcnow().date()
-                    statement = (
-                        raw.get("Statement")
-                        or raw.get("statement")
-                        or result.metadata.get("statement")
-                        or "provider"
-                    )
-                    period = raw.get("Period") or raw.get("period") or "latest"
-                    for metric_name, metric_value in metrics_payload.items():
-                        records.append(
-                            {
-                                "Ticker": raw.get("Ticker")
-                                or raw.get("ticker")
-                                or self.config.ticker,
-                                "Statement": statement,
-                                "Period": period,
-                                "AsOf": as_of,
-                                "Metric": metric_name,
-                                "Value": self._safe_float(metric_value),
-                                "Raw": raw,
-                            }
-                        )
-                    continue
-                metric = (
-                    raw.get("Metric")
-                    or raw.get("metric")
-                    or raw.get("name")
-                    or raw.get("field")
-                )
-                if metric is None:
-                    continue
-                as_of_value = (
-                    raw.get("AsOf")
-                    or raw.get("as_of")
-                    or raw.get("date")
-                    or raw.get("Date")
-                )
-                as_of = self._normalize_date(as_of_value) or datetime.utcnow().date()
-                value = raw.get("Value")
-                if value is None and "value" in raw:
-                    value = raw.get("value")
-                records.append(
-                    {
-                        "Ticker": raw.get("Ticker")
-                        or raw.get("ticker")
-                        or self.config.ticker,
-                        "Statement": raw.get("Statement")
-                        or raw.get("statement")
-                        or result.metadata.get("statement")
-                        or "provider",
-                        "Period": raw.get("Period")
-                        or raw.get("period")
-                        or result.metadata.get("period")
-                        or "latest",
-                        "AsOf": as_of,
-                        "Metric": metric,
-                        "Value": self._safe_float(value),
-                        "Raw": raw,
-                    }
-                )
-        return records
 
     def list_sources(self) -> list[dict[str, object]]:
         """Return structured metadata describing the data sources consulted."""

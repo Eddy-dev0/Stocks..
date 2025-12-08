@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
@@ -733,6 +734,69 @@ class QuandlProvider(BaseProvider):
         return ProviderResult(dataset_type=request.dataset_type, source=self.name, records=records)
 
 
+class StablePriceStoreProvider(BaseProvider):
+    """Load OHLCV bars from a vetted local store for stable backfills."""
+
+    name = "stable_price_store"
+    supported_datasets = (DatasetType.PRICES,)
+
+    def __init__(self, path: str | None = None) -> None:
+        super().__init__(cache_ttl=0, rate_limit_per_sec=0)
+        default_path = path or os.environ.get(
+            "STABLE_PRICE_STORE_PATH", "data/stable_price_store.parquet"
+        )
+        self._default_path = Path(default_path)
+
+    async def _fetch(self, request: ProviderRequest) -> ProviderResult:
+        path_value = request.params.get("local_store_path")
+        path = Path(path_value) if path_value else self._default_path
+        if not path.exists():
+            return ProviderResult(
+                dataset_type=request.dataset_type,
+                source=self.name,
+                records=[],
+                metadata={"reason": "missing", "path": str(path)},
+            )
+
+        loader = pd.read_parquet if path.suffix.lower() in {".parquet", ".pq"} else pd.read_csv
+        frame = await asyncio.to_thread(loader, path)
+        working = frame.copy()
+        if "Ticker" in working.columns:
+            working = working[working["Ticker"].str.upper() == request.symbol.upper()]
+        date_column = request.params.get("date_column", "Date")
+        if date_column in working.columns:
+            working[date_column] = pd.to_datetime(working[date_column], errors="coerce")
+            start = request.params.get("start")
+            end = request.params.get("end")
+            if start:
+                working = working[working[date_column] >= pd.to_datetime(start)]
+            if end:
+                working = working[working[date_column] <= pd.to_datetime(end)]
+        bars: list[PriceBar] = []
+        for _, row in working.iterrows():
+            timestamp = pd.Timestamp(row.get(date_column)).to_pydatetime().replace(
+                tzinfo=timezone.utc
+            )
+            bars.append(
+                PriceBar(
+                    symbol=request.symbol,
+                    timestamp=timestamp,
+                    open=_parse_float(row.get("Open")),
+                    high=_parse_float(row.get("High")),
+                    low=_parse_float(row.get("Low")),
+                    close=_parse_float(row.get("Close")),
+                    adj_close=_parse_float(row.get("Adj Close")),
+                    volume=_parse_float(row.get("Volume")),
+                )
+            )
+        return ProviderResult(
+            dataset_type=request.dataset_type,
+            source=self.name,
+            records=bars,
+            metadata={"path": str(path)},
+        )
+
+
 class CSVPriceLoader(BaseProvider):
     """Adapter that loads price data from a CSV file."""
 
@@ -815,6 +879,7 @@ __all__ = [
     "ParquetPriceLoader",
     "PolygonProvider",
     "QuandlProvider",
+    "StablePriceStoreProvider",
     "RedditProvider",
     "StooqProvider",
     "TiingoProvider",
