@@ -430,6 +430,7 @@ class StockPredictorDesktopApp:
         self._configure_horizons(horizon_values)
         self.current_prediction: dict[str, Any] = {}
         self.current_market_timestamp: pd.Timestamp | None = None
+        self.market_timestamp_stale: bool = False
         self.current_market_price: float | None = None
         self.price_history: pd.DataFrame | None = None
         self.feature_snapshot: pd.DataFrame | None = None
@@ -3533,9 +3534,8 @@ class StockPredictorDesktopApp:
         self.market_holidays = self._resolve_market_holidays(self.current_prediction)
         latest_price, latest_timestamp = self._extract_latest_price_point()
         localized_price_timestamp = self._localize_market_timestamp(latest_timestamp)
-        self.current_market_timestamp = (
-            localized_price_timestamp or prediction_timestamp or self._now()
-        )
+        self.current_market_timestamp = localized_price_timestamp or prediction_timestamp
+        self.market_timestamp_stale = localized_price_timestamp is None
         self.current_market_price = latest_price
         if self.current_market_price is None:
             self.current_market_price = _safe_float(
@@ -3592,15 +3592,19 @@ class StockPredictorDesktopApp:
     def _today(self) -> pd.Timestamp:
         return self._now().normalize()
 
-    def _resolve_market_timestamp(self) -> pd.Timestamp:
-        timestamp = self.current_market_timestamp
-        if timestamp is None:
-            _, latest_timestamp = self._extract_latest_price_point()
-            timestamp = latest_timestamp
-        if timestamp is None:
-            timestamp = self._now()
-        localized = self._localize_market_timestamp(timestamp)
-        return localized if localized is not None else self._now()
+    def _resolve_market_timestamp(self) -> pd.Timestamp | None:
+        latest_timestamp: pd.Timestamp | None = None
+        has_history = isinstance(self.price_history, pd.DataFrame) and not self.price_history.empty
+        if has_history:
+            _, latest_timestamp = self._extract_latest_price_point(self.price_history)
+        elif self.current_market_timestamp is not None:
+            latest_timestamp = self.current_market_timestamp
+
+        localized = self._localize_market_timestamp(latest_timestamp)
+        self.market_timestamp_stale = localized is None or not has_history
+        if localized is not None:
+            self.current_market_timestamp = localized
+        return localized
 
     def _extract_latest_price_point(
         self, frame: pd.DataFrame | None = None
@@ -3960,15 +3964,60 @@ class StockPredictorDesktopApp:
         """Return the raw and converted reference price for calculations."""
 
         data = prediction if isinstance(prediction, Mapping) else {}
-        raw_value = self.current_market_price
-        if raw_value is None:
+        raw_value: float | None = None
+        converted: float | None = None
+
+        if isinstance(self.price_history, pd.DataFrame) and not self.price_history.empty:
+            raw_value, _ = self._extract_latest_price_point(self.price_history)
+            converted_frame = getattr(self, "price_history_converted", None)
+            if isinstance(converted_frame, pd.DataFrame) and not converted_frame.empty:
+                converted, _ = self._extract_latest_price_point(converted_frame)
+        else:
             raw_value = _safe_float(data.get("last_price"))
-        if raw_value is None:
-            raw_value = _safe_float(data.get("last_close"))
-        if raw_value is None:
-            raw_value, _ = self._extract_latest_price_point()
-        converted = self._convert_currency(raw_value)
+            if raw_value is None:
+                raw_value = _safe_float(data.get("last_close"))
+            if raw_value is None:
+                raw_value = self.current_market_price
+
+        if converted is None:
+            converted = self._convert_currency(raw_value)
         return raw_value, converted
+
+    def _derive_prediction_metrics(
+        self, prediction: Mapping[str, Any] | None = None
+    ) -> dict[str, float | None]:
+        """Normalise prediction fields around a shared anchor price."""
+
+        anchor_raw, anchor_converted = self._reference_last_price(prediction)
+        predicted_raw = _safe_float(prediction.get("predicted_close")) if isinstance(
+            prediction, Mapping
+        ) else None
+        predicted_converted = self._convert_currency(predicted_raw)
+
+        change_raw = _safe_float(prediction.get("expected_change")) if isinstance(
+            prediction, Mapping
+        ) else None
+        pct_change = _safe_float(prediction.get("expected_change_pct")) if isinstance(
+            prediction, Mapping
+        ) else None
+
+        if predicted_raw is not None and anchor_raw is not None:
+            change_raw = predicted_raw - anchor_raw
+            pct_change = (change_raw / anchor_raw) if anchor_raw != 0 else None
+        elif change_raw is not None and anchor_raw not in (None, 0) and pct_change is None:
+            pct_change = change_raw / anchor_raw
+
+        change_converted = self._convert_currency(change_raw)
+
+        return {
+            "anchor_raw": anchor_raw,
+            "anchor_converted": anchor_converted,
+            "predicted_raw": predicted_raw,
+            "predicted_converted": predicted_converted,
+            "change_raw": change_raw,
+            "change_converted": change_converted,
+            "pct_change": pct_change,
+        }
 
     def _extract_sentiment_from_row(
         self, row: Mapping[str, Any] | pd.Series | None
@@ -4043,9 +4092,14 @@ class StockPredictorDesktopApp:
         )
         self.metric_vars["as_of"].set(as_of_display)
 
-        status_message = (
-            f"Market data as of {as_of_display}" if as_of_display != "—" else "Market data timestamp unavailable."
-        )
+        if self.market_timestamp_stale:
+            status_message = "Market data timestamp unavailable or stale."
+        else:
+            status_message = (
+                f"Market data as of {as_of_display}"
+                if as_of_display != "—"
+                else "Market data timestamp unavailable."
+            )
 
         confluence_info = prediction.get("signal_confluence") if isinstance(prediction, Mapping) else None
         if isinstance(confluence_info, Mapping):
@@ -4055,14 +4109,10 @@ class StockPredictorDesktopApp:
                 gate_note = "Signal confluence not met; target price and alerts are gated."
             status_message = f"{status_message} • {gate_note}" if status_message else gate_note
 
-        _, last_price = self._reference_last_price(prediction)
-        predicted_close = prediction.get("predicted_close")
-        expected_change = prediction.get("expected_change")
-        expected_change_pct = prediction.get("expected_change_pct")
-
-        last_close_converted = last_price
-        predicted_converted = self._convert_currency(predicted_close)
-        change_converted = self._convert_currency(expected_change)
+        derived_metrics = self._derive_prediction_metrics(prediction)
+        last_close_converted = derived_metrics["anchor_converted"]
+        predicted_converted = derived_metrics["predicted_converted"]
+        change_converted = derived_metrics["change_converted"]
 
         decimals = self.price_decimal_places
         self.metric_vars["last_close"].set(
@@ -4096,7 +4146,7 @@ class StockPredictorDesktopApp:
             stop_loss_var.set(stop_loss_display)
 
         change_display = fmt_ccy(change_converted, self.currency_symbol, decimals=decimals)
-        pct_display = fmt_pct(expected_change_pct, show_sign=True)
+        pct_display = fmt_pct(derived_metrics["pct_change"], show_sign=True)
         if change_display == "—" and pct_display == "—":
             self.metric_vars["expected_change"].set("—")
         elif change_display == "—":
@@ -5202,21 +5252,24 @@ class StockPredictorDesktopApp:
         prefix = f"Expected P&L for {size:,} {share_label}: "
 
         prediction = self.current_prediction or {}
-        last_raw, last_converted = self._reference_last_price(prediction)
-        predicted_raw = _safe_float(prediction.get("predicted_close"))
-        if last_raw is None or predicted_raw is None:
+        derived_metrics = self._derive_prediction_metrics(prediction)
+        anchor_raw = derived_metrics["anchor_raw"]
+        anchor_converted = derived_metrics["anchor_converted"]
+        predicted_raw = derived_metrics["predicted_raw"]
+        predicted_converted = derived_metrics["predicted_converted"]
+
+        if anchor_raw is None or predicted_raw is None:
             self.pnl_var.set(prefix + "—")
             return
 
-        predicted_converted = self._convert_currency(predicted_raw)
-        if last_converted is None or predicted_converted is None:
+        if anchor_converted is None or predicted_converted is None:
             self.pnl_var.set(prefix + "—")
             return
 
-        pnl_value = (predicted_converted - last_converted) * size
-        pct_change = _safe_float(prediction.get("expected_change_pct"))
-        if pct_change is None and last_raw != 0:
-            pct_change = (predicted_raw - last_raw) / last_raw
+        pnl_value = (predicted_converted - anchor_converted) * size
+        pct_change = derived_metrics["pct_change"]
+        if pct_change is None and anchor_raw not in (None, 0):
+            pct_change = (predicted_raw - anchor_raw) / anchor_raw
 
         pnl_display = fmt_ccy(pnl_value, self.currency_symbol, decimals=self.price_decimal_places)
         pct_display = fmt_pct(pct_change, show_sign=True)
