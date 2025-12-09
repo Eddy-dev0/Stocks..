@@ -34,6 +34,7 @@ from ..indicator_bundle import evaluate_signal_confluence
 from ..sentiment import aggregate_daily_sentiment
 from ..ml_preprocessing import get_feature_names_from_pipeline
 from ..database import Database
+from .exceptions import InsufficientSamplesError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -113,10 +114,12 @@ class MultiHorizonModelingEngine:
         *,
         horizons: Sequence[int] | None = None,
         tickers: Iterable[str] | None = None,
+        targets: Iterable[str] | None = None,
         force: bool = False,
     ) -> MultiHorizonDataset:
         horizons = tuple(horizons) if horizons is not None else tuple(self.config.prediction_horizons)
         ticker_universe = list(tickers) if tickers else [self.config.ticker]
+        requested_targets = set(targets) if targets else {"close_h", "direction_h", "return_h"}
 
         feature_frames: list[pd.DataFrame] = []
         targets: dict[int, dict[str, list[pd.Series]]] = {h: {"close_h": [], "direction_h": [], "return_h": []} for h in horizons}
@@ -167,7 +170,12 @@ class MultiHorizonModelingEngine:
                 metadata.setdefault("signal_confluence", {})[ticker] = {}
 
         if not feature_frames:
-            raise ValueError("Unable to build dataset: no price history available for the requested tickers.")
+            raise InsufficientSamplesError(
+                "Unable to build dataset: no price history available for the requested tickers.",
+                horizons=horizons,
+                targets=tuple(sorted(requested_targets)),
+                sample_counts={h: {t: 0 for t in sorted(requested_targets)} for h in horizons},
+            )
 
         features_df = pd.concat(feature_frames, axis=0).sort_index()
         target_map: dict[int, dict[str, pd.Series]] = {}
@@ -221,8 +229,8 @@ class MultiHorizonModelingEngine:
         force: bool = False,
     ) -> dict[str, Any]:
         horizons = (int(horizon),) if horizon else tuple(self.config.prediction_horizons)
-        dataset = self.build_dataset(horizons=horizons)
         requested_targets = set(targets) if targets else {"close_h", "direction_h", "return_h"}
+        dataset = self.build_dataset(horizons=horizons, targets=requested_targets)
 
         artefacts: dict[int, HorizonArtifacts] = {}
         random_state = int(self.config.model_params.get("global", {}).get("random_state", 42))
@@ -310,8 +318,22 @@ class MultiHorizonModelingEngine:
                 json.dump(target_sample_counts, handle, indent=2)
 
         if not artefacts:
-            raise ValueError(
-                "Training aborted: insufficient samples to train any requested horizons."
+            sample_counts = dataset.metadata.get("target_counts", dataset.count_targets())
+            requested_counts = {
+                int(h): {t: int(sample_counts.get(int(h), {}).get(t, 0)) for t in sorted(requested_targets)}
+                for h in horizons
+            }
+            missing = {
+                int(h): {t: count for t, count in horizon_counts.items() if count <= 0}
+                for h, horizon_counts in requested_counts.items()
+                if any(count <= 0 for count in horizon_counts.values())
+            }
+            raise InsufficientSamplesError(
+                "Training aborted: insufficient samples to train any requested horizons. "
+                f"Missing targets: {json.dumps(missing)}. Sample counts: {json.dumps(requested_counts)}",
+                horizons=horizons,
+                targets=tuple(sorted(requested_targets)),
+                sample_counts=requested_counts,
             )
 
         metadata = {
@@ -364,7 +386,7 @@ class MultiHorizonModelingEngine:
             )
             try:
                 self.train(horizon=resolved_horizon, force=True)
-            except ValueError as exc:
+            except InsufficientSamplesError as exc:
                 raise RuntimeError(
                     f"Unable to train horizon {resolved_horizon} due to insufficient samples"
                 ) from exc
@@ -396,7 +418,7 @@ class MultiHorizonModelingEngine:
             try:
                 self.train(horizon=resolved_horizon, force=True)
                 artefacts = self._load_horizon_artefacts(resolved_horizon)
-            except ValueError as exc:
+            except InsufficientSamplesError as exc:
                 raise RuntimeError(
                     f"Unable to train horizon {resolved_horizon} due to insufficient samples"
                 ) from exc
