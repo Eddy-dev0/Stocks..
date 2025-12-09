@@ -3467,6 +3467,8 @@ class StockPredictorDesktopApp:
                 raw_payload = prediction.to_dict()
         except Exception as exc:  # pragma: no cover - defensive guard for optional metadata
             LOGGER.debug("Failed to serialise prediction for UI payload: %s", exc)
+        if raw_payload is None and isinstance(prediction, Mapping):
+            raw_payload = prediction
 
         status = None
         reason = None
@@ -3475,8 +3477,13 @@ class StockPredictorDesktopApp:
             status = raw_payload.get("status")
             reason = raw_payload.get("reason")
             message = raw_payload.get("message")
+        payload_horizon = raw_payload.get("horizon") if isinstance(raw_payload, Mapping) else None
         if status == "no_data":
-            friendly_message = message or "Not enough historical data to generate predictions yet"
+            friendly_message = (
+                message
+                or f"Not enough historical data to generate predictions for {self.config.ticker} (horizon {payload_horizon or horizon_arg}) yet."
+            )
+            LOGGER.info(friendly_message)
             self._log_prediction_unavailability(
                 horizon=horizon_arg,
                 status=status,
@@ -3491,6 +3498,30 @@ class StockPredictorDesktopApp:
                     "sample_counts": raw_payload.get("sample_counts", {}) if isinstance(raw_payload, Mapping) else {},
                     "missing_targets": raw_payload.get("missing_targets", {}) if isinstance(raw_payload, Mapping) else {},
                     "checked_at": raw_payload.get("checked_at") if isinstance(raw_payload, Mapping) else None,
+                },
+                "snapshot": None,
+                "feature_history": None,
+                "price_history": None,
+                "indicator_history": None,
+                "horizons": self.config.prediction_horizons,
+                "stop_loss_multiplier": self.stop_loss_multiplier,
+                "raw": raw_payload,
+                "message": friendly_message,
+            }
+        if status == "error":
+            friendly_message = message or "An error occurred while generating predictions."
+            LOGGER.error(
+                "Prediction failed for %s (horizon %s): %s",
+                self.config.ticker,
+                payload_horizon or horizon_arg,
+                friendly_message,
+                exc_info=True,
+            )
+            return {
+                "prediction": {
+                    "status": status,
+                    "reason": reason,
+                    "message": friendly_message,
                 },
                 "snapshot": None,
                 "feature_history": None,
@@ -3586,7 +3617,10 @@ class StockPredictorDesktopApp:
         reason = prediction.get("reason") if isinstance(prediction, Mapping) else None
         message = prediction.get("message") if isinstance(prediction, Mapping) else None
         if status == "no_data":
-            message = message or "Not enough historical data to generate predictions yet"
+            message = message or (
+                f"Not enough historical data to generate predictions for {self.config.ticker} (horizon {prediction.get('horizon') if isinstance(prediction, Mapping) else '?'}) yet."
+            )
+            LOGGER.info(message)
             self.current_prediction = {}
             self.feature_snapshot = None
             self.feature_history = None
@@ -3594,6 +3628,18 @@ class StockPredictorDesktopApp:
             self.indicator_history = None
             self._set_busy(False, message)
             messagebox.showinfo("Predictions unavailable", message)
+            return
+        if status == "error":
+            message = message or "An error occurred while generating predictions."
+            LOGGER.error(
+                "Prediction failed for %s (horizon %s): %s",
+                self.config.ticker,
+                prediction.get("horizon") if isinstance(prediction, Mapping) else "?",
+                message,
+                exc_info=True,
+            )
+            self._set_busy(False, message)
+            messagebox.showerror("Prediction failed", message)
             return
 
         is_prediction_mapping = isinstance(prediction, (Mapping, PredictionResult))
