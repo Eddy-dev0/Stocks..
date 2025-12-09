@@ -3613,21 +3613,33 @@ class StockPredictorDesktopApp:
         price_history = payload.get("price_history")
         indicator_history = payload.get("indicator_history")
 
-        status = prediction.get("status") if isinstance(prediction, Mapping) else None
-        reason = prediction.get("reason") if isinstance(prediction, Mapping) else None
-        message = prediction.get("message") if isinstance(prediction, Mapping) else None
+        status = None
+        reason = None
+        message = None
+        if isinstance(prediction, Mapping):
+            status = prediction.get("status")
+            reason = prediction.get("reason")
+            message = prediction.get("message")
+        elif isinstance(prediction, PredictionResult):
+            status = prediction.status
+            reason = prediction.reason
+            message = prediction.message
         if status == "no_data":
-            message = message or (
-                f"Not enough historical data to generate predictions for {self.config.ticker} (horizon {prediction.get('horizon') if isinstance(prediction, Mapping) else '?'}) yet."
+            summary = f"Prediction unavailable (status={status}, reason={reason or 'unknown'})"
+            LOGGER.warning(summary)
+            user_message = (
+                message
+                if message and "Horizon" not in str(message)
+                else f"Not enough historical data to generate predictions for {self.config.ticker} yet."
             )
-            LOGGER.info(message)
+            LOGGER.info(user_message)
             self.current_prediction = {}
             self.feature_snapshot = None
             self.feature_history = None
             self.price_history = None
             self.indicator_history = None
-            self._set_busy(False, message)
-            messagebox.showinfo("Predictions unavailable", message)
+            self._set_busy(False, user_message)
+            messagebox.showinfo("Predictions unavailable", user_message)
             return
         if status == "error":
             message = message or "An error occurred while generating predictions."

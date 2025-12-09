@@ -204,8 +204,8 @@ class MultiHorizonModelingEngine:
                 latest_ts = pd.to_datetime(dataset.features.index.max())
             for horizon, missing_targets in insufficient.items():
                 previous_ts = self._insufficient_log_state.get(int(horizon))
-                repeated = previous_ts is not None and latest_ts is not None and previous_ts >= latest_ts
-                log_fn = LOGGER.info if repeated else LOGGER.warning
+                repeated = previous_ts == latest_ts
+                log_fn = LOGGER.warning if not repeated else LOGGER.debug
                 log_fn(
                     "Insufficient samples for horizon %s: %s",
                     horizon,
@@ -450,7 +450,7 @@ class MultiHorizonModelingEngine:
         def _log_unavailability(horizon_value: int, *, reason: str, message: str | None = None) -> None:
             cache = self._untrainable_until.get(int(horizon_value)) or {}
             first = not cache.get("warning_emitted")
-            log_fn = LOGGER.warning if first else LOGGER.info
+            log_fn = LOGGER.warning if first else LOGGER.debug
             log_fn(
                 "Prediction unavailable for horizon %s (%s)%s",
                 horizon_value,
@@ -530,7 +530,7 @@ class MultiHorizonModelingEngine:
                 cache["data_timestamp"] = latest_timestamp
                 self._untrainable_until[resolved_horizon] = cache
             if cache and cache.get("not_trainable") and not new_data_available:
-                if cache_ts is not None and (latest_timestamp is None or latest_timestamp <= cache_ts):
+                if cache_ts is None or (latest_timestamp is None or latest_timestamp <= cache_ts):
                     msg = f"Horizon {resolved_horizon} still below min samples; waiting for more data"
                     LOGGER.info(msg)
                     LOGGER.debug("%s (latest_ts=%s, cache_ts=%s)", msg, latest_timestamp, cache_ts)

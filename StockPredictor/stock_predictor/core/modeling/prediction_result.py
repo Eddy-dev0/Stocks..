@@ -24,6 +24,11 @@ class PredictionResult(Mapping[str, Any]):
     predicted_close: float | None
     expected_low: float | None
     stop_loss: float | None
+    status: str | None = None
+    reason: str | None = None
+    message: str | None = None
+    sample_counts: Mapping[str, Any] | None = None
+    missing_targets: Mapping[str, Any] | None = None
     feature_groups_used: list[str] = field(default_factory=list)
     indicators_used: list[str] = field(default_factory=list)
     feature_usage_summary: list[FeatureUsageSummary] = field(default_factory=list)
@@ -37,6 +42,11 @@ class PredictionResult(Mapping[str, Any]):
             "predicted_close": self.predicted_close,
             "expected_low": self.expected_low,
             "stop_loss": self.stop_loss,
+            "status": self.status,
+            "reason": self.reason,
+            "message": self.message,
+            "sample_counts": dict(self.sample_counts or {}),
+            "missing_targets": dict(self.missing_targets or {}),
             "feature_groups_used": list(self.feature_groups_used),
             "indicators_used": list(self.indicators_used),
             "feature_usage_summary": feature_usage_summary,
