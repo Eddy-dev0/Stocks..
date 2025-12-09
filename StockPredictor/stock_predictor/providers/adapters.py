@@ -763,20 +763,41 @@ class StablePriceStoreProvider(BaseProvider):
         working = frame.copy()
         if "Ticker" in working.columns:
             working = working[working["Ticker"].str.upper() == request.symbol.upper()]
+        start = request.params.get("start")
+        end = request.params.get("end")
+        start_ts = pd.Timestamp(start, tz="UTC") if start else None
+        end_ts = pd.Timestamp(end, tz="UTC") if end else None
         date_column = request.params.get("date_column", "Date")
         if date_column in working.columns:
-            working[date_column] = pd.to_datetime(working[date_column], errors="coerce")
-            start = request.params.get("start")
-            end = request.params.get("end")
-            if start:
-                working = working[working[date_column] >= pd.to_datetime(start)]
-            if end:
-                working = working[working[date_column] <= pd.to_datetime(end)]
+            parsed_dates = pd.to_datetime(working[date_column], errors="coerce")
+            if parsed_dates.dt.tz is None:
+                parsed_dates = parsed_dates.dt.tz_localize(
+                    "UTC", nonexistent="NaT", ambiguous="NaT"
+                )
+            else:
+                parsed_dates = parsed_dates.dt.tz_convert("UTC")
+            working[date_column] = parsed_dates
+            working = working.dropna(subset=[date_column])
+            if start_ts is not None:
+                working = working[working[date_column] >= start_ts]
+            if end_ts is not None:
+                working = working[working[date_column] <= end_ts]
+        if date_column in working.columns and working.empty:
+            LOGGER.warning(
+                "StablePriceStoreProvider returned no rows for %s between %s and %s",
+                request.symbol,
+                start_ts.isoformat() if start_ts else None,
+                end_ts.isoformat() if end_ts else None,
+            )
+            return ProviderResult(
+                dataset_type=request.dataset_type,
+                source=self.name,
+                records=[],
+                metadata={"path": str(path), "reason": "empty"},
+            )
         bars: list[PriceBar] = []
         for _, row in working.iterrows():
-            timestamp = pd.Timestamp(row.get(date_column)).to_pydatetime().replace(
-                tzinfo=timezone.utc
-            )
+            timestamp = pd.Timestamp(row.get(date_column)).tz_convert("UTC").to_pydatetime()
             bars.append(
                 PriceBar(
                     symbol=request.symbol,
