@@ -238,6 +238,7 @@ class MultiHorizonModelingEngine:
             target_metrics: dict[str, Any] = {}
             target_sample_counts: dict[str, int] = {}
             trained_models: dict[str, Any] = {}
+            fitted_pre: Pipeline | None = None
 
             for target_name, series in horizon_targets.items():
                 if target_name not in requested_targets:
@@ -280,6 +281,13 @@ class MultiHorizonModelingEngine:
                 target_sample_counts[target_name] = int(len(y_train))
                 trained_models[target_name] = model
 
+            if fitted_pre is None or not trained_models:
+                LOGGER.warning(
+                    "Skipping persistence for horizon %s; no models were trained (insufficient samples or targets).",
+                    horizon_value,
+                )
+                continue
+
             artefacts[horizon_value] = HorizonArtifacts(
                 horizon=horizon_value,
                 preprocessor=fitted_pre,
@@ -300,6 +308,11 @@ class MultiHorizonModelingEngine:
                 json.dump(target_metrics, handle, indent=2)
             with open(horizon_dir / "samples.json", "w", encoding="utf-8") as handle:
                 json.dump(target_sample_counts, handle, indent=2)
+
+        if not artefacts:
+            raise ValueError(
+                "Training aborted: insufficient samples to train any requested horizons."
+            )
 
         metadata = {
             **dataset.metadata,
@@ -349,7 +362,12 @@ class MultiHorizonModelingEngine:
                 "No persisted artefacts found for horizon %s; triggering training run.",
                 resolved_horizon,
             )
-            self.train(horizon=resolved_horizon, force=True)
+            try:
+                self.train(horizon=resolved_horizon, force=True)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Unable to train horizon {resolved_horizon} due to insufficient samples"
+                ) from exc
             artefacts = self._load_horizon_artefacts(resolved_horizon)
 
         price_df = self.fetcher.fetch_price_data()
@@ -375,9 +393,19 @@ class MultiHorizonModelingEngine:
                 "Preprocessor for horizon %s is not fitted; retraining before inference.",
                 resolved_horizon,
             )
-            self.train(horizon=resolved_horizon, force=True)
-            artefacts = self._load_horizon_artefacts(resolved_horizon)
+            try:
+                self.train(horizon=resolved_horizon, force=True)
+                artefacts = self._load_horizon_artefacts(resolved_horizon)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Unable to train horizon {resolved_horizon} due to insufficient samples"
+                ) from exc
             transformed = artefacts.preprocessor.transform(latest_row)
+
+        if not artefacts.models:
+            raise RuntimeError(
+                f"No trained models are available for horizon {resolved_horizon}; prediction cannot proceed."
+            )
 
         requested_targets = set(targets) if targets else set(artefacts.models.keys())
         predictions: dict[str, Any] = {}
