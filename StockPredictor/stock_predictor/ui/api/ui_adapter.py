@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Iterable
 
 from stock_predictor.app import StockPredictorApplication
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 async def get_prediction(
@@ -21,7 +25,39 @@ async def get_prediction(
         ticker=ticker, **(overrides or {})
     )
     prediction = application.predict(targets=targets, refresh=refresh, horizon=horizon)
-    payload = prediction.to_dict()
+    raw_payload: Dict[str, Any] = {}
+    try:
+        raw_payload = prediction.to_dict() if hasattr(prediction, "to_dict") else {}
+    except Exception as exc:  # pragma: no cover - defensive serialization guard
+        LOGGER.debug("Failed to serialise prediction payload: %s", exc)
+
+    unavailable_reason = raw_payload.get("unavailable_reason")
+    status = raw_payload.get("status")
+    if unavailable_reason == "insufficient_samples" or status == "no_data":
+        message = "Not enough historical data to generate predictions yet"
+        log_fn = LOGGER.info if unavailable_reason == "insufficient_samples" else LOGGER.warning
+        log_fn(
+            "Prediction unavailable for %s (reason=%s, status=%s)",
+            ticker,
+            unavailable_reason,
+            status,
+        )
+        return {
+            "ticker": ticker,
+            "horizon": horizon,
+            "last_price": None,
+            "predicted_close": None,
+            "expected_low": None,
+            "expected_change_abs": None,
+            "expected_change_pct": None,
+            "stop_loss": None,
+            "direction": None,
+            "accuracy": {},
+            "message": message,
+            "raw": raw_payload,
+        }
+
+    payload = raw_payload or prediction.to_dict()
 
     last_price = payload.get("latest_price") or payload.get("latest_close")
     predicted_close = payload.get("predicted_close")
