@@ -82,6 +82,8 @@ class MultiHorizonModelingEngine:
         self.dataset_builder = TrainingDatasetBuilder(config, database=self.database)
         self.models_dir = Path(config.models_dir) / "nextgen"
         self.models_dir.mkdir(parents=True, exist_ok=True)
+        self._untrainable_until: dict[int, dict[str, Any]] = {}
+        self._insufficient_log_state: dict[int, pd.Timestamp | None] = {}
 
     # ------------------------------------------------------------------
     # Dataset construction
@@ -196,7 +198,19 @@ class MultiHorizonModelingEngine:
             if missing:
                 insufficient[horizon] = missing
         if insufficient:
-            LOGGER.warning("Insufficient samples for some horizons: %s", json.dumps(insufficient))
+            latest_ts = None
+            if not dataset.features.empty:
+                latest_ts = pd.to_datetime(dataset.features.index.max())
+            for horizon, missing_targets in insufficient.items():
+                previous_ts = self._insufficient_log_state.get(int(horizon))
+                repeated = previous_ts is not None and latest_ts is not None and previous_ts >= latest_ts
+                log_fn = LOGGER.info if repeated else LOGGER.warning
+                log_fn(
+                    "Insufficient samples for horizon %s: %s",
+                    horizon,
+                    json.dumps(missing_targets),
+                )
+                self._insufficient_log_state[int(horizon)] = latest_ts
             metadata["insufficient_samples"] = insufficient
         return dataset
 
@@ -390,33 +404,118 @@ class MultiHorizonModelingEngine:
         horizon: int | None = None,
     ) -> dict[str, Any]:
         resolved_horizon = int(horizon or min(self.config.prediction_horizons))
+        
+        def _latest_timestamp(frame: pd.DataFrame | None) -> pd.Timestamp | None:
+            if frame is None or frame.empty:
+                return None
+            if "Date" in frame.columns:
+                normalized = pd.to_datetime(frame["Date"], errors="coerce")
+                if not normalized.empty:
+                    return normalized.max()
+            if isinstance(frame.index, pd.DatetimeIndex) and not frame.index.empty:
+                return pd.to_datetime(frame.index.max())
+            return None
+
+        def _build_payload(
+            *,
+            status: str,
+            reason: str | None,
+            predictions: Mapping[str, Any],
+            probabilities: Mapping[str, Any],
+            quantile_forecasts: Mapping[str, Any],
+            sample_counts: Mapping[int, Any],
+            missing_targets: Mapping[int, Any],
+            feature_columns: Iterable[str] | None,
+            metrics: Mapping[str, Any],
+            checked_at: pd.Timestamp | None,
+            message: str | None = None,
+        ) -> dict[str, Any]:
+            return {
+                "status": status,
+                "reason": reason,
+                "horizon": resolved_horizon,
+                "predictions": dict(predictions),
+                "probabilities": dict(probabilities),
+                "quantile_forecasts": dict(quantile_forecasts),
+                "feature_columns": list(feature_columns or []),
+                "sample_counts": dict(sample_counts),
+                "missing_targets": dict(missing_targets),
+                "metrics": dict(metrics),
+                "checked_at": (checked_at.isoformat() if checked_at is not None else None),
+                "message": message,
+            }
+
+        def _log_unavailability(horizon_value: int, *, reason: str, message: str | None = None) -> None:
+            cache = self._untrainable_until.get(int(horizon_value)) or {}
+            first = not cache.get("warning_emitted")
+            log_fn = LOGGER.warning if first else LOGGER.info
+            log_fn(
+                "Prediction unavailable for horizon %s (%s)%s",
+                horizon_value,
+                reason,
+                f": {message}" if message else "",
+            )
+            cache["warning_emitted"] = True
+            cache.setdefault("reason", reason)
+            self._untrainable_until[int(horizon_value)] = cache
 
         def _unavailable(
             reason: str,
+            *,
             sample_counts: Mapping[int, Any] | None = None,
             missing_targets: Mapping[int, Any] | None = None,
+            message: str | None = None,
+            checked_at: pd.Timestamp | None = None,
         ) -> dict[str, Any]:
-            return {
-                "horizon": resolved_horizon,
-                "predictions": {},
-                "unavailable_reason": reason,
-                "sample_counts": sample_counts or {},
-                "missing_targets": missing_targets or {},
-            }
-
-        def _handle_insufficient(exc: InsufficientSamplesError) -> dict[str, Any]:
-            LOGGER.warning(
-                "Prediction unavailable for horizon %s due to insufficient samples: %s",
-                resolved_horizon,
-                exc,
+            _log_unavailability(resolved_horizon, reason=reason, message=message)
+            return _build_payload(
+                status="no_data",
+                reason=reason,
+                predictions={},
+                probabilities={},
+                quantile_forecasts={},
+                sample_counts=sample_counts or {},
+                missing_targets=missing_targets or {},
+                feature_columns=[],
+                metrics={},
+                checked_at=checked_at,
+                message=message,
             )
+
+        def _handle_insufficient(exc: InsufficientSamplesError, *, latest_ts: pd.Timestamp | None) -> dict[str, Any]:
+            self._untrainable_until[resolved_horizon] = {
+                "data_timestamp": latest_ts,
+                "sample_counts": getattr(exc, "sample_counts", None) or {},
+                "missing_targets": getattr(exc, "missing_targets", None) or {},
+                "reason": "insufficient_samples",
+                "checked_at": latest_ts,
+                "warning_emitted": False,
+            }
             return _unavailable(
                 "insufficient_samples",
-                getattr(exc, "sample_counts", None),
-                getattr(exc, "missing_targets", None),
+                sample_counts=getattr(exc, "sample_counts", None),
+                missing_targets=getattr(exc, "missing_targets", None),
+                checked_at=latest_ts,
+                message=str(exc),
             )
 
         try:
+            price_df = self.fetcher.fetch_price_data()
+            latest_timestamp = _latest_timestamp(price_df)
+            cache = self._untrainable_until.get(resolved_horizon)
+            if cache:
+                cache_ts = cache.get("data_timestamp")
+                if cache_ts is not None and (latest_timestamp is None or latest_timestamp <= cache_ts):
+                    return _unavailable(
+                        cache.get("reason", "insufficient_samples") or "insufficient_samples",
+                        sample_counts=cache.get("sample_counts"),
+                        missing_targets=cache.get("missing_targets"),
+                        checked_at=cache_ts,
+                        message="Awaiting additional data before retraining.",
+                    )
+                if cache_ts is not None and latest_timestamp is not None and latest_timestamp > cache_ts:
+                    self._untrainable_until.pop(resolved_horizon, None)
+
             try:
                 artefacts = self._load_horizon_artefacts(resolved_horizon)
             except FileNotFoundError:
@@ -427,7 +526,6 @@ class MultiHorizonModelingEngine:
                 self.train(horizon=resolved_horizon, force=True)
                 artefacts = self._load_horizon_artefacts(resolved_horizon)
 
-            price_df = self.fetcher.fetch_price_data()
             news_df = self.fetcher.fetch_news_data() if self.config.sentiment else pd.DataFrame()
             macro_df = pd.DataFrame()
             if self.config.feature_toggles.macro:
@@ -446,16 +544,41 @@ class MultiHorizonModelingEngine:
             try:
                 transformed = artefacts.preprocessor.transform(latest_row)
             except NotFittedError:
+                cached = self._untrainable_until.get(resolved_horizon)
+                if cached:
+                    cache_ts = cached.get("data_timestamp")
+                    if cache_ts is not None and (latest_timestamp is None or latest_timestamp <= cache_ts):
+                        return _unavailable(
+                            cached.get("reason", "insufficient_samples") or "insufficient_samples",
+                            sample_counts=cached.get("sample_counts"),
+                            missing_targets=cached.get("missing_targets"),
+                            checked_at=cache_ts,
+                            message="Preprocessor not fitted; waiting for more data before retraining.",
+                        )
                 LOGGER.warning(
                     "Preprocessor for horizon %s is not fitted; retraining before inference.",
                     resolved_horizon,
                 )
                 self.train(horizon=resolved_horizon, force=True)
+                self._untrainable_until.pop(resolved_horizon, None)
                 artefacts = self._load_horizon_artefacts(resolved_horizon)
                 transformed = artefacts.preprocessor.transform(latest_row)
 
             if not artefacts.models:
-                return _unavailable("insufficient_samples", artefacts.sample_counts, {})
+                self._untrainable_until[resolved_horizon] = {
+                    "data_timestamp": latest_timestamp,
+                    "sample_counts": artefacts.sample_counts,
+                    "missing_targets": {},
+                    "reason": "insufficient_samples",
+                    "checked_at": latest_timestamp,
+                    "warning_emitted": False,
+                }
+                return _unavailable(
+                    "insufficient_samples",
+                    sample_counts=artefacts.sample_counts,
+                    missing_targets={},
+                    checked_at=latest_timestamp,
+                )
 
             requested_targets = set(targets) if targets else set(artefacts.models.keys())
             predictions: dict[str, Any] = {}
@@ -492,18 +615,21 @@ class MultiHorizonModelingEngine:
                             if value is not None and not (isinstance(value, float) and math.isnan(value))
                         }
 
-            return {
-                "horizon": resolved_horizon,
-                "predictions": predictions,
-                "probabilities": probabilities,
-                "quantile_forecasts": quantile_forecasts,
-                "feature_columns": get_feature_names_from_pipeline(artefacts.preprocessor),
-                "sample_counts": artefacts.sample_counts,
-                "missing_targets": {},
-                "metrics": artefacts.metrics,
-            }
+            self._untrainable_until.pop(resolved_horizon, None)
+            return _build_payload(
+                status="ok",
+                reason=None,
+                predictions=predictions,
+                probabilities=probabilities,
+                quantile_forecasts=quantile_forecasts,
+                feature_columns=get_feature_names_from_pipeline(artefacts.preprocessor),
+                sample_counts=artefacts.sample_counts,
+                missing_targets={},
+                metrics=artefacts.metrics,
+                checked_at=latest_timestamp,
+            )
         except InsufficientSamplesError as exc:
-            return _handle_insufficient(exc)
+            return _handle_insufficient(exc, latest_ts=locals().get("latest_timestamp"))
 
 
 __all__ = ["MultiHorizonModelingEngine", "MultiHorizonDataset", "HorizonArtifacts"]
