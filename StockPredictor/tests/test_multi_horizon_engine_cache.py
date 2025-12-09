@@ -128,7 +128,7 @@ def test_predict_latest_skips_retrain_until_new_data(tmp_path: Path, caplog: pyt
     assert first["status"] == "no_data"
     assert second["status"] == "no_data"
     warning_messages = [record.message for record in caplog.records if record.levelno == logging.WARNING]
-    assert any("Prediction unavailable" in message for message in warning_messages)
+    assert len(warning_messages) == 1
 
     extended_prices = _price_frame(start="2023-01-10", periods=4)
     engine.fetcher._price_df = extended_prices  # type: ignore[attr-defined]
@@ -166,7 +166,7 @@ def test_not_fitted_preprocessor_uses_cache(tmp_path: Path, caplog: pytest.LogCa
     engine._load_horizon_artefacts = _load  # type: ignore[method-assign]
     engine.train = _train  # type: ignore[method-assign]
 
-    with caplog.at_level(logging.INFO):
+    with caplog.at_level(logging.DEBUG):
         first = engine.predict_latest(horizon=1)
         second = engine.predict_latest(horizon=1)
 
@@ -175,8 +175,16 @@ def test_not_fitted_preprocessor_uses_cache(tmp_path: Path, caplog: pytest.LogCa
     assert second["status"] == "no_data"
     warning_count = len([record for record in caplog.records if record.levelno == logging.WARNING])
     info_count = len([record for record in caplog.records if record.levelno == logging.INFO])
+    debug_count = len([record for record in caplog.records if record.levelno == logging.DEBUG])
+    availability_warnings = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "Prediction unavailable" in record.message
+    ]
     assert warning_count >= 1
-    assert info_count >= 1
+    assert len(availability_warnings) == 1
+    assert info_count >= 0
+    assert debug_count >= 1
 
 
 def test_build_dataset_downgrades_repeated_insufficient_logs(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
@@ -184,14 +192,14 @@ def test_build_dataset_downgrades_repeated_insufficient_logs(tmp_path: Path, cap
     engine = _engine(tmp_path, price_df)
     setattr(engine.config, "min_samples_per_horizon", 5)
 
-    with caplog.at_level(logging.INFO):
+    with caplog.at_level(logging.DEBUG):
         engine.build_dataset(horizons=(1,), targets=("close_h",))
     first_levels = [record.levelno for record in caplog.records if "Insufficient samples for horizon" in record.message]
     assert logging.WARNING in first_levels
 
     caplog.clear()
-    with caplog.at_level(logging.INFO):
+    with caplog.at_level(logging.DEBUG):
         engine.build_dataset(horizons=(1,), targets=("close_h",))
     second_levels = [record.levelno for record in caplog.records if "Insufficient samples for horizon" in record.message]
     assert logging.WARNING not in second_levels
-    assert logging.INFO in second_levels
+    assert logging.DEBUG in second_levels
