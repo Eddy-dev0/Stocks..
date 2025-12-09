@@ -175,6 +175,7 @@ class MultiHorizonModelingEngine:
                 horizons=horizons,
                 targets=tuple(sorted(requested_targets)),
                 sample_counts={h: {t: 0 for t in sorted(requested_targets)} for h in horizons},
+                missing_targets={h: {t: 0 for t in sorted(requested_targets)} for h in horizons},
             )
 
         features_df = pd.concat(feature_frames, axis=0).sort_index()
@@ -334,6 +335,7 @@ class MultiHorizonModelingEngine:
                 horizons=horizons,
                 targets=tuple(sorted(requested_targets)),
                 sample_counts=requested_counts,
+                missing_targets=missing,
             )
 
         metadata = {
@@ -378,12 +380,17 @@ class MultiHorizonModelingEngine:
     ) -> dict[str, Any]:
         resolved_horizon = int(horizon or min(self.config.prediction_horizons))
 
-        def _unavailable(reason: str, sample_counts: Mapping[int, Any] | None = None) -> dict[str, Any]:
+        def _unavailable(
+            reason: str,
+            sample_counts: Mapping[int, Any] | None = None,
+            missing_targets: Mapping[int, Any] | None = None,
+        ) -> dict[str, Any]:
             return {
                 "horizon": resolved_horizon,
                 "predictions": {},
                 "unavailable_reason": reason,
                 "sample_counts": sample_counts or {},
+                "missing_targets": missing_targets or {},
             }
 
         try:
@@ -402,7 +409,9 @@ class MultiHorizonModelingEngine:
                     exc,
                 )
                 return _unavailable(
-                    "insufficient_samples", getattr(exc, "sample_counts", None)
+                    "insufficient_samples",
+                    getattr(exc, "sample_counts", None),
+                    getattr(exc, "missing_targets", None),
                 )
             artefacts = self._load_horizon_artefacts(resolved_horizon)
         except InsufficientSamplesError as exc:
@@ -411,7 +420,11 @@ class MultiHorizonModelingEngine:
                 resolved_horizon,
                 exc,
             )
-            return _unavailable("insufficient_samples", getattr(exc, "sample_counts", None))
+            return _unavailable(
+                "insufficient_samples",
+                getattr(exc, "sample_counts", None),
+                getattr(exc, "missing_targets", None),
+            )
 
         price_df = self.fetcher.fetch_price_data()
         news_df = self.fetcher.fetch_news_data() if self.config.sentiment else pd.DataFrame()
@@ -446,7 +459,9 @@ class MultiHorizonModelingEngine:
                     exc,
                 )
                 return _unavailable(
-                    "insufficient_samples", getattr(exc, "sample_counts", None)
+                    "insufficient_samples",
+                    getattr(exc, "sample_counts", None),
+                    getattr(exc, "missing_targets", None),
                 )
             transformed = artefacts.preprocessor.transform(latest_row)
 
@@ -497,6 +512,7 @@ class MultiHorizonModelingEngine:
             "quantile_forecasts": quantile_forecasts,
             "feature_columns": get_feature_names_from_pipeline(artefacts.preprocessor),
             "sample_counts": artefacts.sample_counts,
+            "missing_targets": {},
             "metrics": artefacts.metrics,
         }
 
