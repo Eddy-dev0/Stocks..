@@ -3438,6 +3438,38 @@ class StockPredictorDesktopApp:
             horizon_arg = self.selected_horizon_offset
         self._sync_stop_loss_multiplier()
         prediction = self.application.predict(horizon=horizon_arg, refresh=refresh)
+        raw_payload: Mapping[str, Any] | None = None
+        try:
+            if hasattr(prediction, "to_dict"):
+                raw_payload = prediction.to_dict()
+        except Exception as exc:  # pragma: no cover - defensive guard for optional metadata
+            LOGGER.debug("Failed to serialise prediction for UI payload: %s", exc)
+
+        unavailable_reason = None
+        status = None
+        if isinstance(raw_payload, Mapping):
+            unavailable_reason = raw_payload.get("unavailable_reason")
+            status = raw_payload.get("status")
+        if unavailable_reason == "insufficient_samples" or status == "no_data":
+            message = "Not enough historical data to generate predictions yet"
+            log_fn = LOGGER.info if unavailable_reason == "insufficient_samples" else LOGGER.warning
+            log_fn(
+                "Prediction unavailable for %s (reason=%s, status=%s)",
+                self.config.ticker,
+                unavailable_reason,
+                status,
+            )
+            return {
+                "prediction": {"unavailable_reason": unavailable_reason or status},
+                "snapshot": None,
+                "feature_history": None,
+                "price_history": None,
+                "indicator_history": None,
+                "horizons": self.config.prediction_horizons,
+                "stop_loss_multiplier": self.stop_loss_multiplier,
+                "raw": raw_payload,
+                "message": message,
+            }
         prediction_meta: Mapping[str, Any] | None = None
         if isinstance(prediction, PredictionResult):
             prediction_meta = prediction.meta
