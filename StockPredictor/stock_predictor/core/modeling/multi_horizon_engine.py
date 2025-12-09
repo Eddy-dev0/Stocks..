@@ -13,7 +13,7 @@ import logging
 from dataclasses import dataclass, field
 import math
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Literal, Mapping, Sequence
 
 import joblib
 import numpy as np
@@ -35,6 +35,7 @@ from ..sentiment import aggregate_daily_sentiment
 from ..ml_preprocessing import get_feature_names_from_pipeline
 from ..database import Database
 from .exceptions import InsufficientSamplesError
+from .prediction_result import PredictionOutcome
 
 LOGGER = logging.getLogger(__name__)
 
@@ -402,7 +403,7 @@ class MultiHorizonModelingEngine:
         *,
         targets: Iterable[str] | None = None,
         horizon: int | None = None,
-    ) -> dict[str, Any]:
+    ) -> PredictionOutcome:
         resolved_horizon = int(horizon or min(self.config.prediction_horizons))
         
         def _latest_timestamp(frame: pd.DataFrame | None) -> pd.Timestamp | None:
@@ -418,7 +419,7 @@ class MultiHorizonModelingEngine:
 
         def _build_payload(
             *,
-            status: str,
+            status: Literal["ok", "no_data", "error"],
             reason: str | None,
             predictions: Mapping[str, Any],
             probabilities: Mapping[str, Any],
@@ -429,21 +430,22 @@ class MultiHorizonModelingEngine:
             metrics: Mapping[str, Any],
             checked_at: pd.Timestamp | None,
             message: str | None = None,
-        ) -> dict[str, Any]:
-            return {
-                "status": status,
-                "reason": reason,
-                "horizon": resolved_horizon,
-                "predictions": dict(predictions),
-                "probabilities": dict(probabilities),
-                "quantile_forecasts": dict(quantile_forecasts),
-                "feature_columns": list(feature_columns or []),
-                "sample_counts": dict(sample_counts),
-                "missing_targets": dict(missing_targets),
-                "metrics": dict(metrics),
-                "checked_at": (checked_at.isoformat() if checked_at is not None else None),
-                "message": message,
-            }
+        ) -> PredictionOutcome:
+            return PredictionOutcome(
+                status=status,
+                reason=reason,
+                horizon=resolved_horizon,
+                symbol=self.config.ticker,
+                predictions=dict(predictions),
+                probabilities=dict(probabilities),
+                quantile_forecasts=dict(quantile_forecasts),
+                feature_columns=list(feature_columns or []),
+                sample_counts=dict(sample_counts),
+                missing_targets=dict(missing_targets),
+                metrics=dict(metrics),
+                checked_at=checked_at,
+                message=message,
+            )
 
         def _log_unavailability(horizon_value: int, *, reason: str, message: str | None = None) -> None:
             cache = self._untrainable_until.get(int(horizon_value)) or {}
@@ -467,7 +469,7 @@ class MultiHorizonModelingEngine:
             message: str | None = None,
             checked_at: pd.Timestamp | None = None,
             last_training_attempt: pd.Timestamp | None = None,
-        ) -> dict[str, Any]:
+        ) -> PredictionOutcome:
             cache = self._untrainable_until.get(resolved_horizon) or {}
             if checked_at is not None:
                 cache["data_timestamp"] = checked_at
@@ -495,7 +497,7 @@ class MultiHorizonModelingEngine:
                 message=message,
             )
 
-        def _handle_insufficient(exc: InsufficientSamplesError, *, latest_ts: pd.Timestamp | None) -> dict[str, Any]:
+        def _handle_insufficient(exc: InsufficientSamplesError, *, latest_ts: pd.Timestamp | None) -> PredictionOutcome:
             self._untrainable_until[resolved_horizon] = {
                 "data_timestamp": latest_ts,
                 "sample_counts": getattr(exc, "sample_counts", None) or {},

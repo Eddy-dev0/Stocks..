@@ -3710,19 +3710,12 @@ class StockPredictorAI:
         prediction_output = self.nextgen_engine.predict_latest(
             horizon=resolved_horizon,
         )
-        status = prediction_output.get("status") if isinstance(prediction_output, Mapping) else None
-        reason = prediction_output.get("reason") if isinstance(prediction_output, Mapping) else None
-        preds = prediction_output.get("predictions", {}) if isinstance(prediction_output, dict) else {}
-        quantiles = (
-            prediction_output.get("quantile_forecasts", {})
-            if isinstance(prediction_output, dict)
-            else {}
-        )
-        prob_block = (
-            prediction_output.get("probabilities", {})
-            if isinstance(prediction_output, dict)
-            else {}
-        )
+        is_prediction_mapping = isinstance(prediction_output, Mapping)
+        status = prediction_output.get("status") if is_prediction_mapping else None
+        reason = prediction_output.get("reason") if is_prediction_mapping else None
+        preds = prediction_output.get("predictions", {}) if is_prediction_mapping else {}
+        quantiles = prediction_output.get("quantile_forecasts", {}) if is_prediction_mapping else {}
+        prob_block = prediction_output.get("probabilities", {}) if is_prediction_mapping else {}
 
         predicted_close = self._safe_float(preds.get("close_h"))
         predicted_return = self._safe_float(preds.get("return_h"))
