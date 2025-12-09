@@ -233,12 +233,34 @@ class MultiHorizonModelingEngine:
         requested_targets = set(targets) if targets else {"close_h", "direction_h", "return_h"}
         dataset = self.build_dataset(horizons=horizons, targets=requested_targets)
 
+        sample_counts = dataset.metadata.get("target_counts") or dataset.count_targets()
+        requested_counts = {
+            int(h): {t: int(sample_counts.get(int(h), {}).get(t, 0)) for t in sorted(requested_targets)}
+            for h in horizons
+        }
+        min_samples = int(getattr(self.config, "min_samples_per_horizon", 500_000))
+        missing_targets = {}
+        for horizon_value, horizon_counts in requested_counts.items():
+            missing = {t: count for t, count in horizon_counts.items() if count < min_samples}
+            if missing:
+                missing_targets[int(horizon_value)] = missing
+
         artefacts: dict[int, HorizonArtifacts] = {}
         random_state = int(self.config.model_params.get("global", {}).get("random_state", 42))
 
         # Train per horizon
         for horizon_value in horizons:
             horizon_targets = dataset.targets.get(int(horizon_value), {})
+            horizon_counts = requested_counts.get(int(horizon_value), {})
+            if not any(count >= min_samples for count in horizon_counts.values()):
+                raise InsufficientSamplesError(
+                    f"Horizon {horizon_value} does not meet minimum sample requirements.",
+                    horizons=horizons,
+                    targets=tuple(sorted(requested_targets)),
+                    sample_counts=requested_counts,
+                    missing_targets=missing_targets,
+                )
+
             aligned_features = dataset.features.copy()
             aligned_features = aligned_features.loc[horizon_targets.get("close_h", pd.Series(index=aligned_features.index)).index]
             aligned_features = aligned_features.dropna(axis=1, how="all")
@@ -319,23 +341,12 @@ class MultiHorizonModelingEngine:
                 json.dump(target_sample_counts, handle, indent=2)
 
         if not artefacts:
-            sample_counts = dataset.metadata.get("target_counts", dataset.count_targets())
-            requested_counts = {
-                int(h): {t: int(sample_counts.get(int(h), {}).get(t, 0)) for t in sorted(requested_targets)}
-                for h in horizons
-            }
-            missing = {
-                int(h): {t: count for t, count in horizon_counts.items() if count <= 0}
-                for h, horizon_counts in requested_counts.items()
-                if any(count <= 0 for count in horizon_counts.values())
-            }
             raise InsufficientSamplesError(
-                "Training aborted: insufficient samples to train any requested horizons. "
-                f"Missing targets: {json.dumps(missing)}. Sample counts: {json.dumps(requested_counts)}",
+                "Insufficient samples to train any requested horizons.",
                 horizons=horizons,
                 targets=tuple(sorted(requested_targets)),
                 sample_counts=requested_counts,
-                missing_targets=missing,
+                missing_targets=missing_targets,
             )
 
         metadata = {
