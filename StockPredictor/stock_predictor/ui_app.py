@@ -40,6 +40,7 @@ from stock_predictor.core import (
 from stock_predictor.core.pipeline import NoPriceDataError, resolve_market_timezone
 from stock_predictor.core.features import FEATURE_REGISTRY, FeatureToggles
 from stock_predictor.core.preprocessing import derive_price_feature_toggles
+from stock_predictor.core.modeling import InsufficientSamplesError
 from stock_predictor.core.support_levels import indicator_support_floor
 
 LOGGER = logging.getLogger(__name__)
@@ -3492,6 +3493,9 @@ class StockPredictorDesktopApp:
             except NoPriceDataError as exc:
                 LOGGER.warning("No price data available for %s: %s", exc.ticker, exc)
                 self.root.after(0, lambda err=exc: self._on_no_price_data_error(err))
+            except InsufficientSamplesError as exc:
+                LOGGER.info("Insufficient samples for prediction: %s", exc)
+                self.root.after(0, lambda err=exc: self._on_insufficient_samples(err))
             except Exception as exc:  # pragma: no cover - defensive wrapper around worker
                 LOGGER.exception("Desktop worker failed: %s", exc)
                 self.root.after(0, lambda err=exc: self._on_async_failure(err))
@@ -3514,6 +3518,23 @@ class StockPredictorDesktopApp:
         feature_history = payload.get("feature_history")
         price_history = payload.get("price_history")
         indicator_history = payload.get("indicator_history")
+
+        unavailable_reason: str | None = None
+        if isinstance(prediction, (Mapping, PredictionResult)):
+            unavailable_reason = prediction.get("unavailable_reason")
+        if unavailable_reason is not None:
+            message = (
+                str(unavailable_reason).strip()
+                or "Not enough historical data to generate predictions yet"
+            )
+            self.current_prediction = {}
+            self.feature_snapshot = None
+            self.feature_history = None
+            self.price_history = None
+            self.indicator_history = None
+            self._set_busy(False, message)
+            messagebox.showinfo("Predictions unavailable", message)
+            return
 
         is_prediction_mapping = isinstance(prediction, (Mapping, PredictionResult))
         self.current_prediction = prediction if is_prediction_mapping else {}
@@ -3560,6 +3581,13 @@ class StockPredictorDesktopApp:
         status = detail if detail else f"No data available for {ticker}."
         self._set_busy(False, status)
         messagebox.showwarning("No price data", detail)
+
+    def _on_insufficient_samples(self, exc: InsufficientSamplesError) -> None:
+        message = "Not enough historical data to generate predictions yet"
+        detail = str(exc).strip()
+        self._set_busy(False, message)
+        display_message = f"{message}\n\n{detail}" if detail and detail != message else message
+        messagebox.showinfo("Predictions unavailable", display_message)
 
     def _set_busy(self, busy: bool, status: str | None = None) -> None:
         self._busy = busy
