@@ -2275,6 +2275,7 @@ class StockPredictorAI:
             "horizon": modern_predictions.get("horizon", resolved_horizon),
             "targets": list(preds.keys()),
             "sample_counts": modern_predictions.get("sample_counts", {}),
+            "missing_targets": modern_predictions.get("missing_targets", {}),
             "metrics": modern_predictions.get("metrics", {}),
             "feature_columns": modern_predictions.get("feature_columns", []),
             "unavailable_reason": unavailable_reason,
