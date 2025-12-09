@@ -377,6 +377,15 @@ class MultiHorizonModelingEngine:
         horizon: int | None = None,
     ) -> dict[str, Any]:
         resolved_horizon = int(horizon or min(self.config.prediction_horizons))
+
+        def _unavailable(reason: str, sample_counts: Mapping[int, Any] | None = None) -> dict[str, Any]:
+            return {
+                "horizon": resolved_horizon,
+                "predictions": {},
+                "unavailable_reason": reason,
+                "sample_counts": sample_counts or {},
+            }
+
         try:
             artefacts = self._load_horizon_artefacts(resolved_horizon)
         except FileNotFoundError:
@@ -387,10 +396,22 @@ class MultiHorizonModelingEngine:
             try:
                 self.train(horizon=resolved_horizon, force=True)
             except InsufficientSamplesError as exc:
-                raise RuntimeError(
-                    f"Unable to train horizon {resolved_horizon} due to insufficient samples"
-                ) from exc
+                LOGGER.warning(
+                    "Unable to train horizon %s due to insufficient samples: %s",
+                    resolved_horizon,
+                    exc,
+                )
+                return _unavailable(
+                    "insufficient_samples", getattr(exc, "sample_counts", None)
+                )
             artefacts = self._load_horizon_artefacts(resolved_horizon)
+        except InsufficientSamplesError as exc:
+            LOGGER.warning(
+                "Artefact load failed for horizon %s due to insufficient samples: %s",
+                resolved_horizon,
+                exc,
+            )
+            return _unavailable("insufficient_samples", getattr(exc, "sample_counts", None))
 
         price_df = self.fetcher.fetch_price_data()
         news_df = self.fetcher.fetch_news_data() if self.config.sentiment else pd.DataFrame()
@@ -419,9 +440,14 @@ class MultiHorizonModelingEngine:
                 self.train(horizon=resolved_horizon, force=True)
                 artefacts = self._load_horizon_artefacts(resolved_horizon)
             except InsufficientSamplesError as exc:
-                raise RuntimeError(
-                    f"Unable to train horizon {resolved_horizon} due to insufficient samples"
-                ) from exc
+                LOGGER.warning(
+                    "Unable to retrain horizon %s due to insufficient samples: %s",
+                    resolved_horizon,
+                    exc,
+                )
+                return _unavailable(
+                    "insufficient_samples", getattr(exc, "sample_counts", None)
+                )
             transformed = artefacts.preprocessor.transform(latest_row)
 
         if not artefacts.models:
