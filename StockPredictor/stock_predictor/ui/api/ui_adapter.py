@@ -31,16 +31,16 @@ async def get_prediction(
     except Exception as exc:  # pragma: no cover - defensive serialization guard
         LOGGER.debug("Failed to serialise prediction payload: %s", exc)
 
-    unavailable_reason = raw_payload.get("unavailable_reason")
     status = raw_payload.get("status")
-    if unavailable_reason == "insufficient_samples" or status == "no_data":
-        message = "Not enough historical data to generate predictions yet"
-        log_fn = LOGGER.info if unavailable_reason == "insufficient_samples" else LOGGER.warning
+    reason = raw_payload.get("reason")
+    if status == "no_data":
+        message = raw_payload.get("message") or "Not enough historical data to generate predictions yet"
+        log_fn = LOGGER.info if reason == "insufficient_samples" else LOGGER.warning
         log_fn(
-            "Prediction unavailable for %s (reason=%s, status=%s)",
+            "Prediction unavailable for %s (status=%s, reason=%s)",
             ticker,
-            unavailable_reason,
             status,
+            reason,
         )
         return {
             "ticker": ticker,
@@ -55,6 +55,8 @@ async def get_prediction(
             "accuracy": {},
             "message": message,
             "raw": raw_payload,
+            "status": status,
+            "reason": reason,
         }
 
     payload = raw_payload or prediction.to_dict()

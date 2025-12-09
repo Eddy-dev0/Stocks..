@@ -538,6 +538,7 @@ class StockPredictorDesktopApp:
         self.sentiment_score_var = tk.StringVar(value="—")
 
         self._busy = False
+        self._availability_log_state: dict[str, bool] = {}
 
         self._build_layout(horizon_values)
         self.apply_theme(self.dark_mode_var.get())
@@ -3430,6 +3431,28 @@ class StockPredictorDesktopApp:
     def _predict_only(self) -> dict[str, Any]:
         return self._predict_payload(refresh=True)
 
+    def _log_prediction_unavailability(
+        self,
+        *,
+        horizon: Any,
+        status: str | None,
+        reason: str | None,
+        message: str | None = None,
+    ) -> None:
+        if status != "no_data":
+            return
+        key = f"{horizon}:{reason}"
+        seen = self._availability_log_state.get(key, False)
+        log_fn = LOGGER.warning if not seen else LOGGER.info
+        log_fn(
+            "Prediction unavailable for %s (status=%s, reason=%s)%s",
+            self.config.ticker,
+            status,
+            reason,
+            f": {message}" if message else "",
+        )
+        self._availability_log_state[key] = True
+
     def _predict_payload(self, *, refresh: bool = False) -> dict[str, Any]:
         horizon_arg: Any
         if self.selected_horizon_code:
@@ -3445,22 +3468,30 @@ class StockPredictorDesktopApp:
         except Exception as exc:  # pragma: no cover - defensive guard for optional metadata
             LOGGER.debug("Failed to serialise prediction for UI payload: %s", exc)
 
-        unavailable_reason = None
         status = None
+        reason = None
+        message = None
         if isinstance(raw_payload, Mapping):
-            unavailable_reason = raw_payload.get("unavailable_reason")
             status = raw_payload.get("status")
-        if unavailable_reason == "insufficient_samples" or status == "no_data":
-            message = "Not enough historical data to generate predictions yet"
-            log_fn = LOGGER.info if unavailable_reason == "insufficient_samples" else LOGGER.warning
-            log_fn(
-                "Prediction unavailable for %s (reason=%s, status=%s)",
-                self.config.ticker,
-                unavailable_reason,
-                status,
+            reason = raw_payload.get("reason")
+            message = raw_payload.get("message")
+        if status == "no_data":
+            friendly_message = message or "Not enough historical data to generate predictions yet"
+            self._log_prediction_unavailability(
+                horizon=horizon_arg,
+                status=status,
+                reason=reason,
+                message=friendly_message,
             )
             return {
-                "prediction": {"unavailable_reason": unavailable_reason or status},
+                "prediction": {
+                    "status": status,
+                    "reason": reason,
+                    "message": friendly_message,
+                    "sample_counts": raw_payload.get("sample_counts", {}) if isinstance(raw_payload, Mapping) else {},
+                    "missing_targets": raw_payload.get("missing_targets", {}) if isinstance(raw_payload, Mapping) else {},
+                    "checked_at": raw_payload.get("checked_at") if isinstance(raw_payload, Mapping) else None,
+                },
                 "snapshot": None,
                 "feature_history": None,
                 "price_history": None,
@@ -3468,7 +3499,7 @@ class StockPredictorDesktopApp:
                 "horizons": self.config.prediction_horizons,
                 "stop_loss_multiplier": self.stop_loss_multiplier,
                 "raw": raw_payload,
-                "message": message,
+                "message": friendly_message,
             }
         prediction_meta: Mapping[str, Any] | None = None
         if isinstance(prediction, PredictionResult):
@@ -3551,14 +3582,11 @@ class StockPredictorDesktopApp:
         price_history = payload.get("price_history")
         indicator_history = payload.get("indicator_history")
 
-        unavailable_reason: str | None = None
-        if isinstance(prediction, (Mapping, PredictionResult)):
-            unavailable_reason = prediction.get("unavailable_reason")
-        if unavailable_reason is not None:
-            message = (
-                str(unavailable_reason).strip()
-                or "Not enough historical data to generate predictions yet"
-            )
+        status = prediction.get("status") if isinstance(prediction, Mapping) else None
+        reason = prediction.get("reason") if isinstance(prediction, Mapping) else None
+        message = prediction.get("message") if isinstance(prediction, Mapping) else None
+        if status == "no_data":
+            message = message or "Not enough historical data to generate predictions yet"
             self.current_prediction = {}
             self.feature_snapshot = None
             self.feature_history = None

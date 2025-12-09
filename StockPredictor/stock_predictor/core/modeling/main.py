@@ -2261,7 +2261,8 @@ class StockPredictorAI:
             targets=list(targets) if targets else None,
             horizon=resolved_horizon,
         )
-        unavailable_reason = modern_predictions.get("unavailable_reason")
+        status = modern_predictions.get("status")
+        reason = modern_predictions.get("reason")
         preds = modern_predictions.get("predictions", {})
         predicted_close = preds.get("close_h") if preds else None
         expected_low = None
@@ -2278,7 +2279,10 @@ class StockPredictorAI:
             "missing_targets": modern_predictions.get("missing_targets", {}),
             "metrics": modern_predictions.get("metrics", {}),
             "feature_columns": modern_predictions.get("feature_columns", []),
-            "unavailable_reason": unavailable_reason,
+            "status": status,
+            "reason": reason,
+            "checked_at": modern_predictions.get("checked_at"),
+            "message": modern_predictions.get("message"),
         }
         return PredictionResult(
             predicted_close=predicted_close,
@@ -3706,11 +3710,8 @@ class StockPredictorAI:
         prediction_output = self.nextgen_engine.predict_latest(
             horizon=resolved_horizon,
         )
-        unavailable_reason = (
-            prediction_output.get("unavailable_reason")
-            if isinstance(prediction_output, Mapping)
-            else None
-        )
+        status = prediction_output.get("status") if isinstance(prediction_output, Mapping) else None
+        reason = prediction_output.get("reason") if isinstance(prediction_output, Mapping) else None
         preds = prediction_output.get("predictions", {}) if isinstance(prediction_output, dict) else {}
         quantiles = (
             prediction_output.get("quantile_forecasts", {})
@@ -3852,7 +3853,8 @@ class StockPredictorAI:
             "ticker": self.config.ticker,
             "market_time": timestamp.to_pydatetime() if timestamp is not None else None,
             "last_price": last_price,
-            "unavailable_reason": unavailable_reason,
+            "status": status,
+            "reason": reason,
             "predicted_close": predicted_close,
             "expected_change_pct": expected_change_pct,
             "expected_low": expected_low,
