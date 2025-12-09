@@ -404,30 +404,9 @@ class MultiHorizonModelingEngine:
                 "missing_targets": missing_targets or {},
             }
 
-        try:
-            artefacts = self._load_horizon_artefacts(resolved_horizon)
-        except FileNotFoundError:
-            LOGGER.info(
-                "No persisted artefacts found for horizon %s; triggering training run.",
-                resolved_horizon,
-            )
-            try:
-                self.train(horizon=resolved_horizon, force=True)
-            except InsufficientSamplesError as exc:
-                LOGGER.warning(
-                    "Unable to train horizon %s due to insufficient samples: %s",
-                    resolved_horizon,
-                    exc,
-                )
-                return _unavailable(
-                    "insufficient_samples",
-                    getattr(exc, "sample_counts", None),
-                    getattr(exc, "missing_targets", None),
-                )
-            artefacts = self._load_horizon_artefacts(resolved_horizon)
-        except InsufficientSamplesError as exc:
+        def _handle_insufficient(exc: InsufficientSamplesError) -> dict[str, Any]:
             LOGGER.warning(
-                "Artefact load failed for horizon %s due to insufficient samples: %s",
+                "Prediction unavailable for horizon %s due to insufficient samples: %s",
                 resolved_horizon,
                 exc,
             )
@@ -437,95 +416,94 @@ class MultiHorizonModelingEngine:
                 getattr(exc, "missing_targets", None),
             )
 
-        price_df = self.fetcher.fetch_price_data()
-        news_df = self.fetcher.fetch_news_data() if self.config.sentiment else pd.DataFrame()
-        macro_df = pd.DataFrame()
-        if self.config.feature_toggles.macro:
-            macro_df = self.database.get_indicators(
-                ticker=self.config.ticker, interval=self.config.interval, category="macro"
-            )
-        feature_result = self.feature_assembler.build(
-            price_df,
-            news_df,
-            bool(self.config.sentiment),
-            macro_df=macro_df if not macro_df.empty else None,
-        )
-        latest_features = feature_result.features.copy()
-        latest_features["ticker"] = self.config.ticker
-        latest_row = latest_features.iloc[[-1]]
         try:
-            transformed = artefacts.preprocessor.transform(latest_row)
-        except NotFittedError:
-            LOGGER.warning(
-                "Preprocessor for horizon %s is not fitted; retraining before inference.",
-                resolved_horizon,
-            )
             try:
+                artefacts = self._load_horizon_artefacts(resolved_horizon)
+            except FileNotFoundError:
+                LOGGER.info(
+                    "No persisted artefacts found for horizon %s; triggering training run.",
+                    resolved_horizon,
+                )
                 self.train(horizon=resolved_horizon, force=True)
                 artefacts = self._load_horizon_artefacts(resolved_horizon)
-            except InsufficientSamplesError as exc:
-                LOGGER.warning(
-                    "Unable to retrain horizon %s due to insufficient samples: %s",
-                    resolved_horizon,
-                    exc,
-                )
-                return _unavailable(
-                    "insufficient_samples",
-                    getattr(exc, "sample_counts", None),
-                    getattr(exc, "missing_targets", None),
-                )
-            transformed = artefacts.preprocessor.transform(latest_row)
 
-        if not artefacts.models:
-            raise RuntimeError(
-                f"No trained models are available for horizon {resolved_horizon}; prediction cannot proceed."
+            price_df = self.fetcher.fetch_price_data()
+            news_df = self.fetcher.fetch_news_data() if self.config.sentiment else pd.DataFrame()
+            macro_df = pd.DataFrame()
+            if self.config.feature_toggles.macro:
+                macro_df = self.database.get_indicators(
+                    ticker=self.config.ticker, interval=self.config.interval, category="macro"
+                )
+            feature_result = self.feature_assembler.build(
+                price_df,
+                news_df,
+                bool(self.config.sentiment),
+                macro_df=macro_df if not macro_df.empty else None,
             )
+            latest_features = feature_result.features.copy()
+            latest_features["ticker"] = self.config.ticker
+            latest_row = latest_features.iloc[[-1]]
+            try:
+                transformed = artefacts.preprocessor.transform(latest_row)
+            except NotFittedError:
+                LOGGER.warning(
+                    "Preprocessor for horizon %s is not fitted; retraining before inference.",
+                    resolved_horizon,
+                )
+                self.train(horizon=resolved_horizon, force=True)
+                artefacts = self._load_horizon_artefacts(resolved_horizon)
+                transformed = artefacts.preprocessor.transform(latest_row)
 
-        requested_targets = set(targets) if targets else set(artefacts.models.keys())
-        predictions: dict[str, Any] = {}
-        probabilities: dict[str, dict[str, float]] = {}
-        quantile_forecasts: dict[str, dict[str, float]] = {}
-        for target_name, model in artefacts.models.items():
-            if target_name not in requested_targets:
-                continue
-            y_hat = model.predict(transformed)
-            predictions[target_name] = float(y_hat[0])
+            if not artefacts.models:
+                return _unavailable("insufficient_samples", artefacts.sample_counts, {})
 
-            estimator = model.named_steps.get("estimator") if hasattr(model, "named_steps") else model
+            requested_targets = set(targets) if targets else set(artefacts.models.keys())
+            predictions: dict[str, Any] = {}
+            probabilities: dict[str, dict[str, float]] = {}
+            quantile_forecasts: dict[str, dict[str, float]] = {}
+            for target_name, model in artefacts.models.items():
+                if target_name not in requested_targets:
+                    continue
+                y_hat = model.predict(transformed)
+                predictions[target_name] = float(y_hat[0])
 
-            if hasattr(estimator, "predict_proba"):
-                try:
-                    proba = estimator.predict_proba(transformed)[0]
-                    classes = getattr(estimator, "classes_", range(len(proba)))
-                    probabilities[target_name] = {
-                        str(label): float(prob)
-                        for label, prob in zip(classes, proba)
-                    }
-                except Exception:  # pragma: no cover - defensive against model quirks
-                    probabilities[target_name] = {}
+                estimator = model.named_steps.get("estimator") if hasattr(model, "named_steps") else model
 
-            if hasattr(estimator, "predict_quantiles"):
-                try:
-                    quantiles = estimator.predict_quantiles(transformed)
-                except Exception:  # pragma: no cover - estimator specific
-                    quantiles = {}
-                if isinstance(quantiles, dict):
-                    quantile_forecasts[target_name] = {
-                        str(key): float(np.nanmean(value)) if hasattr(value, "__iter__") else float(value)
-                        for key, value in quantiles.items()
-                        if value is not None and not (isinstance(value, float) and math.isnan(value))
-                    }
+                if hasattr(estimator, "predict_proba"):
+                    try:
+                        proba = estimator.predict_proba(transformed)[0]
+                        classes = getattr(estimator, "classes_", range(len(proba)))
+                        probabilities[target_name] = {
+                            str(label): float(prob)
+                            for label, prob in zip(classes, proba)
+                        }
+                    except Exception:  # pragma: no cover - defensive against model quirks
+                        probabilities[target_name] = {}
 
-        return {
-            "horizon": resolved_horizon,
-            "predictions": predictions,
-            "probabilities": probabilities,
-            "quantile_forecasts": quantile_forecasts,
-            "feature_columns": get_feature_names_from_pipeline(artefacts.preprocessor),
-            "sample_counts": artefacts.sample_counts,
-            "missing_targets": {},
-            "metrics": artefacts.metrics,
-        }
+                if hasattr(estimator, "predict_quantiles"):
+                    try:
+                        quantiles = estimator.predict_quantiles(transformed)
+                    except Exception:  # pragma: no cover - estimator specific
+                        quantiles = {}
+                    if isinstance(quantiles, dict):
+                        quantile_forecasts[target_name] = {
+                            str(key): float(np.nanmean(value)) if hasattr(value, "__iter__") else float(value)
+                            for key, value in quantiles.items()
+                            if value is not None and not (isinstance(value, float) and math.isnan(value))
+                        }
+
+            return {
+                "horizon": resolved_horizon,
+                "predictions": predictions,
+                "probabilities": probabilities,
+                "quantile_forecasts": quantile_forecasts,
+                "feature_columns": get_feature_names_from_pipeline(artefacts.preprocessor),
+                "sample_counts": artefacts.sample_counts,
+                "missing_targets": {},
+                "metrics": artefacts.metrics,
+            }
+        except InsufficientSamplesError as exc:
+            return _handle_insufficient(exc)
 
 
 __all__ = ["MultiHorizonModelingEngine", "MultiHorizonDataset", "HorizonArtifacts"]
