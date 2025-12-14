@@ -394,9 +394,37 @@ class FeatureAssembler:
 
 def _ensure_datetime_index(price_df: pd.DataFrame) -> pd.DataFrame:
     df = price_df.copy()
-    if "Date" not in df.columns:
-        raise ValueError("Input price data must contain a 'Date' column.")
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    initial_rows = len(df)
+
+    candidate_columns = [
+        column
+        for column in df.columns
+        if column.lower() in {"date", "datetime"}
+    ]
+
+    datetime_column: str | None = None
+    for column in candidate_columns:
+        if df[column].notna().any():
+            datetime_column = column
+            break
+
+    if datetime_column is not None:
+        df = df.reset_index(drop=True)
+        if datetime_column != "Date":
+            df = df.rename(columns={datetime_column: "Date"})
+        unused_sources = [col for col in candidate_columns if col != datetime_column]
+        if unused_sources:
+            df = df.drop(columns=unused_sources)
+        datetime_source = "column"
+    else:
+        df = df.reset_index()
+        index_column = df.columns[0]
+        df = df.rename(columns={index_column: "Date"})
+        if candidate_columns:
+            df = df.drop(columns=candidate_columns, errors="ignore")
+        datetime_source = "index"
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce", utc=True)
     df = df.dropna(subset=["Date"])
 
     numeric_candidates = [
@@ -410,8 +438,25 @@ def _ensure_datetime_index(price_df: pd.DataFrame) -> pd.DataFrame:
     for column in numeric_candidates:
         if column in df.columns:
             df[column] = pd.to_numeric(df[column], errors="coerce")
+
     df = df.dropna(subset=["Close"])
     df = df.sort_values("Date")
+    df = df.drop_duplicates(subset=["Date"], keep="last")
+    df = df.set_index("Date")
+    df.index.name = "Date"
+    df = df.sort_index()
+
+    final_rows = len(df)
+    logger.info(
+        "Normalized datetime from %s; rows before=%d after=%d",
+        datetime_source,
+        initial_rows,
+        final_rows,
+    )
+
+    if df.empty:
+        raise ValueError("Input price data must contain at least one valid datetime row.")
+
     return df
 
 
