@@ -446,6 +446,13 @@ def _ensure_datetime_index(price_df: pd.DataFrame) -> pd.DataFrame:
     df.index.name = "Date"
     df = df.sort_index()
 
+    # Preserve the timestamp information as an explicit column because many
+    # downstream feature builders expect ``Date`` both as an index and as a
+    # column when joining or exporting feature frames.
+    if "Date" not in df.columns:
+        df = df.copy()
+        df["Date"] = df.index
+
     final_rows = len(df)
     logger.info(
         "Normalized datetime from %s; rows before=%d after=%d",
@@ -636,7 +643,11 @@ def _build_elliott_wave_descriptors(price_df: pd.DataFrame) -> FeatureBlock | No
     if "Close" not in price_df:
         return None
 
-    df = price_df[["Date", "Close"]].copy()
+    df = price_df.reset_index()
+    if "Date" not in df.columns:
+        df = df.rename(columns={df.columns[0]: "Date"})
+
+    df = df[["Date", "Close"]].copy()
     df = df.sort_values("Date").reset_index(drop=True)
     close = pd.to_numeric(df["Close"], errors="coerce")
 
