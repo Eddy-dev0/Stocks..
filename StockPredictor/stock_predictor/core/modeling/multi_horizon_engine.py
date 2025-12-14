@@ -367,16 +367,20 @@ class MultiHorizonModelingEngine:
                 )
                 LOGGER.error(message)
                 raise ValueError(message)
-        insufficient = {}
+        insufficient: dict[int, dict[str, int]] = {}
         threshold = int(
             getattr(
                 self.config, "min_samples_per_horizon", DEFAULT_MIN_SAMPLES_PER_HORIZON
             )
         )
         for horizon, horizon_counts in counts.items():
-            missing = [name for name, count in horizon_counts.items() if count < threshold]
-            if missing:
-                insufficient[horizon] = missing
+            below_threshold = {
+                name: int(count)
+                for name, count in horizon_counts.items()
+                if name in requested_targets and count < threshold
+            }
+            if below_threshold:
+                insufficient[horizon] = below_threshold
         if insufficient:
             latest_ts = None
             if not dataset.features.empty:
@@ -386,12 +390,14 @@ class MultiHorizonModelingEngine:
                 repeated = previous_ts == latest_ts
                 log_fn = LOGGER.warning if not repeated else LOGGER.debug
                 log_fn(
-                    "Insufficient samples for horizon %s: %s",
+                    "Targets below min_samples_per_horizon=%s for horizon %s: %s",
+                    threshold,
                     horizon,
                     json.dumps(missing_targets),
                 )
                 self._insufficient_log_state[int(horizon)] = latest_ts
             metadata["insufficient_samples"] = insufficient
+        metadata["min_samples_per_horizon"] = threshold
         return dataset
 
     # ------------------------------------------------------------------
@@ -459,6 +465,20 @@ class MultiHorizonModelingEngine:
                     missing_targets=missing_targets,
                 )
 
+            below_threshold = {
+                target: count
+                for target, count in horizon_counts.items()
+                if 0 < count < min_samples
+            }
+            for target_name, count in below_threshold.items():
+                LOGGER.warning(
+                    "Target %s for horizon %s has %s samples, below min_samples_per_horizon=%s; skipping training for this target.",
+                    target_name,
+                    horizon_value,
+                    count,
+                    min_samples,
+                )
+
             aligned_features = dataset.features.copy()
             aligned_features = aligned_features.loc[horizon_targets.get("close_h", pd.Series(index=aligned_features.index)).index]
             aligned_features = aligned_features.dropna(axis=1, how="all")
@@ -471,6 +491,9 @@ class MultiHorizonModelingEngine:
 
             for target_name, series in horizon_targets.items():
                 if target_name not in requested_targets:
+                    continue
+                target_count = horizon_counts.get(target_name, 0)
+                if target_count < min_samples:
                     continue
                 y = series.dropna()
                 if y.empty:
