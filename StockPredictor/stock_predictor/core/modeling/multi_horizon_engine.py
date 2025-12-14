@@ -142,6 +142,16 @@ class MultiHorizonModelingEngine:
             if price_df.empty:
                 LOGGER.warning("No price data available for %s; skipping", ticker)
                 continue
+
+            canonical_price_df = price_df.copy()
+            if "Date" in canonical_price_df.columns:
+                canonical_price_df = canonical_price_df.sort_values("Date").drop_duplicates("Date", keep="last")
+                canonical_index = pd.to_datetime(canonical_price_df["Date"])
+            else:
+                canonical_price_df = canonical_price_df.sort_index()
+                canonical_index = pd.to_datetime(canonical_price_df.index)
+            canonical_price_df.index = canonical_index
+
             news_df = self.database.get_news(ticker) if sentiment_enabled else pd.DataFrame()
             macro_df = pd.DataFrame()
             if self.config.feature_toggles.macro:
@@ -149,20 +159,20 @@ class MultiHorizonModelingEngine:
                     ticker=ticker, interval=self.config.interval, category="macro"
                 )
             feature_result = self.feature_assembler.build(
-                price_df,
+                canonical_price_df,
                 news_df,
                 sentiment_enabled,
                 macro_df=macro_df if not macro_df.empty else None,
             )
             features = feature_result.features.copy()
             features["ticker"] = ticker
-            features.index = pd.to_datetime(features.index)
+            features.index = canonical_index
             feature_frames.append(features)
 
-            ticker_targets = self._compute_targets(price_df, horizons)
+            ticker_targets = self._compute_targets(canonical_price_df, horizons)
             for horizon, label_map in ticker_targets.items():
                 for name, series in label_map.items():
-                    aligned = series.reindex(features.index)
+                    aligned = series.reindex(canonical_index)
                     targets[horizon][name].append(aligned)
 
             if news_df is not None and not news_df.empty:
@@ -192,6 +202,17 @@ class MultiHorizonModelingEngine:
         dataset = MultiHorizonDataset(features=features_df, targets=target_map, metadata=metadata)
         counts = dataset.count_targets()
         metadata["target_counts"] = counts
+        if 1 in counts and len(features_df) > 1:
+            missing_alignment = [
+                name for name in requested_targets if counts[1].get(name, 0) == 0
+            ]
+            if missing_alignment:
+                message = (
+                    "Target alignment failed for horizon 1: no aligned values for "
+                    f"{sorted(missing_alignment)}"
+                )
+                LOGGER.error(message)
+                raise ValueError(message)
         insufficient = {}
         threshold = int(getattr(self.config, "min_samples_per_horizon", 500_000))
         for horizon, horizon_counts in counts.items():
