@@ -203,3 +203,30 @@ def test_build_dataset_downgrades_repeated_insufficient_logs(tmp_path: Path, cap
     second_levels = [record.levelno for record in caplog.records if "Insufficient samples for horizon" in record.message]
     assert logging.WARNING not in second_levels
     assert logging.DEBUG in second_levels
+
+
+def test_build_dataset_aligns_targets_on_canonical_dates(tmp_path: Path) -> None:
+    price_df = pd.DataFrame(
+        {
+            "Date": pd.to_datetime(
+                ["2023-01-03", "2023-01-01", "2023-01-02", "2023-01-01"]
+            ),
+            "Close": [103, 101, 102, 100],
+        }
+    )
+
+    engine = _engine(tmp_path, price_df)
+    dataset = engine.build_dataset(horizons=(1,), targets=("close_h", "return_h", "direction_h"))
+
+    expected_index = pd.to_datetime(["2023-01-01", "2023-01-02", "2023-01-03"])
+    assert list(dataset.features.index) == list(expected_index)
+
+    horizon_targets = dataset.targets[1]
+    for name in ("close_h", "return_h"):
+        aligned = horizon_targets[name]
+        assert list(aligned.index) == list(expected_index)
+        assert aligned.dropna().shape[0] == len(expected_index) - 1
+
+    direction = horizon_targets["direction_h"]
+    assert list(direction.index) == list(expected_index)
+    assert direction.dropna().shape[0] == len(expected_index)
