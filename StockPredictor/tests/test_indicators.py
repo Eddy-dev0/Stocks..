@@ -78,6 +78,23 @@ def test_feature_assembler_uses_indicator_config() -> None:
     assert any(col.startswith("Supertrend_5") for col in features.features.columns)
 
 
+def test_feature_assembler_handles_date_column_and_index() -> None:
+    price_df = _sample_price_frame()
+    price_df = price_df.set_index("Date")
+    price_df["Date"] = price_df.index
+
+    assembler = FeatureAssembler(
+        feature_toggles={"technical": True, "volume_liquidity": True, "macro": True},
+        horizons=(1,),
+    )
+
+    result = assembler.build(price_df, news_df=None, sentiment_enabled=False)
+
+    assert not result.features.empty
+    expected_date = pd.to_datetime(price_df["Date"], utc=True).iloc[-1]
+    assert result.metadata["latest_date"] == expected_date
+
+
 def test_liquidity_proxies_generate_columns() -> None:
     price_df = _sample_price_frame()
     inputs = IndicatorInputs(

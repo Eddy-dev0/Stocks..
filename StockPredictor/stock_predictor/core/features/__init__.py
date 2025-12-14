@@ -265,11 +265,11 @@ class FeatureAssembler:
         if not feature_blocks:
             raise RuntimeError("No feature blocks were generated. Check configuration.")
 
-        merged = processed[["Date", "Close"]].copy()
+        merged = processed.reset_index(drop=True)[["Date", "Close"]].copy()
         for block in feature_blocks:
             merged = merged.merge(block.frame, on="Date", how="left")
 
-        merged = merged.sort_values("Date").reset_index(drop=True)
+        merged = merged.reset_index(drop=True).sort_values("Date").reset_index(drop=True)
         merged = merged.replace([np.inf, -np.inf], np.nan)
         merged = merged.ffill().bfill()
         numeric_cols = merged.select_dtypes(include=[np.number]).columns
@@ -476,7 +476,7 @@ def _build_technical_features(
     if price_df.empty:
         return None, metadata
 
-    df = price_df.sort_values("Date").reset_index(drop=True)
+    df = price_df.reset_index(drop=True).sort_values("Date").reset_index(drop=True)
     close = pd.to_numeric(df["Close"], errors="coerce")
     volume = _get_numeric_series(df, "Volume", default=np.nan)
     high = _get_numeric_series(df, "High", default=np.nan).fillna(close)
@@ -569,7 +569,7 @@ def _build_volume_liquidity_block(price_df: pd.DataFrame) -> FeatureBlock | None
     if price_df.empty or "Volume" not in price_df:
         return None
 
-    df = price_df.sort_values("Date").reset_index(drop=True)
+    df = price_df.reset_index(drop=True).sort_values("Date").reset_index(drop=True)
     raw_volume = pd.to_numeric(df["Volume"], errors="coerce")
     if raw_volume.isna().all():
         return None
@@ -721,7 +721,7 @@ def _build_macro_context(price_df: pd.DataFrame) -> FeatureBlock | None:
     if "Close" not in price_df:
         return None
 
-    df = price_df.sort_values("Date").reset_index(drop=True)
+    df = price_df.reset_index(drop=True).sort_values("Date").reset_index(drop=True)
     returns = pd.to_numeric(df["Close"], errors="coerce").pct_change(fill_method=None)
 
     macro = pd.DataFrame({"Date": df["Date"]})
@@ -794,9 +794,9 @@ def _build_macro_benchmarks(
     if not features:
         return None
 
-    feature_frame = pd.DataFrame({"Date": date_series})
+    feature_frame = pd.DataFrame({"Date": date_series.reset_index(drop=True)})
     for name, series in features.items():
-        feature_frame[name] = series
+        feature_frame[name] = series.reset_index(drop=True)
 
     column_categories = {col: "macro_benchmark" for col in feature_frame.columns if col != "Date"}
     return FeatureBlock(feature_frame.fillna(0.0), category="macro", column_categories=column_categories)
@@ -840,9 +840,9 @@ def _build_cross_sectional_betas(
     if not beta_features:
         return None
 
-    frame = pd.DataFrame({"Date": price_df["Date"]})
+    frame = pd.DataFrame({"Date": price_df["Date"].reset_index(drop=True)})
     for name, series in beta_features.items():
-        frame[name] = series
+        frame[name] = series.reset_index(drop=True)
 
     column_categories = {col: "macro_beta" for col in frame.columns if col != "Date"}
     return FeatureBlock(frame, category="macro", column_categories=column_categories)
