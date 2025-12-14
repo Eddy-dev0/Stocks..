@@ -643,9 +643,16 @@ def _build_elliott_wave_descriptors(price_df: pd.DataFrame) -> FeatureBlock | No
     if "Close" not in price_df:
         return None
 
-    df = price_df.reset_index()
-    if "Date" not in df.columns:
-        df = df.rename(columns={df.columns[0]: "Date"})
+    df = price_df.copy()
+
+    # Avoid duplicating the Date column when it already exists alongside a Date
+    # index (pandas would otherwise raise "cannot insert Date, already exists").
+    if "Date" in df.columns:
+        df = df.reset_index(drop=True)
+    else:
+        df = df.reset_index()
+        if "Date" not in df.columns:
+            df = df.rename(columns={df.columns[0]: "Date"})
 
     df = df[["Date", "Close"]].copy()
     df = df.sort_values("Date").reset_index(drop=True)
