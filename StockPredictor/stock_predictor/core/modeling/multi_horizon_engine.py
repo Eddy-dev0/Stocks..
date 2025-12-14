@@ -406,15 +406,23 @@ class MultiHorizonModelingEngine:
     ) -> PredictionOutcome:
         resolved_horizon = int(horizon or min(self.config.prediction_horizons))
         
+        def _to_utc(timestamp: pd.Timestamp | None) -> pd.Timestamp | None:
+            if timestamp is None:
+                return None
+            ts = pd.to_datetime(timestamp)
+            if ts.tzinfo is None or ts.tzinfo.utcoffset(ts) is None:
+                return ts.tz_localize("UTC")
+            return ts.tz_convert("UTC")
+
         def _latest_timestamp(frame: pd.DataFrame | None) -> pd.Timestamp | None:
             if frame is None or frame.empty:
                 return None
             if "Date" in frame.columns:
                 normalized = pd.to_datetime(frame["Date"], errors="coerce")
                 if not normalized.empty:
-                    return normalized.max()
+                    return _to_utc(normalized.max())
             if isinstance(frame.index, pd.DatetimeIndex) and not frame.index.empty:
-                return pd.to_datetime(frame.index.max())
+                return _to_utc(pd.to_datetime(frame.index.max()))
             return None
 
         def _build_payload(
@@ -471,10 +479,12 @@ class MultiHorizonModelingEngine:
             last_training_attempt: pd.Timestamp | None = None,
         ) -> PredictionOutcome:
             cache = self._untrainable_until.get(resolved_horizon) or {}
+            checked_at = _to_utc(checked_at)
             if checked_at is not None:
                 cache["data_timestamp"] = checked_at
                 cache.setdefault("checked_at", checked_at)
             cache["not_trainable"] = True
+            last_training_attempt = _to_utc(last_training_attempt)
             if last_training_attempt is not None:
                 cache["last_training_attempt"] = last_training_attempt
             cache.setdefault("sample_counts", sample_counts or {})
@@ -498,6 +508,7 @@ class MultiHorizonModelingEngine:
             )
 
         def _handle_insufficient(exc: InsufficientSamplesError, *, latest_ts: pd.Timestamp | None) -> PredictionOutcome:
+            current_attempt = pd.Timestamp.now(tz="UTC")
             self._untrainable_until[resolved_horizon] = {
                 "data_timestamp": latest_ts,
                 "sample_counts": getattr(exc, "sample_counts", None) or {},
@@ -506,7 +517,7 @@ class MultiHorizonModelingEngine:
                 "checked_at": latest_ts,
                 "warning_emitted": False,
                 "not_trainable": True,
-                "last_training_attempt": pd.Timestamp.utcnow(),
+                "last_training_attempt": current_attempt,
             }
             return _unavailable(
                 "insufficient_samples",
@@ -514,14 +525,14 @@ class MultiHorizonModelingEngine:
                 missing_targets=getattr(exc, "missing_targets", None),
                 checked_at=latest_ts,
                 message=str(exc),
-                last_training_attempt=pd.Timestamp.utcnow(),
+                last_training_attempt=current_attempt,
             )
 
         try:
             price_df = self.fetcher.fetch_price_data()
             latest_timestamp = _latest_timestamp(price_df)
             cache = self._untrainable_until.get(resolved_horizon)
-            cache_ts = cache.get("data_timestamp") if cache else None
+            cache_ts = _to_utc(cache.get("data_timestamp")) if cache else None
             new_data_available = (
                 cache_ts is not None and latest_timestamp is not None and latest_timestamp > cache_ts
             )
@@ -572,7 +583,7 @@ class MultiHorizonModelingEngine:
             except NotFittedError:
                 cached = self._untrainable_until.get(resolved_horizon)
                 if cached and cached.get("not_trainable") and not new_data_available:
-                    cache_ts = cached.get("data_timestamp")
+                    cache_ts = _to_utc(cached.get("data_timestamp"))
                     if cache_ts is not None and (latest_timestamp is None or latest_timestamp <= cache_ts):
                         return _unavailable(
                             cached.get("reason", "insufficient_samples") or "insufficient_samples",
@@ -591,6 +602,7 @@ class MultiHorizonModelingEngine:
                 transformed = artefacts.preprocessor.transform(latest_row)
 
             if not artefacts.models:
+                current_attempt = pd.Timestamp.now(tz="UTC")
                 self._untrainable_until[resolved_horizon] = {
                     "data_timestamp": latest_timestamp,
                     "sample_counts": artefacts.sample_counts,
@@ -599,14 +611,14 @@ class MultiHorizonModelingEngine:
                     "checked_at": latest_timestamp,
                     "warning_emitted": False,
                     "not_trainable": True,
-                    "last_training_attempt": pd.Timestamp.utcnow(),
+                    "last_training_attempt": current_attempt,
                 }
                 return _unavailable(
                     "insufficient_samples",
                     sample_counts=artefacts.sample_counts,
                     missing_targets={},
                     checked_at=latest_timestamp,
-                    last_training_attempt=pd.Timestamp.utcnow(),
+                    last_training_attempt=current_attempt,
                 )
 
             requested_targets = set(targets) if targets else set(artefacts.models.keys())
