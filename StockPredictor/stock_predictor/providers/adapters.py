@@ -763,10 +763,6 @@ class StablePriceStoreProvider(BaseProvider):
         working = frame.copy()
         if "Ticker" in working.columns:
             working = working[working["Ticker"].str.upper() == request.symbol.upper()]
-        start = request.params.get("start")
-        end = request.params.get("end")
-        start_ts = pd.Timestamp(start, tz="UTC") if start else None
-        end_ts = pd.Timestamp(end, tz="UTC") if end else None
         date_column = request.params.get("date_column", "Date")
         if date_column in working.columns:
             parsed_dates = pd.to_datetime(working[date_column], errors="coerce")
@@ -778,6 +774,21 @@ class StablePriceStoreProvider(BaseProvider):
                 parsed_dates = parsed_dates.dt.tz_convert("UTC")
             working[date_column] = parsed_dates
             working = working.dropna(subset=[date_column])
+        start = request.params.get("start")
+        end = request.params.get("end")
+
+        def _to_utc_timestamp(value: Any | None) -> pd.Timestamp | None:
+            if value is None:
+                return None
+            if isinstance(value, pd.Timestamp):
+                return (
+                    value.tz_localize("UTC") if value.tzinfo is None else value.tz_convert("UTC")
+                )
+            return pd.to_datetime(value, utc=True)
+
+        start_ts = _to_utc_timestamp(start)
+        end_ts = _to_utc_timestamp(end)
+        if date_column in working.columns:
             if start_ts is not None:
                 working = working[working[date_column] >= start_ts]
             if end_ts is not None:
