@@ -10,7 +10,7 @@ from typing import Any, Mapping
 import pandas as pd
 from sklearn.pipeline import Pipeline
 
-from .config import PredictorConfig
+from .config import DEFAULT_MIN_SAMPLES_PER_HORIZON, PredictorConfig
 from .features import FeatureAssembler
 from .ml_preprocessing import PreprocessingBuilder, get_feature_names_from_pipeline
 from .sentiment import aggregate_daily_sentiment
@@ -100,7 +100,9 @@ class TrainingDatasetBuilder:
         metadata["target_counts"] = target_counts
 
         insufficient: dict[int, list[str]] = {}
-        threshold = getattr(self.config, "min_samples_per_horizon", 500_000)
+        threshold = getattr(
+            self.config, "min_samples_per_horizon", DEFAULT_MIN_SAMPLES_PER_HORIZON
+        )
         for horizon, horizon_counts in target_counts.items():
             missing = [
                 name for name, count in horizon_counts.items() if count < int(threshold)

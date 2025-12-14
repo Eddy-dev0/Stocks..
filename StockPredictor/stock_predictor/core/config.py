@@ -42,6 +42,7 @@ DEFAULT_BACKTEST_STRATEGY = "rolling"
 DEFAULT_BACKTEST_WINDOW = 252
 DEFAULT_BACKTEST_STEP = 21
 DEFAULT_VOLATILITY_WINDOW = 20
+DEFAULT_MIN_SAMPLES_PER_HORIZON = 100
 DEFAULT_TARGET_GAIN_PCT = 0.03
 DEFAULT_MACRO_MERGE_SYMBOLS: tuple[str, ...] = ("^VIX", "DXY", "^TNX")
 
@@ -63,6 +64,20 @@ HORIZON_UNIT_TO_DAYS: dict[str, int] = {
     "month": 21,
     "months": 21,
 }
+
+
+def _coerce_min_samples_per_horizon(value: Any | None) -> int:
+    """Validate the minimum sample threshold for each horizon."""
+
+    if value is None:
+        return DEFAULT_MIN_SAMPLES_PER_HORIZON
+
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("min_samples_per_horizon must be an integer.") from exc
+
+    return max(1, parsed)
 
 
 @dataclass
@@ -187,7 +202,7 @@ class PredictorConfig:
     price_backfill_page_size: int | None = None
     training_cache_dir: Path | None = None
     use_cached_training_data: bool = True
-    min_samples_per_horizon: int = 500_000
+    min_samples_per_horizon: int = DEFAULT_MIN_SAMPLES_PER_HORIZON
     # Provide a local CSV file path to enable the CSVPriceLoader provider.
     csv_price_loader_path: Path | None = None
     # Provide a local Parquet file path to enable the ParquetPriceLoader provider.
@@ -401,11 +416,9 @@ class PredictorConfig:
                 self.price_backfill_page_size = None
             if self.price_backfill_page_size is not None and self.price_backfill_page_size <= 0:
                 self.price_backfill_page_size = None
-        try:
-            self.min_samples_per_horizon = int(self.min_samples_per_horizon)
-        except (TypeError, ValueError):
-            self.min_samples_per_horizon = 500_000
-        self.min_samples_per_horizon = max(1, self.min_samples_per_horizon)
+        self.min_samples_per_horizon = _coerce_min_samples_per_horizon(
+            self.min_samples_per_horizon
+        )
         self.use_cached_training_data = bool(self.use_cached_training_data)
         if isinstance(self.buy_zone, Mapping):
             self.buy_zone = BuyZoneConfirmationSettings.from_mapping(self.buy_zone)
@@ -648,6 +661,7 @@ def build_config(
     direction_bootstrap_paths: Optional[int] = None,
     direction_bootstrap_workers: Optional[int] = None,
     direction_bootstrap_blend: Optional[float] = None,
+    min_samples_per_horizon: Optional[int] = None,
 ) -> PredictorConfig:
     """Build a :class:`PredictorConfig` instance from string parameters."""
 
@@ -770,6 +784,13 @@ def build_config(
         except (TypeError, ValueError):
             bootstrap_blend_float = None
 
+    min_samples_value = min_samples_per_horizon or os.getenv(
+        "STOCK_PREDICTOR_MIN_SAMPLES_PER_HORIZON"
+    )
+    min_samples_int: int | None = None
+    if min_samples_value is not None:
+        min_samples_int = _coerce_min_samples_per_horizon(min_samples_value)
+
     stop_loss_value = k_stop
     if stop_loss_value is None:
         stop_loss_env = os.getenv("STOCK_PREDICTOR_STOP_LOSS_K")
@@ -885,6 +906,8 @@ def build_config(
         config_kwargs["direction_bootstrap_blend"] = bootstrap_blend_float
     if stop_loss_value is not None:
         config_kwargs["k_stop"] = stop_loss_value
+    if min_samples_int is not None:
+        config_kwargs["min_samples_per_horizon"] = min_samples_int
 
     config = PredictorConfig(**config_kwargs)
     config.ensure_directories()
@@ -1050,6 +1073,10 @@ def load_config_from_mapping(payload: Mapping[str, Any]) -> PredictorConfig:
             data["k_stop"] = float(data["k_stop"])
         except (TypeError, ValueError):
             data.pop("k_stop")
+    if "min_samples_per_horizon" in payload:
+        data["min_samples_per_horizon"] = _coerce_min_samples_per_horizon(
+            payload.get("min_samples_per_horizon")
+        )
     if "monte_carlo_paths" in data:
         try:
             data["monte_carlo_paths"] = int(data["monte_carlo_paths"])

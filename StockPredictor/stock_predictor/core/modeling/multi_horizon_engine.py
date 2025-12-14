@@ -27,7 +27,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
 
-from ..config import PredictorConfig
+from ..config import DEFAULT_MIN_SAMPLES_PER_HORIZON, PredictorConfig
 from ..features import FeatureAssembler
 from ..training_data import TrainingDatasetBuilder
 from ..indicator_bundle import evaluate_signal_confluence
@@ -368,7 +368,11 @@ class MultiHorizonModelingEngine:
                 LOGGER.error(message)
                 raise ValueError(message)
         insufficient = {}
-        threshold = int(getattr(self.config, "min_samples_per_horizon", 500_000))
+        threshold = int(
+            getattr(
+                self.config, "min_samples_per_horizon", DEFAULT_MIN_SAMPLES_PER_HORIZON
+            )
+        )
         for horizon, horizon_counts in counts.items():
             missing = [name for name, count in horizon_counts.items() if count < threshold]
             if missing:
@@ -428,7 +432,11 @@ class MultiHorizonModelingEngine:
             int(h): {t: int(sample_counts.get(int(h), {}).get(t, 0)) for t in sorted(requested_targets)}
             for h in horizons
         }
-        min_samples = int(getattr(self.config, "min_samples_per_horizon", 500_000))
+        min_samples = int(
+            getattr(
+                self.config, "min_samples_per_horizon", DEFAULT_MIN_SAMPLES_PER_HORIZON
+            )
+        )
         missing_targets = {}
         for horizon_value, horizon_counts in requested_counts.items():
             missing = {t: count for t, count in horizon_counts.items() if count < min_samples}
