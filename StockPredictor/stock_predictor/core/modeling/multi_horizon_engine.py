@@ -522,11 +522,13 @@ class MultiHorizonModelingEngine:
                         "test_accuracy": float(accuracy_score(y_test, y_hat_test)),
                     }
                 else:
+                    mse_val = mean_squared_error(y_val, y_hat_val)
+                    mse_test = mean_squared_error(y_test, y_hat_test)
                     metric_value = {
                         "val_mae": float(mean_absolute_error(y_val, y_hat_val)),
-                        "val_rmse": float(mean_squared_error(y_val, y_hat_val, squared=False)),
+                        "val_rmse": float(math.sqrt(mse_val)),
                         "test_mae": float(mean_absolute_error(y_test, y_hat_test)),
-                        "test_rmse": float(mean_squared_error(y_test, y_hat_test, squared=False)),
+                        "test_rmse": float(math.sqrt(mse_test)),
                     }
 
                 target_metrics[target_name] = metric_value
