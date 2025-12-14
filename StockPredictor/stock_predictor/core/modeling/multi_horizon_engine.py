@@ -123,6 +123,46 @@ class MultiHorizonModelingEngine:
         horizons = tuple(horizons) if horizons is not None else tuple(self.config.prediction_horizons)
         ticker_universe = list(tickers) if tickers else [self.config.ticker]
         requested_targets = set(targets) if targets else {"close_h", "direction_h", "return_h"}
+        minimum_viable_rows = max(1, int(getattr(self.config, "minimum_viable_rows", 1)))
+
+        def _frame_stats(frame: pd.DataFrame) -> dict[str, Any]:
+            if frame is None:
+                return {"row_count": 0, "date_min": None, "date_max": None, "columns": []}
+            date_series = pd.Series(dtype="datetime64[ns]")
+            if "Date" in frame.columns:
+                date_series = pd.to_datetime(frame["Date"], errors="coerce")
+            elif isinstance(frame.index, pd.DatetimeIndex):
+                date_series = pd.to_datetime(frame.index, errors="coerce")
+            return {
+                "row_count": int(frame.shape[0]),
+                "date_min": date_series.min(),
+                "date_max": date_series.max(),
+                "columns": sorted(list(frame.columns)),
+            }
+
+        def _log_stage(stage: str, frame: pd.DataFrame, *, ticker: str | None = None, extra: Mapping[str, Any] | None = None) -> None:
+            payload: dict[str, Any] = {"stage": stage, "ticker": ticker}
+            payload.update(_frame_stats(frame))
+            if extra:
+                payload.update(dict(extra))
+            LOGGER.info("dataset_build_stage", extra={"dataset_stage": payload})
+
+        def _raise_stage_error(stage: str, reason: str, *, details: Mapping[str, Any] | None = None) -> None:
+            detail_payload = {"stage": stage, "reason": reason}
+            if details:
+                detail_payload.update(dict(details))
+            message = (
+                f"Dataset build failed after {stage}: {reason}. "
+                f"Details: {json.dumps(detail_payload, default=str)}"
+            )
+            LOGGER.error(message)
+            raise InsufficientSamplesError(
+                message,
+                horizons=horizons,
+                targets=tuple(sorted(requested_targets)),
+                sample_counts={},
+                missing_targets={},
+            )
 
         feature_frames: list[pd.DataFrame] = []
         targets: dict[int, dict[str, list[pd.Series]]] = {h: {"close_h": [], "direction_h": [], "return_h": []} for h in horizons}
@@ -143,6 +183,14 @@ class MultiHorizonModelingEngine:
                 LOGGER.warning("No price data available for %s; skipping", ticker)
                 continue
 
+            _log_stage("price_fetch", price_df, ticker=ticker)
+            if price_df.shape[0] < minimum_viable_rows:
+                _raise_stage_error(
+                    "price_fetch",
+                    "insufficient rows returned from price fetch",
+                    details={"ticker": ticker, "row_count": price_df.shape[0], "minimum_viable_rows": minimum_viable_rows},
+                )
+
             canonical_price_df = price_df.copy()
             if "Date" in canonical_price_df.columns:
                 canonical_price_df = canonical_price_df.sort_values("Date").drop_duplicates("Date", keep="last")
@@ -151,6 +199,26 @@ class MultiHorizonModelingEngine:
                 canonical_price_df = canonical_price_df.sort_index()
                 canonical_index = pd.to_datetime(canonical_price_df.index)
             canonical_price_df.index = canonical_index
+
+            _log_stage(
+                "canonicalized_prices",
+                canonical_price_df,
+                ticker=ticker,
+                extra={
+                    "deduplicated_rows": int(price_df.shape[0] - canonical_price_df.shape[0]),
+                },
+            )
+            if canonical_price_df.shape[0] < minimum_viable_rows:
+                _raise_stage_error(
+                    "canonicalized_prices",
+                    "insufficient rows after sorting/deduplication",
+                    details={
+                        "ticker": ticker,
+                        "row_count": canonical_price_df.shape[0],
+                        "deduplicated": int(price_df.shape[0] - canonical_price_df.shape[0]),
+                        "minimum_viable_rows": minimum_viable_rows,
+                    },
+                )
 
             news_df = self.database.get_news(ticker) if sentiment_enabled else pd.DataFrame()
             macro_df = pd.DataFrame()
@@ -169,11 +237,49 @@ class MultiHorizonModelingEngine:
             features.index = canonical_index
             feature_frames.append(features)
 
+            _log_stage(
+                "feature_merge",
+                features,
+                ticker=ticker,
+                extra={
+                    "dropped_rows": int(canonical_price_df.shape[0] - features.shape[0]),
+                    "source_rows": int(canonical_price_df.shape[0]),
+                },
+            )
+            if features.shape[0] < minimum_viable_rows:
+                _raise_stage_error(
+                    "feature_merge",
+                    "feature assembly produced insufficient rows (likely warmup trimming)",
+                    details={
+                        "ticker": ticker,
+                        "row_count": features.shape[0],
+                        "dropped_rows": int(canonical_price_df.shape[0] - features.shape[0]),
+                        "minimum_viable_rows": minimum_viable_rows,
+                    },
+                )
+
             ticker_targets = self._compute_targets(canonical_price_df, horizons)
             for horizon, label_map in ticker_targets.items():
                 for name, series in label_map.items():
                     aligned = series.reindex(canonical_index)
                     targets[horizon][name].append(aligned)
+
+            target_counts = {
+                int(h): {name: int(series.dropna().shape[0]) for name, series in label_map.items()}
+                for h, label_map in ticker_targets.items()
+            }
+            _log_stage(
+                "target_generation",
+                canonical_price_df,
+                ticker=ticker,
+                extra={"target_counts": target_counts},
+            )
+            if any(count == 0 for horizon_counts in target_counts.values() for count in horizon_counts.values()):
+                _raise_stage_error(
+                    "target_generation",
+                    "target generation produced empty columns",
+                    details={"ticker": ticker, "target_counts": target_counts},
+                )
 
             if news_df is not None and not news_df.empty:
                 metadata.setdefault("sentiment_daily", {})[ticker] = aggregate_daily_sentiment(news_df)
@@ -192,12 +298,60 @@ class MultiHorizonModelingEngine:
             )
 
         features_df = pd.concat(feature_frames, axis=0).sort_index()
+        _log_stage("feature_concat", features_df, extra={"tickers": ticker_universe})
         target_map: dict[int, dict[str, pd.Series]] = {}
         for horizon, label_map in targets.items():
             target_map[horizon] = {
                 name: pd.concat(series_list, axis=0).sort_index() if series_list else pd.Series(dtype=float)
                 for name, series_list in label_map.items()
             }
+
+        # Align all targets to the available feature dates and drop rows where no target exists.
+        alignment_candidates: dict[str, pd.Series] = {}
+        for horizon_value, label_map in target_map.items():
+            for name, series in label_map.items():
+                if name not in requested_targets:
+                    continue
+                alignment_candidates[f"{horizon_value}:{name}"] = series
+
+        if alignment_candidates:
+            concatenated_targets = pd.DataFrame(alignment_candidates).reindex(features_df.index)
+            presence_mask = concatenated_targets.notna().any(axis=1)
+            aligned_features_df = features_df.loc[presence_mask]
+            drop_count = int(features_df.shape[0] - aligned_features_df.shape[0])
+            for horizon_value, label_map in target_map.items():
+                for name, series in label_map.items():
+                    target_map[horizon_value][name] = series.reindex(aligned_features_df.index)
+
+            _log_stage(
+                "final_alignment",
+                aligned_features_df,
+                extra={
+                    "dropped_for_alignment": drop_count,
+                    "initial_rows": int(features_df.shape[0]),
+                    "target_columns": sorted(list(alignment_candidates.keys())),
+                },
+            )
+            if aligned_features_df.shape[0] < minimum_viable_rows:
+                _raise_stage_error(
+                    "final_alignment",
+                    "insufficient rows after aligning targets to features",
+                    details={
+                        "row_count": aligned_features_df.shape[0],
+                        "dropped_for_alignment": drop_count,
+                        "minimum_viable_rows": minimum_viable_rows,
+                    },
+                )
+            features_df = aligned_features_df
+
+        horizon_one_targets = target_map.get(1, {})
+        horizon_one_counts = {name: int(series.dropna().shape[0]) for name, series in horizon_one_targets.items() if name in requested_targets}
+        if any(count == 0 for count in horizon_one_counts.values()) or not horizon_one_counts:
+            _raise_stage_error(
+                "target_alignment",
+                "horizon 1 targets are empty after alignment",
+                details={"horizon_one_counts": horizon_one_counts},
+            )
 
         dataset = MultiHorizonDataset(features=features_df, targets=target_map, metadata=metadata)
         counts = dataset.count_targets()
