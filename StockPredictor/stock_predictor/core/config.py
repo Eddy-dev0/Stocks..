@@ -203,6 +203,7 @@ class PredictorConfig:
     training_cache_dir: Path | None = None
     use_cached_training_data: bool = True
     min_samples_per_horizon: int = DEFAULT_MIN_SAMPLES_PER_HORIZON
+    forecast_tolerance_bands: dict[int, float] = field(default_factory=dict)
     # Provide a local CSV file path to enable the CSVPriceLoader provider.
     csv_price_loader_path: Path | None = None
     # Provide a local Parquet file path to enable the ParquetPriceLoader provider.
@@ -247,6 +248,9 @@ class PredictorConfig:
         )
         self.macro_merge_symbols = _coerce_iterable(
             self.macro_merge_symbols, DEFAULT_MACRO_MERGE_SYMBOLS
+        )
+        self.forecast_tolerance_bands = _coerce_tolerance_bands(
+            self.forecast_tolerance_bands
         )
         if not 0 < self.test_size < 1:
             raise ValueError("test_size must be between 0 and 1.")
@@ -507,6 +511,21 @@ class PredictorConfig:
             )
         return value
 
+    def resolve_tolerance_band(self, horizon: Optional[int]) -> float | None:
+        """Return the configured tolerance band for a given horizon."""
+
+        if horizon is None:
+            return None
+        try:
+            resolved = int(horizon)
+        except (TypeError, ValueError):
+            return None
+
+        band = self.forecast_tolerance_bands.get(resolved)
+        if band is None or not math.isfinite(band) or band <= 0:
+            return None
+        return float(band)
+
     def _coerce_horizon_value(self, horizon: Any) -> int:
         if isinstance(horizon, int):
             return horizon
@@ -662,6 +681,7 @@ def build_config(
     direction_bootstrap_workers: Optional[int] = None,
     direction_bootstrap_blend: Optional[float] = None,
     min_samples_per_horizon: Optional[int] = None,
+    forecast_tolerance_bands: Optional[Mapping[int, Any] | str] = None,
 ) -> PredictorConfig:
     """Build a :class:`PredictorConfig` instance from string parameters."""
 
@@ -791,6 +811,11 @@ def build_config(
     if min_samples_value is not None:
         min_samples_int = _coerce_min_samples_per_horizon(min_samples_value)
 
+    tolerance_value = forecast_tolerance_bands or os.getenv(
+        "STOCK_PREDICTOR_FORECAST_TOLERANCE_BANDS"
+    )
+    tolerance_bands = _coerce_tolerance_bands(tolerance_value)
+
     stop_loss_value = k_stop
     if stop_loss_value is None:
         stop_loss_env = os.getenv("STOCK_PREDICTOR_STOP_LOSS_K")
@@ -908,6 +933,8 @@ def build_config(
         config_kwargs["k_stop"] = stop_loss_value
     if min_samples_int is not None:
         config_kwargs["min_samples_per_horizon"] = min_samples_int
+    if tolerance_bands:
+        config_kwargs["forecast_tolerance_bands"] = tolerance_bands
 
     config = PredictorConfig(**config_kwargs)
     config.ensure_directories()
@@ -988,6 +1015,48 @@ def _coerce_int_iterable(
             continue
         result.append(number)
     return tuple(result) if result else tuple(default)
+
+
+def _coerce_tolerance_bands(
+    value: Optional[Mapping[int | str, Any] | Iterable[Any] | str]
+) -> dict[int, float]:
+    """Parse tolerance bands from mappings, iterable pairs, or a compact string."""
+
+    if value is None:
+        return {}
+
+    if isinstance(value, Mapping):
+        items = value.items()
+    elif isinstance(value, str):
+        tokens = [token.strip() for token in value.split(",") if token.strip()]
+        pairs: list[tuple[str, str]] = []
+        for token in tokens:
+            if ":" not in token:
+                continue
+            key_str, val_str = token.split(":", 1)
+            pairs.append((key_str.strip(), val_str.strip()))
+        items = pairs
+    else:
+        try:
+            items = list(value)
+        except Exception:
+            return {}
+
+    bands: dict[int, float] = {}
+    for key, raw_value in items:
+        try:
+            horizon_key = int(key)
+        except (TypeError, ValueError):
+            continue
+        try:
+            band_value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(band_value) or band_value <= 0:
+            continue
+        bands[horizon_key] = float(band_value)
+
+    return bands
 
 
 def load_config_from_mapping(payload: Mapping[str, Any]) -> PredictorConfig:
