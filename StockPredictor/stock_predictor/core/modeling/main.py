@@ -1183,6 +1183,8 @@ class StockPredictorAI:
                 model_params["interval_alpha"] = ensemble_config.get("interval_alpha", 0.2)
                 model_type = "ensemble"
 
+            template = self.preprocessor_templates.get(resolved_horizon)
+
             factory = ModelFactory(model_type, {**global_params, **model_params})
             tuning_summary = self._tune_model(
                 factory,
@@ -1203,7 +1205,6 @@ class StockPredictorAI:
                     "folds": int(self.config.tuning_folds or self.config.evaluation_folds),
                 }
 
-            template = self.preprocessor_templates.get(resolved_horizon)
             evaluation = self._evaluate_model(
                 factory,
                 aligned_X,
