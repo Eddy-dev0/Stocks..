@@ -16,7 +16,7 @@ class _ConfigStub:
 def test_plausibility_validation_allows_reasonable_move() -> None:
     predictor = StockPredictorAI.__new__(StockPredictorAI)
     predictor.config = _ConfigStub()
-    predictor.metadata = {}
+    predictor.metadata = {"daily_log_return_std": 0.05}
     warnings: list[str] = []
 
     result = predictor._validate_prediction_ranges(  # type: ignore[attr-defined]
@@ -72,6 +72,7 @@ def test_dynamic_band_clamps_stable_ticker() -> None:
     assert result[1] == max_move
     assert result[2] == pytest.approx(103.0)
     assert warnings and "exceeds volatility band" in warnings[0]
+    assert predictor.metadata.get("warnings") == warnings
 
 
 def test_dynamic_band_accepts_volatile_ticker() -> None:
@@ -93,3 +94,27 @@ def test_dynamic_band_accepts_volatile_ticker() -> None:
 
     assert result == pytest.approx((0.15, 0.15, 115.0, 100.0, 98.0))
     assert warnings == []
+
+
+def test_log_return_band_used_when_recent_std_missing() -> None:
+    predictor = StockPredictorAI.__new__(StockPredictorAI)
+    predictor.config = _ConfigStub()
+    predictor.metadata = {"daily_log_return_std": 0.02}
+    warnings: list[str] = []
+
+    result = predictor._validate_prediction_ranges(  # type: ignore[attr-defined]
+        predicted_return=0.2,
+        expected_change_pct=0.25,
+        predicted_close=130.0,
+        expected_low=95.0,
+        stop_loss=90.0,
+        anchor_price=100.0,
+        horizon=1,
+        prediction_warnings=warnings,
+    )
+
+    max_move = pytest.approx(0.06)
+    assert result[0] == max_move
+    assert result[1] == max_move
+    assert result[2] == pytest.approx(106.0)
+    assert warnings and predictor.metadata.get("warnings") == warnings
