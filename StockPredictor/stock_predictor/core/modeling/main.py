@@ -2261,45 +2261,25 @@ class StockPredictorAI:
             targets=list(targets) if targets else None,
             horizon=resolved_horizon,
         )
-        status = modern_predictions.get("status")
-        reason = modern_predictions.get("reason")
-        preds = modern_predictions.get("predictions", {})
-        predicted_close = preds.get("close_h") if preds else None
-        expected_low = None
-        if predicted_close is not None:
-            # Derive a conservative expected low based on predicted return magnitude when available.
-            predicted_return = preds.get("return_h")
-            if predicted_return is not None:
-                expected_low = float(predicted_close * (1 - abs(predicted_return)))
-        stop_loss = expected_low
-        meta = {
-            "horizon": modern_predictions.get("horizon", resolved_horizon),
-            "targets": list(preds.keys()),
-            "sample_counts": modern_predictions.get("sample_counts", {}),
-            "missing_targets": modern_predictions.get("missing_targets", {}),
-            "metrics": modern_predictions.get("metrics", {}),
-            "feature_columns": modern_predictions.get("feature_columns", []),
-            "status": status,
-            "reason": reason,
-            "checked_at": modern_predictions.get("checked_at"),
-            "message": modern_predictions.get("message"),
-        }
-        return PredictionResult(
-            predicted_close=predicted_close,
-            expected_low=expected_low,
-            stop_loss=stop_loss,
-            status=status,
-            reason=reason,
-            message=modern_predictions.get("message"),
-            sample_counts=modern_predictions.get("sample_counts"),
-            missing_targets=modern_predictions.get("missing_targets"),
-            feature_groups_used=[],
-            indicators_used=[],
-            feature_usage_summary=[],
-            meta=meta,
+        modern_payload = (
+            modern_predictions.to_dict()
+            if hasattr(modern_predictions, "to_dict")
+            else dict(modern_predictions or {})
         )
-        resolved_horizon = self._resolve_horizon(horizon)
-        self.horizon = resolved_horizon
+        status = modern_payload.get("status")
+        reason = modern_payload.get("reason")
+        message = modern_payload.get("message")
+        modern_preds = modern_payload.get("predictions") or {}
+        modern_probabilities = modern_payload.get("probabilities") or {}
+        modern_quantiles = modern_payload.get("quantile_forecasts") or {}
+        modern_sample_counts = modern_payload.get("sample_counts") or {}
+        modern_missing_targets = modern_payload.get("missing_targets") or {}
+        modern_metrics = modern_payload.get("metrics") or {}
+        modern_feature_columns = modern_payload.get("feature_columns") or []
+        modern_checked_at = modern_payload.get("checked_at")
+
+        if modern_feature_columns:
+            self.metadata.setdefault("feature_columns", modern_feature_columns)
         if refresh_data:
             LOGGER.info("Refreshing data prior to prediction.")
             self.download_data(force=True)
@@ -2391,6 +2371,16 @@ class StockPredictorAI:
         training_report: dict[str, Any] = {}
         event_probabilities: dict[str, Dict[str, float]] = {}
 
+        def _normalize_target(name: str) -> str:
+            return name[:-2] if name.endswith("_h") else name
+
+        for target_name, value in modern_preds.items():
+            predictions[_normalize_target(str(target_name))] = value
+        for target_name, value in modern_probabilities.items():
+            probabilities[_normalize_target(str(target_name))] = value
+        for target_name, value in modern_quantiles.items():
+            quantile_forecasts[_normalize_target(str(target_name))] = value
+
         filtered_targets: list[str] = []
         for target in requested_targets:
             if target not in SUPPORTED_TARGETS:
@@ -2400,6 +2390,8 @@ class StockPredictorAI:
                 filtered_targets.append(target)
 
         for target in filtered_targets:
+            if target in predictions:
+                continue
             spec = TARGET_SPECS.get(target)
             task = spec.task if spec else ("classification" if target == "direction" else "regression")
             model = self.models.get((target, resolved_horizon))
@@ -3115,6 +3107,13 @@ class StockPredictorAI:
             "predictions": predictions,
             "horizon": resolved_horizon,
             "target_date": _to_iso(target_date) or "",
+            "status": status,
+            "reason": reason,
+            "message": message,
+            "sample_counts": modern_sample_counts,
+            "missing_targets": modern_missing_targets,
+            "metrics": modern_metrics,
+            "checked_at": _to_iso(modern_checked_at) if modern_checked_at else None,
         }
         if latest_features_snapshot:
             result["latest_features_snapshot"] = latest_features_snapshot
@@ -3205,6 +3204,11 @@ class StockPredictorAI:
             predicted_close=close_prediction,
             expected_low=expected_low,
             stop_loss=stop_loss,
+            status=status,
+            reason=reason,
+            message=message,
+            sample_counts=modern_sample_counts,
+            missing_targets=modern_missing_targets,
             feature_groups_used=list(executed_feature_groups or []),
             indicators_used=indicator_columns,
             feature_usage_summary=feature_usage_summary,
