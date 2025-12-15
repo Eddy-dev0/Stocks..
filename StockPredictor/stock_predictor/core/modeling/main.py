@@ -89,6 +89,8 @@ DEFAULT_STOP_LOSS_MULTIPLIER = 1.0
 DEFAULT_EXPECTED_LOW_MAX_VOLATILITY = 1.0
 DEFAULT_EXPECTED_LOW_FLOOR_WINDOW = 20
 DEFAULT_PLAUSIBILITY_SIGMA_MULTIPLIER = 3.0
+DEFAULT_LOG_RETURN_WINDOW = 252
+DEFAULT_VOLATILITY_FLOOR = 0.02
 
 
 LabelFunction = Callable[[pd.DataFrame, int, Any], pd.Series]
@@ -530,6 +532,18 @@ class StockPredictorAI:
                     return_std = float(recent_window.std())
                     metadata["recent_return_std"] = return_std
                     metadata["recent_return_mean"] = float(recent_window.mean())
+
+                log_return_window = getattr(
+                    self.config, "log_return_window", DEFAULT_LOG_RETURN_WINDOW
+                )
+                log_returns = np.log(pd.to_numeric(price_history[close_column], errors="coerce"))
+                log_returns = log_returns.diff().dropna()
+                if not log_returns.empty:
+                    trailing_log_returns = log_returns.tail(int(log_return_window))
+                    log_return_std = float(trailing_log_returns.std())
+                    if np.isfinite(log_return_std):
+                        metadata["daily_log_return_std"] = log_return_std
+                        metadata["daily_log_return_window"] = int(log_return_window)
 
             for horizon_value in horizons:
                 try:
@@ -3614,6 +3628,9 @@ class StockPredictorAI:
 
         sigma_candidates: list[float] = []
         if isinstance(getattr(self, "metadata", None), Mapping):
+            sigma_candidates.append(
+                self._safe_float(self.metadata.get("daily_log_return_std")) or 0.0
+            )
             sigma_candidates.append(self._safe_float(self.metadata.get("recent_return_std")) or 0.0)
 
         residual_pct = None
@@ -3629,19 +3646,26 @@ class StockPredictorAI:
         if sigma_multiplier_value <= 0:
             sigma_multiplier_value = DEFAULT_PLAUSIBILITY_SIGMA_MULTIPLIER
 
-        dynamic_band = None
-        if sigma_values:
-            dynamic_band = max(sigma_values) * sigma_multiplier_value * math.sqrt(horizon_days)
+        fallback_sigma = getattr(self.config, "volatility_floor", DEFAULT_VOLATILITY_FLOOR)
+        fallback_sigma_value = self._safe_float(fallback_sigma) or DEFAULT_VOLATILITY_FLOOR
+        if fallback_sigma_value <= 0:
+            fallback_sigma_value = DEFAULT_VOLATILITY_FLOOR
 
-        max_move = dynamic_band if dynamic_band is not None else 0.5 * math.sqrt(horizon_days)
+        resolved_sigma = max(sigma_values) if sigma_values else fallback_sigma_value
+        max_move = resolved_sigma * sigma_multiplier_value * math.sqrt(horizon_days)
 
         warning_sink = prediction_warnings if isinstance(prediction_warnings, list) else None
+        metadata_warnings = None
+        if isinstance(getattr(self, "metadata", None), Mapping):
+            metadata_warnings = self.metadata.setdefault("warnings", [])
 
         def _add_warning(message: str) -> None:
             if warning_sink is None:
                 return
             if message not in warning_sink:
                 warning_sink.append(message)
+            if isinstance(metadata_warnings, list) and message not in metadata_warnings:
+                metadata_warnings.append(message)
 
         validated_return = predicted_return
         validated_change_pct = expected_change_pct
