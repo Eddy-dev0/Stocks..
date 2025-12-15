@@ -24,6 +24,9 @@ class PredictionResult(Mapping[str, Any]):
     predicted_close: float | None
     expected_low: float | None
     stop_loss: float | None
+    probability_within_tolerance: float | None = None
+    tolerance_band: float | None = None
+    training_accuracy: Mapping[str, Any] | None = None
     status: str | None = None
     reason: str | None = None
     message: str | None = None
@@ -42,6 +45,11 @@ class PredictionResult(Mapping[str, Any]):
             "predicted_close": self.predicted_close,
             "expected_low": self.expected_low,
             "stop_loss": self.stop_loss,
+            "probability_within_tolerance": self.probability_within_tolerance,
+            "tolerance_band": self.tolerance_band,
+            "training_accuracy": (
+                dict(self.training_accuracy) if self.training_accuracy is not None else None
+            ),
             "status": self.status,
             "reason": self.reason,
             "message": self.message,

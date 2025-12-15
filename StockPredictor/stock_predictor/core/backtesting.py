@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -49,6 +49,7 @@ class Backtester:
         neutral_threshold: float = 0.001,
         trading_days: int = 252,
         risk_free_rate: float = 0.0,
+        tolerance_bands: Mapping[int, float] | None = None,
     ) -> None:
         self.model_factory = model_factory
         self.strategy = strategy
@@ -60,6 +61,14 @@ class Backtester:
         self.trading_days = max(1, int(trading_days))
         self.risk_free_rate = float(risk_free_rate)
         self.cost_per_turn = (self.slippage_bps + self.fee_bps) / 10000.0
+        self.tolerance_bands = {
+            int(key): float(value)
+            for key, value in (tolerance_bands or {}).items()
+            if isinstance(key, (int, float))
+            and isinstance(value, (int, float))
+            and np.isfinite(value)
+            and float(value) > 0
+        }
 
     def run(
         self,
@@ -78,6 +87,13 @@ class Backtester:
         feature_totals: Dict[str, float] = {}
         feature_counts: Dict[str, int] = {}
         directional_totals = DirectionalStats()
+
+        tolerance_band = None
+        if horizon is not None:
+            try:
+                tolerance_band = self.tolerance_bands.get(int(horizon))
+            except (TypeError, ValueError):
+                tolerance_band = None
 
         for index, (train_slice, test_slice) in enumerate(splits, start=1):
             X_train, y_train = X.iloc[train_slice], y.iloc[train_slice]
@@ -115,6 +131,7 @@ class Backtester:
                 X_test,
                 y_proba=y_proba,
                 classes=classes,
+                tolerance_band=tolerance_band,
             )
             directional_stats = evaluate_directional_predictions(
                 task, target, y_test, y_pred, raw_features=X_test
@@ -179,6 +196,7 @@ class Backtester:
         *,
         y_proba: np.ndarray | None = None,
         classes: np.ndarray | None = None,
+        tolerance_band: float | None = None,
     ) -> Dict[str, float]:
         if task == "classification":
             metrics = classification_metrics(
@@ -202,6 +220,17 @@ class Backtester:
             np.mean((predicted_direction >= 0) == (actual_direction >= 0))
         )
         metrics["signed_error"] = float(np.mean(y_pred - y_true.to_numpy()))
+
+        if target == "close" and tolerance_band is not None and tolerance_band > 0:
+            tolerance_width = np.abs(y_pred) * float(tolerance_band)
+            absolute_error = np.abs(y_true.to_numpy() - y_pred)
+            mask = np.isfinite(absolute_error) & np.isfinite(tolerance_width)
+            hits = int(np.sum(absolute_error[mask] <= tolerance_width[mask]))
+            total = int(np.sum(mask))
+            metrics["tolerance_hits"] = hits
+            metrics["tolerance_total"] = total
+            metrics["tolerance_hit_rate"] = float(hits / total) if total else 0.0
+            metrics["tolerance_band"] = float(tolerance_band)
         return metrics
 
     def _calibration_by_bin(
@@ -535,6 +564,7 @@ class Backtester:
             for key in entry.keys()
             if key not in {"split", "train_size", "test_size"}
         }
+        sum_keys = {"tolerance_hits", "tolerance_total"}
         for key in keys:
             values = [
                 entry[key]
@@ -543,7 +573,10 @@ class Backtester:
                 and np.isfinite(entry.get(key))
             ]
             if values:
-                aggregate[key] = float(np.mean(values))
+                if key in sum_keys:
+                    aggregate[key] = float(np.sum(values))
+                else:
+                    aggregate[key] = float(np.mean(values))
         aggregate["test_rows"] = int(sum(entry.get("test_size", 0) for entry in split_metrics))
         aggregate["splits"] = int(len(split_metrics))
         return aggregate

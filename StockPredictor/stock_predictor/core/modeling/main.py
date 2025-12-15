@@ -2712,6 +2712,8 @@ class StockPredictorAI:
             anchor_price=anchor_price,
         )
 
+        tolerance_band_value = self.config.resolve_tolerance_band(resolved_horizon)
+        tolerance_probability = None
         monte_carlo_target_probability = None
         monte_carlo_iterations = None
         target_price_value = self.metadata.get("target_price")
@@ -2755,6 +2757,13 @@ class StockPredictorAI:
 
                 cumulative_paths = 0
                 cumulative_hits = 0.0
+                cumulative_tolerance_hits: float | None = (
+                    0.0
+                    if tolerance_band_value is not None
+                    and tolerance_band_value > 0
+                    and close_prediction is not None
+                    else None
+                )
                 standard_error = None
                 expected_close_value = self._safe_float(close_prediction)
 
@@ -2799,6 +2808,7 @@ class StockPredictorAI:
                         probability,
                         used_paths,
                         iteration_standard_error,
+                        tolerance_probability_iteration,
                     ) = run_monte_carlo_adaptive(
                         current_price=float(latest_close),
                         target_price=float(target_price_value),
@@ -2808,10 +2818,21 @@ class StockPredictorAI:
                         initial_paths=initial_paths,
                         max_paths=remaining_budget,
                         precision_target=float(precision_value),
+                        tolerance_center=float(close_prediction)
+                        if close_prediction is not None
+                        else None,
+                        tolerance_fraction=float(tolerance_band_value)
+                        if tolerance_band_value is not None
+                        else None,
                     )
 
                     cumulative_hits += probability * used_paths
                     cumulative_paths += used_paths
+                    if (
+                        cumulative_tolerance_hits is not None
+                        and tolerance_probability_iteration is not None
+                    ):
+                        cumulative_tolerance_hits += tolerance_probability_iteration * used_paths
                     if cumulative_paths <= 0:
                         break
 
@@ -2867,6 +2888,10 @@ class StockPredictorAI:
 
                 used_paths = cumulative_paths
                 expected_low = expected_low_value
+                if cumulative_tolerance_hits is not None and cumulative_paths > 0:
+                    tolerance_probability = float(
+                        cumulative_tolerance_hits / float(cumulative_paths)
+                    )
 
                 event_probabilities["monte_carlo_target_hit"] = {
                     "probability": monte_carlo_target_probability,
@@ -2889,6 +2914,13 @@ class StockPredictorAI:
                 event_probabilities["monte_carlo_target_hit"][
                     "stabilized_probability"
                 ] = monte_carlo_target_probability
+                if tolerance_probability is not None:
+                    event_probabilities["monte_carlo_within_tolerance"] = {
+                        "probability": tolerance_probability,
+                        "paths": used_paths,
+                        "tolerance_band": float(tolerance_band_value),
+                        "method": "geometric_brownian_motion",
+                    }
 
         stop_loss = self._compute_stop_loss(
             close_prediction,
@@ -3096,6 +3128,12 @@ class StockPredictorAI:
             getattr(self, "metadata", {}).get("data_sources")
         )
 
+        training_accuracy: dict[str, Any] | None = None
+        try:
+            training_accuracy = self.accuracy_summary(horizon=resolved_horizon)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            LOGGER.debug("Failed to compute accuracy summary: %s", exc)
+
         result = {
             "ticker": self.config.ticker,
             "as_of": _to_iso(market_data_as_of) or "",
@@ -3110,12 +3148,15 @@ class StockPredictorAI:
             "predicted_volatility": predicted_volatility,
             "expected_low": expected_low,
             "stop_loss": stop_loss,
+            "probability_within_tolerance": tolerance_probability,
+            "tolerance_band": tolerance_band_value,
             "direction_probability_up": direction_probability_up,
             "direction_probability_down": direction_probability_down,
             "target_hit_probability": target_hit_probability,
             "monte_carlo_target_hit_probability": monte_carlo_target_probability,
             "monte_carlo_stabilized_probability": monte_carlo_target_probability,
             "monte_carlo_iterations": monte_carlo_iterations,
+            "training_accuracy": training_accuracy,
             "target_price": self.metadata.get("target_price"),
             "feature_toggles": dict(getattr(self.config, "feature_toggles", {})),
             "predictions": predictions,
@@ -5352,6 +5393,7 @@ class StockPredictorAI:
                 fee_bps=self.config.backtest_fee_bps,
                 neutral_threshold=self.config.backtest_neutral_threshold,
                 risk_free_rate=self.config.risk_free_rate,
+                tolerance_bands=self.config.forecast_tolerance_bands,
             )
             template = self.preprocessor_templates.get(resolved_horizon)
             result = backtester.run(
@@ -5396,13 +5438,15 @@ class StockPredictorAI:
     # Evaluation summaries
     # ------------------------------------------------------------------
     def accuracy_summary(self, *, horizon: Optional[int] = None) -> Dict[str, Any]:
-        """Aggregate directional accuracy across stored backtest runs."""
+        """Aggregate directional accuracy and tolerance hit rates across backtests."""
 
         resolved_horizon = self._resolve_horizon(horizon)
         runs = self.tracker.load_runs(run_type="backtest")
 
         total_predictions = 0
         correct_predictions = 0.0
+        tolerance_predictions = 0
+        tolerance_hits = 0.0
         runs_considered = 0
 
         for run in runs:
@@ -5417,24 +5461,43 @@ class StockPredictorAI:
                     continue
 
             splits = [entry for entry in context.get("splits", []) if isinstance(entry, Mapping)]
-            split_total, split_correct = self._summarise_splits(splits)
+            split_total, split_correct, split_tolerance_total, split_tolerance_hits = (
+                self._summarise_splits(splits)
+            )
 
             metrics = run.get("metrics") or {}
             if split_total == 0:
-                aggregate_total, aggregate_correct = self._summarise_aggregate(metrics)
+                (
+                    aggregate_total,
+                    aggregate_correct,
+                    aggregate_tolerance_total,
+                    aggregate_tolerance_hits,
+                ) = self._summarise_aggregate(metrics)
                 split_total = aggregate_total
                 split_correct = aggregate_correct
+                split_tolerance_total = aggregate_tolerance_total
+                split_tolerance_hits = aggregate_tolerance_hits
 
             if split_total > 0:
                 total_predictions += split_total
                 correct_predictions += split_correct
                 runs_considered += 1
+            if split_tolerance_total > 0:
+                tolerance_predictions += split_tolerance_total
+                tolerance_hits += split_tolerance_hits
 
         correct_count = int(round(correct_predictions))
         correct_count = min(correct_count, total_predictions)
         incorrect_count = max(total_predictions - correct_count, 0)
         correct_pct = (correct_predictions / total_predictions) if total_predictions else 0.0
         incorrect_pct = (incorrect_count / total_predictions) if total_predictions else 0.0
+
+        tolerance_hit_count = int(round(tolerance_hits))
+        tolerance_hit_count = min(tolerance_hit_count, tolerance_predictions)
+        tolerance_miss_count = max(tolerance_predictions - tolerance_hit_count, 0)
+        tolerance_hit_rate = (
+            (tolerance_hits / tolerance_predictions) if tolerance_predictions else 0.0
+        )
 
         return {
             "horizon": resolved_horizon,
@@ -5444,6 +5507,11 @@ class StockPredictorAI:
             "incorrect": incorrect_count,
             "correct_pct": correct_pct,
             "incorrect_pct": incorrect_pct,
+            "tolerance_band": self.config.resolve_tolerance_band(resolved_horizon),
+            "tolerance_total": tolerance_predictions,
+            "tolerance_hits": tolerance_hit_count,
+            "tolerance_misses": tolerance_miss_count,
+            "tolerance_hit_rate": tolerance_hit_rate,
         }
 
     @staticmethod
@@ -5454,9 +5522,13 @@ class StockPredictorAI:
                 return float(value)
         return None
 
-    def _summarise_splits(self, splits: Iterable[Mapping[str, Any]]) -> tuple[int, float]:
+    def _summarise_splits(
+        self, splits: Iterable[Mapping[str, Any]]
+    ) -> tuple[int, float, int, float]:
         total = 0
         correct = 0.0
+        tolerance_total = 0
+        tolerance_hits = 0.0
         for split in splits:
             test_size = split.get("test_size")
             accuracy = self._coerce_accuracy(split)
@@ -5466,18 +5538,36 @@ class StockPredictorAI:
                 continue
             total += int(test_size)
             correct += float(accuracy) * int(test_size)
-        return total, correct
+            tolerance_count = split.get("tolerance_total")
+            tolerance_hit_count = split.get("tolerance_hits")
+            if isinstance(tolerance_count, (int, float)) and isinstance(
+                tolerance_hit_count, (int, float)
+            ):
+                if math.isfinite(tolerance_count) and math.isfinite(tolerance_hit_count):
+                    tolerance_total += int(tolerance_count)
+                    tolerance_hits += float(tolerance_hit_count)
+        return total, correct, tolerance_total, tolerance_hits
 
-    def _summarise_aggregate(self, metrics: Mapping[str, Any]) -> tuple[int, float]:
+    def _summarise_aggregate(
+        self, metrics: Mapping[str, Any]
+    ) -> tuple[int, float, int, float]:
         total = 0
         correct = 0.0
+        tolerance_total = 0
+        tolerance_hits = 0.0
         if not isinstance(metrics, Mapping):
-            return total, correct
+            return total, correct, tolerance_total, tolerance_hits
 
         test_rows = metrics.get("test_rows")
         accuracy = self._coerce_accuracy(metrics)
         if isinstance(test_rows, (int, float)) and accuracy is not None and math.isfinite(test_rows):
             total = int(test_rows)
             correct = float(accuracy) * total
-        return total, correct
+        tol_total_value = metrics.get("tolerance_total")
+        tol_hit_value = metrics.get("tolerance_hits")
+        if isinstance(tol_total_value, (int, float)) and math.isfinite(tol_total_value):
+            tolerance_total = int(tol_total_value)
+        if isinstance(tol_hit_value, (int, float)) and math.isfinite(tol_hit_value):
+            tolerance_hits = float(tol_hit_value)
+        return total, correct, tolerance_total, tolerance_hits
 

@@ -14,12 +14,18 @@ def _simulate_gbm_hits(
     horizon: int,
     paths: int,
     rng: np.random.Generator,
-) -> int:
-    """Return number of simulated paths that reach ``target_price``.
+    tolerance_center: float | None = None,
+    tolerance_fraction: float | None = None,
+) -> tuple[int, int | None]:
+    """Return hit counts for target price and optional tolerance band.
 
     The helper performs a vectorised geometric Brownian motion rollout and counts
     how many trajectories touch or exceed the target. Returning hits instead of a
     probability enables incremental aggregation for adaptive Monte Carlo runs.
+
+    When ``tolerance_center`` and ``tolerance_fraction`` are provided, the
+    function also counts how many terminal prices end within the symmetric band
+    defined around ``tolerance_center``.
     """
 
     current = float(current_price)
@@ -45,7 +51,16 @@ def _simulate_gbm_hits(
     ], axis=1)
 
     hits = (prices_with_start >= target).any(axis=1)
-    return int(np.count_nonzero(hits))
+
+    tolerance_hits: int | None = None
+    if tolerance_center is not None and tolerance_fraction is not None and tolerance_fraction > 0:
+        band = abs(float(tolerance_center)) * float(tolerance_fraction)
+        lower = float(tolerance_center) - band
+        upper = float(tolerance_center) + band
+        terminal = prices_with_start[:, -1]
+        tolerance_hits = int(np.count_nonzero((terminal >= lower) & (terminal <= upper)))
+
+    return int(np.count_nonzero(hits)), tolerance_hits
 
 
 def run_monte_carlo(
@@ -81,7 +96,7 @@ def run_monte_carlo(
     steps = int(horizon)
     rng = np.random.default_rng(random_state)
 
-    hits = _simulate_gbm_hits(
+    hits, _ = _simulate_gbm_hits(
         current_price=current,
         target_price=target,
         drift=mu,
@@ -104,12 +119,16 @@ def run_monte_carlo_adaptive(
     max_paths: int = 2_000_000,
     precision_target: float = 0.001,
     random_state: int | None = None,
-) -> tuple[float, int, float]:
+    tolerance_center: float | None = None,
+    tolerance_fraction: float | None = None,
+) -> tuple[float, int, float, float | None]:
     """Run Monte Carlo batches until the standard error drops below the target.
 
     The function aggregates hit counts incrementally to avoid exhausting memory
     while still converging toward a more precise probability estimate. A maximum
-    path budget guards against unbounded computation.
+    path budget guards against unbounded computation. When tolerance parameters
+    are provided, the final element of the return tuple reports the probability
+    of landing within the specified band at the terminal step.
     """
 
     if horizon <= 0:
@@ -134,12 +153,15 @@ def run_monte_carlo_adaptive(
 
     total_paths = 0
     total_hits = 0
+    total_tolerance_hits: int | None = 0 if (
+        tolerance_center is not None and tolerance_fraction is not None and tolerance_fraction > 0
+    ) else None
     batch_size = int(initial_paths)
 
     while total_paths < max_paths:
         remaining_budget = max_paths - total_paths
         current_batch = min(batch_size, remaining_budget)
-        hits = _simulate_gbm_hits(
+        hits, tolerance_hits = _simulate_gbm_hits(
             current_price=current,
             target_price=target,
             drift=mu,
@@ -147,18 +169,32 @@ def run_monte_carlo_adaptive(
             horizon=steps,
             paths=current_batch,
             rng=rng,
+            tolerance_center=tolerance_center,
+            tolerance_fraction=tolerance_fraction,
         )
         total_hits += hits
         total_paths += current_batch
+        if total_tolerance_hits is not None and tolerance_hits is not None:
+            total_tolerance_hits += tolerance_hits
 
         probability = float(total_hits) / float(total_paths)
         standard_error = float(np.sqrt(probability * (1 - probability) / total_paths))
 
         if standard_error <= precision_target:
-            return probability, total_paths, standard_error
+            tolerance_probability = (
+                float(total_tolerance_hits) / float(total_paths)
+                if total_tolerance_hits is not None
+                else None
+            )
+            return probability, total_paths, standard_error, tolerance_probability
 
         batch_size *= 2
 
     probability = float(total_hits) / float(total_paths)
     standard_error = float(np.sqrt(probability * (1 - probability) / total_paths))
-    return probability, total_paths, standard_error
+    tolerance_probability = (
+        float(total_tolerance_hits) / float(total_paths)
+        if total_tolerance_hits is not None
+        else None
+    )
+    return probability, total_paths, standard_error, tolerance_probability

@@ -65,6 +65,9 @@ async def get_prediction(
     predicted_close = payload.get("predicted_close")
     expected_low = payload.get("expected_low")
     stop_loss = payload.get("stop_loss") or expected_low
+    probability_within_tolerance = payload.get("probability_within_tolerance")
+    tolerance_band = payload.get("tolerance_band")
+    training_accuracy = payload.get("training_accuracy")
 
     change_abs = None
     change_pct = None
@@ -88,6 +91,9 @@ async def get_prediction(
         "stop_loss": stop_loss,
         "direction": direction,
         "accuracy": accuracy_summary,
+        "probability_within_tolerance": probability_within_tolerance,
+        "tolerance_band": tolerance_band,
+        "training_accuracy": training_accuracy,
         "raw": payload,
     }
 
