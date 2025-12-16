@@ -66,6 +66,8 @@ class BacktestResult:
     reliability: dict[str, float]
     interval_coverage: dict[str, float]
     confidence_intervals: dict[str, tuple[float, float]]
+    summary: dict[str, Any]
+    warnings: list[str] = field(default_factory=list)
     outputs: dict[str, str] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
@@ -81,6 +83,8 @@ class BacktestResult:
                 name: {"low": low, "high": high}
                 for name, (low, high) in self.confidence_intervals.items()
             },
+            "summary": self.summary,
+            "warnings": self.warnings,
             "outputs": self.outputs,
         }
         return payload
@@ -195,6 +199,25 @@ class Backtester:
         interval_coverage = self._compute_interval_coverage(regression_pool)
         confidence_intervals = self._metric_confidence_intervals(splits, seed=cfg.random_seed)
 
+        summary = {
+            "classification": {
+                "accuracy": aggregate.get("accuracy"),
+                "precision": aggregate.get("precision"),
+                "recall": aggregate.get("recall"),
+                "f1": aggregate.get("f1"),
+                "expected_calibration_error": reliability.get("expected_calibration_error"),
+                "max_calibration_error": reliability.get("max_calibration_error"),
+            },
+            "regression": {
+                "mae": aggregate.get("mae"),
+                "rmse": aggregate.get("rmse"),
+                "mape": aggregate.get("mape"),
+                "residual_std": interval_coverage.get("residual_std", aggregate.get("residual_std")),
+                "interval_coverage": interval_coverage.get("interval_coverage"),
+            },
+        }
+        warnings = self._build_warnings(splits, reliability, interval_coverage)
+
         return BacktestResult(
             config=cfg,
             splits=splits,
@@ -203,6 +226,8 @@ class Backtester:
             reliability=reliability,
             interval_coverage=interval_coverage,
             confidence_intervals=confidence_intervals,
+            summary=summary,
+            warnings=warnings,
         )
 
     def _evaluate_target(
@@ -512,12 +537,13 @@ class Backtester:
 
     def _persist_outputs(self, result: BacktestResult, cfg: BacktestConfig) -> None:
         output_dir = cfg.output_dir or (self.config.data_dir / "reports" / "backtests")
-        output_dir.mkdir(parents=True, exist_ok=True)
+        versioned_dir = output_dir / cfg.schema_version.replace("/", "_")
+        versioned_dir.mkdir(parents=True, exist_ok=True)
 
         splits_frame = pd.DataFrame(result.splits)
-        json_path = output_dir / "backtest.json"
-        parquet_path = output_dir / "backtest.parquet"
-        csv_path = output_dir / "backtest.csv"
+        json_path = versioned_dir / "backtest.json"
+        parquet_path = versioned_dir / "backtest.parquet"
+        csv_path = versioned_dir / "backtest.csv"
 
         with json_path.open("w", encoding="utf-8") as handle:
             json.dump(result.as_dict(), handle, indent=2, default=str)
@@ -536,5 +562,31 @@ class Backtester:
             }
         )
 
+    def _build_warnings(
+        self,
+        splits: Sequence[Mapping[str, Any]],
+        reliability: Mapping[str, Any],
+        interval_coverage: Mapping[str, Any],
+    ) -> list[str]:
+        warnings: list[str] = []
+        total_predictions = sum(int(entry.get("test_size", 0) or 0) for entry in splits)
+        if total_predictions < 50:
+            warnings.append(
+                "Backtest covers fewer than 50 out-of-sample predictions; interpret metrics cautiously."
+            )
 
-__all__ = ["Backtester", "BacktestConfig", "BacktestResult"]
+        ece = reliability.get("expected_calibration_error")
+        if isinstance(ece, (int, float)) and ece > 0.1:
+            warnings.append(
+                "Calibration drift detected (ECE > 0.10). Consider refreshing models or adjusting thresholds."
+            )
+
+        coverage = interval_coverage.get("interval_coverage")
+        if isinstance(coverage, (int, float)) and coverage < 0.6:
+            warnings.append(
+                "Prediction intervals cover fewer than 60% of observations; distribution shift may be present."
+            )
+        return warnings
+
+
+__all__ = ["Backtester", "BacktestConfig", "BacktestResult", "SCHEMA_VERSION"]

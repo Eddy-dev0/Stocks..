@@ -22,7 +22,7 @@ from stock_predictor.core import (
 from stock_predictor.data.indicator_store import IndicatorDataStore
 from stock_predictor.features.engineer import IndicatorFeatureEngineer
 from stock_predictor.models.trainer import HorizonModelTrainer
-from stock_predictor.evaluation.backtester import Backtester
+from stock_predictor.evaluation.backtester import Backtester, BacktestConfig, SCHEMA_VERSION
 from stock_predictor.dashboard_app import run_streamlit_app
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -125,11 +125,55 @@ class StockPredictorApplication:
         self.pipeline = self.model_trainer.pipeline
         LOGGER.info("Switched application context to ticker %s", new_ticker)
 
-    def backtest(self, *, targets: Iterable[str] | None = None) -> dict[str, Any]:
+    def backtest(
+        self,
+        *,
+        targets: Iterable[str] | None = None,
+        backtest_config: BacktestConfig | None = None,
+    ) -> dict[str, Any]:
         """Run historical simulations to evaluate the active models."""
 
         LOGGER.info("Running backtest for ticker %s", self.config.ticker)
-        result = self.evaluator.run(targets=targets)
+        result = self.evaluator.run(targets=targets, backtest_config=backtest_config)
+        return result.as_dict()
+
+    def reliability_backtest(
+        self,
+        *,
+        targets: Iterable[str] | None = None,
+        horizon: int | None = None,
+        n_runs: int | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        step_size: int | None = None,
+    ) -> dict[str, Any]:
+        """Run an extended reliability-oriented backtest with persisted artefacts."""
+
+        output_dir = self.config.data_dir / "cache" / "backtests" / self.config.ticker
+        cfg = BacktestConfig(
+            n_runs=n_runs or getattr(self.config, "backtest_runs", 1),
+            start_date=start_date or self.config.start_date,
+            end_date=end_date or self.config.end_date,
+            horizon=horizon,
+            targets=tuple(targets) if targets is not None else None,
+            toggles=self.config.feature_toggles,
+            training_window=getattr(self.config, "backtest_window", 252),
+            step_size=step_size or getattr(self.config, "backtest_step", 21),
+            embargo=getattr(self.config, "backtest_embargo", 1),
+            random_seed=getattr(self.config, "random_seed", None),
+            caching=True,
+            cache_trained_windows=True,
+            output_dir=output_dir,
+            schema_version=SCHEMA_VERSION,
+        )
+        LOGGER.info(
+            "Running reliability backtest for %s (runs=%s, window=%s, step=%s)",
+            self.config.ticker,
+            cfg.n_runs,
+            cfg.training_window,
+            cfg.step_size,
+        )
+        result = self.evaluator.run(targets=targets, backtest_config=cfg)
         return result.as_dict()
 
     def accuracy(self, *, horizon: int | None = None) -> dict[str, Any]:

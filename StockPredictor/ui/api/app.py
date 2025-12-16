@@ -87,6 +87,44 @@ class BacktestRequest(BaseModel):
     )
 
 
+class ReliabilityBacktestRequest(BaseModel):
+    """Payload used to trigger reliability-focused backtests for a ticker."""
+
+    targets: list[str] | None = Field(
+        default=None,
+        description="Optional list of targets to include in the backtest.",
+    )
+    feature_toggles: dict[str, bool] | None = Field(
+        default=None,
+        description=(
+            "Optional map of feature-group toggles keyed by registry name. "
+            "Supported keys: elliott, macro, sentiment, technical, volume_liquidity."
+        ),
+        example={"technical": True, "macro": False},
+    )
+    n_runs: int | None = Field(
+        default=None,
+        ge=1,
+        description="Number of resampled backtest runs to execute per target.",
+    )
+    start_date: str | None = Field(
+        default=None, description="Optional ISO date that bounds the backtest window."
+    )
+    end_date: str | None = Field(
+        default=None, description="Optional ISO end date that bounds the backtest window."
+    )
+    horizon: int | None = Field(
+        default=None,
+        ge=1,
+        description="Forecast horizon to evaluate. Uses default configuration when omitted.",
+    )
+    step_size: int | None = Field(
+        default=None,
+        ge=1,
+        description="Step size for rolling window evaluation between folds.",
+    )
+
+
 class TrainRequest(BaseModel):
     """Payload used to retrain models for a ticker."""
 
@@ -379,6 +417,26 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
             },
         )
         return {"status": "ok", "backtest": result}
+
+    @app.post("/reliability-backtests/{ticker}", dependencies=[Depends(require_api_key)])
+    async def reliability_backtest(
+        ticker: str, request: ReliabilityBacktestRequest
+    ) -> Dict[str, Any]:
+        result = await _call_with_error_handling(
+            ui_adapter.run_reliability_backtest,
+            ticker,
+            targets=request.targets,
+            overrides={
+                "feature_toggles": request.feature_toggles,
+                "price_feature_toggles": request.feature_toggles,
+            },
+            n_runs=request.n_runs,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            horizon=request.horizon,
+            step_size=request.step_size,
+        )
+        return {"status": "ok", "reliability_backtest": result}
 
     @app.post("/train/{ticker}", dependencies=[Depends(require_api_key)])
     async def retrain(ticker: str, request: TrainRequest) -> Dict[str, Any]:
