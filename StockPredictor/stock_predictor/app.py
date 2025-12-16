@@ -129,7 +129,8 @@ class StockPredictorApplication:
         """Run historical simulations to evaluate the active models."""
 
         LOGGER.info("Running backtest for ticker %s", self.config.ticker)
-        return self.evaluator.run(targets=targets)
+        result = self.evaluator.run(targets=targets)
+        return result.as_dict()
 
     def accuracy(self, *, horizon: int | None = None) -> dict[str, Any]:
         """Summarise stored prediction accuracy for the configured ticker."""
