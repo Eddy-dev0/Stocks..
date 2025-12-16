@@ -19,6 +19,7 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 import pandas as pd
 from sklearn.calibration import calibration_curve
+from sklearn.metrics import mean_pinball_loss
 
 from stock_predictor.core import PredictorConfig
 from stock_predictor.core.features import FeatureToggles
@@ -100,6 +101,7 @@ class Backtester:
         self.trainer = trainer
         self.dataset_builder = TrainingDatasetBuilder(config)
         self._trained_window_cache: dict[tuple[str, int, int, int], tuple[Any, Any]] = {}
+        self._feature_cache: dict[tuple[str, int, int, int], TrainingDataset] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -145,7 +147,19 @@ class Backtester:
                 self.config.feature_toggles = toggles
             except Exception:  # pragma: no cover - defensive guard
                 LOGGER.warning("Failed to apply custom feature toggles; using defaults.")
+        toggle_fingerprint = json.dumps(self.config.feature_toggles.asdict(), sort_keys=True)
+        cache_key = (
+            self.config.ticker,
+            int(cfg.horizon or 0),
+            int(cfg.training_window or 0),
+            hash(toggle_fingerprint),
+        )
+        if cfg.caching and cache_key in self._feature_cache:
+            return self._feature_cache[cache_key]
+
         dataset = self.dataset_builder.build(force=not cfg.caching)
+        if cfg.caching:
+            self._feature_cache[cache_key] = dataset
         return dataset
 
     def _run_evaluation(self, dataset: TrainingDataset, cfg: BacktestConfig) -> BacktestResult:
@@ -155,7 +169,7 @@ class Backtester:
 
         splits: list[dict[str, Any]] = []
         calibration_pool: list[tuple[np.ndarray, np.ndarray]] = []
-        regression_pool: list[tuple[np.ndarray, np.ndarray]] = []
+        regression_pool: list[tuple[np.ndarray, np.ndarray, Mapping[float, np.ndarray] | None]] = []
 
         for target_name, target_series in targets.items():
             if cfg.targets and target_name not in cfg.targets:
@@ -179,7 +193,7 @@ class Backtester:
         calibration = self._build_calibration(calibration_pool)
         reliability = self._compute_reliability(calibration)
         interval_coverage = self._compute_interval_coverage(regression_pool)
-        confidence_intervals = self._metric_confidence_intervals(splits)
+        confidence_intervals = self._metric_confidence_intervals(splits, seed=cfg.random_seed)
 
         return BacktestResult(
             config=cfg,
@@ -200,7 +214,11 @@ class Backtester:
         cfg: BacktestConfig,
         *,
         horizon: int,
-    ) -> tuple[list[dict[str, Any]], list[tuple[np.ndarray, np.ndarray]], list[tuple[np.ndarray, np.ndarray]]]:
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[tuple[np.ndarray, np.ndarray]],
+        list[tuple[np.ndarray, np.ndarray, Mapping[float, np.ndarray] | None]],
+    ]:
         sorted_index = pd.DatetimeIndex(features.index).sort_values()
         aligned_features = features.loc[sorted_index]
         aligned_target = target_series.reindex(sorted_index).dropna()
@@ -214,12 +232,13 @@ class Backtester:
         )
         split_metrics: list[dict[str, Any]] = []
         calibration_entries: list[tuple[np.ndarray, np.ndarray]] = []
-        regression_entries: list[tuple[np.ndarray, np.ndarray]] = []
+        regression_entries: list[tuple[np.ndarray, np.ndarray, Mapping[float, np.ndarray] | None]] = []
         template = dataset.preprocessors.get(int(horizon))
         model_params = {
             **self.config.model_params.get("global", {}),
             **self.config.model_params.get(target, {}),
         }
+        calibration_params = self.config.model_params.get("calibration", {})
         factory = ModelFactory(self.config.model_type, model_params)
 
         for run_idx in range(max(1, cfg.n_runs)):
@@ -245,16 +264,20 @@ class Backtester:
                 if cfg.cache_trained_windows and cache_key in self._trained_window_cache:
                     model, pipeline = self._clone_cached(cache_key)
                 if model is None:
-                    model = factory.create("classification" if target == "direction" else "regression")
+                    calibrate_flag = target == "direction"
+                    model = factory.create(
+                        "classification" if calibrate_flag else "regression",
+                        calibrate=calibrate_flag,
+                        calibration_params=calibration_params,
+                    )
                     model.fit(X_train_processed, y_train)
                     if cfg.cache_trained_windows:
                         self._trained_window_cache[cache_key] = (
                             copy.deepcopy(model),
                             copy.deepcopy(pipeline),
                         )
-
                 y_pred = model.predict(X_test_processed)
-                metrics = self._score_predictions(
+                metrics, quantiles = self._score_predictions(
                     target,
                     y_test,
                     y_pred,
@@ -281,7 +304,7 @@ class Backtester:
                 if metrics.get("task") == "classification" and "proba_positive" in metrics:
                     calibration_entries.append((metrics["y_true"], metrics["proba_positive"]))
                 else:
-                    regression_entries.append((metrics["y_true"], metrics["y_pred"]))
+                    regression_entries.append((metrics["y_true"], metrics["y_pred"], quantiles))
 
         return split_metrics, calibration_entries, regression_entries
 
@@ -300,6 +323,7 @@ class Backtester:
         task = "classification" if target == "direction" else "regression"
         metrics: dict[str, Any]
         result: dict[str, Any] = {"task": task, "y_true": y_true.to_numpy(), "y_pred": y_pred}
+        quantiles: Mapping[float, np.ndarray] | None = None
 
         if task == "classification":
             try:
@@ -327,8 +351,29 @@ class Backtester:
                 train_pred = None
             residual_std = float(np.std(y_train.to_numpy() - train_pred)) if train_pred is not None else float("nan")
             metrics["residual_std"] = residual_std
+            estimator = getattr(model, "named_steps", {}).get("estimator")
+            if hasattr(estimator, "predict_quantiles"):
+                try:
+                    quantile_preds = estimator.predict_quantiles(
+                        pipeline.transform(raw_features) if pipeline is not None else raw_features
+                    )
+                except Exception:
+                    quantile_preds = {}
+                if isinstance(quantile_preds, Mapping):
+                    quantiles = {
+                        float(key): np.asarray(value)
+                        for key, value in quantile_preds.items()
+                        if isinstance(key, (int, float))
+                    }
+                    for q, values in quantiles.items():
+                        try:
+                            metrics[f"pinball_q{int(q*100)}"] = float(
+                                mean_pinball_loss(y_true.to_numpy(), values, alpha=q)
+                            )
+                        except Exception:
+                            continue
         result.update(metrics)
-        return result
+        return result, quantiles
 
     def _generate_walk_forward_splits(
         self, n_samples: int, window: int, step: int, embargo: int
@@ -379,7 +424,9 @@ class Backtester:
         return {"expected_calibration_error": ece, "max_calibration_error": mce}
 
     def _compute_interval_coverage(
-        self, regression_entries: Sequence[tuple[np.ndarray, np.ndarray]], interval_sigma: float = 1.96
+        self,
+        regression_entries: Sequence[tuple[np.ndarray, np.ndarray, Mapping[float, np.ndarray] | None]],
+        interval_sigma: float = 1.96,
     ) -> dict[str, float]:
         if not regression_entries:
             return {}
@@ -387,11 +434,29 @@ class Backtester:
         y_pred = np.concatenate([entry[1] for entry in regression_entries])
         residuals = y_true - y_pred
         std = np.std(residuals)
-        coverage = float(np.mean(np.abs(residuals) <= interval_sigma * std)) if std > 0 else float("nan")
+
+        coverage_values: list[float] = []
+        for _, truth, quantiles in regression_entries:
+            lower = upper = None
+            if isinstance(quantiles, Mapping):
+                lower = quantiles.get(0.1) or quantiles.get(0.05)
+                upper = quantiles.get(0.9) or quantiles.get(0.95)
+            if lower is not None and upper is not None:
+                mask = (truth >= lower) & (truth <= upper)
+                coverage_values.append(float(np.mean(mask)))
+
+        coverage = float(np.mean(coverage_values)) if coverage_values else (
+            float(np.mean(np.abs(residuals) <= interval_sigma * std)) if std > 0 else float("nan")
+        )
         return {"residual_std": float(std), "interval_coverage": coverage}
 
     def _metric_confidence_intervals(
-        self, splits: Sequence[Mapping[str, Any]], confidence: float = 0.95, n_boot: int = 200
+        self,
+        splits: Sequence[Mapping[str, Any]],
+        confidence: float = 0.95,
+        n_boot: int = 200,
+        *,
+        seed: int | None = None,
     ) -> dict[str, tuple[float, float]]:
         if not splits:
             return {}
@@ -402,7 +467,7 @@ class Backtester:
                     continue
                 if isinstance(value, (int, float, np.number)) and np.isfinite(value):
                     metrics.setdefault(key, []).append(float(value))
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(seed)
         intervals: dict[str, tuple[float, float]] = {}
         for key, values in metrics.items():
             if len(values) < 2:

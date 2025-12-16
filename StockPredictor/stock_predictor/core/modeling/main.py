@@ -38,7 +38,7 @@ from sklearn.metrics import brier_score_loss, r2_score
 from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 
-from ..backtesting import Backtester
+from ..backtesting import Backtester as LegacyBacktester
 from ..config import PredictorConfig
 from ..data_fetcher import DataFetcher
 from ..database import ExperimentTracker
@@ -46,6 +46,7 @@ from ..directional import DirectionalStats, evaluate_directional_predictions
 from ..features import FeatureAssembler, FeatureToggles
 from ..indicator_bundle import evaluate_signal_confluence
 from ..training_data import TrainingDatasetBuilder
+from ...evaluation.backtester import BacktestConfig, Backtester
 from .multi_horizon_engine import MultiHorizonModelingEngine
 from ..ml_preprocessing import (
     DataFrameSimpleImputer,
@@ -1936,7 +1937,7 @@ class StockPredictorAI:
             evaluation_rows = int(sum(item.get("test_size", 0) for item in splits))
             parameters = {"folds": int(self.config.evaluation_folds)}
         elif strategy == "rolling":
-            backtester = Backtester(
+            backtester = LegacyBacktester(
                 model_factory=factory,
                 strategy=self.config.backtest_strategy,
                 window=self.config.evaluation_window,
@@ -5353,86 +5354,77 @@ class StockPredictorAI:
     # Backtesting
     # ------------------------------------------------------------------
     def run_backtest(
-        self, targets: Optional[Iterable[str]] = None, horizon: Optional[int] = None
+        self,
+        targets: Optional[Iterable[str]] = None,
+        horizon: Optional[int] = None,
+        *,
+        backtest_config: BacktestConfig | None = None,
     ) -> Dict[str, Any]:
         resolved_horizon = self._resolve_horizon(horizon)
         self.horizon = resolved_horizon
-        X, targets_by_horizon, _ = self.prepare_features()
-        horizon_targets = targets_by_horizon.get(resolved_horizon)
-        if not horizon_targets:
-            raise RuntimeError(f"No targets available for horizon {resolved_horizon}.")
-        requested_targets = list(targets) if targets else list(self.config.prediction_targets)
-        results: dict[str, Any] = {}
+        requested_targets = tuple(targets) if targets else tuple(self.config.prediction_targets)
 
-        for target in requested_targets:
-            if target not in horizon_targets:
-                LOGGER.warning("Skipping backtest for target '%s' (no data available).", target)
+        default_config = BacktestConfig(
+            n_runs=getattr(self.config, "backtest_runs", 1),
+            start_date=self.config.start_date,
+            end_date=self.config.end_date,
+            horizon=resolved_horizon,
+            targets=requested_targets,
+            toggles=self.config.feature_toggles,
+            training_window=self.config.backtest_window,
+            step_size=self.config.backtest_step,
+            embargo=getattr(self.config, "backtest_embargo", 1),
+            random_seed=getattr(self.config, "random_seed", None),
+            caching=True,
+            cache_trained_windows=True,
+        )
+        cfg = default_config
+        if backtest_config is not None:
+            merged = {**default_config.__dict__, **{k: v for k, v in backtest_config.__dict__.items() if v is not None}}
+            cfg = BacktestConfig(**merged)
+
+        backtester = Backtester(self.config, trainer=self)
+        result = backtester.run(targets=requested_targets, backtest_config=cfg)
+
+        target_breakdown: dict[str, Any] = {}
+        for target_name in requested_targets:
+            target_splits = [
+                split for split in result.splits if split.get("target") == target_name
+            ]
+            if not target_splits:
                 continue
-            factory = ModelFactory(
-                self.config.model_type,
-                {**self.config.model_params.get("global", {}), **self.config.model_params.get(target, {})},
-            )
-            y_clean = horizon_targets[target].dropna()
-            aligned_X = X.loc[y_clean.index]
-
-            auxiliary_columns: Dict[str, pd.Series] = {}
-            for aux_name, series in horizon_targets.items():
-                if aux_name == target:
-                    continue
-                auxiliary_columns[aux_name] = series.reindex(aligned_X.index)
-            auxiliary_df = None
-            if auxiliary_columns:
-                auxiliary_df = pd.DataFrame(auxiliary_columns, index=aligned_X.index).fillna(0.0)
-
-            backtester = Backtester(
-                model_factory=factory,
-                strategy=self.config.backtest_strategy,
-                window=self.config.backtest_window,
-                step=self.config.backtest_step,
-                slippage_bps=self.config.backtest_slippage_bps,
-                fee_bps=self.config.backtest_fee_bps,
-                neutral_threshold=self.config.backtest_neutral_threshold,
-                risk_free_rate=self.config.risk_free_rate,
-                tolerance_bands=self.config.forecast_tolerance_bands,
-            )
-            template = self.preprocessor_templates.get(resolved_horizon)
-            result = backtester.run(
-                aligned_X,
-                y_clean,
-                target,
-                preprocessor_template=template,
-                auxiliary_targets=auxiliary_df,
-                target_kind=self.metadata.get("target_kind"),
-                horizon=resolved_horizon,
-            )
-            results[target] = {
-                "target_kind": result.target_kind,
-                "aggregate": result.aggregate,
-                "splits": result.splits,
-                "feature_importance": result.feature_importance,
-                "directional": result.directional,
+            target_breakdown[target_name] = {
+                "splits": target_splits,
+                "aggregate": self._aggregate_evaluation_metrics(target_splits),
             }
-            self.tracker.log_run(
-                target=target,
-                run_type="backtest",
-                parameters={
-                    "model_type": self.config.model_type,
-                    "strategy": self.config.backtest_strategy,
-                    "window": self.config.backtest_window,
-                    "step": self.config.backtest_step,
-                    "slippage_bps": self.config.backtest_slippage_bps,
-                    "fee_bps": self.config.backtest_fee_bps,
-                },
-                metrics=result.aggregate,
-                context={
-                    "splits": result.splits,
-                    "horizon": resolved_horizon,
-                    "feature_importance": result.feature_importance,
-                    "target_kind": result.target_kind,
-                },
-            )
+
+        payload = result.as_dict()
+        payload["targets"] = target_breakdown
+        payload["horizon"] = resolved_horizon
         self.metadata["active_horizon"] = resolved_horizon
-        return results
+        self.tracker.log_run(
+            target=",".join(requested_targets),
+            run_type="backtest",
+            parameters={
+                "model_type": self.config.model_type,
+                "training_window": cfg.training_window,
+                "step_size": cfg.step_size,
+                "embargo": cfg.embargo,
+                "runs": cfg.n_runs,
+                "seed": cfg.random_seed,
+                "start_date": str(cfg.start_date) if cfg.start_date is not None else None,
+                "end_date": str(cfg.end_date) if cfg.end_date is not None else None,
+            },
+            metrics=result.aggregate,
+            context={
+                "splits": result.splits,
+                "confidence_intervals": result.confidence_intervals,
+                "calibration": result.calibration,
+                "reliability": result.reliability,
+                "interval_coverage": result.interval_coverage,
+            },
+        )
+        return payload
 
     # ------------------------------------------------------------------
     # Evaluation summaries
