@@ -6,6 +6,7 @@ import logging
 from typing import Any, Dict, Iterable
 
 from stock_predictor.app import StockPredictorApplication
+from stock_predictor.evaluation.backtester import BacktestConfig
 
 
 LOGGER = logging.getLogger(__name__)
@@ -103,11 +104,36 @@ async def run_backtest(
     *,
     targets: Iterable[str] | None = None,
     overrides: Dict[str, Any] | None = None,
+    backtest_config: BacktestConfig | None = None,
 ) -> Dict[str, Any]:
     application = StockPredictorApplication.from_environment(
         ticker=ticker, **(overrides or {})
     )
-    return application.backtest(targets=targets)
+    return application.backtest(targets=targets, backtest_config=backtest_config)
+
+
+async def run_reliability_backtest(
+    ticker: str,
+    *,
+    targets: Iterable[str] | None = None,
+    overrides: Dict[str, Any] | None = None,
+    n_runs: int | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    horizon: int | None = None,
+    step_size: int | None = None,
+) -> Dict[str, Any]:
+    application = StockPredictorApplication.from_environment(
+        ticker=ticker, **(overrides or {})
+    )
+    return application.reliability_backtest(
+        targets=targets,
+        horizon=horizon,
+        n_runs=n_runs,
+        start_date=start_date,
+        end_date=end_date,
+        step_size=step_size,
+    )
 
 
 async def train_models(
@@ -144,6 +170,7 @@ async def get_accuracy(
 __all__ = [
     "get_prediction",
     "run_backtest",
+    "run_reliability_backtest",
     "train_models",
     "refresh_data",
     "get_accuracy",

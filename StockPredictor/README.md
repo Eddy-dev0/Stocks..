@@ -163,6 +163,35 @@ This launches the Tkinter UI, the background API thread and the Streamlit
 dashboard. Closing the Tkinter window gracefully terminates the dashboard
 process.
 
+### Reliability backtests (API & UI)
+
+Run reliability-focused walk-forward tests directly against the API to generate
+calibration and coverage summaries plus cached artefacts:
+
+```bash
+LOG_LEVEL=INFO STOCK_PREDICTOR_UI_API_KEYS=local-key python main.py --mode api --host 0.0.0.0 --port 8000
+
+curl -X POST "http://localhost:8000/reliability-backtests/AAPL" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: local-key" \
+  -d '{
+        "targets": ["close", "direction"],
+        "n_runs": 5,
+        "horizon": 5,
+        "step_size": 21,
+        "start_date": "2022-01-01",
+        "end_date": "2023-12-31"
+      }'
+```
+
+The server logs stream progress for each run and writes JSON + parquet results
+under `data/cache/backtests/<TICKER>/backtest_1.0/`. The Streamlit dashboard now
+exposes a **Run Reliability Backtest** control with the same parameters
+(`n_runs`, horizon override, start/end dates, step size, targets). Metrics for
+accuracy, precision/recall, calibration error, regression MAE/RMSE and interval
+coverage are surfaced inline along with warnings when sample sizes are small or
+drift is detected.
+
 Run `python main.py --help` for the full list of options and defaults.
 
 ### Headless live analysis loop

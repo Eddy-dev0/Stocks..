@@ -47,6 +47,7 @@ for key, value in {
     "insights_response": None,
     "live_price_response": None,
     "accuracy_response": None,
+    "reliability_response": None,
     "feature_toggles": DEFAULT_FEATURE_TOGGLES.copy(),
 }.items():
     st.session_state.setdefault(key, value)
@@ -1222,6 +1223,138 @@ with col_forecast:
             )
         else:
             st.info("Run a backtest and refresh accuracy to see directional hit rates.")
+
+    st.markdown("**Reliability backtests**")
+    reliability_param_cols = st.columns(3)
+    reliability_runs = reliability_param_cols[0].number_input(
+        "Backtest runs",
+        min_value=1,
+        max_value=50,
+        value=3,
+        step=1,
+        help="Number of re-sampled walk-forward passes to average over.",
+    )
+    reliability_step = reliability_param_cols[1].number_input(
+        "Step size (days)",
+        min_value=1,
+        max_value=252,
+        value=21,
+        step=1,
+        help="Stride between successive walk-forward evaluation windows.",
+    )
+    reliability_horizon_enabled = reliability_param_cols[2].checkbox(
+        "Override horizon",
+        value=False,
+        help="Use a manual forecast horizon instead of the configured default.",
+    )
+    reliability_horizon = None
+    if reliability_horizon_enabled:
+        reliability_horizon = reliability_param_cols[2].number_input(
+            "Horizon (days)",
+            min_value=1,
+            max_value=365,
+            value=horizon_value or 5,
+            step=1,
+        )
+
+    reliability_dates = st.columns(2)
+    reliability_start_date = reliability_dates[0].date_input(
+        "Backtest start", value=start_default, key="reliability_start_date"
+    )
+    reliability_end_date = reliability_dates[1].date_input(
+        "Backtest end", value=end_date, key="reliability_end_date"
+    )
+
+    if st.button("Run Reliability Backtest", type="primary"):
+        with st.spinner("Running reliability backtest..."):
+            response = _request(
+                f"/reliability-backtests/{ticker}",
+                method="POST",
+                json_payload={
+                    "targets": _parse_targets(targets_raw),
+                    "feature_toggles": feature_toggles.asdict(),
+                    "n_runs": int(reliability_runs),
+                    "start_date": reliability_start_date.isoformat() if reliability_start_date else None,
+                    "end_date": reliability_end_date.isoformat() if reliability_end_date else None,
+                    "horizon": int(reliability_horizon) if reliability_horizon else None,
+                    "step_size": int(reliability_step),
+                },
+            )
+            if response is not None:
+                st.session_state["reliability_response"] = response
+                st.success("Reliability backtest complete")
+
+    reliability_response = st.session_state.get("reliability_response") or {}
+    reliability_payload = reliability_response.get("reliability_backtest", reliability_response)
+    if reliability_payload:
+        st.write("**Reliability summary**")
+        summary_block = reliability_payload.get("summary", {}) if isinstance(reliability_payload, Mapping) else {}
+        warnings_block = reliability_payload.get("warnings", []) if isinstance(reliability_payload, Mapping) else []
+        summary_cols = st.columns(3)
+        summary_cols[0].metric(
+            "Accuracy",
+            f"{float(summary_block.get('classification', {}).get('accuracy', 0)) * 100:.1f}%"
+            if summary_block.get("classification", {}).get("accuracy") is not None
+            else "—",
+        )
+        summary_cols[1].metric(
+            "Precision",
+            f"{float(summary_block.get('classification', {}).get('precision', 0)) * 100:.1f}%"
+            if summary_block.get("classification", {}).get("precision") is not None
+            else "—",
+        )
+        summary_cols[2].metric(
+            "Recall",
+            f"{float(summary_block.get('classification', {}).get('recall', 0)) * 100:.1f}%"
+            if summary_block.get("classification", {}).get("recall") is not None
+            else "—",
+        )
+
+        regression_cols = st.columns(3)
+        regression_cols[0].metric(
+            "MAE",
+            f"{float(summary_block.get('regression', {}).get('mae')):,.4f}"
+            if summary_block.get("regression", {}).get("mae") is not None
+            else "—",
+        )
+        regression_cols[1].metric(
+            "RMSE",
+            f"{float(summary_block.get('regression', {}).get('rmse')):,.4f}"
+            if summary_block.get("regression", {}).get("rmse") is not None
+            else "—",
+        )
+        coverage_value = summary_block.get("regression", {}).get("interval_coverage")
+        regression_cols[2].metric(
+            "Within band",
+            f"{float(coverage_value) * 100:.1f}%" if coverage_value is not None else "—",
+            help="Share of observations captured by prediction intervals.",
+        )
+
+        calibration_block = summary_block.get("classification", {})
+        calibration_cols = st.columns(2)
+        calibration_cols[0].metric(
+            "ECE",
+            f"{float(calibration_block.get('expected_calibration_error')):,.3f}"
+            if calibration_block.get("expected_calibration_error") is not None
+            else "—",
+        )
+        calibration_cols[1].metric(
+            "MCE",
+            f"{float(calibration_block.get('max_calibration_error')):,.3f}"
+            if calibration_block.get("max_calibration_error") is not None
+            else "—",
+        )
+
+        if warnings_block:
+            for warning in warnings_block:
+                st.warning(warning)
+
+        _download_button(
+            "Download reliability JSON",
+            json.dumps(reliability_payload, indent=2, default=str).encode("utf-8"),
+            file_name=f"{ticker}_reliability_backtest.json",
+            mime="application/json",
+        )
 
     if st.button("Run backtest"):
         with st.spinner("Running backtest..."):
