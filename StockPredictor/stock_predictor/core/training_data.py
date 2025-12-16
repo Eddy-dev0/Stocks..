@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping
 
 import pandas as pd
@@ -133,15 +134,37 @@ class TrainingDatasetBuilder:
     def _cache_available(self) -> bool:
         cache_path = self.config.training_cache_path
         target_path = cache_path.with_name(f"{cache_path.stem}_targets.parquet")
-        return (
-            self.config.training_cache_path.exists()
-            and target_path.exists()
-            and self.config.training_metadata_path.exists()
-        )
+        pickle_cache_path = cache_path.with_suffix(".pkl")
+        pickle_target_path = target_path.with_suffix(".pkl")
+
+        metadata_exists = self.config.training_metadata_path.exists()
+        parquet_available = cache_path.exists() and target_path.exists()
+        pickle_available = pickle_cache_path.exists() and pickle_target_path.exists()
+        return metadata_exists and (parquet_available or pickle_available)
 
     def _load_cached(self) -> TrainingDataset:
-        features = pd.read_parquet(self.config.training_cache_path)
-        targets = self._read_cached_targets()
+        features: pd.DataFrame | None = None
+        parquet_path = self.config.training_cache_path
+        pickle_path = parquet_path.with_suffix(".pkl")
+
+        if parquet_path.exists():
+            try:
+                features = pd.read_parquet(parquet_path)
+            except ImportError:
+                LOGGER.info(
+                    "Parquet engine unavailable; attempting to load cached features from pickle at %s",
+                    pickle_path,
+                )
+
+        if features is None and pickle_path.exists():
+            features = pd.read_pickle(pickle_path)
+
+        if features is None:
+            raise FileNotFoundError(
+                f"No cached features found at {parquet_path} or {pickle_path}"
+            )
+
+        targets = self._read_cached_targets(parquet_path=parquet_path)
         with open(self.config.training_metadata_path, "r", encoding="utf-8") as handle:
             metadata = json.load(handle)
         preprocessors = self._build_preprocessors_from_metadata(features, targets, metadata)
@@ -151,19 +174,45 @@ class TrainingDatasetBuilder:
         path = self.config.training_cache_path
         metadata_path = self.config.training_metadata_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        dataset.features.to_parquet(path, index=True)
+
         target_frame = self._serialise_targets(dataset.targets)
-        target_path = path.with_name(f"{path.stem}_targets.parquet")
-        target_frame.to_parquet(target_path, index=False)
+        target_parquet_path = path.with_name(f"{path.stem}_targets.parquet")
+        target_pickle_path = target_parquet_path.with_suffix(".pkl")
+
+        try:
+            dataset.features.to_parquet(path, index=True)
+            target_frame.to_parquet(target_parquet_path, index=False)
+        except ImportError:
+            LOGGER.info(
+                "Parquet engine unavailable; caching training data as pickle at %s",
+                path.with_suffix(".pkl"),
+            )
+            dataset.features.to_pickle(path.with_suffix(".pkl"))
+            target_frame.to_pickle(target_pickle_path)
+
         with open(metadata_path, "w", encoding="utf-8") as handle:
             json.dump(dataset.metadata, handle, indent=2, default=str)
 
-    def _read_cached_targets(self) -> dict[int, dict[str, pd.Series]]:
-        cache_path = self.config.training_cache_path
+    def _read_cached_targets(self, *, parquet_path: Path | None = None) -> dict[int, dict[str, pd.Series]]:
+        cache_path = parquet_path or self.config.training_cache_path
         path = cache_path.with_name(f"{cache_path.stem}_targets.parquet")
-        if not path.exists():
+        pickle_path = path.with_suffix(".pkl")
+
+        frame: pd.DataFrame | None = None
+        if path.exists():
+            try:
+                frame = pd.read_parquet(path)
+            except ImportError:
+                LOGGER.info(
+                    "Parquet engine unavailable; attempting to load cached targets from pickle at %s",
+                    pickle_path,
+                )
+
+        if frame is None and pickle_path.exists():
+            frame = pd.read_pickle(pickle_path)
+
+        if frame is None:
             return {}
-        frame = pd.read_parquet(path)
         targets: dict[int, dict[str, pd.Series]] = {}
         for (horizon, name), group in frame.groupby(["horizon", "target"], sort=False):
             series = pd.Series(group["value"].values, index=pd.Index(group["index"]))
