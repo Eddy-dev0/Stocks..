@@ -3754,7 +3754,13 @@ class StockPredictorAI:
             if numeric < 0:
                 raise ValueError(f"{label} cannot be negative.")
             if validated_close is not None and numeric - validated_close > 1e-6:
-                raise ValueError(f"{label} must not exceed the predicted close.")
+                warning_message = (
+                    f"{label}={numeric:.3f} exceeds predicted close {validated_close:.3f}; clipping to close"
+                )
+                if warning_sink is None:
+                    raise ValueError(f"{label} must not exceed the predicted close.")
+                _add_warning(warning_message)
+                numeric = validated_close
             if label == "expected_low":
                 validated_expected_low = numeric
             else:
