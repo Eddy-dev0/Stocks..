@@ -219,6 +219,8 @@ class PredictorConfig:
     expected_low_sigma: float = 1.0
     expected_low_max_volatility: float = 1.0
     expected_low_floor_window: int = 20
+    expected_low_std_window: int = 20
+    expected_low_std_cap: float = 0.0
     time_series_baselines: tuple[str, ...] = field(default_factory=tuple)
     time_series_params: dict[str, dict[str, Any]] = field(default_factory=dict)
     buy_zone: BuyZoneConfirmationSettings = field(
@@ -368,6 +370,18 @@ class PredictorConfig:
             self.k_stop = 1.0
         if not math.isfinite(self.k_stop) or self.k_stop <= 0:
             self.k_stop = 1.0
+        try:
+            self.expected_low_std_window = int(self.expected_low_std_window)
+        except (TypeError, ValueError):
+            self.expected_low_std_window = 20
+        if self.expected_low_std_window <= 0:
+            self.expected_low_std_window = 0
+        try:
+            self.expected_low_std_cap = float(self.expected_low_std_cap)
+        except (TypeError, ValueError):
+            self.expected_low_std_cap = 0.0
+        if not math.isfinite(self.expected_low_std_cap) or self.expected_low_std_cap < 0:
+            self.expected_low_std_cap = 0.0
         try:
             self.monte_carlo_paths = int(self.monte_carlo_paths)
         except (TypeError, ValueError):

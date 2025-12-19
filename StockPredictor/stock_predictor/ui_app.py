@@ -498,6 +498,12 @@ class StockPredictorDesktopApp:
         self.expected_low_floor_window = int(
             getattr(self.config, "expected_low_floor_window", 20)
         )
+        self.expected_low_std_window = int(
+            _safe_float(getattr(self.config, "expected_low_std_window", 20)) or 0
+        )
+        self.expected_low_std_cap = float(
+            _safe_float(getattr(self.config, "expected_low_std_cap", 0.0)) or 0.0
+        )
         self.expected_low_multiplier_var.trace_add(
             "write", self._on_expected_low_multiplier_changed
         )
@@ -4043,6 +4049,23 @@ class StockPredictorDesktopApp:
                 lows = lows.tail(window)
             return float(lows.min())
 
+        def _return_std_from_history(frame: pd.DataFrame | None, window: int) -> float | None:
+            if frame is None or frame.empty or window <= 0:
+                return None
+            lower_columns = {column.lower(): column for column in frame.columns}
+            close_column = lower_columns.get("close") or lower_columns.get("adj close")
+            if close_column is None:
+                return None
+            closes = pd.to_numeric(frame[close_column], errors="coerce").dropna()
+            if closes.empty:
+                return None
+            returns = closes.pct_change().dropna()
+            if returns.empty:
+                return None
+            if len(returns) > window:
+                returns = returns.tail(window)
+            return float(returns.std())
+
         intervals = prediction.get("prediction_intervals")
         if isinstance(intervals, Mapping):
             close_interval = intervals.get("close")
@@ -4140,6 +4163,25 @@ class StockPredictorDesktopApp:
         if historical_cap is None:
             historical_cap = _max_drawdown_from_history(frame_source)
         cap_candidates = [value for value in (max_volatility, historical_cap) if value and value > 0]
+
+        expected_low_std_window = int(
+            _safe_float(prediction.get("expected_low_return_window"))
+            or self.expected_low_std_window
+            or 0
+        )
+        expected_low_std_cap = self.expected_low_std_cap
+        std_cap_value = None
+        if expected_low_std_window > 0 and expected_low_std_cap and expected_low_std_cap > 0:
+            std_value = _safe_float(prediction.get("expected_low_return_std"))
+            if std_value is None:
+                std_value = _safe_float(prediction.get("recent_return_std"))
+            if std_value is None:
+                std_value = _return_std_from_history(frame_source, expected_low_std_window)
+            if std_value is not None and std_value > 0:
+                std_cap_value = abs(float(std_value)) * float(expected_low_std_cap)
+                if std_cap_value > 0:
+                    cap_candidates.append(std_cap_value)
+
         volatility_cap = min(cap_candidates) if cap_candidates else max_volatility
         if volatility_pct > volatility_cap:
             LOGGER.warning(
