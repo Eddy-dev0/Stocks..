@@ -1564,7 +1564,7 @@ class StockPredictorDesktopApp:
     # Event handlers
     # ------------------------------------------------------------------
     def _on_refresh(self) -> None:
-        self._run_async(self._refresh_and_predict, "Refreshing market data…")
+        self._run_async(self._refresh_data_only, "Refreshing market data…")
 
     def _on_predict(self) -> None:
         self._run_async(self._predict_only, "Generating prediction…")
@@ -3461,6 +3461,52 @@ class StockPredictorDesktopApp:
         self.application.refresh_data(force=True)
         return self._predict_payload(refresh=True)
 
+    def _refresh_data_only(self) -> dict[str, Any]:
+        fetcher = getattr(self.application.pipeline, "fetcher", None)
+        summary: Mapping[str, Any] | None = None
+        if fetcher is not None and hasattr(fetcher, "refresh_data"):
+            summary = fetcher.refresh_data(force=True)
+        else:
+            summary = self.application.refresh_data(force=True)
+
+        feature_history: pd.DataFrame | None = None
+        try:
+            feature_history, _, _ = self.application.pipeline.prepare_features()
+        except Exception as exc:  # pragma: no cover - optional data sources
+            LOGGER.debug("Failed to rebuild feature history after refresh: %s", exc)
+        snapshot: pd.DataFrame | None = None
+        if isinstance(feature_history, pd.DataFrame) and not feature_history.empty:
+            snapshot = feature_history.iloc[[-1]]
+
+        price_history: pd.DataFrame | None = None
+        try:
+            if fetcher is not None and hasattr(fetcher, "fetch_price_data"):
+                price_history = fetcher.fetch_price_data()
+        except Exception as exc:  # pragma: no cover - optional dataset
+            LOGGER.debug("Failed to fetch refreshed price history: %s", exc)
+        indicators: pd.DataFrame | None = None
+        try:
+            if fetcher is not None and hasattr(fetcher, "fetch_indicator_data"):
+                indicators = fetcher.fetch_indicator_data()
+        except Exception as exc:  # pragma: no cover - optional dataset
+            LOGGER.debug("Indicator dataset unavailable after refresh: %s", exc)
+
+        existing_prediction = (
+            self.current_prediction
+            if isinstance(self.current_prediction, (Mapping, PredictionResult))
+            else {}
+        )
+        return {
+            "prediction": existing_prediction,
+            "snapshot": snapshot,
+            "feature_history": feature_history,
+            "price_history": price_history if isinstance(price_history, pd.DataFrame) else None,
+            "indicator_history": indicators if isinstance(indicators, pd.DataFrame) else None,
+            "refresh_only": True,
+            "refresh_summary": summary,
+            "horizons": self.config.prediction_horizons,
+        }
+
     def _predict_only(self) -> dict[str, Any]:
         return self._predict_payload(refresh=True)
 
@@ -3720,7 +3766,10 @@ class StockPredictorDesktopApp:
         self._update_price_chart()
         self._update_indicator_view()
         self._update_explanation()
-        self._set_busy(False, "Prediction updated.")
+        if payload.get("refresh_only"):
+            self._set_busy(False, "Market data refreshed.")
+        else:
+            self._set_busy(False, "Prediction updated.")
 
     def _on_async_failure(self, exc: Exception) -> None:
         self._set_busy(False, "An error occurred.")
