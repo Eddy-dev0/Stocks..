@@ -57,6 +57,8 @@ def test_ui_expected_low_matches_model_logic() -> None:
     app.expected_low_multiplier = 1.0
     app.expected_low_max_volatility = 1.0
     app.expected_low_floor_window = 20
+    app.expected_low_std_window = 0
+    app.expected_low_std_cap = 0.0
 
     expected_low = app._compute_expected_low(  # type: ignore[attr-defined]
         {
@@ -98,16 +100,17 @@ def test_model_expected_low_prefers_indicator_floor() -> None:
     assert expected_low == pytest.approx(94.5)
 
 
-def test_model_stop_loss_uses_percentage_formula() -> None:
+def test_model_stop_loss_uses_expected_low_sigma() -> None:
     predictor = StockPredictorAI.__new__(StockPredictorAI)
     predictor.config = _ConfigStub()
 
     stop_loss = predictor._compute_stop_loss(  # type: ignore[attr-defined]
         100.0,
-        0.02,
+        2.0,
+        expected_low=98.0,
     )
 
-    assert stop_loss == pytest.approx(98.0)
+    assert stop_loss == pytest.approx(96.0)
 
 
 def test_model_stop_loss_is_clamped_between_zero_and_close() -> None:
@@ -116,10 +119,24 @@ def test_model_stop_loss_is_clamped_between_zero_and_close() -> None:
 
     stop_loss = predictor._compute_stop_loss(  # type: ignore[attr-defined]
         10.0,
-        5.0,
+        10.0,
+        expected_low=4.0,
     )
 
     assert stop_loss == pytest.approx(0.0)
+
+
+def test_model_stop_loss_clamps_to_predicted_close() -> None:
+    predictor = StockPredictorAI.__new__(StockPredictorAI)
+    predictor.config = _ConfigStub()
+
+    stop_loss = predictor._compute_stop_loss(  # type: ignore[attr-defined]
+        50.0,
+        2.0,
+        expected_low=60.0,
+    )
+
+    assert stop_loss == pytest.approx(50.0)
 
 
 def test_model_stop_loss_falls_back_to_expected_low() -> None:
@@ -140,6 +157,8 @@ def test_ui_expected_low_uses_indicator_snapshot() -> None:
     app.expected_low_multiplier = 1.0
     app.expected_low_max_volatility = 1.0
     app.expected_low_floor_window = 20
+    app.expected_low_std_window = 0
+    app.expected_low_std_cap = 0.0
     app.feature_snapshot = pd.DataFrame({
         "BB_Lower_20": [97.0],
         "Support_1": [93.0],

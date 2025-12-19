@@ -3620,12 +3620,36 @@ class StockPredictorAI:
         """Derive a stop-loss level using the forecasted volatility."""
 
         anchor_value = self._safe_float(anchor_price)
-        numeric_close = self._safe_float(predicted_close)
+        predicted_close_value = self._safe_float(predicted_close)
+        numeric_close = predicted_close_value
         if numeric_close is None:
             numeric_close = anchor_value
         fallback_low = self._safe_float(expected_low)
         if numeric_close is None:
             return fallback_low
+
+        if fallback_low is not None:
+            volatility_sigma = self._safe_float(predicted_volatility)
+            multiplier = getattr(self.config, "k_stop", DEFAULT_STOP_LOSS_MULTIPLIER)
+            try:
+                multiplier_value = float(multiplier)
+            except (TypeError, ValueError):
+                multiplier_value = DEFAULT_STOP_LOSS_MULTIPLIER
+            if not np.isfinite(multiplier_value) or multiplier_value <= 0:
+                multiplier_value = DEFAULT_STOP_LOSS_MULTIPLIER
+
+            if volatility_sigma is None:
+                stop_loss = float(fallback_low)
+            else:
+                sigma = abs(float(volatility_sigma))
+                if not np.isfinite(sigma):
+                    sigma = 0.0
+                stop_loss = float(fallback_low) - sigma * multiplier_value
+
+            stop_loss = max(0.0, stop_loss)
+            if predicted_close_value is not None:
+                stop_loss = min(stop_loss, float(predicted_close_value))
+            return float(stop_loss)
 
         if residual_error is not None:
             delta = abs(float(residual_error)) * 1.5
@@ -3633,22 +3657,16 @@ class StockPredictorAI:
                 delta = min(delta, float(anchor_value) * 0.45)
             stop_loss = float(numeric_close - delta)
             stop_loss = max(0.0, stop_loss)
-            if fallback_low is not None:
-                stop_loss = min(stop_loss, float(fallback_low))
             return float(min(stop_loss, numeric_close))
 
         pct_hint_value = self._safe_float(pct_hint)
         if pct_hint_value is not None and anchor_value is not None:
             stop_loss = max(0.0, float(anchor_value * (1 - abs(float(pct_hint_value)))))
-            if fallback_low is not None:
-                stop_loss = min(stop_loss, float(fallback_low))
             return float(min(stop_loss, numeric_close))
 
         volatility_pct = self._safe_float(predicted_volatility)
         if volatility_pct is None:
-            if fallback_low is None:
-                return None
-            return float(max(0.0, min(numeric_close, fallback_low)))
+            return None
 
         multiplier = getattr(self.config, "k_stop", DEFAULT_STOP_LOSS_MULTIPLIER)
         try:
@@ -3665,8 +3683,6 @@ class StockPredictorAI:
 
         stop_loss = float(numeric_close - delta)
         stop_loss = max(0.0, min(float(numeric_close), stop_loss))
-        if fallback_low is not None:
-            stop_loss = min(stop_loss, float(fallback_low))
         return float(stop_loss)
 
     def _indicator_support_floor(self) -> tuple[Optional[float], Dict[str, float]]:
