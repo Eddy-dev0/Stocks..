@@ -534,6 +534,20 @@ class StockPredictorAI:
                     metadata["recent_return_std"] = return_std
                     metadata["recent_return_mean"] = float(recent_window.mean())
 
+                    expected_low_std_window = getattr(
+                        self.config, "expected_low_std_window", int(window)
+                    )
+                    try:
+                        expected_low_std_window = int(expected_low_std_window)
+                    except (TypeError, ValueError):
+                        expected_low_std_window = int(window)
+                    if expected_low_std_window > 0:
+                        expected_low_window = recent_returns.tail(expected_low_std_window)
+                        if not expected_low_window.empty:
+                            expected_low_return_std = float(expected_low_window.std())
+                            metadata["expected_low_return_std"] = expected_low_return_std
+                            metadata["expected_low_return_window"] = int(expected_low_std_window)
+
                 log_return_window = getattr(
                     self.config, "log_return_window", DEFAULT_LOG_RETURN_WINDOW
                 )
@@ -3195,6 +3209,15 @@ class StockPredictorAI:
                 result["trailing_low_window"] = trailing_window
         if drawdown_fraction is not None:
             result["max_drawdown_fraction"] = drawdown_fraction
+        if isinstance(getattr(self, "metadata", None), Mapping):
+            expected_low_return_std = self._safe_float(
+                self.metadata.get("expected_low_return_std")
+            )
+            expected_low_return_window = self.metadata.get("expected_low_return_window")
+            if expected_low_return_std is not None:
+                result["expected_low_return_std"] = expected_low_return_std
+            if expected_low_return_window is not None:
+                result["expected_low_return_window"] = expected_low_return_window
         if confluence_block:
             result["signal_confluence"] = confluence_block
         if combined_confidence is not None:
@@ -3535,6 +3558,30 @@ class StockPredictorAI:
             historical_cap = self._safe_float(self.metadata.get("max_drawdown_fraction"))
         cap_candidates = [value for value in (max_volatility, historical_cap) if value and value > 0]
         volatility_cap = min(cap_candidates) if cap_candidates else max_volatility
+
+        expected_low_std_window = getattr(self.config, "expected_low_std_window", 0)
+        expected_low_std_cap = getattr(self.config, "expected_low_std_cap", 0.0)
+        try:
+            expected_low_std_window = int(expected_low_std_window)
+        except (TypeError, ValueError):
+            expected_low_std_window = 0
+        try:
+            expected_low_std_cap = float(expected_low_std_cap)
+        except (TypeError, ValueError):
+            expected_low_std_cap = 0.0
+        std_cap_value = None
+        if expected_low_std_window > 0 and expected_low_std_cap > 0:
+            std_value = None
+            if isinstance(getattr(self, "metadata", None), Mapping):
+                std_value = self._safe_float(self.metadata.get("expected_low_return_std"))
+                if std_value is None:
+                    std_value = self._safe_float(self.metadata.get("recent_return_std"))
+                if std_value is None:
+                    std_value = self._safe_float(self.metadata.get("daily_log_return_std"))
+            if std_value is not None and std_value > 0:
+                std_cap_value = abs(float(std_value)) * expected_low_std_cap
+                if std_cap_value > 0:
+                    volatility_cap = min(volatility_cap, std_cap_value)
 
         if volatility_pct > volatility_cap:
             LOGGER.warning(
@@ -5568,4 +5615,3 @@ class StockPredictorAI:
         if isinstance(tol_hit_value, (int, float)) and math.isfinite(tol_hit_value):
             tolerance_hits = float(tol_hit_value)
         return total, correct, tolerance_total, tolerance_hits
-
