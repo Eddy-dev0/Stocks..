@@ -438,6 +438,8 @@ class StockPredictorDesktopApp:
         self.market_timestamp_stale: bool = False
         self.market_timestamp_live_estimate: bool = False
         self.current_market_price: float | None = None
+        self.last_price_cached: bool = False
+        self.last_price_timestamp: pd.Timestamp | None = None
         self.price_history: pd.DataFrame | None = None
         self.feature_snapshot: pd.DataFrame | None = None
         self.feature_history: pd.DataFrame | None = None
@@ -3759,16 +3761,21 @@ class StockPredictorDesktopApp:
 
     def _resolve_market_timestamp(self) -> pd.Timestamp | None:
         latest_timestamp: pd.Timestamp | None = None
+        live_timestamp: pd.Timestamp | None = None
         has_history = isinstance(self.price_history, pd.DataFrame) and not self.price_history.empty
         cache_fresh = False
         self.market_timestamp_live_estimate = False
+        if self.last_price_cached is False and self.last_price_timestamp is not None:
+            live_timestamp = self.last_price_timestamp
         if has_history:
             cache_timestamp = self.price_history.attrs.get("cache_timestamp")
             cache_fresh = self._is_cache_timestamp_fresh(cache_timestamp)
-            if cache_fresh:
+            if cache_fresh and live_timestamp is None:
                 _, latest_timestamp = self._extract_latest_price_point(self.price_history)
+            elif live_timestamp is not None:
+                latest_timestamp = live_timestamp
+                self.market_timestamp_live_estimate = True
             else:
-                live_timestamp: pd.Timestamp | None = None
                 fetcher = getattr(
                     getattr(getattr(self, "application", None), "pipeline", None),
                     "fetcher",
@@ -3781,11 +3788,17 @@ class StockPredictorDesktopApp:
                         live_timestamp = None
                 latest_timestamp = live_timestamp or self._now()
                 self.market_timestamp_live_estimate = True
+        elif live_timestamp is not None:
+            latest_timestamp = live_timestamp
+            self.market_timestamp_live_estimate = True
         elif self.current_market_timestamp is not None:
             latest_timestamp = self.current_market_timestamp
 
         localized = self._localize_market_timestamp(latest_timestamp)
-        self.market_timestamp_stale = localized is None or not has_history or (has_history and not cache_fresh)
+        has_live = live_timestamp is not None and not self.last_price_cached
+        self.market_timestamp_stale = localized is None or (
+            not has_live and (not has_history or (has_history and not cache_fresh))
+        )
         if localized is not None:
             self.current_market_timestamp = localized
         return localized
@@ -4164,9 +4177,33 @@ class StockPredictorDesktopApp:
         data = prediction if isinstance(prediction, Mapping) else {}
         raw_value: float | None = None
         converted: float | None = None
+        self.last_price_cached = True
+        self.last_price_timestamp = None
+
+        fetcher = getattr(
+            getattr(getattr(self, "application", None), "pipeline", None),
+            "fetcher",
+            None,
+        )
+        if fetcher is not None and hasattr(fetcher, "fetch_live_price"):
+            try:
+                live_price, live_timestamp = fetcher.fetch_live_price(force=False)
+            except Exception:  # pragma: no cover - defensive
+                live_price, live_timestamp = None, None
+            raw_value = _safe_float(live_price)
+            if raw_value is not None:
+                self.last_price_cached = False
+                self.current_market_price = raw_value
+                localized = self._localize_market_timestamp(live_timestamp)
+                if localized is not None:
+                    self.last_price_timestamp = localized
+                    self.current_market_timestamp = localized
+                converted = self._convert_currency(raw_value)
+                return raw_value, converted
 
         if isinstance(self.price_history, pd.DataFrame) and not self.price_history.empty:
-            raw_value, _ = self._extract_latest_price_point(self.price_history)
+            raw_value, latest_timestamp = self._extract_latest_price_point(self.price_history)
+            self.last_price_timestamp = self._localize_market_timestamp(latest_timestamp)
             converted_frame = getattr(self, "price_history_converted", None)
             if isinstance(converted_frame, pd.DataFrame) and not converted_frame.empty:
                 converted, _ = self._extract_latest_price_point(converted_frame)
@@ -4182,11 +4219,18 @@ class StockPredictorDesktopApp:
         return raw_value, converted
 
     def _derive_prediction_metrics(
-        self, prediction: Mapping[str, Any] | None = None
+        self,
+        prediction: Mapping[str, Any] | None = None,
+        *,
+        anchor_raw: float | None = None,
+        anchor_converted: float | None = None,
     ) -> dict[str, float | None]:
         """Normalise prediction fields around a shared anchor price."""
 
-        anchor_raw, anchor_converted = self._reference_last_price(prediction)
+        if anchor_raw is None and anchor_converted is None:
+            anchor_raw, anchor_converted = self._reference_last_price(prediction)
+        elif anchor_converted is None:
+            anchor_converted = self._convert_currency(anchor_raw)
         predicted_raw = _safe_float(prediction.get("predicted_close")) if isinstance(
             prediction, Mapping
         ) else None
@@ -4284,6 +4328,7 @@ class StockPredictorDesktopApp:
         prediction = self.current_prediction or {}
         explanation = prediction.get("explanation") if isinstance(prediction, Mapping) else None
         self.metric_vars["ticker"].set(str(prediction.get("ticker") or self.config.ticker))
+        anchor_raw, anchor_converted = self._reference_last_price(prediction)
         localized_as_of = self._resolve_market_timestamp()
         as_of_display = (
             localized_as_of.strftime("%Y-%m-%d %H:%M %Z") if localized_as_of is not None else "—"
@@ -4311,15 +4356,22 @@ class StockPredictorDesktopApp:
                 gate_note = "Signal confluence not met; target price and alerts are gated."
             status_message = f"{status_message} • {gate_note}" if status_message else gate_note
 
-        derived_metrics = self._derive_prediction_metrics(prediction)
+        derived_metrics = self._derive_prediction_metrics(
+            prediction,
+            anchor_raw=anchor_raw,
+            anchor_converted=anchor_converted,
+        )
         last_close_converted = derived_metrics["anchor_converted"]
         predicted_converted = derived_metrics["predicted_converted"]
         change_converted = derived_metrics["change_converted"]
 
         decimals = self.price_decimal_places
-        self.metric_vars["last_close"].set(
-            fmt_ccy(last_close_converted, self.currency_symbol, decimals=decimals)
+        last_close_display = fmt_ccy(
+            last_close_converted, self.currency_symbol, decimals=decimals
         )
+        if self.last_price_cached and last_close_display != "—":
+            last_close_display = f"{last_close_display} (cached)"
+        self.metric_vars["last_close"].set(last_close_display)
 
         forecast = self.current_forecast_date
         if forecast is None:
