@@ -22,6 +22,19 @@ class _DummyVar:
         self.value = value
 
 
+class _DummyWidget:
+    def __init__(self) -> None:
+        self.grid_calls: list[dict[str, object]] = []
+        self.removed = False
+
+    def grid(self, **kwargs: object) -> None:
+        self.grid_calls.append(kwargs)
+        self.removed = False
+
+    def grid_remove(self) -> None:
+        self.removed = True
+
+
 def _build_stubbed_app() -> StockPredictorDesktopApp:
     app = StockPredictorDesktopApp.__new__(StockPredictorDesktopApp)
     app.market_timezone = ZoneInfo("America/New_York")
@@ -41,10 +54,15 @@ def _build_stubbed_app() -> StockPredictorDesktopApp:
             "expected_low",
             "stop_loss",
             "expected_change",
+            "daily_change",
             "direction",
         )
     }
     app.stop_loss_var = app.metric_vars["stop_loss"]
+    app.stop_loss_label = _DummyWidget()
+    app.stop_loss_value = _DummyWidget()
+    app._stop_loss_label_grid_options = {"row": 2, "column": 0, "sticky": "e"}
+    app._stop_loss_value_grid_options = {"row": 2, "column": 1, "sticky": "e"}
     app.sentiment_label_var = _DummyVar()
     app.sentiment_score_var = _DummyVar()
     app.current_market_timestamp = pd.Timestamp("2024-05-01 15:00", tz="UTC")
@@ -148,3 +166,33 @@ def test_last_price_prefers_live_fetcher_over_history() -> None:
     app._update_metrics()
 
     assert app.metric_vars["last_close"].value == "$333.25"
+
+
+def test_stop_loss_hidden_without_volatility() -> None:
+    app = _build_stubbed_app()
+    app.current_prediction = {
+        "ticker": "TSLA",
+        "market_data_as_of": pd.Timestamp("2024-05-01 15:00"),
+    }
+
+    app._update_metrics()
+
+    assert app.stop_loss_label.removed is True
+    assert app.stop_loss_value.removed is True
+    assert app.stop_loss_var.value is None
+
+
+def test_stop_loss_visible_with_volatility() -> None:
+    app = _build_stubbed_app()
+    app.current_prediction = {
+        "ticker": "TSLA",
+        "market_data_as_of": pd.Timestamp("2024-05-01 15:00"),
+        "predicted_volatility": 0.02,
+        "stop_loss": 287.5,
+    }
+
+    app._update_metrics()
+
+    assert app.stop_loss_label.removed is False
+    assert app.stop_loss_value.removed is False
+    assert app.stop_loss_var.value == "$287.50"
