@@ -14,6 +14,7 @@ import re
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
 
 from .features import FEATURE_REGISTRY, FeatureToggles, default_feature_toggles
 from .preprocessing import default_price_feature_toggles, derive_price_feature_toggles
@@ -214,6 +215,7 @@ class PredictorConfig:
     price_provider_priority: tuple[str, ...] = field(default_factory=tuple)
     disabled_providers: tuple[str, ...] = field(default_factory=tuple)
     memory_cache_seconds: float | None = None
+    timezone: ZoneInfo | str | None = None
     market_timezone: str | None = None
     k_stop: float = 1.0
     expected_low_sigma: float = 1.0
@@ -361,9 +363,20 @@ class PredictorConfig:
         self.time_series_params = self._normalise_model_params(self.time_series_params)
         if self.memory_cache_seconds is not None:
             self.memory_cache_seconds = max(60.0, float(self.memory_cache_seconds))
-        if self.market_timezone is not None:
-            tz_str = str(self.market_timezone).strip()
-            self.market_timezone = tz_str or None
+        if self.timezone is None and self.market_timezone is not None:
+            self.timezone = self.market_timezone
+        if isinstance(self.timezone, ZoneInfo):
+            normalized_timezone: ZoneInfo | str | None = self.timezone
+        elif self.timezone is not None:
+            tz_str = str(self.timezone).strip()
+            normalized_timezone = tz_str or None
+        else:
+            normalized_timezone = None
+        self.timezone = normalized_timezone
+        if isinstance(self.timezone, ZoneInfo):
+            self.market_timezone = self.timezone.key
+        else:
+            self.market_timezone = self.timezone
         try:
             self.k_stop = float(self.k_stop)
         except (TypeError, ValueError):

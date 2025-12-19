@@ -109,7 +109,7 @@ _TZ_ALIAS_MAP: dict[str, str] = {
 def resolve_market_timezone(config: PredictorConfig | None = None) -> ZoneInfo:
     """Return the market timezone configured for the application context."""
 
-    tz_key = getattr(config, "market_timezone", None)
+    tz_key = getattr(config, "timezone", None)
     timezone = _coerce_zoneinfo(tz_key)
     if timezone is not None:
         return timezone
@@ -139,7 +139,9 @@ def _normalise_timezone_key(value: str) -> str:
     return normalised.strip()
 
 
-def _coerce_zoneinfo(value: str | None) -> ZoneInfo | None:
+def _coerce_zoneinfo(value: str | ZoneInfo | None) -> ZoneInfo | None:
+    if isinstance(value, ZoneInfo):
+        return value
     if not value:
         return None
     candidate = value.strip()
@@ -275,6 +277,13 @@ class MarketDataETL:
         if ttl is None:
             ttl = self._memory_cache_default_ttl
         self._memory_cache_ttl = max(60.0, float(ttl))
+
+    def _now(self) -> datetime:
+        tz = self.market_timezone or DEFAULT_MARKET_TIMEZONE
+        return datetime.now(tz)
+
+    def _today(self) -> date:
+        return self._now().date()
 
     # ------------------------------------------------------------------
     # Public refresh API
@@ -626,7 +635,7 @@ class MarketDataETL:
                 {
                     "Ticker": self.config.ticker,
                     "EventType": "placeholder",
-                    "EventDate": datetime.utcnow().date(),
+                    "EventDate": self._today(),
                     "Reference": "placeholder",
                     "Value": None,
                     "Currency": None,
@@ -657,7 +666,7 @@ class MarketDataETL:
         ticker = yf.Ticker(self.config.ticker)
         records: list[dict[str, Any]] = []
         downloaded = False
-        as_of = datetime.utcnow()
+        as_of = self._now()
 
         expirations = self._safe_download(lambda: list(getattr(ticker, "options", []) or []))
         if expirations:
@@ -862,7 +871,7 @@ class MarketDataETL:
             sentiment_records.append(
                 {
                     "Ticker": self.config.ticker,
-                    "AsOf": datetime.utcnow(),
+                    "AsOf": self._now(),
                     "Provider": "placeholder",
                     "SignalType": "news_sentiment",
                     "Score": 0.0,
@@ -903,7 +912,7 @@ class MarketDataETL:
         LOGGER.info("Using cached ESG placeholder metrics for %s", self.config.ticker)
         records: list[dict[str, Any]] = []
         downloaded = False
-        today = datetime.utcnow().date()
+        today = self._today()
 
         if not records:
             records.append(
@@ -960,7 +969,7 @@ class MarketDataETL:
                     as_of_val = getattr(row, as_of_col) if as_of_col else None
                     as_of_date = self._normalize_date(as_of_val)
                     if as_of_date is None:
-                        as_of_date = datetime.utcnow().date()
+                        as_of_date = self._today()
                     row_dict = row._asdict()
                     for metric_key, metric_name in (
                         ("shares", "shares"),
@@ -1000,11 +1009,11 @@ class MarketDataETL:
                     continue
                 records.append(
                     {
-                        "Ticker": self.config.ticker,
-                        "AsOf": datetime.utcnow().date(),
-                        "Holder": description,
-                        "HolderType": "major",
-                        "Metric": "percent_shares_outstanding",
+                    "Ticker": self.config.ticker,
+                    "AsOf": self._today(),
+                    "Holder": description,
+                    "HolderType": "major",
+                    "Metric": "percent_shares_outstanding",
                         "Value": percent,
                         "Raw": {"percent": percent, "description": description},
                         "Source": "yfinance",
@@ -1016,7 +1025,7 @@ class MarketDataETL:
             records.append(
                 {
                     "Ticker": self.config.ticker,
-                    "AsOf": datetime.utcnow().date(),
+                    "AsOf": self._today(),
                     "Holder": "placeholder",
                     "HolderType": "unknown",
                     "Metric": "shares",
@@ -1415,7 +1424,7 @@ class MarketDataETL:
             return False
         if isinstance(timestamp, pd.Timestamp):
             timestamp = timestamp.to_pydatetime()
-        reference = datetime.now(timezone.utc)
+        reference = self._now().astimezone(timezone.utc)
         if timestamp.tzinfo is None:
             timestamp = timestamp.replace(tzinfo=timezone.utc)
         else:
@@ -1469,7 +1478,7 @@ class MarketDataETL:
         path = self.config.price_cache_path
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.now(timezone.utc)
+            timestamp = self._now().astimezone(timezone.utc)
             payload = frame.copy()
             payload["CacheTimestamp"] = timestamp.isoformat()
             payload.to_csv(path, index=False)
@@ -1622,7 +1631,7 @@ class MarketDataETL:
     def _latest_trading_session(
         self, reference: datetime | pd.Timestamp | None = None
     ) -> date:
-        basis = pd.Timestamp.utcnow() if reference is None else reference
+        basis = pd.Timestamp.now(tz=self.market_timezone) if reference is None else reference
         current = self._normalize_to_market_tz(basis)
         session = current.normalize()
         if not self._is_trading_day(session):
@@ -1758,4 +1767,3 @@ __all__ = [
     "NoPriceDataError",
     "resolve_market_timezone",
 ]
-
