@@ -3834,6 +3834,17 @@ class StockPredictorDesktopApp:
             timestamp = timestamp.astimezone(timezone.utc)
         return reference - timestamp <= CACHE_MAX_AGE
 
+    def _display_timezone(self) -> ZoneInfo | None:
+        tz = getattr(self.config, "timezone", None)
+        if isinstance(tz, ZoneInfo):
+            return tz
+        if tz:
+            try:
+                return ZoneInfo(str(tz))
+            except Exception:  # pragma: no cover - defensive fallback
+                return self.market_timezone
+        return self.market_timezone
+
     def _resolve_market_timestamp(self) -> pd.Timestamp | None:
         latest_timestamp: pd.Timestamp | None = None
         live_timestamp: pd.Timestamp | None = None
@@ -3937,7 +3948,7 @@ class StockPredictorDesktopApp:
         if pd.isna(parsed):
             return None
         ts = pd.Timestamp(parsed)
-        tz = getattr(self, "market_timezone", None)
+        tz = self._display_timezone()
         if tz is None:
             return ts
         if ts.tzinfo is None:
@@ -3952,6 +3963,13 @@ class StockPredictorDesktopApp:
             return ts.tz_convert(tz)
         except Exception:  # pragma: no cover - defensive fallback
             return ts.tz_localize(tz)
+
+    def _format_forecast_date(self, forecast: pd.Timestamp) -> str:
+        tz = self._display_timezone()
+        local_forecast = (
+            forecast.tz_convert(tz) if forecast.tzinfo else forecast.tz_localize(tz)
+        )
+        return local_forecast.strftime("%Y-%m-%d %Z")
 
     def _forecast_base_date(self) -> pd.Timestamp:
         last_market_date = self._resolve_market_timestamp()
@@ -4044,12 +4062,7 @@ class StockPredictorDesktopApp:
         display = "Forecast date: —"
         forecast = self._compute_forecast_date(target_date)
         if forecast is not None:
-            local_forecast = (
-                forecast.tz_convert(self.market_timezone)
-                if forecast.tzinfo
-                else forecast.tz_localize(self.market_timezone)
-            )
-            display = f"Forecast date: {local_forecast.date().isoformat()}"
+            display = f"Forecast date: {self._format_forecast_date(forecast)}"
         self.forecast_date_var.set(display)
 
     # ------------------------------------------------------------------
@@ -4499,8 +4512,7 @@ class StockPredictorDesktopApp:
             forecast = self._compute_forecast_date(self.current_prediction.get("target_date"))
         predicted_display = fmt_ccy(predicted_converted, self.currency_symbol, decimals=decimals)
         if forecast is not None:
-            local_forecast = forecast.tz_convert(self.market_timezone) if forecast.tzinfo else forecast.tz_localize(self.market_timezone)
-            forecast_str = local_forecast.date().isoformat()
+            forecast_str = self._format_forecast_date(forecast)
             if predicted_display == "—":
                 predicted_display = f"— ({forecast_str})"
             else:
@@ -4690,7 +4702,7 @@ class StockPredictorDesktopApp:
             forecast = self._compute_forecast_date(fallback_target)
         title = "Forecast date: —"
         if forecast is not None:
-            title = f"Forecast date: {forecast.date().isoformat()}"
+            title = f"Forecast date: {self._format_forecast_date(forecast)}"
         ax.set_title(title)
 
         try:
@@ -4925,7 +4937,7 @@ class StockPredictorDesktopApp:
                 decimals=self.price_decimal_places,
             )
             if forecast is not None:
-                annotation_text = f"{annotation_text} ({forecast.date().isoformat()})"
+                annotation_text = f"{annotation_text} ({self._format_forecast_date(forecast)})"
             ax.annotate(
                 annotation_text,
                 xy=annotation_xy,
