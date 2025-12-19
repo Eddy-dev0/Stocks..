@@ -2981,19 +2981,7 @@ class StockPredictorAI:
                 uncertainty_clean[tgt] = numeric_values
 
         def _to_iso(value: Any) -> Optional[str]:
-            if value is None:
-                return None
-            if isinstance(value, datetime):
-                return value.isoformat(timespec="seconds")
-            if isinstance(value, str):
-                return value
-            try:
-                timestamp = pd.to_datetime(value)
-            except (TypeError, ValueError):
-                return str(value)
-            if pd.isna(timestamp):
-                return None
-            return timestamp.to_pydatetime().isoformat(timespec="seconds")
+            return self._format_timestamp(value)
 
         confluence_scaled = False
 
@@ -3988,7 +3976,7 @@ class StockPredictorAI:
 
         return {
             "ticker": self.config.ticker,
-            "market_time": timestamp.to_pydatetime() if timestamp is not None else None,
+            "market_time": self._format_timestamp(timestamp),
             "last_price": last_price,
             "status": status,
             "reason": reason,
@@ -3999,6 +3987,51 @@ class StockPredictorAI:
             "probabilities": {"up": prob_up, "down": prob_down},
             "warnings": snapshot_warnings or None,
         }
+
+    def _format_timestamp(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+
+        config_timezone = getattr(self.config, "timezone", None)
+        target_timezone: ZoneInfo | None
+        if isinstance(config_timezone, ZoneInfo):
+            target_timezone = config_timezone
+        elif config_timezone:
+            try:
+                target_timezone = ZoneInfo(str(config_timezone))
+            except Exception:
+                target_timezone = None
+        else:
+            target_timezone = None
+
+        def _normalize(dt: datetime) -> datetime:
+            if target_timezone is None:
+                return dt
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=target_timezone)
+            return dt.astimezone(target_timezone)
+
+        def _format(dt: datetime) -> str:
+            normalized = _normalize(dt)
+            tz_label = normalized.strftime("%Z") if normalized.tzinfo else ""
+            if tz_label:
+                return f"{normalized.strftime('%Y-%m-%d %H:%M:%S')} {tz_label}".strip()
+            return normalized.isoformat(timespec="seconds")
+
+        if isinstance(value, datetime):
+            return _format(value)
+
+        try:
+            timestamp = pd.to_datetime(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if pd.isna(timestamp):
+            return None
+        if isinstance(timestamp, pd.Timestamp):
+            return _format(timestamp.to_pydatetime())
+        if isinstance(timestamp, datetime):
+            return _format(timestamp)
+        return str(timestamp)
 
     def _estimate_prediction_uncertainty(
         self,
