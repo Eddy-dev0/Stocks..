@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import pandas as pd
@@ -11,6 +11,7 @@ import pandas as pd
 from .config import PredictorConfig
 from .database import Database
 from .etl import MarketDataETL
+from ..core.pipeline import CACHE_MAX_AGE
 
 LOGGER = logging.getLogger(__name__)
 
@@ -24,6 +25,7 @@ class DataFetcher:
         self.etl = MarketDataETL(config, database=self.database)
         self._sources: dict[str, str] = {
             "prices": "database",
+            "indicators": "database",
             "news": "database",
             "corporate_events": "database",
             "options_surface": "database",
@@ -107,6 +109,33 @@ class DataFetcher:
                 self._sources[key] = "remote"
         return summary
 
+    def refresh_data(self, force: bool = False) -> dict[str, int]:
+        """Refresh price data and indicators when cache staleness requires it."""
+
+        needs_price_refresh = force or self._is_price_cache_stale()
+        if needs_price_refresh:
+            price_result = self.etl.refresh_prices(force=force)
+            price_frame = price_result.data
+            self._set_source("prices", price_result.downloaded or force)
+        else:
+            price_frame = self.database.get_prices(
+                ticker=self.config.ticker,
+                interval=self.config.interval,
+                start=self.config.start_date,
+                end=self.config.end_date,
+            )
+            self._set_source("prices", False)
+
+        price_rows = len(price_frame.index)
+        indicator_rows = 0
+        if needs_price_refresh:
+            indicator_rows = self.etl.refresh_indicators(
+                price_frame=price_frame, force=force
+            )
+        self._sources["indicators"] = "local" if indicator_rows else "database"
+
+        return {"price_rows": price_rows, "indicator_rows": indicator_rows}
+
     def fetch_live_price(self, force: bool = False) -> tuple[float | None, pd.Timestamp | None]:
         """Fetch the most recent intraday price and timestamp."""
 
@@ -163,6 +192,33 @@ class DataFetcher:
     def _set_source(self, category: str, downloaded: bool) -> None:
         self._sources[category] = "remote" if downloaded else "database"
 
+    @staticmethod
+    def _is_timestamp_fresh(timestamp: datetime | None) -> bool:
+        if timestamp is None:
+            return False
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        else:
+            timestamp = timestamp.astimezone(timezone.utc)
+        return datetime.now(timezone.utc) - timestamp <= CACHE_MAX_AGE
+
+    def _is_price_cache_stale(self) -> bool:
+        refresh_ts = self.database.get_refresh_timestamp(
+            self.config.ticker, self.config.interval, "prices"
+        )
+        if self._is_timestamp_fresh(refresh_ts):
+            return False
+
+        cache_path = self.config.price_cache_path
+        if cache_path.exists():
+            try:
+                cache_timestamp = datetime.fromtimestamp(
+                    cache_path.stat().st_mtime, timezone.utc
+                )
+            except OSError:
+                return True
+            return not self._is_timestamp_fresh(cache_timestamp)
+        return True
+
 
 __all__ = ["DataFetcher"]
-
