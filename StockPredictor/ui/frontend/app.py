@@ -17,10 +17,12 @@ from stock_predictor.core.features import (
     FeatureToggles,
     default_feature_toggles,
 )
+from stock_predictor.core.config import PredictorConfig
 
 DEFAULT_API_URL = os.getenv("STOCK_PREDICTOR_API_URL", "http://localhost:8000")
 DEFAULT_TICKER = os.getenv("STOCK_PREDICTOR_DEFAULT_TICKER", "AAPL")
 DEFAULT_API_KEY = os.getenv("STOCK_PREDICTOR_UI_API_KEY", "")
+DEFAULT_EXPECTED_LOW_MULTIPLIER = PredictorConfig.__dataclass_fields__["expected_low_sigma"].default
 IMPLEMENTED_FEATURE_GROUPS = {
     name for name, spec in FEATURE_REGISTRY.items() if getattr(spec, "implemented", False)
 }
@@ -729,6 +731,15 @@ with st.sidebar:
         format="%.4f",
         help="Expected downside move from the latest price (negative decimals allowed).",
     )
+    expected_low_multiplier = st.number_input(
+        "Expected low multiplier",
+        min_value=0.1,
+        max_value=2.0,
+        value=float(DEFAULT_EXPECTED_LOW_MULTIPLIER),
+        step=0.05,
+        format="%.2f",
+        help="Multiplier applied to the expected-low calculation (defaults to the configured sigma).",
+    )
     stop_loss_pct = st.number_input(
         "Stop-loss % (decimal)",
         value=0.05,
@@ -900,6 +911,7 @@ with col_live_action:
                 json_payload={
                     "expected_change_pct_model": expected_change_pct_model,
                     "expected_low_pct_model": expected_low_pct_model,
+                    "expected_low_multiplier": expected_low_multiplier,
                     "stop_loss_pct": stop_loss_pct,
                     "prob_up": prob_up,
                 },

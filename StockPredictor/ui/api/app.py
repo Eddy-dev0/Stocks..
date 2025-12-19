@@ -237,6 +237,12 @@ class LivePriceRequest(BaseModel):
         description="Optional override for the forecast horizon to evaluate.",
         ge=1,
     )
+    expected_low_multiplier: float | None = Field(
+        default=None,
+        ge=0.1,
+        le=2.0,
+        description="Optional multiplier to scale the expected-low calculation.",
+    )
 
 
 class DirectionProbabilities(BaseModel):
@@ -485,10 +491,11 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
         response_model=LivePriceEnvelope,
     )
     async def live_price(ticker: str, request: LivePriceRequest) -> LivePriceEnvelope:
-        application = await _build_application(ticker, {})
         snapshot_payload = await _call_with_error_handling(
-            application.pipeline.live_price_snapshot,
+            ui_adapter.live_price_snapshot,
+            ticker,
             horizon=request.horizon,
+            expected_low_multiplier=request.expected_low_multiplier,
         )
 
         snapshot = LivePriceResponse(**snapshot_payload)

@@ -99,6 +99,24 @@ async def get_prediction(
     }
 
 
+async def live_price_snapshot(
+    ticker: str,
+    *,
+    horizon: int | None = None,
+    expected_low_multiplier: float | None = None,
+    overrides: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Return a live price snapshot with optional expected-low scaling."""
+
+    merged_overrides = dict(overrides or {})
+    if expected_low_multiplier is not None:
+        merged_overrides["expected_low_sigma"] = expected_low_multiplier
+    application = StockPredictorApplication.from_environment(
+        ticker=ticker, **merged_overrides
+    )
+    return application.pipeline.live_price_snapshot(horizon=horizon)
+
+
 async def run_backtest(
     ticker: str,
     *,
