@@ -972,6 +972,7 @@ class StockPredictorDesktopApp:
                 stop_loss_var,
             ),
             ("expected_change", "Expected change", None),
+            ("daily_change", "Daily change", None),
             ("direction", "Direction", None),
         ]
         for column in range(4):
@@ -4412,6 +4413,73 @@ class StockPredictorDesktopApp:
             self.metric_vars["expected_change"].set(change_display)
         else:
             self.metric_vars["expected_change"].set(f"{change_display} ({pct_display})")
+
+        current_price = _safe_float(self.current_market_price)
+        if current_price is None:
+            current_price = _safe_float(
+                prediction.get("last_price")
+                or prediction.get("last_close")
+                or anchor_raw
+            )
+
+        previous_close = None
+        price_history = self.price_history
+        if isinstance(price_history, pd.DataFrame) and not price_history.empty:
+            columns = {str(column).lower(): column for column in price_history.columns}
+            if "date" in columns:
+                timestamp_series = pd.to_datetime(
+                    price_history[columns["date"]], errors="coerce"
+                )
+            else:
+                timestamp_series = pd.to_datetime(price_history.index, errors="coerce")
+            valid_mask = pd.notna(timestamp_series)
+            data_frame = price_history.loc[valid_mask]
+            timestamps = pd.DatetimeIndex(timestamp_series[valid_mask])
+
+            price_col = None
+            for key in ("close", "adj close", "adjclose", "adj_close", "last", "price"):
+                if key in columns:
+                    price_col = columns[key]
+                    break
+
+            if price_col is None:
+                numeric_cols = [
+                    col
+                    for col in data_frame.columns
+                    if pd.api.types.is_numeric_dtype(data_frame[col])
+                ]
+                price_col = numeric_cols[0] if numeric_cols else None
+
+            if price_col is not None:
+                prices = pd.to_numeric(data_frame[price_col], errors="coerce")
+                price_series = pd.Series(prices.values, index=timestamps).dropna()
+                if len(price_series) >= 2:
+                    previous_close = float(price_series.iloc[-2])
+
+        if previous_close is None:
+            previous_close = _safe_float(prediction.get("last_close"))
+
+        daily_change = None
+        if current_price is not None and previous_close is not None:
+            daily_change = current_price - previous_close
+
+        daily_change_converted = self._convert_currency(daily_change)
+        daily_change_display = fmt_ccy(
+            daily_change_converted, self.currency_symbol, decimals=decimals
+        )
+        if daily_change_display == "—":
+            self.metric_vars["daily_change"].set("—")
+        else:
+            pct_daily = None
+            if previous_close:
+                pct_daily = daily_change / previous_close if daily_change is not None else None
+            pct_daily_display = fmt_pct(pct_daily, show_sign=True)
+            if pct_daily_display == "—":
+                self.metric_vars["daily_change"].set(daily_change_display)
+            else:
+                self.metric_vars["daily_change"].set(
+                    f"{daily_change_display} ({pct_daily_display})"
+                )
 
         prob_up = prediction.get("direction_probability_up")
         prob_down = prediction.get("direction_probability_down")
