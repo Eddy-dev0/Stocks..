@@ -4104,6 +4104,13 @@ class StockPredictorDesktopApp:
         predicted_close = _safe_float(prediction.get("predicted_close"))
         predicted_volatility = _safe_float(prediction.get("predicted_volatility"))
         fallback = _safe_float(prediction.get("expected_low"))
+        if fallback is not None:
+            base_low = fallback
+            if floor_value is not None:
+                base_low = max(base_low, floor_value)
+            if predicted_close is not None:
+                base_low = min(base_low, predicted_close)
+            return float(base_low)
         if predicted_close is None:
             return floor_value if floor_value is not None else fallback
         if predicted_volatility is None:
