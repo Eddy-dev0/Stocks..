@@ -43,6 +43,7 @@ def _build_stubbed_app() -> StockPredictorDesktopApp:
     app.sentiment_label_var = _DummyVar()
     app.sentiment_score_var = _DummyVar()
     app.current_market_timestamp = pd.Timestamp("2024-05-01 15:00", tz="UTC")
+    app.market_timestamp_live_estimate = False
     app.current_market_price = None
     app.price_history = None
     app.currency_symbol = "$"
@@ -82,10 +83,32 @@ def test_market_timestamp_from_price_history() -> None:
             "Close": [100.0, 101.0],
         }
     )
+    app.price_history.attrs["cache_timestamp"] = pd.Timestamp.now(tz="UTC")
 
     app._update_metrics()
 
     assert app.metric_vars["as_of"].value == "2024-05-01 11:00 EDT"
+
+
+def test_market_timestamp_live_estimate_for_stale_cache() -> None:
+    app = _build_stubbed_app()
+    app.current_market_timestamp = None
+    app.price_history = pd.DataFrame(
+        {
+            "Date": pd.date_range(
+                "2024-04-30 15:00", periods=2, freq="D", tz=ZoneInfo("UTC")
+            ),
+            "Close": [100.0, 101.0],
+        }
+    )
+    app.price_history.attrs["cache_timestamp"] = pd.Timestamp(
+        "2024-04-01 12:00", tz=ZoneInfo("UTC")
+    )
+
+    app._update_metrics()
+
+    assert app.metric_vars["as_of"].value == "2024-05-01 11:00 EDT (live estimate)"
+    assert "live estimate" in app.status_var.value
 
 
 def test_last_price_prefers_price_history() -> None:

@@ -10,7 +10,7 @@ import threading
 import tkinter as tk
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from tkinter import messagebox, ttk
 from typing import Any, Callable, Iterable, Mapping
@@ -37,7 +37,11 @@ from stock_predictor.core import (
     TrendFinder,
     TrendInsight,
 )
-from stock_predictor.core.pipeline import NoPriceDataError, resolve_market_timezone
+from stock_predictor.core.pipeline import (
+    CACHE_MAX_AGE,
+    NoPriceDataError,
+    resolve_market_timezone,
+)
 from stock_predictor.core.features import FEATURE_REGISTRY, FeatureToggles
 from stock_predictor.core.preprocessing import derive_price_feature_toggles
 from stock_predictor.core.modeling import InsufficientSamplesError
@@ -432,6 +436,7 @@ class StockPredictorDesktopApp:
         self.current_prediction: dict[str, Any] = {}
         self.current_market_timestamp: pd.Timestamp | None = None
         self.market_timestamp_stale: bool = False
+        self.market_timestamp_live_estimate: bool = False
         self.current_market_price: float | None = None
         self.price_history: pd.DataFrame | None = None
         self.feature_snapshot: pd.DataFrame | None = None
@@ -3738,16 +3743,49 @@ class StockPredictorDesktopApp:
     def _today(self) -> pd.Timestamp:
         return self._now().normalize()
 
+    def _is_cache_timestamp_fresh(
+        self, timestamp: datetime | pd.Timestamp | None
+    ) -> bool:
+        if timestamp is None:
+            return False
+        if isinstance(timestamp, pd.Timestamp):
+            timestamp = timestamp.to_pydatetime()
+        reference = datetime.now(timezone.utc)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        else:
+            timestamp = timestamp.astimezone(timezone.utc)
+        return reference - timestamp <= CACHE_MAX_AGE
+
     def _resolve_market_timestamp(self) -> pd.Timestamp | None:
         latest_timestamp: pd.Timestamp | None = None
         has_history = isinstance(self.price_history, pd.DataFrame) and not self.price_history.empty
+        cache_fresh = False
+        self.market_timestamp_live_estimate = False
         if has_history:
-            _, latest_timestamp = self._extract_latest_price_point(self.price_history)
+            cache_timestamp = self.price_history.attrs.get("cache_timestamp")
+            cache_fresh = self._is_cache_timestamp_fresh(cache_timestamp)
+            if cache_fresh:
+                _, latest_timestamp = self._extract_latest_price_point(self.price_history)
+            else:
+                live_timestamp: pd.Timestamp | None = None
+                fetcher = getattr(
+                    getattr(getattr(self, "application", None), "pipeline", None),
+                    "fetcher",
+                    None,
+                )
+                if fetcher is not None and hasattr(fetcher, "fetch_live_price"):
+                    try:
+                        _, live_timestamp = fetcher.fetch_live_price(force=False)
+                    except Exception:  # pragma: no cover - defensive
+                        live_timestamp = None
+                latest_timestamp = live_timestamp or self._now()
+                self.market_timestamp_live_estimate = True
         elif self.current_market_timestamp is not None:
             latest_timestamp = self.current_market_timestamp
 
         localized = self._localize_market_timestamp(latest_timestamp)
-        self.market_timestamp_stale = localized is None or not has_history
+        self.market_timestamp_stale = localized is None or not has_history or (has_history and not cache_fresh)
         if localized is not None:
             self.current_market_timestamp = localized
         return localized
@@ -4250,9 +4288,13 @@ class StockPredictorDesktopApp:
         as_of_display = (
             localized_as_of.strftime("%Y-%m-%d %H:%M %Z") if localized_as_of is not None else "—"
         )
+        if self.market_timestamp_live_estimate and as_of_display != "—":
+            as_of_display = f"{as_of_display} (live estimate)"
         self.metric_vars["as_of"].set(as_of_display)
 
-        if self.market_timestamp_stale:
+        if self.market_timestamp_live_estimate and as_of_display != "—":
+            status_message = f"Market data as of {as_of_display}"
+        elif self.market_timestamp_stale:
             status_message = "Market data timestamp unavailable or stale."
         else:
             status_message = (
