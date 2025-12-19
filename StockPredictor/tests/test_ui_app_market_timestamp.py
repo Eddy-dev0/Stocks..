@@ -26,6 +26,11 @@ def _build_stubbed_app() -> StockPredictorDesktopApp:
     app = StockPredictorDesktopApp.__new__(StockPredictorDesktopApp)
     app.market_timezone = ZoneInfo("America/New_York")
     app._now = lambda: pd.Timestamp("2024-05-01 15:00", tz=ZoneInfo("UTC"))
+    app.application = SimpleNamespace(
+        pipeline=SimpleNamespace(
+            fetcher=SimpleNamespace(fetch_live_price=lambda force=False: (None, None))
+        )
+    )
     app.metric_vars = {
         key: _DummyVar()
         for key in (
@@ -121,7 +126,25 @@ def test_last_price_prefers_price_history() -> None:
         }
     )
 
-    raw, converted = app._reference_last_price(app.current_prediction)
+    app._update_metrics()
 
-    assert raw == 321.5
-    assert converted == 321.5
+    assert app.metric_vars["last_close"].value == "$321.50 (cached)"
+
+
+def test_last_price_prefers_live_fetcher_over_history() -> None:
+    app = _build_stubbed_app()
+    app.current_market_price = None
+    app.price_history = pd.DataFrame(
+        {
+            "Date": [pd.Timestamp("2024-05-01 15:00", tz=ZoneInfo("UTC"))],
+            "Close": [321.5],
+        }
+    )
+    app.application.pipeline.fetcher.fetch_live_price = lambda force=False: (
+        333.25,
+        pd.Timestamp("2024-05-01 15:00", tz=ZoneInfo("UTC")),
+    )
+
+    app._update_metrics()
+
+    assert app.metric_vars["last_close"].value == "$333.25"
