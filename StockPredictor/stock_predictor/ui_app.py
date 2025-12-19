@@ -3828,11 +3828,8 @@ class StockPredictorDesktopApp:
             return ts.tz_localize(tz)
 
     def _forecast_base_date(self) -> pd.Timestamp:
-        timestamp = self._resolve_market_timestamp()
-        if timestamp is not None:
-            return timestamp.normalize()
-
-        if isinstance(self.price_history, pd.DataFrame) and not self.price_history.empty:
+        last_market_date = self._resolve_market_timestamp()
+        if last_market_date is None and isinstance(self.price_history, pd.DataFrame) and not self.price_history.empty:
             frame = self.price_history.copy()
             lower_map = {str(column).lower(): column for column in frame.columns}
             if "date" in lower_map:
@@ -3840,15 +3837,32 @@ class StockPredictorDesktopApp:
                 if not dates.empty:
                     localized = self._localize_market_timestamp(dates.iloc[-1])
                     if localized is not None:
-                        return localized.normalize()
-            index_dates = pd.to_datetime(frame.index, errors="coerce")
-            index_series = pd.Series(index_dates).dropna()
-            if not index_series.empty:
-                localized = self._localize_market_timestamp(index_series.iloc[-1])
-                if localized is not None:
-                    return localized.normalize()
+                        last_market_date = localized
+            if last_market_date is None:
+                index_dates = pd.to_datetime(frame.index, errors="coerce")
+                index_series = pd.Series(index_dates).dropna()
+                if not index_series.empty:
+                    localized = self._localize_market_timestamp(index_series.iloc[-1])
+                    if localized is not None:
+                        last_market_date = localized
 
-        return self._today()
+        if last_market_date is None:
+            return self._today()
+
+        base_date = last_market_date.normalize()
+        holidays = self.market_holidays or self._resolve_market_holidays()
+        if not self.market_holidays and holidays:
+            self.market_holidays = list(holidays)
+        today = self._today()
+        offset = (
+            CustomBusinessDay(n=1, holidays=holidays)
+            if holidays
+            else BDay(n=1)
+        )
+        previous_trading_day = (today - offset).normalize()
+        if base_date < previous_trading_day:
+            return today.normalize()
+        return base_date
 
     def _compute_forecast_date(
         self, target_date: Any | None = None, *, offset: int | None = None

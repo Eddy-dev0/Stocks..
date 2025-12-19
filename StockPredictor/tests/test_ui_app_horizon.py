@@ -4,6 +4,7 @@ from datetime import date
 
 import sys
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -27,6 +28,17 @@ def _build_app() -> StockPredictorDesktopApp:
     app._resolve_market_holidays = lambda: []
     base = pd.Timestamp(date(2025, 11, 14))
     app._forecast_base_date = lambda: base
+    return app
+
+
+def _build_base_date_app() -> StockPredictorDesktopApp:
+    app = StockPredictorDesktopApp.__new__(StockPredictorDesktopApp)
+    app.price_history = pd.DataFrame()
+    app.market_holidays = []
+    app.current_market_timestamp = None
+    app.market_timezone = ZoneInfo("UTC")
+    app._resolve_market_timestamp = lambda: None
+    app._resolve_market_holidays = lambda: []
     return app
 
 
@@ -66,3 +78,24 @@ def test_rejects_past_target_date(caplog: pytest.LogCaptureFixture) -> None:
 
     assert forecast is None
     assert "precedes" in caplog.text.lower()
+
+
+def test_forecast_base_date_rolls_forward_when_cache_stale_with_holiday() -> None:
+    app = _build_base_date_app()
+    app._today = lambda: pd.Timestamp("2024-01-16", tz="UTC").normalize()
+    app.market_holidays = [pd.Timestamp("2024-01-15", tz="UTC")]
+    app.price_history = pd.DataFrame({"Date": [pd.Timestamp("2024-01-11")]})
+
+    base_date = app._forecast_base_date()
+
+    assert base_date.date() == date(2024, 1, 16)
+
+
+def test_forecast_base_date_accepts_previous_trading_day_on_weekend_roll() -> None:
+    app = _build_base_date_app()
+    app._today = lambda: pd.Timestamp("2024-01-08", tz="UTC").normalize()
+    app.price_history = pd.DataFrame({"Date": [pd.Timestamp("2024-01-05")]})
+
+    base_date = app._forecast_base_date()
+
+    assert base_date.date() == date(2024, 1, 5)
