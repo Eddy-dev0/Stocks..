@@ -988,7 +988,14 @@ class StockPredictorDesktopApp:
             row = idx // 2
             column = (idx % 2) * 2
             caption = ttk.Label(summary_frame, text=f"{label}:", anchor=tk.E)
-            caption.grid(row=row, column=column, sticky=tk.E, padx=(4, 8), pady=2)
+            label_grid_options = {
+                "row": row,
+                "column": column,
+                "sticky": tk.E,
+                "padx": (4, 8),
+                "pady": 2,
+            }
+            caption.grid(**label_grid_options)
             metric_var = var or tk.StringVar(value="—")
             value = ttk.Label(
                 summary_frame,
@@ -996,8 +1003,20 @@ class StockPredictorDesktopApp:
                 anchor=tk.E,
                 font=("TkDefaultFont", 10, "bold"),
             )
-            value.grid(row=row, column=column + 1, sticky=tk.E, padx=(0, 8), pady=2)
+            value_grid_options = {
+                "row": row,
+                "column": column + 1,
+                "sticky": tk.E,
+                "padx": (0, 8),
+                "pady": 2,
+            }
+            value.grid(**value_grid_options)
             self.metric_vars[key] = metric_var
+            if key == "stop_loss":
+                self.stop_loss_label = caption
+                self.stop_loss_value = value
+                self._stop_loss_label_grid_options = label_grid_options
+                self._stop_loss_value_grid_options = value_grid_options
 
         self.stop_loss_var = stop_loss_var
 
@@ -4445,12 +4464,42 @@ class StockPredictorDesktopApp:
             fmt_ccy(expected_low_converted, self.currency_symbol, decimals=decimals)
         )
 
-        stop_loss_value = prediction.get("stop_loss") if isinstance(prediction, Mapping) else None
-        stop_loss_converted = self._convert_currency(stop_loss_value)
-        stop_loss_display = fmt_ccy(stop_loss_converted, self.currency_symbol, decimals=decimals)
-        stop_loss_var = getattr(self, "stop_loss_var", self.metric_vars.get("stop_loss"))
-        if stop_loss_var is not None:
-            stop_loss_var.set(stop_loss_display)
+        predicted_volatility = None
+        if isinstance(prediction, Mapping):
+            predicted_volatility = _safe_float(prediction.get("predicted_volatility"))
+            if predicted_volatility is None:
+                predicted_volatility = _safe_float(prediction.get("recent_return_std"))
+            if predicted_volatility is None:
+                predicted_volatility = _safe_float(prediction.get("expected_low_return_std"))
+        stop_loss_label = getattr(self, "stop_loss_label", None)
+        stop_loss_value_widget = getattr(self, "stop_loss_value", None)
+        show_stop_loss = predicted_volatility is not None
+        if show_stop_loss:
+            label_grid_options = getattr(self, "_stop_loss_label_grid_options", None)
+            value_grid_options = getattr(self, "_stop_loss_value_grid_options", None)
+            if stop_loss_label is not None:
+                if label_grid_options:
+                    stop_loss_label.grid(**label_grid_options)
+                else:
+                    stop_loss_label.grid()
+            if stop_loss_value_widget is not None:
+                if value_grid_options:
+                    stop_loss_value_widget.grid(**value_grid_options)
+                else:
+                    stop_loss_value_widget.grid()
+            stop_loss_value = prediction.get("stop_loss") if isinstance(prediction, Mapping) else None
+            stop_loss_converted = self._convert_currency(stop_loss_value)
+            stop_loss_display = fmt_ccy(
+                stop_loss_converted, self.currency_symbol, decimals=decimals
+            )
+            stop_loss_var = getattr(self, "stop_loss_var", self.metric_vars.get("stop_loss"))
+            if stop_loss_var is not None:
+                stop_loss_var.set(stop_loss_display)
+        else:
+            if stop_loss_label is not None:
+                stop_loss_label.grid_remove()
+            if stop_loss_value_widget is not None:
+                stop_loss_value_widget.grid_remove()
 
         change_display = fmt_ccy(change_converted, self.currency_symbol, decimals=decimals)
         pct_display = fmt_pct(derived_metrics["pct_change"], show_sign=True)
