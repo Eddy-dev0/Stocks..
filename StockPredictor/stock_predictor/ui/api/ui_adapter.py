@@ -104,6 +104,7 @@ async def live_price_snapshot(
     *,
     horizon: int | None = None,
     expected_low_multiplier: float | None = None,
+    stop_loss_multiplier: float | None = None,
     overrides: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Return a live price snapshot with optional expected-low scaling."""
@@ -111,6 +112,8 @@ async def live_price_snapshot(
     merged_overrides = dict(overrides or {})
     if expected_low_multiplier is not None:
         merged_overrides["expected_low_sigma"] = expected_low_multiplier
+    if stop_loss_multiplier is not None:
+        merged_overrides["k_stop"] = stop_loss_multiplier
     application = StockPredictorApplication.from_environment(
         ticker=ticker, **merged_overrides
     )

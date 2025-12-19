@@ -243,6 +243,12 @@ class LivePriceRequest(BaseModel):
         le=2.0,
         description="Optional multiplier to scale the expected-low calculation.",
     )
+    stop_loss_multiplier: float | None = Field(
+        default=None,
+        ge=0.1,
+        le=5.0,
+        description="Optional multiplier to scale the stop-loss calculation.",
+    )
 
 
 class DirectionProbabilities(BaseModel):
@@ -496,6 +502,7 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
             ticker,
             horizon=request.horizon,
             expected_low_multiplier=request.expected_low_multiplier,
+            stop_loss_multiplier=request.stop_loss_multiplier,
         )
 
         snapshot = LivePriceResponse(**snapshot_payload)
