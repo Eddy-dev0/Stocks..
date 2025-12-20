@@ -38,7 +38,23 @@ class TrainingDatasetBuilder:
         self.config = config
         self.database = database or Database(config.database_url)
         self.feature_assembler = FeatureAssembler(
-            config.feature_toggles, config.prediction_horizons
+            config.feature_toggles,
+            config.prediction_horizons,
+            regime_params={
+                "trend_window": config.regime_trend_window,
+                "mean_reversion_window": config.regime_mean_reversion_window,
+                "vol_short_window": config.regime_vol_short_window,
+                "vol_long_window": config.regime_vol_long_window,
+                "trend_threshold": config.regime_trend_threshold,
+                "mean_reversion_threshold": config.regime_mean_reversion_threshold,
+                "vol_high_threshold": config.regime_vol_high_threshold,
+                "vol_low_threshold": config.regime_vol_low_threshold,
+            },
+            event_params={
+                "event_window": config.event_feature_window,
+                "keywords": config.event_feature_keywords,
+            },
+            direction_params={"neutral_threshold": config.direction_neutral_threshold},
         )
 
     def build(self, *, force: bool = False) -> TrainingDataset:

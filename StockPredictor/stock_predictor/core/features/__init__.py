@@ -81,9 +81,23 @@ def _elliott_group_builder(context: FeatureBuildContext) -> FeatureBuildOutput:
 def _macro_group_builder(context: FeatureBuildContext) -> FeatureBuildOutput:
     blocks = [
         block
-        for block in _build_macro_blocks(context.price_df, macro_df=context.macro_df)
+        for block in _build_macro_blocks(
+            context.price_df,
+            macro_df=context.macro_df,
+            event_params=context.event_params,
+        )
         if block is not None
     ]
+    status = "executed" if blocks else "skipped_no_data"
+    return FeatureBuildOutput(blocks=blocks, status=status)
+
+
+def _regime_group_builder(context: FeatureBuildContext) -> FeatureBuildOutput:
+    block = _build_regime_block(
+        context.price_df,
+        regime_params=context.regime_params,
+    )
+    blocks = [block] if block is not None else []
     status = "executed" if blocks else "skipped_no_data"
     return FeatureBuildOutput(blocks=blocks, status=status)
 
@@ -119,6 +133,7 @@ FEATURE_REGISTRY: Dict[str, FeatureGroupSpec] = build_feature_registry(
     technical=_technical_group_builder,
     elliott=_elliott_group_builder,
     macro=_macro_group_builder,
+    regime=_regime_group_builder,
     sentiment=_sentiment_group_builder,
     identification=_not_implemented_group_builder("identification"),
     volume_liquidity=_volume_liquidity_group_builder,
@@ -137,6 +152,9 @@ class FeatureAssembler:
         *,
         registry: Mapping[str, FeatureGroupSpec] | None = None,
         technical_indicator_config: Mapping[str, Mapping[str, object]] | None = None,
+        regime_params: Mapping[str, float] | None = None,
+        event_params: Mapping[str, object] | None = None,
+        direction_params: Mapping[str, float] | None = None,
     ) -> None:
         self.registry: Dict[str, FeatureGroupSpec] = dict(registry or FEATURE_REGISTRY)
         if not self.registry:
@@ -158,6 +176,9 @@ class FeatureAssembler:
         if horizons is None:
             horizons = (1,)
         self.horizons = _normalise_horizons(horizons)
+        self.regime_params = dict(regime_params or {})
+        self.event_params = dict(event_params or {})
+        self.direction_params = dict(direction_params or {})
 
     # ------------------------------------------------------------------
     # Public API
@@ -187,6 +208,8 @@ class FeatureAssembler:
             macro_df=context_macro,
             sentiment_enabled=sentiment_enabled,
             technical_indicator_config=self.technical_indicator_config,
+            regime_params=self.regime_params,
+            event_params=self.event_params,
         )
 
         feature_blocks: list[FeatureBlock] = []
@@ -284,7 +307,11 @@ class FeatureAssembler:
 
         merged = merged.assign(Close_Current=merged["Close"])
 
-        targets = _generate_targets(merged, self.horizons)
+        targets = _generate_targets(
+            merged,
+            self.horizons,
+            direction_neutral_threshold=self.direction_params.get("neutral_threshold"),
+        )
         metadata["target_validation"] = _validate_target_alignment(
             merged, targets, self.horizons
         )
@@ -565,6 +592,37 @@ def _safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     return numerator / denominator.replace(0, np.nan)
 
 
+def _event_distance(flags: np.ndarray) -> tuple[pd.Series, pd.Series]:
+    if flags.size == 0:
+        return pd.Series(dtype="float64"), pd.Series(dtype="float64")
+    last_gap = np.full(flags.shape[0], np.nan, dtype="float64")
+    next_gap = np.full(flags.shape[0], np.nan, dtype="float64")
+
+    last_idx: int | None = None
+    for idx, value in enumerate(flags):
+        if value > 0:
+            last_idx = idx
+        if last_idx is not None:
+            last_gap[idx] = float(idx - last_idx)
+
+    next_idx: int | None = None
+    for idx in range(flags.shape[0] - 1, -1, -1):
+        if flags[idx] > 0:
+            next_idx = idx
+        if next_idx is not None:
+            next_gap[idx] = float(next_idx - idx)
+
+    return pd.Series(last_gap), pd.Series(next_gap)
+
+
+def _normalize_event_label(label: str) -> str:
+    safe = "".join(ch if ch.isalnum() else "_" for ch in str(label).strip())
+    safe = safe.strip("_")
+    if not safe:
+        return "Event"
+    return safe.upper()
+
+
 def _build_volume_liquidity_block(price_df: pd.DataFrame) -> FeatureBlock | None:
     if price_df.empty or "Volume" not in price_df:
         return None
@@ -580,6 +638,7 @@ def _build_volume_liquidity_block(price_df: pd.DataFrame) -> FeatureBlock | None
     close = _get_numeric_series(df, "Close", default=np.nan)
     high = _get_numeric_series(df, "High", default=np.nan).fillna(close)
     low = _get_numeric_series(df, "Low", default=np.nan).fillna(close)
+    open_price = _get_numeric_series(df, "Open", default=np.nan).fillna(close)
     adj_close = _get_numeric_series(df, "Adj Close", default=np.nan)
 
     typical_price = (high + low + close) / 3.0
@@ -617,6 +676,20 @@ def _build_volume_liquidity_block(price_df: pd.DataFrame) -> FeatureBlock | None
         volume, volume.rolling(window=20, min_periods=1).mean()
     )
     liquidity_frame["Volume_Price_Elasticity"] = _safe_divide(volume.diff(), price_change.replace(0, np.nan))
+    range_value = (high - low).replace(0, np.nan)
+    close_location = _safe_divide((2 * close - high - low), range_value)
+    body = close - open_price
+    body_ratio = _safe_divide(body, range_value)
+    up_volume = volume.where(body > 0, 0.0)
+    down_volume = volume.where(body < 0, 0.0)
+    volume_imbalance = _safe_divide(up_volume - down_volume, volume)
+    vwap = _safe_divide((typical_price * volume).cumsum(), volume.cumsum())
+    liquidity_frame["Range"] = range_value
+    liquidity_frame["Close_Location_Value"] = close_location
+    liquidity_frame["Body_to_Range"] = body_ratio
+    liquidity_frame["Volume_Imbalance"] = volume_imbalance
+    liquidity_frame["VWAP_Deviation"] = _safe_divide(close, vwap) - 1.0
+    liquidity_frame["Range_to_Close"] = _safe_divide(range_value, close)
 
     column_categories = {
         "OBV": "volume_trend",
@@ -628,6 +701,12 @@ def _build_volume_liquidity_block(price_df: pd.DataFrame) -> FeatureBlock | None
         "Turnover_Value": "liquidity_turnover",
         "Volume_to_Avg20": "volume_relative",
         "Volume_Price_Elasticity": "liquidity_sensitivity",
+        "Range": "microstructure_range",
+        "Close_Location_Value": "microstructure_price_action",
+        "Body_to_Range": "microstructure_price_action",
+        "Volume_Imbalance": "microstructure_volume",
+        "VWAP_Deviation": "microstructure_price_action",
+        "Range_to_Close": "microstructure_range",
     }
 
     liquidity_frame = liquidity_frame.replace([np.inf, -np.inf], np.nan).fillna(0.0)
@@ -708,12 +787,16 @@ def _build_elliott_wave_descriptors(price_df: pd.DataFrame) -> FeatureBlock | No
 
 
 def _build_macro_blocks(
-    price_df: pd.DataFrame, *, macro_df: pd.DataFrame | None = None
+    price_df: pd.DataFrame,
+    *,
+    macro_df: pd.DataFrame | None = None,
+    event_params: Mapping[str, object] | None = None,
 ) -> list[FeatureBlock | None]:
     return [
         _build_macro_context(price_df),
         _build_macro_benchmarks(price_df, macro_df=macro_df),
         _build_cross_sectional_betas(price_df, macro_df=macro_df),
+        _build_event_aware_features(price_df, macro_df=macro_df, event_params=event_params),
     ]
 
 
@@ -741,6 +824,148 @@ def _build_macro_context(price_df: pd.DataFrame) -> FeatureBlock | None:
     }
 
     return FeatureBlock(macro, category="macro", column_categories=column_categories)
+
+
+def _build_regime_block(
+    price_df: pd.DataFrame, *, regime_params: Mapping[str, float] | None = None
+) -> FeatureBlock | None:
+    if "Close" not in price_df:
+        return None
+
+    params = dict(regime_params or {})
+    trend_window = int(params.get("trend_window", 63))
+    mean_reversion_window = int(params.get("mean_reversion_window", 21))
+    vol_short_window = int(params.get("vol_short_window", 21))
+    vol_long_window = int(params.get("vol_long_window", 63))
+    trend_threshold = float(params.get("trend_threshold", 0.003))
+    mean_reversion_threshold = float(params.get("mean_reversion_threshold", 0.15))
+    vol_high_threshold = float(params.get("vol_high_threshold", 1.25))
+    vol_low_threshold = float(params.get("vol_low_threshold", 0.8))
+
+    df = price_df.reset_index(drop=True).sort_values("Date").reset_index(drop=True)
+    close = pd.to_numeric(df["Close"], errors="coerce")
+    returns = close.pct_change(fill_method=None)
+
+    trend_slope = _rolling_linear_trend(close, window=trend_window)
+    trend_strength = _safe_divide(trend_slope.abs(), close.rolling(window=trend_window, min_periods=5).mean())
+    mean_reversion = -returns.rolling(window=mean_reversion_window, min_periods=5).corr(
+        returns.shift(1)
+    )
+    vol_short = returns.rolling(window=vol_short_window, min_periods=5).std()
+    vol_long = returns.rolling(window=vol_long_window, min_periods=10).std()
+    vol_ratio = _safe_divide(vol_short, vol_long)
+
+    trend_flag = (trend_strength > trend_threshold).astype(float)
+    mean_reversion_flag = (mean_reversion > mean_reversion_threshold).astype(float)
+    vol_high = (vol_ratio > vol_high_threshold).astype(float)
+    vol_low = (vol_ratio < vol_low_threshold).astype(float)
+
+    regime_label = np.where(trend_flag > 0, 1.0, 0.0)
+
+    frame = pd.DataFrame(
+        {
+            "Date": df["Date"],
+            "Regime_TrendStrength": trend_strength,
+            "Regime_MeanReversion": mean_reversion,
+            "Regime_VolatilityRatio": vol_ratio,
+            "Regime_TrendFlag": trend_flag,
+            "Regime_MeanReversionFlag": mean_reversion_flag,
+            "Regime_VolHigh": vol_high,
+            "Regime_VolLow": vol_low,
+            "Regime_Label": regime_label,
+        }
+    ).fillna(0.0)
+
+    column_categories = {
+        "Regime_TrendStrength": "regime_trend",
+        "Regime_MeanReversion": "regime_mean_reversion",
+        "Regime_VolatilityRatio": "regime_volatility",
+        "Regime_TrendFlag": "regime_label",
+        "Regime_MeanReversionFlag": "regime_label",
+        "Regime_VolHigh": "regime_volatility",
+        "Regime_VolLow": "regime_volatility",
+        "Regime_Label": "regime_label",
+    }
+
+    return FeatureBlock(frame, category="regime", column_categories=column_categories)
+
+
+def _build_event_aware_features(
+    price_df: pd.DataFrame,
+    *,
+    macro_df: pd.DataFrame | None = None,
+    event_params: Mapping[str, object] | None = None,
+) -> FeatureBlock | None:
+    if macro_df is None or macro_df.empty or "Date" not in macro_df.columns:
+        return None
+    if "Close" not in price_df.columns:
+        return None
+
+    event_params = dict(event_params or {})
+    date_series = pd.to_datetime(price_df["Date"], errors="coerce")
+    macro = macro_df.copy()
+    macro["Date"] = pd.to_datetime(macro["Date"], errors="coerce")
+    macro = macro.dropna(subset=["Date"]).sort_values("Date").set_index("Date")
+
+    keyword_map = tuple(
+        event_params.get(
+            "keywords",
+            (
+                "earnings",
+                "fomc",
+                "cpi",
+                "pce",
+                "gdp",
+                "ppi",
+                "jobs",
+                "nfp",
+                "inflation",
+                "rate",
+                "fed",
+                "pmi",
+                "ism",
+            ),
+        )
+    )
+    event_columns = [
+        col
+        for col in macro.columns
+        if any(keyword in col.lower() for keyword in keyword_map)
+    ]
+    if not event_columns:
+        return None
+
+    close = pd.to_numeric(price_df["Close"], errors="coerce")
+    returns = close.pct_change(fill_method=None)
+
+    event_window = int(event_params.get("event_window", 5))
+    frame = pd.DataFrame({"Date": date_series})
+    column_categories: dict[str, str] = {}
+
+    for col in event_columns:
+        raw = pd.to_numeric(macro[col], errors="coerce").fillna(0.0)
+        flag = raw.where(raw == 0, 1.0)
+        aligned = flag.reindex(pd.DatetimeIndex(date_series)).fillna(0.0)
+        aligned = pd.Series(aligned.to_numpy(), index=price_df.index)
+        last_gap, next_gap = _event_distance(aligned.to_numpy())
+        event_return = returns.rolling(window=event_window, min_periods=1).sum()
+        event_impact = event_return.where(aligned > 0, 0.0)
+        label = _normalize_event_label(col)
+
+        frame[f"{label}_Flag"] = aligned.reset_index(drop=True)
+        frame[f"{label}_Days_Since"] = last_gap
+        frame[f"{label}_Days_Until"] = next_gap
+        frame[f"{label}_Impact_{event_window}d"] = event_impact.reset_index(drop=True)
+        frame[f"{label}_Upcoming_Score"] = _safe_divide(1.0, 1.0 + next_gap)
+
+        column_categories[f"{label}_Flag"] = "event_flag"
+        column_categories[f"{label}_Days_Since"] = "event_timing"
+        column_categories[f"{label}_Days_Until"] = "event_timing"
+        column_categories[f"{label}_Impact_{event_window}d"] = "event_impact"
+        column_categories[f"{label}_Upcoming_Score"] = "event_timing"
+
+    frame = frame.fillna(0.0)
+    return FeatureBlock(frame, category="macro_event", column_categories=column_categories)
 
 
 def _rolling_linear_trend(series: pd.Series, window: int) -> pd.Series:
@@ -925,7 +1150,12 @@ def _empty_sentiment_frame() -> pd.DataFrame:
 # Target generation
 # ----------------------------------------------------------------------
 
-def _generate_targets(merged: pd.DataFrame, horizons: Iterable[int]) -> Dict[int, Dict[str, pd.Series]]:
+def _generate_targets(
+    merged: pd.DataFrame,
+    horizons: Iterable[int],
+    *,
+    direction_neutral_threshold: float | None = None,
+) -> Dict[int, Dict[str, pd.Series]]:
     merged = merged.copy()
     pct_returns = merged["Close"].pct_change(fill_method=None)
     merged["Daily_Return"] = pct_returns
@@ -935,8 +1165,15 @@ def _generate_targets(merged: pd.DataFrame, horizons: Iterable[int]) -> Dict[int
         future_close = merged["Close"].shift(-horizon)
         cumulative_return = _safe_divide(future_close, merged["Close"]) - 1.0
         log_return = np.log1p(cumulative_return)
-        direction = (cumulative_return > 0).astype(float)
-        direction[cumulative_return.isna()] = np.nan
+        if direction_neutral_threshold is None:
+            direction = (cumulative_return > 0).astype(float)
+            direction[cumulative_return.isna()] = np.nan
+        else:
+            threshold = float(abs(direction_neutral_threshold))
+            direction = pd.Series(np.nan, index=cumulative_return.index, dtype="float64")
+            direction[cumulative_return > threshold] = 1.0
+            direction[cumulative_return < -threshold] = -1.0
+            direction[(cumulative_return <= threshold) & (cumulative_return >= -threshold)] = 0.0
         volatility = (
             merged["Daily_Return"].rolling(window=horizon, min_periods=1).std().shift(-horizon)
         )

@@ -100,11 +100,19 @@ class MultiHorizonModelingEngine:
             raise KeyError("Price dataframe must contain a close column for target generation.")
 
         closes = pd.to_numeric(working[close_col], errors="coerce")
+        neutral_threshold = float(getattr(self.config, "direction_neutral_threshold", 0.0))
         targets: dict[int, dict[str, pd.Series]] = {}
         for horizon in horizons:
             future_close = closes.shift(-int(horizon))
-            direction = np.where(future_close > closes, 1, -1)
             returns = (future_close - closes) / closes
+            if neutral_threshold > 0:
+                direction = np.where(
+                    returns > neutral_threshold,
+                    1,
+                    np.where(returns < -neutral_threshold, -1, 0),
+                )
+            else:
+                direction = np.where(future_close > closes, 1, -1)
             targets[int(horizon)] = {
                 "close_h": future_close,
                 "direction_h": pd.Series(direction, index=working.index, dtype=float),

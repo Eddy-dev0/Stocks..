@@ -184,6 +184,46 @@ class PredictorConfig:
     tuning_folds: int | None = None
     tuning_n_jobs: int | None = None
     direction_confidence_threshold: float = 0.5
+    direction_trade_threshold: float = 0.65
+    direction_neutral_threshold: float = 0.003
+    monte_carlo_confirmation_enabled: bool = True
+    monte_carlo_confirmation_threshold: float = 0.6
+    probability_calibration_enabled: bool = True
+    probability_calibration_method: str = "sigmoid"
+    probability_calibration_folds: int = 3
+    regime_models_enabled: bool = True
+    regime_trend_threshold: float = 0.003
+    regime_mean_reversion_threshold: float = 0.15
+    regime_vol_high_threshold: float = 1.25
+    regime_vol_low_threshold: float = 0.8
+    regime_trend_window: int = 63
+    regime_mean_reversion_window: int = 21
+    regime_vol_short_window: int = 21
+    regime_vol_long_window: int = 63
+    event_feature_window: int = 5
+    event_feature_keywords: tuple[str, ...] = field(
+        default_factory=lambda: (
+            "earnings",
+            "fomc",
+            "cpi",
+            "pce",
+            "gdp",
+            "ppi",
+            "jobs",
+            "nfp",
+            "inflation",
+            "rate",
+            "fed",
+            "pmi",
+            "ism",
+        )
+    )
+    cost_sensitive_enabled: bool = True
+    cost_sensitive_up_weight: float = 1.0
+    cost_sensitive_down_weight: float = 1.0
+    cost_sensitive_neutral_weight: float = 0.5
+    purged_cv_purge_window: int = 5
+    purged_cv_embargo: int = 2
     volatility_window: int = DEFAULT_VOLATILITY_WINDOW
     target_gain_pct: float = DEFAULT_TARGET_GAIN_PCT
     risk_free_rate: float = 0.0
@@ -267,12 +307,14 @@ class PredictorConfig:
         self.backtest_neutral_threshold = float(self.backtest_neutral_threshold)
         if self.backtest_neutral_threshold < 0:
             raise ValueError("backtest_neutral_threshold must be non-negative.")
-        if self.evaluation_strategy not in {"holdout", "time_series", "rolling"}:
+        if self.evaluation_strategy not in {"holdout", "time_series", "rolling", "purged"}:
             raise ValueError(
-                "evaluation_strategy must be one of 'holdout', 'time_series', or 'rolling'."
+                "evaluation_strategy must be one of 'holdout', 'time_series', 'rolling', or 'purged'."
             )
         if self.evaluation_folds <= 1 and self.evaluation_strategy == "time_series":
             raise ValueError("evaluation_folds must be greater than 1 for time series cross-validation.")
+        if self.evaluation_folds <= 1 and self.evaluation_strategy == "purged":
+            raise ValueError("evaluation_folds must be greater than 1 for purged cross-validation.")
         if self.evaluation_window <= 0:
             raise ValueError("evaluation_window must be positive.")
         if self.evaluation_step <= 0:
@@ -305,6 +347,71 @@ class PredictorConfig:
                 self.tuning_n_jobs = None
         if not 0.5 <= float(self.direction_confidence_threshold) < 1:
             raise ValueError("direction_confidence_threshold must be between 0.5 and 1.0.")
+        if not 0.5 <= float(self.direction_trade_threshold) < 1:
+            raise ValueError("direction_trade_threshold must be between 0.5 and 1.0.")
+        if float(self.direction_neutral_threshold) < 0:
+            raise ValueError("direction_neutral_threshold must be non-negative.")
+        self.direction_neutral_threshold = float(self.direction_neutral_threshold)
+        self.direction_trade_threshold = float(self.direction_trade_threshold)
+        self.monte_carlo_confirmation_enabled = bool(self.monte_carlo_confirmation_enabled)
+        self.monte_carlo_confirmation_threshold = float(self.monte_carlo_confirmation_threshold)
+        if not 0 <= self.monte_carlo_confirmation_threshold <= 1:
+            raise ValueError("monte_carlo_confirmation_threshold must be between 0 and 1.")
+        self.probability_calibration_enabled = bool(self.probability_calibration_enabled)
+        self.probability_calibration_method = (
+            str(self.probability_calibration_method).strip().lower() or "sigmoid"
+        )
+        if self.probability_calibration_method not in {"sigmoid", "isotonic"}:
+            raise ValueError("probability_calibration_method must be 'sigmoid' or 'isotonic'.")
+        try:
+            self.probability_calibration_folds = int(self.probability_calibration_folds)
+        except (TypeError, ValueError):
+            self.probability_calibration_folds = 3
+        self.probability_calibration_folds = max(2, self.probability_calibration_folds)
+        self.regime_models_enabled = bool(self.regime_models_enabled)
+        for label, value in (
+            ("regime_trend_threshold", self.regime_trend_threshold),
+            ("regime_mean_reversion_threshold", self.regime_mean_reversion_threshold),
+            ("regime_vol_high_threshold", self.regime_vol_high_threshold),
+            ("regime_vol_low_threshold", self.regime_vol_low_threshold),
+        ):
+            if float(value) < 0:
+                raise ValueError(f"{label} must be non-negative.")
+        for label, value in (
+            ("regime_trend_window", self.regime_trend_window),
+            ("regime_mean_reversion_window", self.regime_mean_reversion_window),
+            ("regime_vol_short_window", self.regime_vol_short_window),
+            ("regime_vol_long_window", self.regime_vol_long_window),
+        ):
+            if int(value) <= 0:
+                raise ValueError(f"{label} must be a positive integer.")
+        try:
+            self.event_feature_window = int(self.event_feature_window)
+        except (TypeError, ValueError):
+            self.event_feature_window = 5
+        if self.event_feature_window <= 0:
+            raise ValueError("event_feature_window must be positive.")
+        self.event_feature_keywords = self._normalise_strings(self.event_feature_keywords, lower=True)
+        self.cost_sensitive_enabled = bool(self.cost_sensitive_enabled)
+        for label, value in (
+            ("cost_sensitive_up_weight", self.cost_sensitive_up_weight),
+            ("cost_sensitive_down_weight", self.cost_sensitive_down_weight),
+            ("cost_sensitive_neutral_weight", self.cost_sensitive_neutral_weight),
+        ):
+            if float(value) <= 0:
+                raise ValueError(f"{label} must be positive.")
+        try:
+            self.purged_cv_purge_window = int(self.purged_cv_purge_window)
+        except (TypeError, ValueError):
+            self.purged_cv_purge_window = 5
+        try:
+            self.purged_cv_embargo = int(self.purged_cv_embargo)
+        except (TypeError, ValueError):
+            self.purged_cv_embargo = 2
+        if self.purged_cv_purge_window < 0:
+            raise ValueError("purged_cv_purge_window must be non-negative.")
+        if self.purged_cv_embargo < 0:
+            raise ValueError("purged_cv_embargo must be non-negative.")
         if int(self.volatility_window) <= 0:
             raise ValueError("volatility_window must be a positive integer.")
         self.volatility_window = int(self.volatility_window)
@@ -522,6 +629,28 @@ class PredictorConfig:
         resolved_horizon = self.resolve_horizon(horizon)
         return self.models_dir / self._build_filename(
             target, resolved_horizon, suffix="_preprocessor.joblib"
+        )
+
+    def model_path_for_regime(
+        self, target: str, horizon: Optional[int], regime: str
+    ) -> Path:
+        """Return the filesystem path for a regime-specific model."""
+
+        resolved_horizon = self.resolve_horizon(horizon)
+        suffix = f"_regime_{str(regime).lower()}"
+        return self.models_dir / self._build_filename(
+            f"{target}{suffix}", resolved_horizon, suffix=".joblib"
+        )
+
+    def preprocessor_path_for_regime(
+        self, target: str, horizon: Optional[int], regime: str
+    ) -> Path:
+        """Return the filesystem path for a regime-specific preprocessor."""
+
+        resolved_horizon = self.resolve_horizon(horizon)
+        suffix = f"_regime_{str(regime).lower()}"
+        return self.models_dir / self._build_filename(
+            f"{target}{suffix}", resolved_horizon, suffix="_preprocessor.joblib"
         )
 
     def resolve_horizon(self, horizon: Optional[int]) -> int:

@@ -23,6 +23,8 @@ class FeatureBuildContext:
     macro_df: "pd.DataFrame | None"
     sentiment_enabled: bool
     technical_indicator_config: Mapping[str, Mapping[str, object]] | None
+    regime_params: Mapping[str, float] | None = None
+    event_params: Mapping[str, object] | None = None
 
 
 @dataclass(slots=True)
@@ -85,6 +87,12 @@ REGISTRY_BLUEPRINT: Dict[str, dict[str, object]] = {
     },
     "macro": {
         "description": "Macro context derived from price volatility, trends, and benchmarks.",
+        "dependencies": (),
+        "default_enabled": True,
+        "implemented": True,
+    },
+    "regime": {
+        "description": "Market regime labeling and volatility state features.",
         "dependencies": (),
         "default_enabled": True,
         "implemented": True,
@@ -169,4 +177,3 @@ __all__ = [
     "build_feature_registry",
     "default_feature_toggles",
 ]
-
