@@ -10,6 +10,7 @@ from typing import Any, Iterator
 _FEATURE_FIELDS = (
     "elliott",
     "macro",
+    "regime",
     "technical",
     "sentiment",
     "volume_liquidity",
@@ -29,6 +30,7 @@ class FeatureToggles(MutableMapping[str, bool]):
 
     elliott: bool = True
     macro: bool = True
+    regime: bool = True
     technical: bool = True
     sentiment: bool = True
     volume_liquidity: bool = True

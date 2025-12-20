@@ -333,7 +333,23 @@ class StockPredictorAI:
         self.horizon = self.config.resolve_horizon(horizon)
         self.fetcher = DataFetcher(config)
         self.feature_assembler = FeatureAssembler(
-            config.feature_toggles, config.prediction_horizons
+            config.feature_toggles,
+            config.prediction_horizons,
+            regime_params={
+                "trend_window": config.regime_trend_window,
+                "mean_reversion_window": config.regime_mean_reversion_window,
+                "vol_short_window": config.regime_vol_short_window,
+                "vol_long_window": config.regime_vol_long_window,
+                "trend_threshold": config.regime_trend_threshold,
+                "mean_reversion_threshold": config.regime_mean_reversion_threshold,
+                "vol_high_threshold": config.regime_vol_high_threshold,
+                "vol_low_threshold": config.regime_vol_low_threshold,
+            },
+            event_params={
+                "event_window": config.event_feature_window,
+                "keywords": config.event_feature_keywords,
+            },
+            direction_params={"neutral_threshold": config.direction_neutral_threshold},
         )
         self.training_builder = TrainingDatasetBuilder(
             config, database=getattr(self.fetcher, "database", None)
@@ -342,6 +358,8 @@ class StockPredictorAI:
         self.tracker = ExperimentTracker(config)
         self.models: dict[Tuple[str, int], Any] = {}
         self.preprocessors: dict[Tuple[str, int], Pipeline] = {}
+        self.regime_models: dict[Tuple[str, int, str], Any] = {}
+        self.regime_preprocessors: dict[Tuple[str, int, str], Pipeline] = {}
         self.preprocessor_templates: dict[int, Pipeline] = {}
         self.preprocess_options: dict[str, Any] = {}
         self.metadata: Dict[str, Any] = {}
@@ -354,13 +372,49 @@ class StockPredictorAI:
 
         if self.feature_assembler is None:
             self.feature_assembler = FeatureAssembler(
-                self.config.feature_toggles, self.config.prediction_horizons
+                self.config.feature_toggles,
+                self.config.prediction_horizons,
+                regime_params={
+                    "trend_window": self.config.regime_trend_window,
+                    "mean_reversion_window": self.config.regime_mean_reversion_window,
+                    "vol_short_window": self.config.regime_vol_short_window,
+                    "vol_long_window": self.config.regime_vol_long_window,
+                    "trend_threshold": self.config.regime_trend_threshold,
+                    "mean_reversion_threshold": self.config.regime_mean_reversion_threshold,
+                    "vol_high_threshold": self.config.regime_vol_high_threshold,
+                    "vol_low_threshold": self.config.regime_vol_low_threshold,
+                },
+                event_params={
+                    "event_window": self.config.event_feature_window,
+                    "keywords": self.config.event_feature_keywords,
+                },
+                direction_params={
+                    "neutral_threshold": self.config.direction_neutral_threshold,
+                },
             )
             return
 
         if self.feature_assembler.feature_toggles != self.config.feature_toggles:
             self.feature_assembler = FeatureAssembler(
-                self.config.feature_toggles, self.config.prediction_horizons
+                self.config.feature_toggles,
+                self.config.prediction_horizons,
+                regime_params={
+                    "trend_window": self.config.regime_trend_window,
+                    "mean_reversion_window": self.config.regime_mean_reversion_window,
+                    "vol_short_window": self.config.regime_vol_short_window,
+                    "vol_long_window": self.config.regime_vol_long_window,
+                    "trend_threshold": self.config.regime_trend_threshold,
+                    "mean_reversion_threshold": self.config.regime_mean_reversion_threshold,
+                    "vol_high_threshold": self.config.regime_vol_high_threshold,
+                    "vol_low_threshold": self.config.regime_vol_low_threshold,
+                },
+                event_params={
+                    "event_window": self.config.event_feature_window,
+                    "keywords": self.config.event_feature_keywords,
+                },
+                direction_params={
+                    "neutral_threshold": self.config.direction_neutral_threshold,
+                },
             )
 
     # ------------------------------------------------------------------
@@ -1218,10 +1272,11 @@ class StockPredictorAI:
 
             model_params = dict(self.config.model_params.get(target, {}))
             global_params = dict(self.config.model_params.get("global", {}))
+            model_params = self._apply_cost_sensitive_params(task, y_clean, model_params)
             ensemble_config = self._resolve_ensemble_config(
                 target, task, params=self.config.model_params
             )
-            calibration_params: dict[str, Any] = {}
+            calibration_params = self._build_calibration_params(task)
             for scope in (global_params.get("calibration"), model_params.get("calibration")):
                 if isinstance(scope, Mapping):
                     calibration_params.update(scope)
@@ -1238,6 +1293,8 @@ class StockPredictorAI:
                 calibrate_flag = task == "classification"
             else:
                 calibrate_flag = bool(calibrate_override)
+            if task == "classification" and not self.config.probability_calibration_enabled:
+                calibrate_flag = False
 
             if ensemble_config.get("enabled"):
                 members = self._build_ensemble_members(
@@ -1246,6 +1303,7 @@ class StockPredictorAI:
                     global_params=global_params,
                     model_params=model_params,
                     calibrate_flag=calibrate_flag,
+                    calibration_params=calibration_params,
                     weights=ensemble_config.get("weights", {}),
                 )
                 if members:
@@ -1264,6 +1322,7 @@ class StockPredictorAI:
                 task,
                 preprocessor=template,
                 calibrate_flag=calibrate_flag,
+                calibration_params=calibration_params,
             )
             tuned_params = tuning_summary.get("best_params") if isinstance(tuning_summary, Mapping) else None
             if tuned_params:
@@ -1283,6 +1342,7 @@ class StockPredictorAI:
                 task,
                 target,
                 calibrate_flag,
+                calibration_params,
                 template,
                 collect_predictions=calibration_enabled,
                 horizon=resolved_horizon,
@@ -1315,8 +1375,23 @@ class StockPredictorAI:
             preprocessed_map[resolved_horizon] = feature_names
             self.metadata["feature_columns"] = feature_names
 
-            final_model = factory.create(task, calibrate=calibrate_flag)
+            final_model = factory.create(
+                task,
+                calibrate=calibrate_flag,
+                calibration_params=dict(calibration_params or {}),
+            )
             final_model.fit(transformed_X, y_clean)
+            regime_summary = self._train_regime_models(
+                target,
+                resolved_horizon,
+                task,
+                aligned_X,
+                y_clean,
+                factory=factory,
+                template=template,
+                calibrate_flag=calibrate_flag,
+                calibration_params=calibration_params,
+            )
             calibrator = None
             calibration_stats = None
             validation_block = evaluation.get("validation") if calibration_enabled else None
@@ -1342,6 +1417,8 @@ class StockPredictorAI:
             metrics["test_rows"] = int(evaluation.get("evaluation_rows", 0))
             metrics["horizon"] = resolved_horizon
             metrics["evaluation_strategy"] = evaluation["strategy"]
+            if regime_summary:
+                metrics["regime_models"] = regime_summary
             if calibration_stats:
                 metrics["residual_calibration"] = calibration_stats
             if tuning_summary:
@@ -1562,6 +1639,44 @@ class StockPredictorAI:
             "blender": resolved.get("blender", "ridge"),
         }
 
+    def _build_calibration_params(self, task: str) -> dict[str, Any]:
+        if task != "classification" or not self.config.probability_calibration_enabled:
+            return {}
+        folds = max(2, int(self.config.probability_calibration_folds))
+        return {
+            "method": self.config.probability_calibration_method,
+            "cv": TimeSeriesSplit(n_splits=folds),
+        }
+
+    def _apply_cost_sensitive_params(
+        self, task: str, y_values: pd.Series, model_params: dict[str, Any]
+    ) -> dict[str, Any]:
+        if task != "classification" or not self.config.cost_sensitive_enabled:
+            return model_params
+
+        counts = y_values.value_counts(dropna=True).to_dict()
+        if not counts:
+            return model_params
+
+        total = float(sum(counts.values()))
+        class_weights: dict[float, float] = {}
+        for label, count in counts.items():
+            if count <= 0:
+                continue
+            base_weight = total / (len(counts) * float(count))
+            if label in {1, 1.0, True}:
+                base_weight *= float(self.config.cost_sensitive_up_weight)
+            elif label in {-1, -1.0}:
+                base_weight *= float(self.config.cost_sensitive_down_weight)
+            elif label in {0, 0.0}:
+                base_weight *= float(self.config.cost_sensitive_neutral_weight)
+            class_weights[float(label)] = float(base_weight)
+
+        if class_weights:
+            model_params = dict(model_params)
+            model_params["class_weight"] = class_weights
+        return model_params
+
     def _build_ensemble_members(
         self,
         member_types: Sequence[str],
@@ -1570,6 +1685,7 @@ class StockPredictorAI:
         global_params: Mapping[str, Any],
         model_params: Mapping[str, Any],
         calibrate_flag: bool,
+        calibration_params: Mapping[str, Any] | None,
         weights: Mapping[str, float],
     ) -> list[EnsembleMember]:
         members: list[EnsembleMember] = []
@@ -1579,7 +1695,11 @@ class StockPredictorAI:
             overrides = {**global_params, **model_params}
             weight = float(weights.get(name, 1.0))
             factory = ModelFactory(name, overrides)
-            estimator = factory.create(task, calibrate=calibrate_flag)
+            estimator = factory.create(
+                task,
+                calibrate=calibrate_flag,
+                calibration_params=dict(calibration_params or {}),
+            )
             members.append(EnsembleMember(name=name, estimator=estimator, weight=weight))
         return members
 
@@ -1605,6 +1725,126 @@ class StockPredictorAI:
             "residual_bias": float(np.nanmean(residuals)),
         }
         return calibrator, stats
+
+    def _resolve_regime_label(self, features: pd.DataFrame) -> str | None:
+        if features is None or features.empty:
+            return None
+        label_series = None
+        for col in ("Regime_Label", "Regime_TrendFlag"):
+            if col in features.columns:
+                label_series = pd.to_numeric(features[col], errors="coerce")
+                break
+        if label_series is None or label_series.empty:
+            return None
+        latest_value = float(label_series.iloc[-1])
+        if np.isnan(latest_value):
+            return None
+        return "trend" if latest_value >= 0.5 else "range"
+
+    def _load_regime_preprocessor(
+        self, target: str, horizon: int, regime: str
+    ) -> Pipeline | None:
+        key = (target, horizon, regime)
+        path = self.config.preprocessor_path_for_regime(target, horizon, regime)
+        if not path.exists():
+            return None
+        try:
+            pipeline = joblib.load(path)
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning(
+                "Failed to load regime preprocessor for %s horizon %s (%s): %s",
+                target,
+                horizon,
+                regime,
+                exc,
+            )
+            return None
+        self.regime_preprocessors[key] = pipeline
+        return pipeline
+
+    def _load_regime_model(self, target: str, horizon: int, regime: str) -> Any | None:
+        key = (target, horizon, regime)
+        path = self.config.model_path_for_regime(target, horizon, regime)
+        if not path.exists():
+            return None
+        try:
+            model = joblib.load(path)
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning(
+                "Failed to load regime model for %s horizon %s (%s): %s",
+                target,
+                horizon,
+                regime,
+                exc,
+            )
+            return None
+        self.regime_models[key] = model
+        return model
+
+    def _train_regime_models(
+        self,
+        target: str,
+        horizon: int,
+        task: str,
+        features: pd.DataFrame,
+        target_series: pd.Series,
+        *,
+        factory: ModelFactory,
+        template: Pipeline | None,
+        calibrate_flag: bool,
+        calibration_params: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        if task != "classification" or not self.config.regime_models_enabled:
+            return {}
+        if "Regime_Label" not in features.columns:
+            return {}
+
+        regime_series = pd.to_numeric(features["Regime_Label"], errors="coerce")
+        regime_series = regime_series.reindex(target_series.index)
+        if regime_series.isna().all():
+            return {}
+
+        results: dict[str, Any] = {}
+        for regime, mask in {
+            "trend": regime_series >= 0.5,
+            "range": regime_series < 0.5,
+        }.items():
+            subset_idx = target_series.index[mask.fillna(False)]
+            if subset_idx.size < max(10, int(self.config.min_samples_per_horizon * 0.25)):
+                continue
+            X_subset = features.loc[subset_idx]
+            y_subset = target_series.loc[subset_idx]
+
+            if template is not None:
+                regime_pipeline = clone(template)
+            else:
+                builder = PreprocessingBuilder(**self.preprocess_options)
+                regime_pipeline = builder.create_pipeline()
+            regime_pipeline.fit(X_subset, y_subset)
+            transformed = regime_pipeline.transform(X_subset)
+
+            regime_model = factory.create(
+                task,
+                calibrate=calibrate_flag,
+                calibration_params=dict(calibration_params or {}),
+            )
+            regime_model.fit(transformed, y_subset)
+
+            key = (target, horizon, regime)
+            self.regime_models[key] = regime_model
+            self.regime_preprocessors[key] = regime_pipeline
+
+            joblib.dump(regime_model, self.config.model_path_for_regime(target, horizon, regime))
+            joblib.dump(
+                regime_pipeline,
+                self.config.preprocessor_path_for_regime(target, horizon, regime),
+            )
+            results[regime] = {
+                "rows": int(len(X_subset)),
+                "label": regime,
+            }
+
+        return results
 
     def _validate_no_nans(
         self,
@@ -1727,6 +1967,7 @@ class StockPredictorAI:
         *,
         preprocessor: Pipeline | None,
         calibrate_flag: bool,
+        calibration_params: Mapping[str, Any] | None = None,
     ) -> Dict[str, Any]:
         if not self.config.tuning_enabled or self.config.tuning_method == "none":
             return {}
@@ -1735,7 +1976,11 @@ class StockPredictorAI:
             return {}
 
         try:
-            base_model = factory.create(task, calibrate=calibrate_flag)
+            base_model = factory.create(
+                task,
+                calibrate=calibrate_flag,
+                calibration_params=dict(calibration_params or {}),
+            )
         except Exception as exc:  # pragma: no cover - defensive
             LOGGER.warning("Skipping tuning for %s due to model construction failure: %s", factory.model_type, exc)
             return {}
@@ -1791,6 +2036,7 @@ class StockPredictorAI:
         task: str,
         target_name: str,
         calibrate_flag: bool,
+        calibration_params: Mapping[str, Any] | None,
         preprocessor: Optional[Pipeline] = None,
         *,
         collect_predictions: bool = False,
@@ -1806,6 +2052,24 @@ class StockPredictorAI:
         validation_pred: list[float] = []
         directional_totals = DirectionalStats()
         directional_summary: Dict[str, Any] = {}
+
+        def _purged_splits() -> Iterable[tuple[np.ndarray, np.ndarray]]:
+            n_samples = len(features)
+            purge_window = max(
+                0,
+                int(self.config.purged_cv_purge_window or 0),
+            )
+            embargo = max(0, int(self.config.purged_cv_embargo or 0))
+            splitter = TimeSeriesSplit(n_splits=self.config.evaluation_folds)
+            for train_idx, test_idx in splitter.split(np.arange(n_samples)):
+                if test_idx.size == 0:
+                    continue
+                test_start = int(test_idx[0])
+                test_end = int(test_idx[-1])
+                purge_start = max(0, test_start - purge_window)
+                purge_end = min(n_samples - 1, test_end + embargo)
+                mask = (train_idx < purge_start) | (train_idx > purge_end)
+                yield train_idx[mask], test_idx
 
         def _record_baselines(
             split_label: int, train_series: pd.Series, test_series: pd.Series
@@ -1844,7 +2108,11 @@ class StockPredictorAI:
             else:
                 X_train_transformed = X_train
                 X_test_transformed = X_test
-            model = factory.create(task, calibrate=calibrate_flag)
+            model = factory.create(
+                task,
+                calibrate=calibrate_flag,
+                calibration_params=dict(calibration_params or {}),
+            )
             model.fit(X_train_transformed, y_train)
             y_pred = model.predict(X_test_transformed)
             proba = None
@@ -1906,7 +2174,11 @@ class StockPredictorAI:
                 else:
                     X_train_transformed = X_train
                     X_test_transformed = X_test
-                model = factory.create(task, calibrate=calibrate_flag)
+                model = factory.create(
+                    task,
+                    calibrate=calibrate_flag,
+                    calibration_params=dict(calibration_params or {}),
+                )
                 model.fit(X_train_transformed, y_train)
                 y_pred = model.predict(X_test_transformed)
                 proba = None
@@ -1950,6 +2222,70 @@ class StockPredictorAI:
             aggregate = self._aggregate_evaluation_metrics(splits)
             evaluation_rows = int(sum(item.get("test_size", 0) for item in splits))
             parameters = {"folds": int(self.config.evaluation_folds)}
+        elif strategy == "purged":
+            for fold, (train_idx, test_idx) in enumerate(_purged_splits(), start=1):
+                if len(test_idx) == 0 or len(train_idx) == 0:
+                    continue
+                X_train, X_test = features.iloc[train_idx], features.iloc[test_idx]
+                y_train, y_test = target_series.iloc[train_idx], target_series.iloc[test_idx]
+                pipeline = clone(preprocessor) if preprocessor is not None else None
+                if pipeline is not None:
+                    pipeline.fit(X_train, y_train)
+                    X_train_transformed = pipeline.transform(X_train)
+                    X_test_transformed = pipeline.transform(X_test)
+                else:
+                    X_train_transformed = X_train
+                    X_test_transformed = X_test
+                model = factory.create(
+                    task,
+                    calibrate=calibrate_flag,
+                    calibration_params=dict(calibration_params or {}),
+                )
+                model.fit(X_train_transformed, y_train)
+                y_pred = model.predict(X_test_transformed)
+                proba = None
+                estimator = model.named_steps.get("estimator")
+                if task == "classification" and model_supports_proba(model):
+                    try:
+                        proba = model.predict_proba(X_test_transformed)
+                    except Exception as exc:  # pragma: no cover - defensive
+                        LOGGER.debug("Failed to compute purged probabilities: %s", exc)
+                metrics = self._compute_evaluation_metrics(
+                    task,
+                    y_test,
+                    y_pred,
+                    X_test_transformed,
+                    X_test,
+                    target_name,
+                    proba,
+                    getattr(estimator, "classes_", None),
+                )
+                directional_totals.merge(
+                    evaluate_directional_predictions(
+                        task, target_name, y_test, y_pred, raw_features=X_test
+                    )
+                )
+                if collect_predictions:
+                    validation_true.extend([float(y) for y in y_test.to_numpy()])
+                    validation_pred.extend([float(p) for p in np.ravel(y_pred)])
+                metrics.update(
+                    {
+                        "fold": fold,
+                        "train_size": int(len(train_idx)),
+                        "test_size": int(len(test_idx)),
+                    }
+                )
+                splits.append(metrics)
+                _record_baselines(fold, y_train, y_test)
+            if not splits:
+                raise RuntimeError("Purged cross-validation produced no evaluation splits.")
+            aggregate = self._aggregate_evaluation_metrics(splits)
+            evaluation_rows = int(sum(item.get("test_size", 0) for item in splits))
+            parameters = {
+                "folds": int(self.config.evaluation_folds),
+                "purge_window": int(self.config.purged_cv_purge_window),
+                "embargo": int(self.config.purged_cv_embargo),
+            }
         elif strategy == "rolling":
             backtester = LegacyBacktester(
                 model_factory=factory,
@@ -2135,11 +2471,21 @@ class StockPredictorAI:
             drawdowns = equity_curve / safe_running - 1.0
             max_drawdown = float(np.min(drawdowns))
 
+        gross_profit = float(np.sum(net_returns[net_returns > 0])) if net_returns.size else 0.0
+        gross_loss = float(-np.sum(net_returns[net_returns < 0])) if net_returns.size else 0.0
+        if gross_loss > 0:
+            profit_factor = gross_profit / gross_loss
+        else:
+            profit_factor = float("inf") if gross_profit > 0 else 0.0
+        expectancy = float(np.mean(net_returns)) if net_returns.size else 0.0
+
         pnl_metrics = {
             "pnl_sharpe": float(sharpe),
             "pnl_max_drawdown": max_drawdown,
             "pnl_net_return": float(equity_curve[-1] - 1) if equity_curve.size else 0.0,
             "pnl_hit_rate": float(np.mean(net_returns > 0)) if net_returns.size else 0.0,
+            "pnl_profit_factor": float(profit_factor),
+            "pnl_expectancy": expectancy,
         }
         return pnl_metrics
 
@@ -2164,17 +2510,27 @@ class StockPredictorAI:
         if proba is not None and proba.size:
             probability_array = np.asarray(proba, dtype=float)
             positive_index = 1 if probability_array.ndim > 1 else 0
+            neutral_index = None
             if probability_array.ndim > 1 and classes is not None:
                 for idx, cls in enumerate(classes):
                     if cls in {1, True, "1", "up"}:
                         positive_index = idx
+                        break
+                for idx, cls in enumerate(classes):
+                    if cls in {0, 0.0, "0", "neutral"}:
+                        neutral_index = idx
                         break
             positive_proba = (
                 probability_array
                 if probability_array.ndim == 1
                 else probability_array[:, min(positive_index, probability_array.shape[1] - 1)]
             )
-            return np.where(positive_proba >= 0.55, 1.0, 0.0)
+            threshold = float(self.config.direction_trade_threshold)
+            if neutral_index is not None and probability_array.ndim > 1:
+                neutral_proba = probability_array[:, min(neutral_index, probability_array.shape[1] - 1)]
+                mask = (positive_proba >= threshold) & (neutral_proba <= (1 - threshold))
+                return np.where(mask, 1.0, 0.0)
+            return np.where(positive_proba >= threshold, 1.0, 0.0)
 
         return np.where(forecast > 0.0, 1.0, 0.0)
 
@@ -2190,7 +2546,8 @@ class StockPredictorAI:
             return np.expm1(y_true.to_numpy(dtype=float))
 
         if target_name == "direction":
-            return np.where(y_true.to_numpy(dtype=float) > 0, 0.01, -0.01)
+            values = y_true.to_numpy(dtype=float)
+            return np.where(values > 0, 0.01, np.where(values < 0, -0.01, 0.0))
 
         return y_true.to_numpy(dtype=float)
 
@@ -2385,6 +2742,9 @@ class StockPredictorAI:
             raw_feature_columns = list(latest_features.columns)
             self.metadata["raw_feature_columns"] = raw_feature_columns
         self.metadata["active_horizon"] = resolved_horizon
+        regime_label = self._resolve_regime_label(latest_features)
+        if regime_label:
+            self.metadata["regime_label"] = regime_label
 
         confluence_assessment = evaluate_signal_confluence(latest_features)
         self.metadata["signal_confluence"] = confluence_assessment
@@ -2455,6 +2815,18 @@ class StockPredictorAI:
             pipeline = self.preprocessors.get((target, resolved_horizon))
             if pipeline is None:
                 pipeline = self._load_preprocessor(target, resolved_horizon)
+            if regime_label and self.config.regime_models_enabled:
+                regime_key = (target, resolved_horizon, regime_label)
+                regime_model = self.regime_models.get(regime_key) or self._load_regime_model(
+                    target, resolved_horizon, regime_label
+                )
+                regime_pipeline = self.regime_preprocessors.get(
+                    regime_key
+                ) or self._load_regime_preprocessor(target, resolved_horizon, regime_label)
+                if regime_model is not None and regime_pipeline is not None:
+                    model = regime_model
+                    pipeline = regime_pipeline
+                    training_report.setdefault(target, {})["regime"] = regime_label
             current_raw = latest_features[raw_feature_columns]
             if pipeline is not None:
                 pipeline = self._ensure_preprocessor_fitted(
@@ -2527,13 +2899,29 @@ class StockPredictorAI:
                         or (float(proba[1]) if len(proba) > 1 else 0.0)
                     )
                     down_prob = float(
-                        class_prob_map.get(0)
+                        class_prob_map.get(-1)
+                        or class_prob_map.get(-1.0)
+                        or class_prob_map.get("-1")
+                        or class_prob_map.get(0)
                         or class_prob_map.get(0.0)
                         or class_prob_map.get("0")
                         or class_prob_map.get(False)
                         or (float(proba[0]) if len(proba) > 0 else 0.0)
                     )
+                    has_negative = any(
+                        key in class_prob_map for key in (-1, -1.0, "-1")
+                    )
+                    neutral_prob = None
+                    if has_negative:
+                        neutral_prob = float(
+                            class_prob_map.get(0)
+                            or class_prob_map.get(0.0)
+                            or class_prob_map.get("0")
+                            or (float(proba[1]) if len(proba) > 2 else 0.0)
+                        )
                     probabilities[target] = {"up": up_prob, "down": down_prob}
+                    if neutral_prob is not None:
+                        probabilities[target]["neutral"] = neutral_prob
                     threshold = float(self.config.direction_confidence_threshold)
                     if confidence_value < threshold:
                         warning_msg = (
@@ -2681,9 +3069,11 @@ class StockPredictorAI:
         dir_prob = probabilities.get("direction") if isinstance(probabilities, dict) else None
         direction_probability_up = None
         direction_probability_down = None
+        direction_probability_neutral = None
         if isinstance(dir_prob, dict):
             direction_probability_up = self._safe_float(dir_prob.get("up"))
             direction_probability_down = self._safe_float(dir_prob.get("down"))
+            direction_probability_neutral = self._safe_float(dir_prob.get("neutral"))
         target_hit_prob = probabilities.get("target_hit") if isinstance(probabilities, dict) else None
         target_hit_probability = None
         if isinstance(target_hit_prob, dict):
@@ -3137,6 +3527,13 @@ class StockPredictorAI:
         except Exception as exc:  # pragma: no cover - defensive guard
             LOGGER.debug("Failed to compute accuracy summary: %s", exc)
 
+        trade_gate = self._build_trade_gate(
+            direction_probability_up,
+            direction_probability_down,
+            direction_probability_neutral,
+            monte_carlo_target_probability,
+        )
+
         result = {
             "ticker": self.config.ticker,
             "as_of": _to_iso(market_data_as_of) or "",
@@ -3155,10 +3552,12 @@ class StockPredictorAI:
             "tolerance_band": tolerance_band_value,
             "direction_probability_up": direction_probability_up,
             "direction_probability_down": direction_probability_down,
+            "direction_probability_neutral": direction_probability_neutral,
             "target_hit_probability": target_hit_probability,
             "monte_carlo_target_hit_probability": monte_carlo_target_probability,
             "monte_carlo_stabilized_probability": monte_carlo_target_probability,
             "monte_carlo_iterations": monte_carlo_iterations,
+            "trade_gate": trade_gate,
             "training_accuracy": training_accuracy,
             "target_price": self.metadata.get("target_price"),
             "feature_toggles": dict(getattr(self.config, "feature_toggles", {})),
@@ -4256,6 +4655,51 @@ class StockPredictorAI:
             "sources": sources,
         }
         return explanation
+
+    def _build_trade_gate(
+        self,
+        direction_prob_up: float | None,
+        direction_prob_down: float | None,
+        direction_prob_neutral: float | None,
+        monte_carlo_prob: float | None,
+    ) -> dict[str, Any] | None:
+        if direction_prob_up is None and direction_prob_down is None:
+            return None
+
+        threshold = float(self.config.direction_trade_threshold)
+        up = float(direction_prob_up or 0.0)
+        down = float(direction_prob_down or 0.0)
+        neutral = float(direction_prob_neutral or 0.0)
+
+        direction = "up" if up >= down else "down"
+        confidence = max(up, down)
+        allowed = confidence >= threshold
+        reason = "ok" if allowed else "confidence_below_threshold"
+
+        if (
+            allowed
+            and self.config.monte_carlo_confirmation_enabled
+            and monte_carlo_prob is not None
+        ):
+            mc_threshold = float(self.config.monte_carlo_confirmation_threshold)
+            if monte_carlo_prob < mc_threshold:
+                allowed = False
+                reason = "monte_carlo_below_threshold"
+
+        return {
+            "allowed": bool(allowed),
+            "direction": direction,
+            "confidence": confidence,
+            "threshold": threshold,
+            "neutral_probability": neutral,
+            "monte_carlo_probability": monte_carlo_prob,
+            "monte_carlo_threshold": float(
+                self.config.monte_carlo_confirmation_threshold
+            )
+            if self.config.monte_carlo_confirmation_enabled
+            else None,
+            "reason": reason,
+        }
 
     def _generate_recommendation(self, prediction: Dict[str, Any]) -> Dict[str, Any]:
         expected_return = self._safe_float(prediction.get("predicted_return"))
