@@ -3598,6 +3598,131 @@ class StockPredictorAI:
             if numeric_values:
                 uncertainty_clean[tgt] = numeric_values
 
+        def _parse_quantile_key(key: Any) -> Optional[float]:
+            if isinstance(key, (int, float)):
+                return float(key) if float(key) <= 1 else float(key) / 100.0
+            if isinstance(key, str):
+                cleaned = key.strip().lower()
+                if cleaned in {"low", "lower", "p10", "q10"}:
+                    return 0.1
+                if cleaned in {"mid", "median", "p50", "q50"}:
+                    return 0.5
+                if cleaned in {"high", "upper", "p90", "q90"}:
+                    return 0.9
+                cleaned = cleaned.removeprefix("quantile_")
+                cleaned = cleaned.removeprefix("q").removeprefix("p")
+                if cleaned.endswith("%"):
+                    cleaned = cleaned[:-1]
+                    numeric = self._safe_float(cleaned)
+                    return numeric / 100.0 if numeric is not None else None
+                numeric = self._safe_float(cleaned)
+                if numeric is not None and numeric > 1:
+                    numeric = numeric / 100.0
+                return numeric
+            return None
+
+        def _extract_quantiles(block: Mapping[str, Any] | None) -> dict[float, float]:
+            if not isinstance(block, Mapping):
+                return {}
+            parsed: dict[float, float] = {}
+            for key, raw in block.items():
+                numeric = _parse_quantile_key(key)
+                if numeric is None:
+                    continue
+                value = self._safe_float(raw)
+                if value is not None:
+                    parsed[float(numeric)] = float(value)
+            return parsed
+
+        close_quantiles = _extract_quantiles(quantile_forecasts.get("close"))
+        close_q10 = close_quantiles.get(0.1)
+        close_q50 = close_quantiles.get(0.5)
+        close_q90 = close_quantiles.get(0.9)
+        if close_q50 is None and close_prediction is not None:
+            close_q50 = float(close_prediction)
+
+        std_value = None
+        std_candidate = uncertainty_clean.get("close", {}).get("std")
+        if std_candidate is not None and np.isfinite(std_candidate):
+            std_value = float(std_candidate)
+
+        z10 = -1.281551565545
+        z90 = 1.281551565545
+        if std_value is None and close_q10 is not None and close_q90 is not None:
+            diff = close_q90 - close_q10
+            if np.isfinite(diff) and diff != 0:
+                std_value = float(diff) / (z90 - z10)
+
+        if std_value is not None and close_q50 is not None:
+            if close_q10 is None:
+                close_q10 = float(close_q50 + z10 * std_value)
+            if close_q90 is None:
+                close_q90 = float(close_q50 + z90 * std_value)
+
+        pred_low_q10 = close_q10
+        if expected_low is not None:
+            if pred_low_q10 is None or expected_low < pred_low_q10:
+                pred_low_q10 = float(expected_low)
+        pred_high_q90 = close_q90
+
+        sigma_price = None
+        if std_value is not None and std_value > 0:
+            sigma_price = float(abs(std_value))
+        elif predicted_volatility is not None and anchor_price is not None:
+            sigma_price = float(abs(predicted_volatility)) * float(anchor_price)
+
+        range_1sigma = None
+        if sigma_price is not None and anchor_price is not None:
+            range_1sigma = {
+                "low": float(anchor_price) - sigma_price,
+                "high": float(anchor_price) + sigma_price,
+            }
+
+        def _normal_cdf(value: float) -> float:
+            return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+
+        hit_levels = getattr(self.config, "hit_probability_levels", None)
+        if not hit_levels:
+            hit_levels = [0.01, 0.02, 0.05]
+        p_hit_up: dict[str, float] = {}
+        p_hit_down: dict[str, float] = {}
+        if (
+            sigma_price is not None
+            and sigma_price > 0
+            and anchor_price is not None
+            and close_q50 is not None
+        ):
+            for level in hit_levels:
+                try:
+                    level_value = float(level)
+                except (TypeError, ValueError):
+                    continue
+                if level_value <= 0:
+                    continue
+                up_target = float(anchor_price) * (1 + level_value)
+                down_target = float(anchor_price) * (1 - level_value)
+                z_up = (up_target - float(close_q50)) / sigma_price
+                z_down = (down_target - float(close_q50)) / sigma_price
+                p_hit_up[str(level_value)] = float(1.0 - _normal_cdf(z_up))
+                p_hit_down[str(level_value)] = float(_normal_cdf(z_down))
+
+        calibration_block = None
+        if isinstance(getattr(self, "metadata", None), Mapping):
+            metrics_store = self.metadata.get("metrics")
+            if isinstance(metrics_store, Mapping):
+                target_metrics = metrics_store.get("close")
+                if isinstance(target_metrics, Mapping):
+                    calibration_entry = None
+                    if resolved_horizon is not None:
+                        calibration_entry = target_metrics.get(resolved_horizon)
+                    if calibration_entry is None:
+                        calibration_entry = next(iter(target_metrics.values()), None)
+                    if isinstance(calibration_entry, Mapping):
+                        calibration_block = calibration_entry.get("residual_calibration")
+
+        uncertainty_calibrated = isinstance(calibration_block, Mapping)
+        calibration_version = "residual-linear-v1" if uncertainty_calibrated else None
+
         def _to_iso(value: Any) -> Optional[str]:
             return self._format_timestamp(value)
 
@@ -3611,6 +3736,11 @@ class StockPredictorAI:
                 "score": confluence_score,
                 "components": dict(confluence_assessment.components),
             }
+
+        regime_shift_risk = False
+        if confluence_score is not None and confluence_passed is False:
+            if confluence_score < 0.4:
+                regime_shift_risk = True
 
         base_confidence = None
         if confidences:
@@ -3774,6 +3904,11 @@ class StockPredictorAI:
             "anchor_price": anchor_price,
             "anchor_price_source": anchor_price_source,
             "predicted_close": close_prediction,
+            "pred_close_q10": close_q10,
+            "pred_close_q50": close_q50,
+            "pred_close_q90": close_q90,
+            "pred_low_q10": pred_low_q10,
+            "pred_high_q90": pred_high_q90,
             "expected_change": expected_change,
             "expected_change_pct": pct_change,
             "expected_intraday_move": expected_intraday_move,
@@ -3781,6 +3916,7 @@ class StockPredictorAI:
             "predicted_volatility": predicted_volatility,
             "expected_low": expected_low,
             "stop_loss": stop_loss,
+            "range_1sigma": range_1sigma,
             "probability_within_tolerance": tolerance_probability,
             "tolerance_band": tolerance_band_value,
             "direction_probability_up": direction_probability_up,
@@ -3790,6 +3926,19 @@ class StockPredictorAI:
             "monte_carlo_target_hit_probability": monte_carlo_target_probability,
             "monte_carlo_stabilized_probability": monte_carlo_target_probability,
             "monte_carlo_iterations": monte_carlo_iterations,
+            "p_hit_up": p_hit_up or None,
+            "p_hit_down": p_hit_down or None,
+            "hit_probabilities": {"up": p_hit_up, "down": p_hit_down} if p_hit_up or p_hit_down else None,
+            "close_quantiles": {
+                "q10": close_q10,
+                "q50": close_q50,
+                "q90": close_q90,
+            }
+            if close_q10 is not None or close_q50 is not None or close_q90 is not None
+            else None,
+            "uncertainty_calibrated": uncertainty_calibrated,
+            "calibration_version": calibration_version,
+            "regime_shift_risk": regime_shift_risk,
             "trade_gate": trade_gate,
             "training_accuracy": training_accuracy,
             "target_price": self.metadata.get("target_price"),
