@@ -97,6 +97,7 @@ DEFAULT_EXPECTED_LOW_FLOOR_WINDOW = 20
 DEFAULT_PLAUSIBILITY_SIGMA_MULTIPLIER = 3.0
 DEFAULT_LOG_RETURN_WINDOW = 252
 DEFAULT_VOLATILITY_FLOOR = 0.02
+DEFAULT_MAX_EXPECTED_CHANGE_PCT = 0.1
 
 
 LabelFunction = Callable[[pd.DataFrame, int, Any], pd.Series]
@@ -4208,6 +4209,11 @@ class StockPredictorAI:
 
         resolved_sigma = max(sigma_values) if sigma_values else fallback_sigma_value
         max_move = resolved_sigma * sigma_multiplier_value * math.sqrt(horizon_days)
+        max_expected_change_pct = self._safe_float(
+            getattr(self.config, "max_expected_change_pct", DEFAULT_MAX_EXPECTED_CHANGE_PCT)
+        )
+        if max_expected_change_pct is not None and max_expected_change_pct > 0:
+            max_move = min(max_move, max_expected_change_pct * math.sqrt(horizon_days))
 
         warning_sink = prediction_warnings if isinstance(prediction_warnings, list) else None
         metadata_warnings = None
