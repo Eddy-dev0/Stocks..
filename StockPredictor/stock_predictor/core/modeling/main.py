@@ -739,14 +739,30 @@ class StockPredictorAI:
 
         if price_df is None or price_df.empty:
             return None, None
-        if "Date" not in price_df.columns or "Close" not in price_df.columns:
+        if "Date" not in price_df.columns:
+            return None, None
+        lower_columns = {column.lower(): column for column in price_df.columns}
+        basis = str(getattr(self.config, "target_price_basis", "adj_close") or "adj_close").strip().lower()
+        if basis == "adj_close":
+            close_column = (
+                lower_columns.get("adj close")
+                or lower_columns.get("adj_close")
+                or lower_columns.get("close")
+            )
+        else:
+            close_column = (
+                lower_columns.get("close")
+                or lower_columns.get("adj close")
+                or lower_columns.get("adj_close")
+            )
+        if close_column is None:
             return None, None
 
         market_tz = self.market_timezone or DEFAULT_MARKET_TIMEZONE
         frame = price_df.copy()
         frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
-        frame["Close"] = pd.to_numeric(frame["Close"], errors="coerce")
-        frame = frame.dropna(subset=["Date", "Close"])
+        frame[close_column] = pd.to_numeric(frame[close_column], errors="coerce")
+        frame = frame.dropna(subset=["Date", close_column])
         if frame.empty:
             return None, None
 
@@ -777,7 +793,7 @@ class StockPredictorAI:
             return None, None
 
         latest_row = settled_rows.iloc[-1]
-        return float(latest_row["Close"]), latest_row["Date"]
+        return float(latest_row[close_column]), latest_row["Date"]
 
     def _refresh_live_price_metadata(self, *, force: bool = False) -> None:
         """Update cached live price metadata in-place when available."""

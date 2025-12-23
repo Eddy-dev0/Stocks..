@@ -91,11 +91,21 @@ class MultiHorizonModelingEngine:
     # ------------------------------------------------------------------
     def _compute_targets(self, price_df: pd.DataFrame, horizons: Sequence[int]) -> dict[int, dict[str, pd.Series]]:
         working = price_df.copy()
-        close_col = None
-        for name in working.columns:
-            if name.lower() == "close":
-                close_col = name
-                break
+        lower_columns = {column.lower(): column for column in working.columns}
+        basis = getattr(self.config, "target_price_basis", "adj_close")
+        basis = str(basis or "adj_close").strip().lower()
+        if basis == "adj_close":
+            close_col = (
+                lower_columns.get("adj close")
+                or lower_columns.get("adj_close")
+                or lower_columns.get("close")
+            )
+        else:
+            close_col = (
+                lower_columns.get("close")
+                or lower_columns.get("adj close")
+                or lower_columns.get("adj_close")
+            )
         if close_col is None:
             raise KeyError("Price dataframe must contain a close column for target generation.")
 

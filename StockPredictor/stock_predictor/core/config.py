@@ -241,6 +241,7 @@ class PredictorConfig:
     direction_bootstrap_blend: float = 0.65
     price_backfill_page_days: int = 365
     price_backfill_page_size: int | None = None
+    target_price_basis: str = "adj_close"
     training_cache_dir: Path | None = None
     use_cached_training_data: bool = True
     min_samples_per_horizon: int = DEFAULT_MIN_SAMPLES_PER_HORIZON
@@ -468,6 +469,9 @@ class PredictorConfig:
             self.time_series_baselines, lower=True
         )
         self.time_series_params = self._normalise_model_params(self.time_series_params)
+        self.target_price_basis = str(self.target_price_basis or "adj_close").strip().lower()
+        if self.target_price_basis not in {"adj_close", "close"}:
+            raise ValueError("target_price_basis must be 'adj_close' or 'close'.")
         if self.memory_cache_seconds is not None:
             self.memory_cache_seconds = max(60.0, float(self.memory_cache_seconds))
         if self.timezone is None and self.market_timezone is not None:
@@ -838,6 +842,7 @@ def build_config(
     direction_bootstrap_blend: Optional[float] = None,
     min_samples_per_horizon: Optional[int] = None,
     forecast_tolerance_bands: Optional[Mapping[int, Any] | str] = None,
+    target_price_basis: Optional[str] = None,
 ) -> PredictorConfig:
     """Build a :class:`PredictorConfig` instance from string parameters."""
 
@@ -967,6 +972,11 @@ def build_config(
     if min_samples_value is not None:
         min_samples_int = _coerce_min_samples_per_horizon(min_samples_value)
 
+    target_basis_value = target_price_basis or os.getenv(
+        "STOCK_PREDICTOR_TARGET_PRICE_BASIS"
+    )
+    target_basis_str = str(target_basis_value).strip().lower() if target_basis_value else None
+
     tolerance_value = forecast_tolerance_bands or os.getenv(
         "STOCK_PREDICTOR_FORECAST_TOLERANCE_BANDS"
     )
@@ -1091,6 +1101,8 @@ def build_config(
         config_kwargs["min_samples_per_horizon"] = min_samples_int
     if tolerance_bands:
         config_kwargs["forecast_tolerance_bands"] = tolerance_bands
+    if target_basis_str:
+        config_kwargs["target_price_basis"] = target_basis_str
 
     config = PredictorConfig(**config_kwargs)
     config.ensure_directories()
