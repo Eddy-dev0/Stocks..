@@ -19,7 +19,8 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 import pandas as pd
 from sklearn.calibration import calibration_curve
-from sklearn.metrics import mean_pinball_loss
+from sklearn.metrics import brier_score_loss, mean_pinball_loss
+import matplotlib.pyplot as plt
 
 from stock_predictor.core import PredictorConfig
 from stock_predictor.core.features import FeatureToggles
@@ -207,6 +208,7 @@ class Backtester:
                 "f1": aggregate.get("f1"),
                 "expected_calibration_error": reliability.get("expected_calibration_error"),
                 "max_calibration_error": reliability.get("max_calibration_error"),
+                "brier_score": reliability.get("brier_score"),
             },
             "regression": {
                 "mae": aggregate.get("mae"),
@@ -431,10 +433,13 @@ class Backtester:
             return {}
         y_true = np.concatenate([entry[0] for entry in calibration_entries])
         y_proba = np.concatenate([entry[1] for entry in calibration_entries])
-        frac_pos, mean_pred = calibration_curve(y_true, y_proba, n_bins=10, strategy="quantile")
+        y_binary = self._to_binary_labels(y_true)
+        frac_pos, mean_pred = calibration_curve(y_binary, y_proba, n_bins=10, strategy="quantile")
+        brier = float(brier_score_loss(y_binary, y_proba))
         return {
             "fraction_positives": frac_pos.tolist(),
             "mean_predictions": mean_pred.tolist(),
+            "brier_score": brier,
         }
 
     def _compute_reliability(self, calibration: Mapping[str, Any]) -> dict[str, float]:
@@ -446,7 +451,11 @@ class Backtester:
         mean_arr = np.asarray(mean_pred)
         ece = float(np.mean(np.abs(frac_arr - mean_arr)))
         mce = float(np.max(np.abs(frac_arr - mean_arr)))
-        return {"expected_calibration_error": ece, "max_calibration_error": mce}
+        reliability = {"expected_calibration_error": ece, "max_calibration_error": mce}
+        brier = calibration.get("brier_score")
+        if isinstance(brier, (int, float)):
+            reliability["brier_score"] = float(brier)
+        return reliability
 
     def _compute_interval_coverage(
         self,
@@ -554,6 +563,10 @@ class Backtester:
             LOGGER.debug("Parquet export failed; continuing with CSV only.")
         splits_frame.to_csv(csv_path, index=False)
 
+        plot_path = self._render_reliability_plot(result.calibration, versioned_dir)
+        if plot_path:
+            result.outputs["reliability_plot"] = plot_path
+
         result.outputs.update(
             {
                 "json": str(json_path),
@@ -587,6 +600,36 @@ class Backtester:
                 "Prediction intervals cover fewer than 60% of observations; distribution shift may be present."
             )
         return warnings
+
+    def _render_reliability_plot(
+        self, calibration: Mapping[str, Any], output_dir: Path
+    ) -> str | None:
+        frac = calibration.get("fraction_positives")
+        mean_pred = calibration.get("mean_predictions")
+        if not isinstance(frac, list) or not isinstance(mean_pred, list) or not frac:
+            return None
+        fig, ax = plt.subplots(figsize=(5, 4))
+        ax.plot(mean_pred, frac, marker="o", label="Observed")
+        ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="Perfect")
+        ax.set_xlabel("Mean predicted probability")
+        ax.set_ylabel("Observed frequency")
+        ax.set_title("Reliability plot")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.legend()
+        output_path = output_dir / "reliability_plot.png"
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        return str(output_path)
+
+    @staticmethod
+    def _to_binary_labels(values: np.ndarray) -> np.ndarray:
+        arr = np.asarray(values)
+        if np.issubdtype(arr.dtype, np.number):
+            return (arr > 0).astype(int)
+        return np.array(
+            [1 if value in {1, True, "1", "up"} else 0 for value in arr], dtype=int
+        )
 
 
 __all__ = ["Backtester", "BacktestConfig", "BacktestResult", "SCHEMA_VERSION"]

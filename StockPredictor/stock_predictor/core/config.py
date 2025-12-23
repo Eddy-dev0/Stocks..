@@ -425,6 +425,10 @@ class PredictorConfig:
         if not 0 <= self.monte_carlo_confirmation_threshold <= 1:
             raise ValueError("monte_carlo_confirmation_threshold must be between 0 and 1.")
         self.probability_calibration_enabled = bool(self.probability_calibration_enabled)
+        if not self.probability_calibration_enabled:
+            raise ValueError(
+                "probability_calibration_enabled must be True; calibrated probabilities are required."
+            )
         self.probability_calibration_method = (
             str(self.probability_calibration_method).strip().lower() or "sigmoid"
         )
