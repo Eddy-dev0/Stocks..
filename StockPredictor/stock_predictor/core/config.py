@@ -46,6 +46,7 @@ DEFAULT_VOLATILITY_WINDOW = 20
 DEFAULT_MIN_SAMPLES_PER_HORIZON = 100
 DEFAULT_TARGET_GAIN_PCT = 0.03
 DEFAULT_MACRO_MERGE_SYMBOLS: tuple[str, ...] = ("^VIX", "DXY", "^TNX")
+DEFAULT_MAX_EXPECTED_CHANGE_PCT = 0.1
 
 
 HORIZON_UNIT_TO_DAYS: dict[str, int] = {
@@ -240,6 +241,7 @@ class PredictorConfig:
     direction_confidence_threshold: float = 0.5
     direction_trade_threshold: float = 0.65
     direction_neutral_threshold: float = 0.003
+    max_expected_change_pct: float | None = DEFAULT_MAX_EXPECTED_CHANGE_PCT
     monte_carlo_confirmation_enabled: bool = True
     monte_carlo_confirmation_threshold: float = 0.6
     probability_calibration_enabled: bool = True
@@ -411,6 +413,13 @@ class PredictorConfig:
             raise ValueError("direction_neutral_threshold must be non-negative.")
         self.direction_neutral_threshold = float(self.direction_neutral_threshold)
         self.direction_trade_threshold = float(self.direction_trade_threshold)
+        if self.max_expected_change_pct is not None:
+            try:
+                self.max_expected_change_pct = float(self.max_expected_change_pct)
+            except (TypeError, ValueError):
+                self.max_expected_change_pct = None
+        if self.max_expected_change_pct is not None and self.max_expected_change_pct <= 0:
+            self.max_expected_change_pct = None
         self.monte_carlo_confirmation_enabled = bool(self.monte_carlo_confirmation_enabled)
         self.monte_carlo_confirmation_threshold = float(self.monte_carlo_confirmation_threshold)
         if not 0 <= self.monte_carlo_confirmation_threshold <= 1:
