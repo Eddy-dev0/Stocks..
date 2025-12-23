@@ -258,6 +258,7 @@ class PredictorConfig:
     memory_cache_seconds: float | None = None
     timezone: ZoneInfo | str | None = None
     market_timezone: str | None = None
+    tomorrow_mode: bool = False
     k_stop: float = 1.0
     expected_low_sigma: float = 1.0
     expected_low_max_volatility: float = 1.0
@@ -843,6 +844,7 @@ def build_config(
     min_samples_per_horizon: Optional[int] = None,
     forecast_tolerance_bands: Optional[Mapping[int, Any] | str] = None,
     target_price_basis: Optional[str] = None,
+    tomorrow_mode: Optional[bool] = None,
 ) -> PredictorConfig:
     """Build a :class:`PredictorConfig` instance from string parameters."""
 
@@ -982,6 +984,18 @@ def build_config(
     )
     tolerance_bands = _coerce_tolerance_bands(tolerance_value)
 
+    tomorrow_mode_value = tomorrow_mode
+    if tomorrow_mode_value is None:
+        tomorrow_mode_env = os.getenv("STOCK_PREDICTOR_TOMORROW_MODE")
+        if isinstance(tomorrow_mode_env, str):
+            tomorrow_mode_value = tomorrow_mode_env.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            }
+
     stop_loss_value = k_stop
     if stop_loss_value is None:
         stop_loss_env = os.getenv("STOCK_PREDICTOR_STOP_LOSS_K")
@@ -1039,6 +1053,9 @@ def build_config(
         "prediction_targets": _coerce_iterable(
             prediction_targets, DEFAULT_PREDICTION_TARGETS
         ),
+        "tomorrow_mode": bool(tomorrow_mode_value)
+        if tomorrow_mode_value is not None
+        else False,
         "prediction_horizons": _coerce_int_iterable(
             prediction_horizons, DEFAULT_PREDICTION_HORIZONS
         ),
