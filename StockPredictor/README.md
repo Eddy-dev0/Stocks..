@@ -199,6 +199,24 @@ drift is detected.
 
 Run `python main.py --help` for the full list of options and defaults.
 
+### Backtesting wie ein Profi (Leakage & Overfitting vermeiden)
+
+Backtest-Overfitting ist in Finanz-ML ein Standard-Problem. Setze daher auf
+Walk-forward-Backtests mit **Kosten/Slippage/Latency** und messbare
+Overfitting-Checks. In StockPredictor kannst du die Kosten z. B. über die
+Backtesting- und Evaluation-Parameter steuern (`backtest_slippage_bps`,
+`evaluation_slippage_bps`, `evaluation_fixed_cost`).
+
+**Wenn Labels Horizonte überlappen (z. B. „in 1d erreicht“):**
+Nutze Purging + Embargo in der CV/Backtest-Splitting-Logik, damit keine
+Zukunftsinformation in den Train-Teil „leakt“. Die Purged CV-Embargo-Option
+(`purged_cv_embargo`) ist dafür vorgesehen.
+
+**Reporte nicht nur Accuracy, sondern trading-relevante Kennzahlen:**
+- Hit-Rate pro Signal-Bucket (z. B. nach Konfidenz/Score-Bins)
+- Average adverse excursion (AAE) / Max Drawdown
+- Profit Factor, Sharpe (idealerweise mit Deflated-/Overfit-Checks)
+
 ### Headless live analysis loop
 
 Keep predictions refreshed during the trading day without opening any user
