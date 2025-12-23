@@ -257,6 +257,8 @@ class PredictorConfig:
     memory_cache_seconds: float | None = None
     timezone: ZoneInfo | str | None = None
     market_timezone: str | None = None
+    # Select the anchor price source for return-based calculations ("close" or "live").
+    anchor_price_source: str = "close"
     k_stop: float = 1.0
     expected_low_sigma: float = 1.0
     expected_low_max_volatility: float = 1.0
@@ -484,6 +486,9 @@ class PredictorConfig:
             self.market_timezone = self.timezone.key
         else:
             self.market_timezone = self.timezone
+        self.anchor_price_source = str(self.anchor_price_source or "close").strip().lower()
+        if self.anchor_price_source not in {"close", "live"}:
+            raise ValueError("anchor_price_source must be 'close' or 'live'.")
         try:
             self.k_stop = float(self.k_stop)
         except (TypeError, ValueError):
@@ -815,6 +820,7 @@ def build_config(
     price_provider_priority: Optional[Iterable[str] | str] = None,
     disabled_providers: Optional[Iterable[str] | str] = None,
     memory_cache_seconds: Optional[float] = None,
+    anchor_price_source: Optional[str] = None,
     k_stop: Optional[float] = None,
     time_series_baselines: Optional[Iterable[str] | str] = None,
     time_series_params: Optional[Mapping[str, Mapping[str, Any]] | str] = None,
@@ -887,6 +893,12 @@ def build_config(
             memory_cache_float = float(memory_cache_value)
         except (TypeError, ValueError):
             memory_cache_float = None
+
+    anchor_price_value = anchor_price_source or os.getenv(
+        "STOCK_PREDICTOR_ANCHOR_PRICE_SOURCE"
+    )
+    if anchor_price_value is None:
+        anchor_price_value = "close"
 
     monte_carlo_paths_value = monte_carlo_paths or os.getenv(
         "STOCK_PREDICTOR_MONTE_CARLO_PATHS"
@@ -1055,6 +1067,7 @@ def build_config(
         "price_provider_priority": _coerce_provider_tokens(provider_priority_value),
         "disabled_providers": _coerce_provider_tokens(disabled_providers_value),
         "memory_cache_seconds": memory_cache_float,
+        "anchor_price_source": anchor_price_value,
         "time_series_baselines": baseline_models,
         "time_series_params": baseline_params,
         "buy_zone": buy_zone,
