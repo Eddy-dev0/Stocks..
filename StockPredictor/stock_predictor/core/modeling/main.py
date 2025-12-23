@@ -3149,7 +3149,25 @@ class StockPredictorAI:
             anchor_price=anchor_price,
         )
 
-        tolerance_band_value = self.config.resolve_tolerance_band(resolved_horizon)
+        base_tolerance_band = self.config.resolve_tolerance_band(resolved_horizon)
+        intraday_volatility = None
+        for candidate in (
+            expected_intraday_move,
+            predicted_volatility,
+            historical_volatility,
+        ):
+            numeric = self._safe_float(candidate)
+            if numeric is None:
+                continue
+            if np.isfinite(numeric) and numeric != 0:
+                intraday_volatility = abs(float(numeric))
+                break
+
+        tolerance_band_value = None
+        if base_tolerance_band is not None and intraday_volatility is not None:
+            scaled_band = float(base_tolerance_band) * float(intraday_volatility)
+            if np.isfinite(scaled_band) and scaled_band > 0:
+                tolerance_band_value = float(scaled_band)
         tolerance_probability = None
         monte_carlo_target_probability = None
         monte_carlo_iterations = None

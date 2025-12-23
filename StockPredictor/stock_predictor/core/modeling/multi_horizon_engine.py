@@ -183,16 +183,30 @@ class MultiHorizonModelingEngine:
             direction_series = pd.Series(direction, index=target_frame.index, dtype=float)
             future_open = opens.shift(-int(horizon)) if opens is not None else None
             return_oc = None
+            direction_oc_series = None
             intraday_max = None
             intraday_min = None
             if future_open is not None:
                 return_oc = (future_close - future_open) / future_open
+                if neutral_threshold > 0:
+                    direction_oc = np.where(
+                        return_oc > neutral_threshold,
+                        1,
+                        np.where(return_oc < -neutral_threshold, -1, 0),
+                    )
+                else:
+                    direction_oc = np.where(return_oc > 0, 1, -1)
+                direction_oc_series = pd.Series(
+                    direction_oc, index=target_frame.index, dtype=float
+                )
                 if highs is not None:
                     future_high = highs.shift(-int(horizon))
                     intraday_max = (future_high - future_open) / future_open
                 if lows is not None:
                     future_low = lows.shift(-int(horizon))
                     intraday_min = (future_low - future_open) / future_open
+            if self.config.tomorrow_mode and direction_oc_series is not None:
+                direction_series = direction_oc_series
             if use_daily_targets:
                 label_map = {
                     "close_h": self._align_daily_targets(future_close, working.index),
@@ -210,6 +224,12 @@ class MultiHorizonModelingEngine:
                     self._align_daily_targets(return_oc, working.index)
                     if use_daily_targets
                     else return_oc
+                )
+            if direction_oc_series is not None:
+                label_map["direction_oc_h"] = (
+                    self._align_daily_targets(direction_oc_series, working.index)
+                    if use_daily_targets
+                    else direction_oc_series
                 )
             if intraday_max is not None:
                 label_map["intraday_max_h"] = (
