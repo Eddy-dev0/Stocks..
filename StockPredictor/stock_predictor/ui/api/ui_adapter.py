@@ -68,6 +68,7 @@ async def get_prediction(
         or payload.get("latest_price")
         or payload.get("latest_close")
     )
+    anchor_price = payload.get("anchor_price") or last_price
     predicted_close = payload.get("predicted_close")
     expected_low = payload.get("expected_low")
     stop_loss = payload.get("stop_loss") or expected_low
@@ -78,10 +79,10 @@ async def get_prediction(
     change_abs = None
     change_pct = None
     direction = None
-    if last_price is not None and predicted_close is not None:
-        change_abs = float(predicted_close) - float(last_price)
-        if last_price:
-            change_pct = (change_abs / float(last_price)) * 100
+    if anchor_price is not None and predicted_close is not None:
+        change_abs = float(predicted_close) - float(anchor_price)
+        if anchor_price:
+            change_pct = (change_abs / float(anchor_price)) * 100
         direction = "up" if change_abs >= 0 else "down"
 
     accuracy_summary = application.accuracy(horizon=horizon)

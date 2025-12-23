@@ -66,6 +66,11 @@ config = build_config(
 )
 ```
 
+You can also enable a "tomorrow mode" to anchor 1‑day forecasts to the latest
+close instead of the latest live price. Set `tomorrow_mode=True` in the Python
+config or export `STOCK_PREDICTOR_TOMORROW_MODE=1` to keep the anchor locked to
+`last_close`.
+
 ## Monte Carlo target-hit simulation
 
 The predictor reports a Monte Carlo estimate of the probability that the configured
