@@ -8,6 +8,7 @@ from datetime import date, timedelta
 from typing import Any, Dict, List, Mapping
 
 import altair as alt
+import matplotlib.pyplot as plt
 import pandas as pd
 import requests
 import streamlit as st
@@ -1588,7 +1589,7 @@ with col_forecast:
         )
 
         calibration_block = summary_block.get("classification", {})
-        calibration_cols = st.columns(2)
+        calibration_cols = st.columns(3)
         calibration_cols[0].metric(
             "ECE",
             f"{float(calibration_block.get('expected_calibration_error')):,.3f}"
@@ -1601,6 +1602,28 @@ with col_forecast:
             if calibration_block.get("max_calibration_error") is not None
             else "—",
         )
+        calibration_cols[2].metric(
+            "Brier",
+            f"{float(calibration_block.get('brier_score')):,.3f}"
+            if calibration_block.get("brier_score") is not None
+            else "—",
+        )
+
+        calibration_curve = reliability_payload.get("calibration", {})
+        frac = calibration_curve.get("fraction_positives")
+        mean_pred = calibration_curve.get("mean_predictions")
+        if isinstance(frac, list) and isinstance(mean_pred, list) and frac:
+            fig, ax = plt.subplots(figsize=(5, 4))
+            ax.plot(mean_pred, frac, marker="o", label="Observed")
+            ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="Perfect")
+            ax.set_xlabel("Mean predicted probability")
+            ax.set_ylabel("Observed frequency")
+            ax.set_title("Reliability plot")
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.legend()
+            st.pyplot(fig, use_container_width=True)
+            plt.close(fig)
 
         if warnings_block:
             for warning in warnings_block:

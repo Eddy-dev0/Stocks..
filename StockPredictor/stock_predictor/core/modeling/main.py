@@ -2774,8 +2774,8 @@ class StockPredictorAI:
                         if mapping.get(value, value)
                         == mapping.get(classes[positive_index], positive_index)
                         else 0
+                        for value in y_true
                     ]
-                    for value in y_true
                 )
             else:
                 y_binary = np.array([1 if value in {1, True, "1"} else 0 for value in y_true])
