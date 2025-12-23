@@ -66,6 +66,60 @@ HORIZON_UNIT_TO_DAYS: dict[str, int] = {
     "months": 21,
 }
 
+HORIZON_LABEL_TO_DAYS: dict[str, int] = {
+    "tomorrow": 1,
+}
+
+INTERVAL_UNIT_TO_MINUTES: dict[str, int] = {
+    "m": 1,
+    "min": 1,
+    "mins": 1,
+    "minute": 1,
+    "minutes": 1,
+    "h": 60,
+    "hr": 60,
+    "hrs": 60,
+    "hour": 60,
+    "hours": 60,
+    "d": 1440,
+    "day": 1440,
+    "days": 1440,
+    "w": 10080,
+    "wk": 10080,
+    "wks": 10080,
+    "week": 10080,
+    "weeks": 10080,
+    "mo": 43200,
+    "month": 43200,
+    "months": 43200,
+}
+
+
+def interval_to_minutes(interval: str | None) -> int | None:
+    """Convert an interval string into minutes when possible."""
+
+    if not interval:
+        return None
+    cleaned = str(interval).strip().lower()
+    if not cleaned:
+        return None
+    match = re.fullmatch(r"(?P<value>\d+)\s*(?P<unit>[a-z]+)", cleaned)
+    if not match:
+        return None
+    value = int(match.group("value"))
+    unit = match.group("unit")
+    multiplier = INTERVAL_UNIT_TO_MINUTES.get(unit)
+    if multiplier is None:
+        return None
+    return value * multiplier
+
+
+def interval_is_intraday(interval: str | None) -> bool:
+    """Return True when the interval is shorter than one day."""
+
+    minutes = interval_to_minutes(interval)
+    return minutes is not None and minutes < INTERVAL_UNIT_TO_MINUTES["d"]
+
 
 def _coerce_min_samples_per_horizon(value: Any | None) -> int:
     """Validate the minimum sample threshold for each horizon."""
@@ -698,6 +752,9 @@ class PredictorConfig:
             cleaned = horizon.strip().lower()
             if not cleaned:
                 raise ValueError("horizon must be an integer or supported label")
+            mapped_label = HORIZON_LABEL_TO_DAYS.get(cleaned)
+            if mapped_label is not None:
+                return mapped_label
             try:
                 return int(cleaned)
             except ValueError:

@@ -27,7 +27,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
 
-from ..config import DEFAULT_MIN_SAMPLES_PER_HORIZON, PredictorConfig
+from ..config import DEFAULT_MIN_SAMPLES_PER_HORIZON, PredictorConfig, interval_is_intraday
 from ..features import FeatureAssembler
 from ..training_data import TrainingDatasetBuilder
 from ..indicator_bundle import evaluate_signal_confluence
@@ -89,9 +89,60 @@ class MultiHorizonModelingEngine:
     # ------------------------------------------------------------------
     # Dataset construction
     # ------------------------------------------------------------------
+    def _interval_is_intraday(self) -> bool:
+        return interval_is_intraday(self.config.interval)
+
+    @staticmethod
+    def _aggregate_daily_prices(price_df: pd.DataFrame) -> pd.DataFrame:
+        frame = price_df.copy()
+        if "Date" in frame.columns:
+            frame = frame.sort_values("Date")
+            index = pd.to_datetime(frame["Date"], errors="coerce")
+            frame = frame.set_index(index)
+        else:
+            frame = frame.sort_index()
+            frame.index = pd.to_datetime(frame.index, errors="coerce")
+        frame = frame[~frame.index.isna()]
+        if frame.empty:
+            return frame
+
+        lower_columns = {column.lower(): column for column in frame.columns}
+        agg_map: dict[str, str] = {}
+        for name, agg in (
+            ("open", "first"),
+            ("high", "max"),
+            ("low", "min"),
+            ("close", "last"),
+            ("adj close", "last"),
+            ("adj_close", "last"),
+            ("volume", "sum"),
+        ):
+            column = lower_columns.get(name)
+            if column:
+                agg_map[column] = agg
+
+        if not agg_map:
+            return frame
+
+        daily = frame.resample("1D").agg(agg_map)
+        daily = daily.dropna(how="all")
+        daily.index = pd.to_datetime(daily.index).normalize()
+        return daily
+
+    @staticmethod
+    def _align_daily_targets(series: pd.Series, target_index: pd.Index) -> pd.Series:
+        if target_index.empty:
+            return series
+        normalized = pd.to_datetime(target_index, errors="coerce").normalize()
+        aligned = series.reindex(normalized)
+        aligned.index = target_index
+        return aligned
+
     def _compute_targets(self, price_df: pd.DataFrame, horizons: Sequence[int]) -> dict[int, dict[str, pd.Series]]:
         working = price_df.copy()
-        lower_columns = {column.lower(): column for column in working.columns}
+        use_daily_targets = self._interval_is_intraday()
+        target_frame = self._aggregate_daily_prices(working) if use_daily_targets else working
+        lower_columns = {column.lower(): column for column in target_frame.columns}
         basis = getattr(self.config, "target_price_basis", "adj_close")
         basis = str(basis or "adj_close").strip().lower()
         if basis == "adj_close":
@@ -109,7 +160,7 @@ class MultiHorizonModelingEngine:
         if close_col is None:
             raise KeyError("Price dataframe must contain a close column for target generation.")
 
-        closes = pd.to_numeric(working[close_col], errors="coerce")
+        closes = pd.to_numeric(target_frame[close_col], errors="coerce")
         neutral_threshold = float(getattr(self.config, "direction_neutral_threshold", 0.0))
         targets: dict[int, dict[str, pd.Series]] = {}
         for horizon in horizons:
@@ -123,11 +174,19 @@ class MultiHorizonModelingEngine:
                 )
             else:
                 direction = np.where(future_close > closes, 1, -1)
-            targets[int(horizon)] = {
-                "close_h": future_close,
-                "direction_h": pd.Series(direction, index=working.index, dtype=float),
-                "return_h": returns,
-            }
+            direction_series = pd.Series(direction, index=target_frame.index, dtype=float)
+            if use_daily_targets:
+                targets[int(horizon)] = {
+                    "close_h": self._align_daily_targets(future_close, working.index),
+                    "direction_h": self._align_daily_targets(direction_series, working.index),
+                    "return_h": self._align_daily_targets(returns, working.index),
+                }
+            else:
+                targets[int(horizon)] = {
+                    "close_h": future_close,
+                    "direction_h": direction_series,
+                    "return_h": returns,
+                }
         return targets
 
     def build_dataset(
@@ -142,6 +201,11 @@ class MultiHorizonModelingEngine:
         ticker_universe = list(tickers) if tickers else [self.config.ticker]
         requested_targets = set(targets) if targets else {"close_h", "direction_h", "return_h"}
         minimum_viable_rows = max(1, int(getattr(self.config, "minimum_viable_rows", 1)))
+        if self._interval_is_intraday() and 1 in horizons:
+            LOGGER.warning(
+                "Interval %s is intraday; treating 'Tomorrow' as 1 trading day and using daily bars for targets.",
+                self.config.interval,
+            )
 
         def _frame_stats(frame: pd.DataFrame) -> dict[str, Any]:
             if frame is None:
