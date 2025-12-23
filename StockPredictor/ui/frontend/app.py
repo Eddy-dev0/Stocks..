@@ -339,6 +339,73 @@ def _format_percent_value(value: Any) -> str:
         return str(value)
 
 
+def _coerce_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_quantile_summary(
+    forecast_block: Mapping[str, Any], target: str
+) -> dict[float, float]:
+    quantile_forecasts = forecast_block.get("quantile_forecasts")
+    if not isinstance(quantile_forecasts, Mapping):
+        return {}
+    quantile_block = None
+    for candidate in (f"{target}_h", target):
+        block = quantile_forecasts.get(candidate)
+        if isinstance(block, Mapping):
+            quantile_block = block
+            break
+    if not isinstance(quantile_block, Mapping):
+        return {}
+    parsed: dict[float, float] = {}
+    for key, raw in quantile_block.items():
+        numeric = None
+        if isinstance(key, (int, float)):
+            numeric = float(key)
+        elif isinstance(key, str):
+            cleaned = key.strip().lower()
+            if cleaned in {"lower", "low"}:
+                numeric = 0.1
+            elif cleaned in {"median", "mid"}:
+                numeric = 0.5
+            elif cleaned in {"upper", "high"}:
+                numeric = 0.9
+            else:
+                cleaned = cleaned.removeprefix("quantile_")
+                cleaned = cleaned.removeprefix("q").removeprefix("p")
+                if cleaned.endswith("%"):
+                    cleaned = cleaned.rstrip("%")
+                    numeric = _coerce_float(cleaned)
+                    if numeric is not None:
+                        numeric = numeric / 100.0
+                else:
+                    numeric = _coerce_float(cleaned)
+        if numeric is None:
+            continue
+        if numeric > 1.0:
+            numeric = numeric / 100.0
+        value = _coerce_float(raw)
+        if value is not None:
+            parsed[numeric] = value
+    return parsed
+
+
+def _format_sigma_range(center: float | None, sigma: float | None) -> str:
+    if center is None or sigma is None:
+        return "—"
+    if sigma <= 0:
+        return "—"
+    delta = center * sigma
+    low = center - delta
+    high = center + delta
+    return f"{_format_currency(low)} to {_format_currency(high)}"
+
+
 def _build_live_price_table(snapshot: Dict[str, Any]) -> pd.DataFrame:
     probabilities = snapshot.get("probabilities") or {}
     rows = [
@@ -1232,11 +1299,49 @@ with col_forecast:
                 else:
                     expected_change_display = abs_display if expected_change_abs is not None else pct_display
 
+            close_quantiles = _extract_quantile_summary(forecast_block, "close")
+            high_quantiles = _extract_quantile_summary(forecast_block, "high")
+            low_quantiles = _extract_quantile_summary(forecast_block, "low")
+            direction_probs = forecast_block.get("probabilities") or {}
+            direction_prob_block = (
+                direction_probs.get("direction") if isinstance(direction_probs, Mapping) else {}
+            )
+            p_up = _coerce_float(forecast_block.get("direction_probability_up"))
+            if p_up is None and isinstance(direction_prob_block, Mapping):
+                p_up = _coerce_float(direction_prob_block.get("up"))
+            p_down = _coerce_float(forecast_block.get("direction_probability_down"))
+            if p_down is None and isinstance(direction_prob_block, Mapping):
+                p_down = _coerce_float(direction_prob_block.get("down"))
+            target_hit_prob = _coerce_float(forecast_block.get("target_hit_probability"))
+            if target_hit_prob is None:
+                target_hit_prob = _coerce_float(
+                    forecast_block.get("monte_carlo_target_hit_probability")
+                )
+            range_center = _coerce_float(
+                forecast_block.get("last_price") or forecast_block.get("predicted_close")
+            )
+            range_sigma = _coerce_float(
+                forecast_block.get("predicted_volatility")
+                or forecast_block.get("expected_low_return_std")
+            )
             summary_rows = [
                 {"Metric": "Last price", "Value": _format_currency(forecast_block.get("last_price"))},
                 {"Metric": "Predicted close", "Value": _format_currency(forecast_block.get("predicted_close"))},
+                {"Metric": "q10 close", "Value": _format_currency(close_quantiles.get(0.1))},
+                {"Metric": "q50 close", "Value": _format_currency(close_quantiles.get(0.5))},
+                {"Metric": "q90 close", "Value": _format_currency(close_quantiles.get(0.9))},
+                {"Metric": "q10 high", "Value": _format_currency(high_quantiles.get(0.1))},
+                {"Metric": "q50 high", "Value": _format_currency(high_quantiles.get(0.5))},
+                {"Metric": "q90 high", "Value": _format_currency(high_quantiles.get(0.9))},
+                {"Metric": "q10 low", "Value": _format_currency(low_quantiles.get(0.1))},
+                {"Metric": "q50 low", "Value": _format_currency(low_quantiles.get(0.5))},
+                {"Metric": "q90 low", "Value": _format_currency(low_quantiles.get(0.9))},
                 {"Metric": "Expected low", "Value": _format_currency(forecast_block.get("expected_low"))},
                 {"Metric": "Expected change", "Value": expected_change_display},
+                {"Metric": "Range 1σ", "Value": _format_sigma_range(range_center, range_sigma)},
+                {"Metric": "P(up)", "Value": _format_percentage(p_up)},
+                {"Metric": "P(down)", "Value": _format_percentage(p_down)},
+                {"Metric": "P(hit target)", "Value": _format_percentage(target_hit_prob)},
                 {"Metric": "Stop-loss", "Value": _format_currency(forecast_block.get("stop_loss"))},
                 {"Metric": "Direction", "Value": forecast_block.get("direction") or "—"},
             ]
