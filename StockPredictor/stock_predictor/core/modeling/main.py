@@ -4332,6 +4332,7 @@ class StockPredictorAI:
             stop_loss = min(stop_loss, predicted_close)
 
         snapshot_warnings: list[str] = []
+        # Return-model output can diverge from close-model-derived change.
         (
             _,
             expected_change_pct,
@@ -4339,7 +4340,7 @@ class StockPredictorAI:
             expected_low,
             stop_loss,
         ) = self._validate_prediction_ranges(
-            predicted_return=expected_change_pct,
+            predicted_return=predicted_return,
             expected_change_pct=expected_change_pct,
             predicted_close=predicted_close,
             expected_low=expected_low,
