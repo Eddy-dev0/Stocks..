@@ -314,7 +314,7 @@ class PredictorConfig:
     memory_cache_seconds: float | None = None
     timezone: ZoneInfo | str | None = None
     market_timezone: str | None = None
-    # Select the anchor price source for return-based calculations ("close" or "live").
+    # Select the anchor price source for return-based calculations ("close", "live", "open", "vwap_5m").
     anchor_price_source: str = "close"
     tomorrow_mode: bool = False
     k_stop: float = 1.0
@@ -555,8 +555,10 @@ class PredictorConfig:
         else:
             self.market_timezone = self.timezone
         self.anchor_price_source = str(self.anchor_price_source or "close").strip().lower()
-        if self.anchor_price_source not in {"close", "live"}:
-            raise ValueError("anchor_price_source must be 'close' or 'live'.")
+        if self.anchor_price_source not in {"close", "live", "open", "vwap_5m"}:
+            raise ValueError(
+                "anchor_price_source must be 'close', 'live', 'open', or 'vwap_5m'."
+            )
         self.tomorrow_mode = bool(self.tomorrow_mode)
         try:
             self.k_stop = float(self.k_stop)
