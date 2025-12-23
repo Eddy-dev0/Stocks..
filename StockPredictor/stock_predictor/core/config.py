@@ -323,6 +323,12 @@ class PredictorConfig:
     expected_low_floor_window: int = 20
     expected_low_std_window: int = 20
     expected_low_std_cap: float = 0.0
+    expected_low_atr_multiplier: float = 1.0
+    expected_low_iv_multiplier: float = 1.0
+    expected_low_atr_period: int = 14
+    stop_loss_atr_multiplier: float = 1.2
+    stop_loss_iv_multiplier: float = 1.0
+    implied_volatility_rule_of_16: float = 16.0
     time_series_baselines: tuple[str, ...] = field(default_factory=tuple)
     time_series_params: dict[str, dict[str, Any]] = field(default_factory=dict)
     buy_zone: BuyZoneConfirmationSettings = field(
@@ -582,6 +588,45 @@ class PredictorConfig:
             self.expected_low_std_cap = 0.0
         if not math.isfinite(self.expected_low_std_cap) or self.expected_low_std_cap < 0:
             self.expected_low_std_cap = 0.0
+        try:
+            self.expected_low_atr_multiplier = float(self.expected_low_atr_multiplier)
+        except (TypeError, ValueError):
+            self.expected_low_atr_multiplier = 1.0
+        if not math.isfinite(self.expected_low_atr_multiplier) or self.expected_low_atr_multiplier < 0:
+            self.expected_low_atr_multiplier = 0.0
+        try:
+            self.expected_low_iv_multiplier = float(self.expected_low_iv_multiplier)
+        except (TypeError, ValueError):
+            self.expected_low_iv_multiplier = 1.0
+        if not math.isfinite(self.expected_low_iv_multiplier) or self.expected_low_iv_multiplier < 0:
+            self.expected_low_iv_multiplier = 0.0
+        try:
+            self.expected_low_atr_period = int(self.expected_low_atr_period)
+        except (TypeError, ValueError):
+            self.expected_low_atr_period = 14
+        if self.expected_low_atr_period <= 0:
+            self.expected_low_atr_period = 14
+        try:
+            self.stop_loss_atr_multiplier = float(self.stop_loss_atr_multiplier)
+        except (TypeError, ValueError):
+            self.stop_loss_atr_multiplier = 1.2
+        if not math.isfinite(self.stop_loss_atr_multiplier) or self.stop_loss_atr_multiplier < 0:
+            self.stop_loss_atr_multiplier = 0.0
+        try:
+            self.stop_loss_iv_multiplier = float(self.stop_loss_iv_multiplier)
+        except (TypeError, ValueError):
+            self.stop_loss_iv_multiplier = 1.0
+        if not math.isfinite(self.stop_loss_iv_multiplier) or self.stop_loss_iv_multiplier < 0:
+            self.stop_loss_iv_multiplier = 0.0
+        try:
+            self.implied_volatility_rule_of_16 = float(self.implied_volatility_rule_of_16)
+        except (TypeError, ValueError):
+            self.implied_volatility_rule_of_16 = 16.0
+        if (
+            not math.isfinite(self.implied_volatility_rule_of_16)
+            or self.implied_volatility_rule_of_16 <= 0
+        ):
+            self.implied_volatility_rule_of_16 = 16.0
         try:
             self.monte_carlo_paths = int(self.monte_carlo_paths)
         except (TypeError, ValueError):

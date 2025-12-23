@@ -8,6 +8,7 @@ import logging
 import math
 import multiprocessing as mp
 import os
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time as dt_time
@@ -94,6 +95,12 @@ DEFAULT_EXPECTED_LOW_SIGMA = 1.0
 DEFAULT_STOP_LOSS_MULTIPLIER = 1.0
 DEFAULT_EXPECTED_LOW_MAX_VOLATILITY = 1.0
 DEFAULT_EXPECTED_LOW_FLOOR_WINDOW = 20
+DEFAULT_EXPECTED_LOW_ATR_MULTIPLIER = 1.0
+DEFAULT_EXPECTED_LOW_IV_MULTIPLIER = 1.0
+DEFAULT_STOP_LOSS_ATR_MULTIPLIER = 1.2
+DEFAULT_STOP_LOSS_IV_MULTIPLIER = 1.0
+DEFAULT_IMPLIED_VOLATILITY_RULE_OF_16 = 16.0
+DEFAULT_EXPECTED_LOW_ATR_PERIOD = 14
 DEFAULT_PLAUSIBILITY_SIGMA_MULTIPLIER = 3.0
 DEFAULT_LOG_RETURN_WINDOW = 252
 DEFAULT_VOLATILITY_FLOOR = 0.02
@@ -4039,6 +4046,77 @@ class StockPredictorAI:
             clamped = min(clamped, upper)
         return clamped
 
+    def _resolve_range_anchors(
+        self,
+        anchor_price: float | None,
+    ) -> dict[str, float | None]:
+        atr_value: float | None = None
+        implied_volatility: float | None = None
+        latest_features = None
+        if isinstance(getattr(self, "metadata", None), Mapping):
+            atr_value = self._safe_float(
+                self.metadata.get("atr")
+                or self.metadata.get("atr_14")
+                or self.metadata.get("average_true_range")
+            )
+            implied_volatility = self._safe_float(
+                self.metadata.get("implied_volatility")
+                or self.metadata.get("iv")
+                or self.metadata.get("options_implied_volatility")
+            )
+            latest_features = self.metadata.get("latest_features")
+
+        if atr_value is None and isinstance(latest_features, pd.DataFrame) and not latest_features.empty:
+            target_period = getattr(self.config, "expected_low_atr_period", DEFAULT_EXPECTED_LOW_ATR_PERIOD)
+            try:
+                target_period = int(target_period)
+            except (TypeError, ValueError):
+                target_period = DEFAULT_EXPECTED_LOW_ATR_PERIOD
+            atr_columns = [col for col in latest_features.columns if "atr" in str(col).lower()]
+            if atr_columns:
+                scored: list[tuple[int, str]] = []
+                for column in atr_columns:
+                    match = re.search(r"atr[_\s-]?(\d+)", str(column).lower())
+                    if match:
+                        period = int(match.group(1))
+                    else:
+                        period = target_period
+                    scored.append((abs(period - target_period), str(column)))
+                selected_column = sorted(scored, key=lambda item: item[0])[0][1]
+                atr_value = self._safe_float(latest_features.iloc[0][selected_column])
+
+        if implied_volatility is not None:
+            implied_volatility = abs(float(implied_volatility))
+            if implied_volatility > 1.0 and implied_volatility <= 100:
+                implied_volatility /= 100.0
+
+        atr_fraction = None
+        iv_fraction = None
+        iv_price_sigma = None
+        if atr_value is not None and anchor_price is not None and anchor_price > 0:
+            atr_fraction = abs(float(atr_value)) / float(anchor_price)
+        iv_rule = getattr(
+            self.config, "implied_volatility_rule_of_16", DEFAULT_IMPLIED_VOLATILITY_RULE_OF_16
+        )
+        try:
+            iv_rule_value = float(iv_rule)
+        except (TypeError, ValueError):
+            iv_rule_value = DEFAULT_IMPLIED_VOLATILITY_RULE_OF_16
+        if not np.isfinite(iv_rule_value) or iv_rule_value <= 0:
+            iv_rule_value = DEFAULT_IMPLIED_VOLATILITY_RULE_OF_16
+
+        if implied_volatility is not None:
+            iv_fraction = implied_volatility / iv_rule_value
+            if anchor_price is not None and anchor_price > 0:
+                iv_price_sigma = float(anchor_price) * iv_fraction
+
+        return {
+            "atr_value": atr_value,
+            "atr_fraction": atr_fraction,
+            "iv_fraction": iv_fraction,
+            "iv_price_sigma": iv_price_sigma,
+        }
+
     def _compute_expected_low(
         self,
         predicted_close: Any,
@@ -4124,6 +4202,31 @@ class StockPredictorAI:
         if numeric_close is None:
             numeric_close = anchor_value
         volatility_value = self._safe_float(predicted_volatility)
+        range_anchors = self._resolve_range_anchors(anchor_value)
+        atr_fraction = range_anchors.get("atr_fraction")
+        iv_fraction = range_anchors.get("iv_fraction")
+        atr_multiplier = getattr(
+            self.config, "expected_low_atr_multiplier", DEFAULT_EXPECTED_LOW_ATR_MULTIPLIER
+        )
+        iv_multiplier = getattr(
+            self.config, "expected_low_iv_multiplier", DEFAULT_EXPECTED_LOW_IV_MULTIPLIER
+        )
+        range_floor_candidates: list[float] = []
+        if atr_fraction is not None:
+            try:
+                atr_multiplier_value = float(atr_multiplier)
+            except (TypeError, ValueError):
+                atr_multiplier_value = DEFAULT_EXPECTED_LOW_ATR_MULTIPLIER
+            if np.isfinite(atr_multiplier_value) and atr_multiplier_value > 0:
+                range_floor_candidates.append(atr_fraction * atr_multiplier_value)
+        if iv_fraction is not None:
+            try:
+                iv_multiplier_value = float(iv_multiplier)
+            except (TypeError, ValueError):
+                iv_multiplier_value = DEFAULT_EXPECTED_LOW_IV_MULTIPLIER
+            if np.isfinite(iv_multiplier_value) and iv_multiplier_value > 0:
+                range_floor_candidates.append(iv_fraction * iv_multiplier_value)
+        range_floor = max(range_floor_candidates) if range_floor_candidates else None
 
         if numeric_close is None:
             return floor_value
@@ -4147,10 +4250,12 @@ class StockPredictorAI:
             return float(min(candidate, numeric_close))
 
         if volatility_value is None:
-            base_low = float(numeric_close)
-            if floor_value is not None:
-                base_low = max(base_low, floor_value)
-            return float(min(base_low, numeric_close))
+            if range_floor is None:
+                base_low = float(numeric_close)
+                if floor_value is not None:
+                    base_low = max(base_low, floor_value)
+                return float(min(base_low, numeric_close))
+            volatility_value = range_floor
 
         volatility_pct = abs(float(volatility_value))
         if volatility_pct > 1.0 and volatility_pct <= 100:
@@ -4203,6 +4308,13 @@ class StockPredictorAI:
                 volatility_cap,
             )
             volatility_pct = volatility_cap
+        if range_floor is not None and volatility_pct < range_floor:
+            LOGGER.warning(
+                "Predicted volatility %.4f below range floor %.4f; using floor.",
+                volatility_pct,
+                range_floor,
+            )
+            volatility_pct = range_floor
 
         multiplier = getattr(self.config, "expected_low_sigma", DEFAULT_EXPECTED_LOW_SIGMA)
         try:
@@ -4251,13 +4363,37 @@ class StockPredictorAI:
             if not np.isfinite(multiplier_value) or multiplier_value <= 0:
                 multiplier_value = DEFAULT_STOP_LOSS_MULTIPLIER
 
-            if volatility_sigma is None:
-                stop_loss = float(fallback_low)
-            else:
+            range_anchor_price = anchor_value if anchor_value is not None else numeric_close
+            range_anchors = self._resolve_range_anchors(range_anchor_price)
+            atr_value = range_anchors.get("atr_value")
+            iv_price_sigma = range_anchors.get("iv_price_sigma")
+            atr_multiplier = getattr(
+                self.config, "stop_loss_atr_multiplier", DEFAULT_STOP_LOSS_ATR_MULTIPLIER
+            )
+            iv_multiplier = getattr(
+                self.config, "stop_loss_iv_multiplier", DEFAULT_STOP_LOSS_IV_MULTIPLIER
+            )
+            buffer_candidates: list[float] = []
+            if volatility_sigma is not None:
                 sigma = abs(float(volatility_sigma))
-                if not np.isfinite(sigma):
-                    sigma = 0.0
-                stop_loss = float(fallback_low) - sigma * multiplier_value
+                if np.isfinite(sigma) and sigma > 0:
+                    buffer_candidates.append(sigma * multiplier_value)
+            if atr_value is not None:
+                try:
+                    atr_multiplier_value = float(atr_multiplier)
+                except (TypeError, ValueError):
+                    atr_multiplier_value = DEFAULT_STOP_LOSS_ATR_MULTIPLIER
+                if np.isfinite(atr_multiplier_value) and atr_multiplier_value > 0:
+                    buffer_candidates.append(abs(float(atr_value)) * atr_multiplier_value)
+            if iv_price_sigma is not None:
+                try:
+                    iv_multiplier_value = float(iv_multiplier)
+                except (TypeError, ValueError):
+                    iv_multiplier_value = DEFAULT_STOP_LOSS_IV_MULTIPLIER
+                if np.isfinite(iv_multiplier_value) and iv_multiplier_value > 0:
+                    buffer_candidates.append(float(iv_price_sigma) * iv_multiplier_value)
+            buffer = max(buffer_candidates) if buffer_candidates else 0.0
+            stop_loss = float(fallback_low) - buffer
 
             stop_loss = max(0.0, stop_loss)
             if predicted_close_value is not None:
@@ -4278,8 +4414,36 @@ class StockPredictorAI:
             return float(min(stop_loss, numeric_close))
 
         volatility_pct = self._safe_float(predicted_volatility)
+        range_anchor_price = anchor_value if anchor_value is not None else numeric_close
+        range_anchors = self._resolve_range_anchors(range_anchor_price)
+        atr_fraction = range_anchors.get("atr_fraction")
+        iv_fraction = range_anchors.get("iv_fraction")
+        atr_multiplier = getattr(
+            self.config, "stop_loss_atr_multiplier", DEFAULT_STOP_LOSS_ATR_MULTIPLIER
+        )
+        iv_multiplier = getattr(
+            self.config, "stop_loss_iv_multiplier", DEFAULT_STOP_LOSS_IV_MULTIPLIER
+        )
+        range_floor_candidates: list[float] = []
+        if atr_fraction is not None:
+            try:
+                atr_multiplier_value = float(atr_multiplier)
+            except (TypeError, ValueError):
+                atr_multiplier_value = DEFAULT_STOP_LOSS_ATR_MULTIPLIER
+            if np.isfinite(atr_multiplier_value) and atr_multiplier_value > 0:
+                range_floor_candidates.append(atr_fraction * atr_multiplier_value)
+        if iv_fraction is not None:
+            try:
+                iv_multiplier_value = float(iv_multiplier)
+            except (TypeError, ValueError):
+                iv_multiplier_value = DEFAULT_STOP_LOSS_IV_MULTIPLIER
+            if np.isfinite(iv_multiplier_value) and iv_multiplier_value > 0:
+                range_floor_candidates.append(iv_fraction * iv_multiplier_value)
+        range_floor = max(range_floor_candidates) if range_floor_candidates else None
         if volatility_pct is None:
-            return None
+            volatility_pct = range_floor
+            if volatility_pct is None:
+                return None
 
         multiplier = getattr(self.config, "k_stop", DEFAULT_STOP_LOSS_MULTIPLIER)
         try:
@@ -4290,6 +4454,13 @@ class StockPredictorAI:
             multiplier_value = DEFAULT_STOP_LOSS_MULTIPLIER
 
         volatility_pct = abs(float(volatility_pct))
+        if range_floor is not None and volatility_pct < range_floor:
+            LOGGER.warning(
+                "Predicted volatility %.4f below stop-loss range floor %.4f; using floor.",
+                volatility_pct,
+                range_floor,
+            )
+            volatility_pct = range_floor
         delta = float(numeric_close) * volatility_pct * multiplier_value
         if not np.isfinite(delta):
             delta = 0.0
