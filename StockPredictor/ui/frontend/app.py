@@ -158,6 +158,8 @@ def _extract_feature_usage(
             indicators = sorted({str(item) for item in raw_indicators})
 
         summary_text = forecast_block.get("feature_usage_summary")
+        if not isinstance(summary_text, str):
+            summary_text = None
 
     return {
         "feature_groups": feature_groups,
@@ -191,6 +193,32 @@ def _render_feature_usage(
 
     if indicators:
         st.table(pd.DataFrame({"Indicators": indicators}))
+
+
+def _render_feature_usage_summary(forecast_block: Mapping[str, Any] | None) -> None:
+    """Render the feature usage summary counts from PredictionResult metadata."""
+
+    if not isinstance(forecast_block, Mapping):
+        return
+    summaries = forecast_block.get("feature_usage_summary")
+    if not isinstance(summaries, list) or not summaries:
+        return
+
+    rows = []
+    for entry in summaries:
+        if isinstance(entry, Mapping):
+            name = entry.get("name")
+            count = entry.get("count")
+        else:
+            name = None
+            count = None
+        if name is None and count is None:
+            continue
+        rows.append({"Feature group": name, "Signals executed": count})
+
+    if rows:
+        st.markdown("**Feature signal counts**")
+        st.table(pd.DataFrame(rows))
 
 
 def _render_model_input_details(forecast_block: Mapping[str, Any] | None) -> None:
@@ -296,6 +324,17 @@ def _format_percentage(value: Any) -> str:
         return "—"
     try:
         return f"{float(value) * 100:.2f}%"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _format_percent_value(value: Any) -> str:
+    """Format percent values that are already expressed in percentage points."""
+
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value):.2f}%"
     except (TypeError, ValueError):
         return str(value)
 
@@ -904,6 +943,10 @@ feature_toggles = FeatureToggles.from_any(
 
 forecast_response = st.session_state.get("forecast_response") or {}
 forecast_block = forecast_response.get("forecasts", forecast_response)
+if isinstance(forecast_block, Mapping):
+    raw_forecast = forecast_block.get("raw")
+    if isinstance(raw_forecast, Mapping):
+        forecast_block = {**raw_forecast, **forecast_block}
 
 feature_usage = _extract_feature_usage(forecast_block)
 
@@ -1080,6 +1123,15 @@ with col_data:
                 st.dataframe(pd.DataFrame(rows))
             else:
                 st.caption("No confirmation signals returned by the API.")
+
+            support_components = buy_zone_payload.get("support_components", {})
+            if isinstance(support_components, Mapping) and support_components:
+                st.markdown("**Support level components**")
+                st.table(
+                    pd.DataFrame(
+                        support_components.items(), columns=["Component", "Value"]
+                    )
+                )
         with risk_metrics_placeholder:
             latest_valid = frame.dropna(how="all")
             if latest_valid.empty:
@@ -1160,6 +1212,71 @@ with col_forecast:
 
     if forecast_response:
         st.write("**Forecast summary**")
+        if isinstance(forecast_block, Mapping):
+            expected_change_abs = forecast_block.get("expected_change_abs")
+            expected_change_pct = forecast_block.get("expected_change_pct")
+            expected_change_display = "—"
+            if expected_change_abs is not None or expected_change_pct is not None:
+                abs_display = (
+                    _format_currency(expected_change_abs)
+                    if expected_change_abs is not None
+                    else "—"
+                )
+                pct_display = (
+                    _format_percent_value(expected_change_pct)
+                    if expected_change_pct is not None
+                    else "—"
+                )
+                if expected_change_abs is not None and expected_change_pct is not None:
+                    expected_change_display = f"{abs_display} ({pct_display})"
+                else:
+                    expected_change_display = abs_display if expected_change_abs is not None else pct_display
+
+            summary_rows = [
+                {"Metric": "Last price", "Value": _format_currency(forecast_block.get("last_price"))},
+                {"Metric": "Predicted close", "Value": _format_currency(forecast_block.get("predicted_close"))},
+                {"Metric": "Expected low", "Value": _format_currency(forecast_block.get("expected_low"))},
+                {"Metric": "Expected change", "Value": expected_change_display},
+                {"Metric": "Stop-loss", "Value": _format_currency(forecast_block.get("stop_loss"))},
+                {"Metric": "Direction", "Value": forecast_block.get("direction") or "—"},
+            ]
+            st.table(pd.DataFrame(summary_rows))
+
+            diagnostics_rows = []
+            tolerance_prob = forecast_block.get("probability_within_tolerance")
+            tolerance_band = forecast_block.get("tolerance_band")
+            if tolerance_prob is not None:
+                diagnostics_rows.append(
+                    {"Metric": "Within tolerance probability", "Value": _format_percentage(tolerance_prob)}
+                )
+            if tolerance_band is not None:
+                diagnostics_rows.append(
+                    {"Metric": "Tolerance band", "Value": _format_percentage(tolerance_band)}
+                )
+            if diagnostics_rows:
+                st.markdown("**Forecast diagnostics**")
+                st.table(pd.DataFrame(diagnostics_rows))
+
+            training_accuracy = forecast_block.get("training_accuracy")
+            if isinstance(training_accuracy, Mapping) and training_accuracy:
+                st.markdown("**Training accuracy**")
+                st.table(pd.DataFrame([training_accuracy]))
+
+            accuracy_snapshot = forecast_block.get("accuracy")
+            if isinstance(accuracy_snapshot, Mapping) and accuracy_snapshot:
+                st.markdown("**Accuracy snapshot**")
+                st.table(pd.DataFrame([accuracy_snapshot]))
+
+            sample_counts = forecast_block.get("sample_counts")
+            if isinstance(sample_counts, Mapping) and sample_counts:
+                st.markdown("**Sample counts**")
+                st.table(pd.DataFrame(sample_counts.items(), columns=["Target", "Samples"]))
+
+            missing_targets = forecast_block.get("missing_targets")
+            if isinstance(missing_targets, Mapping) and missing_targets:
+                st.markdown("**Missing targets**")
+                st.table(pd.DataFrame(missing_targets.items(), columns=["Target", "Detail"]))
+
         monte_carlo_prob = None
         if isinstance(forecast_block, dict):
             monte_carlo_prob = forecast_block.get("monte_carlo_target_hit_probability")
@@ -1192,6 +1309,7 @@ with col_forecast:
                 for summary in beta_summaries:
                     st.write(summary)
         _render_feature_usage(forecast_block)
+        _render_feature_usage_summary(forecast_block)
         _render_feature_toggle_summary(forecast_block)
         _download_button(
             "Download forecast JSON",
@@ -1225,6 +1343,8 @@ with col_forecast:
             incorrect_pct = accuracy_payload.get("incorrect_pct")
             total_predictions = accuracy_payload.get("total_predictions")
             runs_considered = accuracy_payload.get("runs_considered")
+            correct_count = accuracy_payload.get("correct")
+            incorrect_count = accuracy_payload.get("incorrect")
             stats_cols = st.columns(3)
             stats_cols[0].metric(
                 "Correct",
@@ -1243,6 +1363,15 @@ with col_forecast:
             )
             st.caption(
                 f"Runs considered: {runs_considered or 0} | Horizon: {accuracy_payload.get('horizon') or 'active'}"
+            )
+            count_cols = st.columns(2)
+            count_cols[0].metric(
+                "Correct count",
+                f"{int(correct_count):,}" if isinstance(correct_count, (int, float)) else "—",
+            )
+            count_cols[1].metric(
+                "Incorrect count",
+                f"{int(incorrect_count):,}" if isinstance(incorrect_count, (int, float)) else "—",
             )
         else:
             st.info("Run a backtest and refresh accuracy to see directional hit rates.")
