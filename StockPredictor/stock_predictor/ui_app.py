@@ -504,6 +504,18 @@ class StockPredictorDesktopApp:
         self.expected_low_std_cap = float(
             _safe_float(getattr(self.config, "expected_low_std_cap", 0.0)) or 0.0
         )
+        self.expected_low_atr_multiplier = float(
+            _safe_float(getattr(self.config, "expected_low_atr_multiplier", 1.0)) or 1.0
+        )
+        self.expected_low_iv_multiplier = float(
+            _safe_float(getattr(self.config, "expected_low_iv_multiplier", 1.0)) or 1.0
+        )
+        self.expected_low_atr_period = int(
+            _safe_float(getattr(self.config, "expected_low_atr_period", 14)) or 14
+        )
+        self.implied_volatility_rule_of_16 = float(
+            _safe_float(getattr(self.config, "implied_volatility_rule_of_16", 16.0)) or 16.0
+        )
         self.expected_low_multiplier_var.trace_add(
             "write", self._on_expected_low_multiplier_changed
         )
@@ -4147,6 +4159,41 @@ class StockPredictorDesktopApp:
                 returns = returns.tail(window)
             return float(returns.std())
 
+        def _extract_atr_value(block: Mapping[str, Any] | None) -> float | None:
+            if not isinstance(block, Mapping):
+                return None
+            for key in ("atr", "atr_14", "average_true_range"):
+                candidate = _safe_float(block.get(key))
+                if candidate is not None:
+                    return candidate
+            atr_columns = [key for key in block.keys() if "atr" in str(key).lower()]
+            if not atr_columns:
+                return None
+            target_period = getattr(self, "expected_low_atr_period", 14)
+            try:
+                target_period = int(target_period)
+            except (TypeError, ValueError):
+                target_period = 14
+            scored: list[tuple[int, str]] = []
+            for column in atr_columns:
+                match = re.search(r"atr[_\s-]?(\d+)", str(column).lower())
+                if match:
+                    period = int(match.group(1))
+                else:
+                    period = target_period
+                scored.append((abs(period - target_period), str(column)))
+            selected_column = sorted(scored, key=lambda item: item[0])[0][1]
+            return _safe_float(block.get(selected_column))
+
+        def _extract_implied_vol(block: Mapping[str, Any] | None) -> float | None:
+            if not isinstance(block, Mapping):
+                return None
+            for key in ("implied_volatility", "iv", "options_implied_volatility"):
+                candidate = _safe_float(block.get(key))
+                if candidate is not None:
+                    return candidate
+            return None
+
         intervals = prediction.get("prediction_intervals")
         if isinstance(intervals, Mapping):
             close_interval = intervals.get("close")
@@ -4207,6 +4254,49 @@ class StockPredictorDesktopApp:
 
         predicted_close = _safe_float(prediction.get("predicted_close"))
         predicted_volatility = _safe_float(prediction.get("predicted_volatility"))
+        anchor_price = _safe_float(prediction.get("anchor_price")) or predicted_close
+        atr_value = _extract_atr_value(prediction)
+        implied_volatility = _extract_implied_vol(prediction)
+        latest_features = prediction.get("latest_features_snapshot")
+        if atr_value is None and isinstance(latest_features, list) and latest_features:
+            atr_value = _extract_atr_value(latest_features[0])
+        if implied_volatility is None and isinstance(latest_features, list) and latest_features:
+            implied_volatility = _extract_implied_vol(latest_features[0])
+        atr_fraction = None
+        if atr_value is not None and anchor_price is not None and anchor_price > 0:
+            atr_fraction = abs(float(atr_value)) / float(anchor_price)
+        if implied_volatility is not None:
+            implied_volatility = abs(float(implied_volatility))
+            if implied_volatility > 1.0 and implied_volatility <= 100:
+                implied_volatility /= 100.0
+        iv_rule = getattr(self, "implied_volatility_rule_of_16", 16.0)
+        try:
+            iv_rule_value = float(iv_rule)
+        except (TypeError, ValueError):
+            iv_rule_value = 16.0
+        if not np.isfinite(iv_rule_value) or iv_rule_value <= 0:
+            iv_rule_value = 16.0
+        iv_fraction = None
+        if implied_volatility is not None:
+            iv_fraction = implied_volatility / iv_rule_value
+        atr_multiplier = getattr(self, "expected_low_atr_multiplier", 1.0)
+        iv_multiplier = getattr(self, "expected_low_iv_multiplier", 1.0)
+        range_floor_candidates: list[float] = []
+        if atr_fraction is not None:
+            try:
+                atr_multiplier_value = float(atr_multiplier)
+            except (TypeError, ValueError):
+                atr_multiplier_value = 1.0
+            if np.isfinite(atr_multiplier_value) and atr_multiplier_value > 0:
+                range_floor_candidates.append(atr_fraction * atr_multiplier_value)
+        if iv_fraction is not None:
+            try:
+                iv_multiplier_value = float(iv_multiplier)
+            except (TypeError, ValueError):
+                iv_multiplier_value = 1.0
+            if np.isfinite(iv_multiplier_value) and iv_multiplier_value > 0:
+                range_floor_candidates.append(iv_fraction * iv_multiplier_value)
+        range_floor = max(range_floor_candidates) if range_floor_candidates else None
         fallback = _safe_float(prediction.get("expected_low"))
         if fallback is not None:
             base_low = fallback
@@ -4218,10 +4308,12 @@ class StockPredictorDesktopApp:
         if predicted_close is None:
             return floor_value if floor_value is not None else fallback
         if predicted_volatility is None:
-            base_low = fallback if fallback is not None else predicted_close
-            if floor_value is not None:
-                base_low = max(base_low, floor_value)
-            return float(base_low)
+            if range_floor is None:
+                base_low = fallback if fallback is not None else predicted_close
+                if floor_value is not None:
+                    base_low = max(base_low, floor_value)
+                return float(base_low)
+            predicted_volatility = range_floor
         scale = multiplier if multiplier is not None else self.expected_low_multiplier
         try:
             scale_value = float(scale)
@@ -4271,6 +4363,13 @@ class StockPredictorDesktopApp:
                 volatility_cap,
             )
             volatility_pct = volatility_cap
+        if range_floor is not None and volatility_pct < range_floor:
+            LOGGER.warning(
+                "Predicted volatility %.4f below range floor %.4f; using floor.",
+                volatility_pct,
+                range_floor,
+            )
+            volatility_pct = range_floor
 
         delta = predicted_close * volatility_pct * scale_value
         if not np.isfinite(delta):
