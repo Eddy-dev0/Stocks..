@@ -10,7 +10,7 @@ import multiprocessing as mp
 import os
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from itertools import repeat
 from pathlib import Path
 from numbers import Real
@@ -98,6 +98,8 @@ DEFAULT_PLAUSIBILITY_SIGMA_MULTIPLIER = 3.0
 DEFAULT_LOG_RETURN_WINDOW = 252
 DEFAULT_VOLATILITY_FLOOR = 0.02
 DEFAULT_MAX_EXPECTED_CHANGE_PCT = 0.1
+EU_MARKET_OPEN = dt_time(9, 0)
+EU_MARKET_CLOSE = dt_time(17, 30)
 
 
 LabelFunction = Callable[[pd.DataFrame, int, Any], pd.Series]
@@ -817,6 +819,173 @@ class StockPredictorAI:
         if live_timestamp is not None:
             self.metadata["market_data_as_of"] = live_timestamp
             self.metadata["latest_price_timestamp"] = live_timestamp
+
+    def _resolve_market_session(self, timestamp: datetime) -> str:
+        """Classify the trading session for a given timestamp."""
+
+        market_tz = self.market_timezone or DEFAULT_MARKET_TIMEZONE
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=market_tz)
+        us_timestamp = timestamp.astimezone(market_tz)
+        us_time = us_timestamp.time()
+
+        if US_MARKET_OPEN <= us_time < US_MARKET_CLOSE:
+            return "US-RTH"
+        if us_time >= US_MARKET_CLOSE:
+            return "US-Afterhours"
+
+        try:
+            eu_timezone = ZoneInfo("Europe/Berlin")
+        except Exception:  # pragma: no cover - defensive fallback
+            eu_timezone = None
+
+        if eu_timezone is not None:
+            eu_time = us_timestamp.astimezone(eu_timezone).time()
+            if EU_MARKET_OPEN <= eu_time < EU_MARKET_CLOSE:
+                return "EU-Open"
+
+        return "US-Premarket"
+
+    def _session_open_price(
+        self, price_df: pd.DataFrame | None, *, timestamp: datetime
+    ) -> float | None:
+        if price_df is None or price_df.empty or "Date" not in price_df.columns:
+            return None
+
+        frame = price_df.copy()
+        frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+        frame = frame.dropna(subset=["Date"])
+        if frame.empty:
+            return None
+
+        lower_columns = {column.lower(): column for column in frame.columns}
+        open_column = lower_columns.get("open") or lower_columns.get("o")
+        if open_column is None:
+            return None
+
+        market_tz = self.market_timezone or DEFAULT_MARKET_TIMEZONE
+        if getattr(frame["Date"].dt, "tz", None) is None:
+            frame["Date"] = frame["Date"].dt.tz_localize(market_tz)
+        else:
+            frame["Date"] = frame["Date"].dt.tz_convert(market_tz)
+
+        session_date = timestamp.astimezone(market_tz).date()
+        has_intraday = (frame["Date"].dt.time != dt_time(0, 0)).any()
+        if has_intraday:
+            open_time = datetime.combine(session_date, US_MARKET_OPEN, tzinfo=market_tz)
+            session_rows = frame[
+                (frame["Date"] >= open_time) & (frame["Date"].dt.date == session_date)
+            ]
+        else:
+            session_rows = frame[frame["Date"].dt.date == session_date]
+
+        if session_rows.empty:
+            return None
+
+        return self._safe_float(session_rows.iloc[0][open_column])
+
+    def _session_open_vwap(
+        self, price_df: pd.DataFrame | None, *, timestamp: datetime
+    ) -> float | None:
+        if price_df is None or price_df.empty or "Date" not in price_df.columns:
+            return None
+
+        frame = price_df.copy()
+        frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+        frame = frame.dropna(subset=["Date"])
+        if frame.empty:
+            return None
+
+        lower_columns = {column.lower(): column for column in frame.columns}
+        volume_column = lower_columns.get("volume") or lower_columns.get("vol")
+        price_column = (
+            lower_columns.get("close")
+            or lower_columns.get("adj close")
+            or lower_columns.get("adj_close")
+        )
+        if volume_column is None or price_column is None:
+            return None
+
+        market_tz = self.market_timezone or DEFAULT_MARKET_TIMEZONE
+        if getattr(frame["Date"].dt, "tz", None) is None:
+            frame["Date"] = frame["Date"].dt.tz_localize(market_tz)
+        else:
+            frame["Date"] = frame["Date"].dt.tz_convert(market_tz)
+
+        has_intraday = (frame["Date"].dt.time != dt_time(0, 0)).any()
+        if not has_intraday:
+            return None
+
+        session_date = timestamp.astimezone(market_tz).date()
+        open_time = datetime.combine(session_date, US_MARKET_OPEN, tzinfo=market_tz)
+        end_time = open_time + timedelta(minutes=5)
+        session_rows = frame[(frame["Date"] >= open_time) & (frame["Date"] < end_time)]
+        if session_rows.empty:
+            return None
+
+        prices = pd.to_numeric(session_rows[price_column], errors="coerce")
+        volumes = pd.to_numeric(session_rows[volume_column], errors="coerce")
+        valid = prices.notna() & volumes.notna() & (volumes > 0)
+        if not valid.any():
+            return None
+
+        weighted = (prices[valid] * volumes[valid]).sum()
+        total_volume = volumes[valid].sum()
+        if total_volume <= 0:
+            return None
+
+        return float(weighted / total_volume)
+
+    def _resolve_anchor_price(
+        self,
+        price_df: pd.DataFrame | None,
+        *,
+        latest_close: float | None,
+        last_price_value: float | None,
+        prediction_timestamp: datetime,
+        market_session: str,
+        prediction_warnings: list[str],
+    ) -> tuple[float | None, str]:
+        requested_source = str(
+            getattr(self.config, "anchor_price_source", "close") or "close"
+        ).strip().lower()
+        anchor_price_source = requested_source
+
+        if market_session != "US-RTH" and requested_source in {"live", "open", "vwap_5m"}:
+            anchor_price_source = "close"
+            prediction_warnings.append(
+                "Anchor price locked to last close outside US RTH to avoid unstable session gaps."
+            )
+
+        anchor_price = self._safe_float(latest_close)
+        if anchor_price_source == "live":
+            anchor_price = self._safe_float(last_price_value)
+        elif anchor_price_source == "open":
+            anchor_price = self._session_open_price(price_df, timestamp=prediction_timestamp)
+        elif anchor_price_source == "vwap_5m":
+            anchor_price = self._session_open_vwap(price_df, timestamp=prediction_timestamp)
+            if anchor_price is None:
+                anchor_price = self._session_open_price(
+                    price_df, timestamp=prediction_timestamp
+                )
+                if anchor_price is not None:
+                    anchor_price_source = "open"
+
+        if anchor_price is None and anchor_price_source != "close":
+            anchor_price_source = "close"
+            anchor_price = self._safe_float(latest_close)
+            if anchor_price is not None:
+                prediction_warnings.append(
+                    "Anchor price source unavailable; reverted to last close."
+                )
+
+        if anchor_price is None and anchor_price_source != "live":
+            candidate = self._safe_float(last_price_value)
+            if candidate is not None:
+                anchor_price = candidate
+                anchor_price_source = "live"
+
+        return anchor_price, anchor_price_source
 
     def _collect_live_sentiment(
         self, *, force: bool = False
@@ -3006,24 +3175,16 @@ class StockPredictorAI:
             last_price_value = latest_close
 
         market_tz = self.market_timezone or DEFAULT_MARKET_TIMEZONE
-        now = datetime.now(market_tz)
-        use_last_close = now.time() < US_MARKET_OPEN
-
-        anchor_price_source = str(
-            getattr(self.config, "anchor_price_source", "close") or "close"
-        ).strip().lower()
-        if use_last_close:
-            anchor_price_source = "close"
-        anchor_price = self._safe_float(latest_close)
-        if not use_last_close and anchor_price_source == "live":
-            anchor_price = self._safe_float(last_price_value)
-            if anchor_price is None:
-                anchor_price_source = "close"
-                anchor_price = self._safe_float(latest_close)
-        if anchor_price is None and not use_last_close:
-            anchor_price = self._safe_float(last_price_value)
-            if anchor_price is not None:
-                anchor_price_source = "live"
+        prediction_timestamp = datetime.now(market_tz)
+        market_session = self._resolve_market_session(prediction_timestamp)
+        anchor_price, anchor_price_source = self._resolve_anchor_price(
+            price_df,
+            latest_close=latest_close,
+            last_price_value=last_price_value,
+            prediction_timestamp=prediction_timestamp,
+            market_session=market_session,
+            prediction_warnings=prediction_warnings,
+        )
 
         close_prediction_raw = predictions.get("close")
         close_prediction = self._safe_float(close_prediction_raw)
@@ -3076,8 +3237,6 @@ class StockPredictorAI:
                 )
         if historical_note:
             confidence_notes.append(historical_note)
-
-        prediction_timestamp = datetime.now()
 
         latest_date = self.metadata.get("latest_date")
         if isinstance(latest_date, pd.Timestamp):
@@ -3601,8 +3760,11 @@ class StockPredictorAI:
             "as_of": _to_iso(market_data_as_of) or "",
             "market_data_as_of": _to_iso(market_data_as_of) or "",
             "generated_at": _to_iso(prediction_timestamp) or "",
+            "prediction_timestamp": _to_iso(prediction_timestamp) or "",
+            "market_session": market_session,
             "last_close": latest_close,
             "last_price": last_price_value,
+            "anchor_price": anchor_price,
             "anchor_price_source": anchor_price_source,
             "predicted_close": close_prediction,
             "expected_change": expected_change,
