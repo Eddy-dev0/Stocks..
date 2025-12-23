@@ -4364,9 +4364,7 @@ class StockPredictorDesktopApp:
             anchor_converted = self._convert_currency(anchor_raw)
         pct_anchor = anchor_raw
         if pct_anchor is None and isinstance(prediction, Mapping):
-            pct_anchor = _safe_float(prediction.get("anchor_price"))
-            if pct_anchor is None:
-                pct_anchor = _safe_float(prediction.get("last_close"))
+            pct_anchor = _safe_float(prediction.get("last_close"))
             if pct_anchor is None:
                 pct_anchor = _safe_float(prediction.get("last_price"))
         if pct_anchor is None:
