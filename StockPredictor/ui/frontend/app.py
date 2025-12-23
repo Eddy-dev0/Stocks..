@@ -25,6 +25,12 @@ DEFAULT_TICKER = os.getenv("STOCK_PREDICTOR_DEFAULT_TICKER", "AAPL")
 DEFAULT_API_KEY = os.getenv("STOCK_PREDICTOR_UI_API_KEY", "")
 DEFAULT_EXPECTED_LOW_MULTIPLIER = PredictorConfig.__dataclass_fields__["expected_low_sigma"].default
 DEFAULT_STOP_LOSS_MULTIPLIER = PredictorConfig.__dataclass_fields__["k_stop"].default
+DEFAULT_BACKTEST_FEE_BPS = PredictorConfig.__dataclass_fields__["backtest_fee_bps"].default
+DEFAULT_BACKTEST_SLIPPAGE_BPS = PredictorConfig.__dataclass_fields__["backtest_slippage_bps"].default
+DEFAULT_DIRECTION_TRADE_THRESHOLD = PredictorConfig.__dataclass_fields__["direction_trade_threshold"].default
+DEFAULT_MONTE_CARLO_THRESHOLD = PredictorConfig.__dataclass_fields__[
+    "monte_carlo_confirmation_threshold"
+].default
 IMPLEMENTED_FEATURE_GROUPS = {
     name for name, spec in FEATURE_REGISTRY.items() if getattr(spec, "implemented", False)
 }
@@ -477,6 +483,138 @@ def _extract_risk_guidance(payload: Any) -> Dict[str, Any]:
     return {}
 
 
+def _format_trade_direction(direction: str | None) -> str:
+    if not direction:
+        return "Hold"
+    normalized = str(direction).lower()
+    if normalized in {"up", "long", "bullish"}:
+        return "Long"
+    if normalized in {"down", "short", "bearish"}:
+        return "Short"
+    return "Hold"
+
+
+def _build_trade_policy_rows(
+    forecast_block: Mapping[str, Any] | None,
+    *,
+    horizon_days: int,
+    target_hit_threshold: float,
+    risk_per_trade_pct: float,
+    max_trades_per_day: int,
+    loss_cooldown: int,
+    trailing_atr_multiple: float,
+    fee_bps: float,
+    slippage_bps: float,
+    atr_value: float | None,
+) -> list[dict[str, str]]:
+    if not isinstance(forecast_block, Mapping):
+        return []
+
+    trade_gate = forecast_block.get("trade_gate")
+    if not isinstance(trade_gate, Mapping):
+        trade_gate = {}
+
+    direction = forecast_block.get("direction") or trade_gate.get("direction")
+    direction_label = _format_trade_direction(direction)
+    confidence = _coerce_float(trade_gate.get("confidence"))
+    threshold = _coerce_float(trade_gate.get("threshold")) or float(
+        DEFAULT_DIRECTION_TRADE_THRESHOLD
+    )
+    target_hit_prob = _coerce_float(forecast_block.get("target_hit_probability"))
+    if target_hit_prob is None:
+        target_hit_prob = _coerce_float(
+            forecast_block.get("monte_carlo_target_hit_probability")
+        )
+
+    entry_parts = [f"Direction: {direction_label}"]
+    if confidence is not None:
+        entry_parts.append(f"Confidence {confidence:.2%} ≥ {threshold:.2%}")
+    else:
+        entry_parts.append(f"Confidence ≥ {threshold:.2%}")
+    if target_hit_prob is not None:
+        entry_parts.append(
+            f"P(hit target) {target_hit_prob:.2%} ≥ {target_hit_threshold:.2%}"
+        )
+    else:
+        entry_parts.append(f"P(hit target) ≥ {target_hit_threshold:.2%}")
+
+    mc_prob = _coerce_float(trade_gate.get("monte_carlo_probability"))
+    mc_threshold = _coerce_float(trade_gate.get("monte_carlo_threshold"))
+    if mc_threshold is None and mc_prob is not None:
+        mc_threshold = float(DEFAULT_MONTE_CARLO_THRESHOLD)
+    if mc_threshold is not None:
+        if mc_prob is not None:
+            entry_parts.append(
+                f"Monte Carlo {mc_prob:.2%} ≥ {mc_threshold:.2%}"
+            )
+        else:
+            entry_parts.append(f"Monte Carlo ≥ {mc_threshold:.2%}")
+
+    gate_allowed = trade_gate.get("allowed")
+    reason = trade_gate.get("reason")
+    if gate_allowed is True:
+        gate_text = "Allowed"
+    elif gate_allowed is False:
+        gate_text = "Blocked"
+    else:
+        gate_text = "Pending"
+    if reason:
+        gate_text = f"{gate_text} ({reason})"
+
+    last_price = _coerce_float(forecast_block.get("last_price"))
+    if last_price is not None and direction_label in {"Long", "Short"}:
+        trigger = (
+            f"Break above {_format_currency(last_price)}"
+            if direction_label == "Long"
+            else f"Break below {_format_currency(last_price)}"
+        )
+    else:
+        trigger = "Directional confirmation required"
+
+    stop_loss = _coerce_float(forecast_block.get("stop_loss"))
+    trailing_text = "Trailing stop: —"
+    if atr_value is not None:
+        trailing_text = f"Trailing stop: {trailing_atr_multiple:.2f}× ATR14 (~{_format_currency(atr_value)})"
+    elif forecast_block.get("predicted_volatility") is not None:
+        trailing_text = (
+            f"Trailing stop: {trailing_atr_multiple:.2f}× forecast volatility"
+        )
+
+    exit_parts = []
+    if stop_loss is not None:
+        exit_parts.append(f"Stop-loss at {_format_currency(stop_loss)}")
+    exit_parts.append(f"Time stop after {horizon_days} day(s)")
+    exit_parts.append(trailing_text)
+
+    take_profit = _coerce_float(
+        forecast_block.get("target_price")
+        or forecast_block.get("predicted_close")
+        or forecast_block.get("expected_low")
+    )
+    take_profit_text = (
+        f"Partial take profit near {_format_currency(take_profit)}"
+        if take_profit is not None
+        else "Partial take profit: —"
+    )
+
+    return [
+        {"Trade policy": "Entry gate", "Detail": gate_text},
+        {"Trade policy": "Entry rule", "Detail": " · ".join(entry_parts)},
+        {"Trade policy": "Entry trigger", "Detail": trigger},
+        {"Trade policy": "Exit rule", "Detail": " · ".join(exit_parts)},
+        {"Trade policy": "Take profit", "Detail": take_profit_text},
+        {"Trade policy": "Risk per trade", "Detail": f"{risk_per_trade_pct:.2%} of equity"},
+        {
+            "Trade policy": "Trade limits",
+            "Detail": f"Max {max_trades_per_day} trades/day · Cooldown after {loss_cooldown} loss(es)",
+        },
+        {
+            "Trade policy": "Costs (backtest)",
+            "Detail": f"Fee {fee_bps:.2f} bps · Slippage {slippage_bps:.2f} bps",
+        },
+    ]
+
+
 def _normalise_timeseries(frame: pd.DataFrame) -> pd.DataFrame:
     frame = frame.copy()
     for column in ("date", "datetime", "timestamp"):
@@ -875,6 +1013,71 @@ with st.sidebar:
         help="Directional probability from the model output.",
     )
 
+    st.header("Trade policy")
+    st.caption("Shape the entry/exit policy and cost assumptions used in backtests.")
+    risk_per_trade_pct_input = st.slider(
+        "Risk per trade (%)",
+        min_value=0.1,
+        max_value=2.0,
+        value=0.5,
+        step=0.05,
+        help="Fraction of account equity risked per trade.",
+    )
+    target_hit_threshold = st.slider(
+        "Target hit threshold",
+        min_value=0.5,
+        max_value=0.9,
+        value=0.62,
+        step=0.01,
+        help="Minimum probability required to attempt the next level.",
+    )
+    max_trades_per_day = st.number_input(
+        "Max trades per day",
+        min_value=1,
+        max_value=10,
+        value=3,
+        step=1,
+    )
+    loss_cooldown = st.number_input(
+        "Cooldown after losses",
+        min_value=1,
+        max_value=5,
+        value=2,
+        step=1,
+        help="Pause trading after this many consecutive losses.",
+    )
+    time_stop_days = st.number_input(
+        "Time stop (days)",
+        min_value=1,
+        max_value=30,
+        value=int(horizon_value or 5),
+        step=1,
+    )
+    trailing_atr_multiple = st.number_input(
+        "Trailing stop (ATR multiple)",
+        min_value=0.5,
+        max_value=3.0,
+        value=1.0,
+        step=0.1,
+        format="%.1f",
+    )
+    fee_bps = st.number_input(
+        "Per-trade fee (bps)",
+        min_value=0.0,
+        max_value=50.0,
+        value=float(DEFAULT_BACKTEST_FEE_BPS),
+        step=0.5,
+        format="%.2f",
+    )
+    slippage_bps = st.number_input(
+        "Per-trade slippage (bps)",
+        min_value=0.0,
+        max_value=50.0,
+        value=float(DEFAULT_BACKTEST_SLIPPAGE_BPS),
+        step=0.5,
+        format="%.2f",
+    )
+
     st.header("Feature groups")
     feature_toggles = FeatureToggles.from_any(
         st.session_state.get("feature_toggles") or DEFAULT_FEATURE_TOGGLES,
@@ -1053,6 +1256,7 @@ with col_live_table:
     else:
         st.caption("Click 'Refresh live snapshot' to load the latest intraday metrics.")
 
+frame: pd.DataFrame | None = None
 col_data, col_forecast = st.columns(2)
 
 with col_data:
@@ -1231,7 +1435,7 @@ with col_data:
         st.info("No tabular data available for the selected configuration.")
 
 with col_forecast:
-    st.subheader("Forecasts & Backtests")
+    st.subheader("Trade Policy & Backtests")
     if st.button("Daten aktualisieren & Modell neu trainieren"):
         with st.spinner("Aktualisiere Daten und trainiere Modelle..."):
             response = _request(
@@ -1262,8 +1466,8 @@ with col_forecast:
             mime="application/json",
         )
 
-    if st.button("Run forecast"):
-        with st.spinner("Generating forecasts..."):
+    if st.button("Run trade-policy forecast"):
+        with st.spinner("Generating trade policy forecast..."):
             response = _request(
                 f"/forecasts/{ticker}",
                 method="POST",
@@ -1276,9 +1480,36 @@ with col_forecast:
             )
             if response is not None:
                 st.session_state["forecast_response"] = response
-                st.success("Forecasts updated")
+                st.success("Trade policy refreshed")
 
     if forecast_response:
+        risk_per_trade_pct = risk_per_trade_pct_input / 100.0
+        policy_horizon_days = int(time_stop_days)
+        atr_value = None
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            atr_series = frame.get("ATR14")
+            if isinstance(atr_series, pd.Series) and not atr_series.dropna().empty:
+                atr_value = float(atr_series.dropna().iloc[-1])
+
+        policy_rows = _build_trade_policy_rows(
+            forecast_block,
+            horizon_days=policy_horizon_days,
+            target_hit_threshold=float(target_hit_threshold),
+            risk_per_trade_pct=risk_per_trade_pct,
+            max_trades_per_day=int(max_trades_per_day),
+            loss_cooldown=int(loss_cooldown),
+            trailing_atr_multiple=float(trailing_atr_multiple),
+            fee_bps=float(fee_bps),
+            slippage_bps=float(slippage_bps),
+            atr_value=atr_value,
+        )
+        if policy_rows:
+            st.markdown("**Trade policy (Entry/Exit)**")
+            st.table(pd.DataFrame(policy_rows))
+            st.caption(
+                "Backtests should be evaluated end-to-end with fees/slippage and the policy constraints above."
+            )
+
         st.write("**Forecast summary**")
         if isinstance(forecast_block, Mapping):
             expected_change_abs = forecast_block.get("expected_change_abs")
