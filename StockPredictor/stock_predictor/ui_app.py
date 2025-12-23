@@ -4362,9 +4362,13 @@ class StockPredictorDesktopApp:
             anchor_raw, anchor_converted = self._reference_last_price(prediction)
         elif anchor_converted is None:
             anchor_converted = self._convert_currency(anchor_raw)
-        current_price = _safe_float(self.current_market_price)
-        if current_price is None:
-            current_price = anchor_raw
+        pct_anchor = anchor_raw
+        if pct_anchor is None and isinstance(prediction, Mapping):
+            pct_anchor = _safe_float(prediction.get("last_close"))
+            if pct_anchor is None:
+                pct_anchor = _safe_float(prediction.get("last_price"))
+        if pct_anchor is None:
+            pct_anchor = _safe_float(self.current_market_price)
         predicted_raw = _safe_float(prediction.get("predicted_close")) if isinstance(
             prediction, Mapping
         ) else None
@@ -4377,11 +4381,11 @@ class StockPredictorDesktopApp:
             prediction, Mapping
         ) else None
 
-        if predicted_raw is not None and anchor_raw is not None:
-            change_raw = predicted_raw - anchor_raw
-            pct_change = (change_raw / current_price) if current_price not in (None, 0) else None
+        if predicted_raw is not None and pct_anchor is not None:
+            change_raw = predicted_raw - pct_anchor
+            pct_change = (change_raw / pct_anchor) if pct_anchor not in (None, 0) else None
         elif change_raw is not None and pct_change is None:
-            pct_change = (change_raw / current_price) if current_price not in (None, 0) else None
+            pct_change = (change_raw / pct_anchor) if pct_anchor not in (None, 0) else None
 
         change_converted = self._convert_currency(change_raw)
 
