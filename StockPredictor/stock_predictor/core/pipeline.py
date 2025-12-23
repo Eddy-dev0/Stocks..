@@ -54,6 +54,7 @@ LOGGER = logging.getLogger(__name__)
 T = TypeVar("T")
 
 DEFAULT_MARKET_TIMEZONE = ZoneInfo("America/New_York")
+US_MARKET_OPEN = dt_time(9, 30)
 US_MARKET_CLOSE = dt_time(16, 0)
 US_MARKET_BUSINESS_DAY = CustomBusinessDay(calendar=USFederalHolidayCalendar())
 CACHE_MAX_AGE = timedelta(hours=24)
