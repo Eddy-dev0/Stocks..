@@ -43,7 +43,7 @@ async def get_prediction(
             status,
             reason,
         )
-        return {
+        summary = {
             "ticker": ticker,
             "horizon": horizon,
             "last_price": None,
@@ -55,10 +55,10 @@ async def get_prediction(
             "direction": None,
             "accuracy": {},
             "message": message,
-            "raw": raw_payload,
             "status": status,
             "reason": reason,
         }
+        return {"summary": summary, "distribution": {}, "raw": raw_payload}
 
     payload = raw_payload or prediction.to_dict()
 
@@ -87,7 +87,7 @@ async def get_prediction(
 
     accuracy_summary = application.accuracy(horizon=horizon)
 
-    return {
+    summary = {
         "ticker": ticker,
         "horizon": horizon,
         "last_price": last_price,
@@ -101,8 +101,33 @@ async def get_prediction(
         "probability_within_tolerance": probability_within_tolerance,
         "tolerance_band": tolerance_band,
         "training_accuracy": training_accuracy,
-        "raw": payload,
     }
+    close_quantiles = payload.get("close_quantiles")
+    if not isinstance(close_quantiles, dict):
+        close_quantiles = {
+            "q10": payload.get("pred_close_q10"),
+            "q50": payload.get("pred_close_q50"),
+            "q90": payload.get("pred_close_q90"),
+        }
+    hit_probabilities = payload.get("hit_probabilities")
+    if not isinstance(hit_probabilities, dict):
+        hit_probabilities = {
+            "up": payload.get("p_hit_up"),
+            "down": payload.get("p_hit_down"),
+        }
+
+    distribution = {
+        "close_quantiles": close_quantiles,
+        "pred_low_q10": payload.get("pred_low_q10"),
+        "pred_high_q90": payload.get("pred_high_q90"),
+        "range_1sigma": payload.get("range_1sigma"),
+        "hit_probabilities": hit_probabilities,
+        "uncertainty_calibrated": payload.get("uncertainty_calibrated"),
+        "calibration_version": payload.get("calibration_version"),
+        "regime_shift_risk": payload.get("regime_shift_risk"),
+    }
+
+    return {"summary": summary, "distribution": distribution, "raw": payload}
 
 
 async def live_price_snapshot(

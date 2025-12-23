@@ -413,6 +413,62 @@ def _format_sigma_range(center: float | None, sigma: float | None) -> str:
     return f"{_format_currency(low)} to {_format_currency(high)}"
 
 
+def _parse_quantile_map(block: Mapping[str, Any] | None) -> dict[float, float]:
+    if not isinstance(block, Mapping):
+        return {}
+    parsed: dict[float, float] = {}
+    for key, raw in block.items():
+        numeric = None
+        if isinstance(key, (int, float)):
+            numeric = float(key)
+        elif isinstance(key, str):
+            cleaned = key.strip().lower()
+            if cleaned in {"low", "lower", "q10", "p10"}:
+                numeric = 0.1
+            elif cleaned in {"median", "mid", "q50", "p50"}:
+                numeric = 0.5
+            elif cleaned in {"high", "upper", "q90", "p90"}:
+                numeric = 0.9
+            else:
+                cleaned = cleaned.removeprefix("quantile_")
+                cleaned = cleaned.removeprefix("q").removeprefix("p")
+                if cleaned.endswith("%"):
+                    cleaned = cleaned.rstrip("%")
+                    numeric = _coerce_float(cleaned)
+                    if numeric is not None:
+                        numeric = numeric / 100.0
+                else:
+                    numeric = _coerce_float(cleaned)
+        if numeric is None:
+            continue
+        if numeric > 1:
+            numeric = numeric / 100.0
+        value = _coerce_float(raw)
+        if value is not None:
+            parsed[numeric] = value
+    return parsed
+
+
+def _render_risk_band(low: float | None, high: float | None, anchor: float | None) -> None:
+    if low is None or high is None:
+        return
+    band_df = pd.DataFrame({"band": ["10–90%"], "low": [low], "high": [high]})
+    chart = (
+        alt.Chart(band_df)
+        .mark_bar(color="#6baed6")
+        .encode(
+            x=alt.X("low:Q", title="Price"),
+            x2="high:Q",
+            y=alt.Y("band:N", title=None),
+        )
+        .properties(height=50)
+    )
+    if anchor is not None:
+        anchor_df = pd.DataFrame({"anchor": [anchor]})
+        chart += alt.Chart(anchor_df).mark_rule(color="#e34a33").encode(x="anchor:Q")
+    st.altair_chart(chart, use_container_width=True)
+
+
 def _build_live_price_table(snapshot: Dict[str, Any]) -> pd.DataFrame:
     probabilities = snapshot.get("probabilities") or {}
     rows = [
@@ -1213,11 +1269,29 @@ feature_toggles = FeatureToggles.from_any(
 )
 
 forecast_response = st.session_state.get("forecast_response") or {}
-forecast_block = forecast_response.get("forecasts", forecast_response)
-if isinstance(forecast_block, Mapping):
-    raw_forecast = forecast_block.get("raw")
-    if isinstance(raw_forecast, Mapping):
-        forecast_block = {**raw_forecast, **forecast_block}
+forecast_payload = forecast_response.get("forecasts", forecast_response)
+summary_block: Mapping[str, Any] = {}
+distribution_block: Mapping[str, Any] = {}
+raw_forecast: Mapping[str, Any] = {}
+forecast_block: Mapping[str, Any] | None = None
+if isinstance(forecast_payload, Mapping):
+    summary_candidate = forecast_payload.get("summary")
+    if isinstance(summary_candidate, Mapping):
+        summary_block = summary_candidate
+    elif any(
+        key in forecast_payload
+        for key in ("predicted_close", "expected_low", "expected_change_abs")
+    ):
+        summary_block = forecast_payload
+    distribution_candidate = forecast_payload.get("distribution")
+    if isinstance(distribution_candidate, Mapping):
+        distribution_block = distribution_candidate
+    raw_candidate = forecast_payload.get("raw")
+    if isinstance(raw_candidate, Mapping):
+        raw_forecast = raw_candidate
+    forecast_block = {**raw_forecast, **summary_block, **distribution_block}
+else:
+    forecast_block = forecast_payload if isinstance(forecast_payload, Mapping) else {}
 
 feature_usage = _extract_feature_usage(forecast_block)
 
@@ -1483,6 +1557,21 @@ with col_forecast:
                 st.success("Trade policy refreshed")
 
     if forecast_response:
+        uncertainty_calibrated = None
+        if isinstance(distribution_block, Mapping):
+            uncertainty_calibrated = distribution_block.get("uncertainty_calibrated")
+        if uncertainty_calibrated is None and isinstance(forecast_block, Mapping):
+            uncertainty_calibrated = forecast_block.get("uncertainty_calibrated")
+        regime_shift_risk = None
+        if isinstance(distribution_block, Mapping):
+            regime_shift_risk = distribution_block.get("regime_shift_risk")
+        if regime_shift_risk is None and isinstance(forecast_block, Mapping):
+            regime_shift_risk = forecast_block.get("regime_shift_risk")
+        if uncertainty_calibrated is False:
+            st.warning("Model uncalibrated — uncertainty bands may be overly optimistic.")
+        if regime_shift_risk:
+            st.warning("High regime shift risk — treat directional signals with caution.")
+
         risk_per_trade_pct = risk_per_trade_pct_input / 100.0
         policy_horizon_days = int(time_stop_days)
         atr_value = None
@@ -1531,7 +1620,13 @@ with col_forecast:
                 else:
                     expected_change_display = abs_display if expected_change_abs is not None else pct_display
 
-            close_quantiles = _extract_quantile_summary(forecast_block, "close")
+            close_quantiles = {}
+            if isinstance(distribution_block, Mapping):
+                close_quantiles = _parse_quantile_map(
+                    distribution_block.get("close_quantiles")
+                )
+            if not close_quantiles:
+                close_quantiles = _extract_quantile_summary(forecast_block, "close")
             high_quantiles = _extract_quantile_summary(forecast_block, "high")
             low_quantiles = _extract_quantile_summary(forecast_block, "low")
             direction_probs = forecast_block.get("probabilities") or {}
@@ -1556,6 +1651,14 @@ with col_forecast:
                 forecast_block.get("predicted_volatility")
                 or forecast_block.get("expected_low_return_std")
             )
+            risk_band_low = _coerce_float(
+                forecast_block.get("pred_low_q10")
+                or close_quantiles.get(0.1)
+            )
+            risk_band_high = _coerce_float(
+                forecast_block.get("pred_high_q90")
+                or close_quantiles.get(0.9)
+            )
             summary_rows = [
                 {"Metric": "Last price", "Value": _format_currency(forecast_block.get("last_price"))},
                 {"Metric": "Predicted close", "Value": _format_currency(forecast_block.get("predicted_close"))},
@@ -1570,6 +1673,14 @@ with col_forecast:
                 {"Metric": "q90 low", "Value": _format_currency(low_quantiles.get(0.9))},
                 {"Metric": "Expected low", "Value": _format_currency(forecast_block.get("expected_low"))},
                 {"Metric": "Expected change", "Value": expected_change_display},
+                {
+                    "Metric": "Risk band (10–90%)",
+                    "Value": _format_currency(risk_band_low)
+                    + " to "
+                    + _format_currency(risk_band_high)
+                    if risk_band_low is not None and risk_band_high is not None
+                    else "—",
+                },
                 {"Metric": "Range 1σ", "Value": _format_sigma_range(range_center, range_sigma)},
                 {"Metric": "P(up)", "Value": _format_percentage(p_up)},
                 {"Metric": "P(down)", "Value": _format_percentage(p_down)},
@@ -1578,6 +1689,10 @@ with col_forecast:
                 {"Metric": "Direction", "Value": forecast_block.get("direction") or "—"},
             ]
             st.table(pd.DataFrame(summary_rows))
+
+            if risk_band_low is not None and risk_band_high is not None:
+                st.markdown("**Risk band (10–90%)**")
+                _render_risk_band(risk_band_low, risk_band_high, range_center)
 
             diagnostics_rows = []
             tolerance_prob = forecast_block.get("probability_within_tolerance")
@@ -1593,6 +1708,50 @@ with col_forecast:
             if diagnostics_rows:
                 st.markdown("**Forecast diagnostics**")
                 st.table(pd.DataFrame(diagnostics_rows))
+
+            if isinstance(distribution_block, Mapping):
+                calibration_rows = []
+                if distribution_block.get("uncertainty_calibrated") is not None:
+                    calibration_rows.append(
+                        {
+                            "Metric": "Uncertainty calibrated",
+                            "Value": "Yes"
+                            if distribution_block.get("uncertainty_calibrated")
+                            else "No",
+                        }
+                    )
+                if distribution_block.get("calibration_version"):
+                    calibration_rows.append(
+                        {
+                            "Metric": "Calibration version",
+                            "Value": distribution_block.get("calibration_version"),
+                        }
+                    )
+                if calibration_rows:
+                    st.markdown("**Calibration**")
+                    st.table(pd.DataFrame(calibration_rows))
+
+                hit_probs = distribution_block.get("hit_probabilities")
+                if isinstance(hit_probs, Mapping):
+                    up_probs = hit_probs.get("up") if isinstance(hit_probs.get("up"), Mapping) else {}
+                    down_probs = hit_probs.get("down") if isinstance(hit_probs.get("down"), Mapping) else {}
+                    def _level_key(value: Any) -> float:
+                        numeric = _coerce_float(value)
+                        return numeric if numeric is not None else 0.0
+
+                    levels = sorted({*up_probs.keys(), *down_probs.keys()}, key=_level_key)
+                    if levels:
+                        rows = []
+                        for level in levels:
+                            rows.append(
+                                {
+                                    "Level": level,
+                                    "P(hit up)": _format_percentage(up_probs.get(level)),
+                                    "P(hit down)": _format_percentage(down_probs.get(level)),
+                                }
+                            )
+                        st.markdown("**Hit probabilities**")
+                        st.table(pd.DataFrame(rows))
 
             training_accuracy = forecast_block.get("training_accuracy")
             if isinstance(training_accuracy, Mapping) and training_accuracy:
