@@ -62,7 +62,12 @@ async def get_prediction(
 
     payload = raw_payload or prediction.to_dict()
 
-    last_price = payload.get("latest_price") or payload.get("latest_close")
+    last_price = (
+        payload.get("last_price")
+        or payload.get("last_close")
+        or payload.get("latest_price")
+        or payload.get("latest_close")
+    )
     predicted_close = payload.get("predicted_close")
     expected_low = payload.get("expected_low")
     stop_loss = payload.get("stop_loss") or expected_low
