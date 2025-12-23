@@ -314,6 +314,7 @@ class PredictorConfig:
     market_timezone: str | None = None
     # Select the anchor price source for return-based calculations ("close" or "live").
     anchor_price_source: str = "close"
+    tomorrow_mode: bool = False
     k_stop: float = 1.0
     expected_low_sigma: float = 1.0
     expected_low_max_volatility: float = 1.0
@@ -547,6 +548,7 @@ class PredictorConfig:
         self.anchor_price_source = str(self.anchor_price_source or "close").strip().lower()
         if self.anchor_price_source not in {"close", "live"}:
             raise ValueError("anchor_price_source must be 'close' or 'live'.")
+        self.tomorrow_mode = bool(self.tomorrow_mode)
         try:
             self.k_stop = float(self.k_stop)
         except (TypeError, ValueError):
