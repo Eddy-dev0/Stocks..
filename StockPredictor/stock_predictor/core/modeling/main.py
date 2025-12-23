@@ -2994,18 +2994,19 @@ class StockPredictorAI:
         if last_price_value is None:
             last_price_value = latest_close
 
-        prefer_close_anchor = bool(getattr(self.config, "tomorrow_mode", False))
-        if resolved_horizon == 1:
-            prefer_close_anchor = True
-
-        anchor_candidates = (
-            (latest_close, last_price_value)
-            if prefer_close_anchor
-            else (last_price_value, latest_close)
-        )
-        anchor_price = self._safe_float(anchor_candidates[0])
+        anchor_price_source = str(
+            getattr(self.config, "anchor_price_source", "close") or "close"
+        ).strip().lower()
+        anchor_price = self._safe_float(latest_close)
+        if anchor_price_source == "live":
+            anchor_price = self._safe_float(last_price_value)
+            if anchor_price is None:
+                anchor_price_source = "close"
+                anchor_price = self._safe_float(latest_close)
         if anchor_price is None:
-            anchor_price = self._safe_float(anchor_candidates[1])
+            anchor_price = self._safe_float(last_price_value)
+            if anchor_price is not None:
+                anchor_price_source = "live"
 
         close_prediction_raw = predictions.get("close")
         close_prediction = self._safe_float(close_prediction_raw)
@@ -3566,7 +3567,7 @@ class StockPredictorAI:
             "generated_at": _to_iso(prediction_timestamp) or "",
             "last_close": latest_close,
             "last_price": last_price_value,
-            "anchor_price": anchor_price,
+            "anchor_price_source": anchor_price_source,
             "predicted_close": close_prediction,
             "expected_change": expected_change,
             "expected_change_pct": pct_change,
