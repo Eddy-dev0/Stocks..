@@ -53,7 +53,12 @@ from ..ml_preprocessing import (
     PreprocessingBuilder,
     get_feature_names_from_pipeline,
 )
-from ..pipeline import DEFAULT_MARKET_TIMEZONE, US_MARKET_CLOSE, resolve_market_timezone
+from ..pipeline import (
+    DEFAULT_MARKET_TIMEZONE,
+    US_MARKET_CLOSE,
+    US_MARKET_OPEN,
+    resolve_market_timezone,
+)
 from .prediction_result import FeatureUsageSummary, PredictionResult
 from ..support_levels import indicator_support_floor
 from .ensembles import EnsembleMember
@@ -2999,16 +3004,22 @@ class StockPredictorAI:
         if last_price_value is None:
             last_price_value = latest_close
 
+        market_tz = self.market_timezone or DEFAULT_MARKET_TIMEZONE
+        now = datetime.now(market_tz)
+        use_last_close = now.time() < US_MARKET_OPEN
+
         anchor_price_source = str(
             getattr(self.config, "anchor_price_source", "close") or "close"
         ).strip().lower()
+        if use_last_close:
+            anchor_price_source = "close"
         anchor_price = self._safe_float(latest_close)
-        if anchor_price_source == "live":
+        if not use_last_close and anchor_price_source == "live":
             anchor_price = self._safe_float(last_price_value)
             if anchor_price is None:
                 anchor_price_source = "close"
                 anchor_price = self._safe_float(latest_close)
-        if anchor_price is None:
+        if anchor_price is None and not use_last_close:
             anchor_price = self._safe_float(last_price_value)
             if anchor_price is not None:
                 anchor_price_source = "live"
