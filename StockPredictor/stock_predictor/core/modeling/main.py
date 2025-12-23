@@ -2969,9 +2969,14 @@ class StockPredictorAI:
         confidence_notes: list[str] = []
 
         predicted_return = self._safe_float(predictions.get("return"))
+        predicted_intraday_move = self._safe_float(predictions.get("return_oc"))
+        use_intraday_as_return = resolved_horizon == 1 and predicted_intraday_move is not None
+        if use_intraday_as_return:
+            predicted_return = predicted_intraday_move
+        return_quantiles = quantile_forecasts.get("return_oc" if use_intraday_as_return else "return")
         predicted_return = self._clamp_with_uncertainty(
             predicted_return,
-            quantile_forecasts.get("return"),
+            return_quantiles,
             prediction_intervals.get("return"),
         )
         if predicted_return is None and drift_per_step is not None and drift_horizon is not None:
@@ -3040,6 +3045,7 @@ class StockPredictorAI:
             pct_change = predicted_return
             if anchor_price is not None:
                 expected_change = anchor_price * predicted_return
+        expected_intraday_move = predicted_intraday_move
 
         historical_confidence, historical_note = self._historical_confidence_score(
             expected_change=expected_change, horizon=resolved_horizon
@@ -3571,6 +3577,7 @@ class StockPredictorAI:
             "predicted_close": close_prediction,
             "expected_change": expected_change,
             "expected_change_pct": pct_change,
+            "expected_intraday_move": expected_intraday_move,
             "predicted_return": predicted_return,
             "predicted_volatility": predicted_volatility,
             "expected_low": expected_low,
@@ -4277,6 +4284,9 @@ class StockPredictorAI:
 
         predicted_close = self._safe_float(preds.get("close_h"))
         predicted_return = self._safe_float(preds.get("return_h"))
+        predicted_intraday_move = self._safe_float(preds.get("return_oc_h"))
+        if resolved_horizon == 1 and predicted_intraday_move is not None:
+            predicted_return = predicted_intraday_move
         predicted_volatility = None
 
         def _extract_quantile(block: Mapping[str, Any] | None) -> tuple[Optional[float], Optional[float]]:
@@ -4298,7 +4308,11 @@ class StockPredictorAI:
             median_value = numeric_block.get("0.5") or numeric_block.get("0.50") or numeric_block.get("median")
             return lower_quantile, median_value
 
-        return_quantiles = quantiles.get("return_h") or quantiles.get("return")
+        return_quantiles = (
+            quantiles.get("return_oc_h")
+            if resolved_horizon == 1 and quantiles.get("return_oc_h") is not None
+            else quantiles.get("return_h") or quantiles.get("return")
+        )
         return_lower, return_median = _extract_quantile(return_quantiles)
         close_quantiles = quantiles.get("close_h") or quantiles.get("close")
         close_lower, close_median = _extract_quantile(close_quantiles)
@@ -4409,6 +4423,7 @@ class StockPredictorAI:
             "reason": reason,
             "predicted_close": predicted_close,
             "expected_change_pct": expected_change_pct,
+            "expected_intraday_move": predicted_intraday_move,
             "expected_low": expected_low,
             "stop_loss": stop_loss,
             "probabilities": {"up": prob_up, "down": prob_down},

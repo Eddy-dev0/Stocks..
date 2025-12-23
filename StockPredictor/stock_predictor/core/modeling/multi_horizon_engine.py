@@ -143,6 +143,9 @@ class MultiHorizonModelingEngine:
         use_daily_targets = self._interval_is_intraday()
         target_frame = self._aggregate_daily_prices(working) if use_daily_targets else working
         lower_columns = {column.lower(): column for column in target_frame.columns}
+        open_col = lower_columns.get("open")
+        high_col = lower_columns.get("high")
+        low_col = lower_columns.get("low")
         basis = getattr(self.config, "target_price_basis", "adj_close")
         basis = str(basis or "adj_close").strip().lower()
         if basis == "adj_close":
@@ -161,6 +164,9 @@ class MultiHorizonModelingEngine:
             raise KeyError("Price dataframe must contain a close column for target generation.")
 
         closes = pd.to_numeric(target_frame[close_col], errors="coerce")
+        opens = pd.to_numeric(target_frame[open_col], errors="coerce") if open_col else None
+        highs = pd.to_numeric(target_frame[high_col], errors="coerce") if high_col else None
+        lows = pd.to_numeric(target_frame[low_col], errors="coerce") if low_col else None
         neutral_threshold = float(getattr(self.config, "direction_neutral_threshold", 0.0))
         targets: dict[int, dict[str, pd.Series]] = {}
         for horizon in horizons:
@@ -175,18 +181,49 @@ class MultiHorizonModelingEngine:
             else:
                 direction = np.where(future_close > closes, 1, -1)
             direction_series = pd.Series(direction, index=target_frame.index, dtype=float)
+            future_open = opens.shift(-int(horizon)) if opens is not None else None
+            return_oc = None
+            intraday_max = None
+            intraday_min = None
+            if future_open is not None:
+                return_oc = (future_close - future_open) / future_open
+                if highs is not None:
+                    future_high = highs.shift(-int(horizon))
+                    intraday_max = (future_high - future_open) / future_open
+                if lows is not None:
+                    future_low = lows.shift(-int(horizon))
+                    intraday_min = (future_low - future_open) / future_open
             if use_daily_targets:
-                targets[int(horizon)] = {
+                label_map = {
                     "close_h": self._align_daily_targets(future_close, working.index),
                     "direction_h": self._align_daily_targets(direction_series, working.index),
                     "return_h": self._align_daily_targets(returns, working.index),
                 }
             else:
-                targets[int(horizon)] = {
+                label_map = {
                     "close_h": future_close,
                     "direction_h": direction_series,
                     "return_h": returns,
                 }
+            if return_oc is not None:
+                label_map["return_oc_h"] = (
+                    self._align_daily_targets(return_oc, working.index)
+                    if use_daily_targets
+                    else return_oc
+                )
+            if intraday_max is not None:
+                label_map["intraday_max_h"] = (
+                    self._align_daily_targets(intraday_max, working.index)
+                    if use_daily_targets
+                    else intraday_max
+                )
+            if intraday_min is not None:
+                label_map["intraday_min_h"] = (
+                    self._align_daily_targets(intraday_min, working.index)
+                    if use_daily_targets
+                    else intraday_min
+                )
+            targets[int(horizon)] = label_map
         return targets
 
     def build_dataset(
@@ -199,7 +236,7 @@ class MultiHorizonModelingEngine:
     ) -> MultiHorizonDataset:
         horizons = tuple(horizons) if horizons is not None else tuple(self.config.prediction_horizons)
         ticker_universe = list(tickers) if tickers else [self.config.ticker]
-        requested_targets = set(targets) if targets else {"close_h", "direction_h", "return_h"}
+        requested_targets = set(targets) if targets else {"close_h", "direction_h", "return_h", "return_oc_h"}
         minimum_viable_rows = max(1, int(getattr(self.config, "minimum_viable_rows", 1)))
         if self._interval_is_intraday() and 1 in horizons:
             LOGGER.warning(
@@ -247,7 +284,7 @@ class MultiHorizonModelingEngine:
             )
 
         feature_frames: list[pd.DataFrame] = []
-        targets: dict[int, dict[str, list[pd.Series]]] = {h: {"close_h": [], "direction_h": [], "return_h": []} for h in horizons}
+        targets: dict[int, dict[str, list[pd.Series]]] = {h: {} for h in horizons}
         metadata: dict[str, Any] = {
             "horizons": horizons,
             "tickers": ticker_universe,
@@ -344,7 +381,7 @@ class MultiHorizonModelingEngine:
             for horizon, label_map in ticker_targets.items():
                 for name, series in label_map.items():
                     aligned = series.reindex(canonical_index)
-                    targets[horizon][name].append(aligned)
+                    targets.setdefault(horizon, {}).setdefault(name, []).append(aligned)
 
             target_counts = {
                 int(h): {name: int(series.dropna().shape[0]) for name, series in label_map.items()}
@@ -512,7 +549,7 @@ class MultiHorizonModelingEngine:
         force: bool = False,
     ) -> dict[str, Any]:
         horizons = (int(horizon),) if horizon else tuple(self.config.prediction_horizons)
-        requested_targets = set(targets) if targets else {"close_h", "direction_h", "return_h"}
+        requested_targets = set(targets) if targets else {"close_h", "direction_h", "return_h", "return_oc_h"}
         dataset = self.build_dataset(horizons=horizons, targets=requested_targets)
 
         sample_counts = dataset.metadata.get("target_counts") or dataset.count_targets()
