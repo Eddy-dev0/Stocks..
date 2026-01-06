@@ -109,11 +109,11 @@ class MultiHorizonModelingEngine:
         frame = price_df.copy()
         if "Date" in frame.columns:
             frame = frame.sort_values("Date")
-            index = pd.to_datetime(frame["Date"], errors="coerce")
+            index = pd.to_datetime(frame["Date"], errors="coerce", utc=True)
             frame = frame.set_index(index)
         else:
             frame = frame.sort_index()
-            frame.index = pd.to_datetime(frame.index, errors="coerce")
+            frame.index = pd.to_datetime(frame.index, errors="coerce", utc=True)
         frame = frame[~frame.index.isna()]
         if frame.empty:
             return frame
