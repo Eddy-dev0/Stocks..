@@ -668,6 +668,51 @@ class MultiHorizonModelingEngine:
         artefacts: dict[int, HorizonArtifacts] = {}
         random_state = int(self.config.model_params.get("global", {}).get("random_state", 42))
 
+        def _latest_ts(frame: pd.DataFrame) -> pd.Timestamp | None:
+            if frame.empty or not isinstance(frame.index, pd.DatetimeIndex):
+                return None
+            return pd.to_datetime(frame.index, errors="coerce").max()
+
+        def _ensure_fit_frame(frame: pd.DataFrame) -> pd.DataFrame:
+            if not frame.empty:
+                return frame
+            if frame.columns.empty:
+                return frame
+            filler: dict[str, Any] = {}
+            for col in frame.columns:
+                if pd.api.types.is_numeric_dtype(frame[col]):
+                    filler[col] = 0.0
+                else:
+                    filler[col] = ""
+            return pd.DataFrame([filler], columns=frame.columns)
+
+        def _persist_preprocessor(
+            *,
+            horizon_value: int,
+            horizon_counts: Mapping[str, int],
+            aligned_features: pd.DataFrame,
+        ) -> None:
+            features_for_preprocessor = aligned_features
+            if features_for_preprocessor.empty:
+                features_for_preprocessor = dataset.features.copy()
+            if not features_for_preprocessor.empty:
+                features_for_preprocessor = features_for_preprocessor.dropna(axis=1, how="all")
+            features_for_preprocessor = _ensure_fit_frame(features_for_preprocessor)
+            if features_for_preprocessor.empty:
+                LOGGER.warning(
+                    "No usable features available to fit preprocessor for horizon %s; skipping persistence.",
+                    horizon_value,
+                )
+                return
+            fitted_pre = preprocessor.fit(features_for_preprocessor)
+            horizon_dir = self.models_dir / f"horizon_{horizon_value}"
+            horizon_dir.mkdir(parents=True, exist_ok=True)
+            joblib.dump(fitted_pre, horizon_dir / "preprocessor.joblib")
+            with open(horizon_dir / "feature_names.json", "w", encoding="utf-8") as handle:
+                json.dump(get_feature_names_from_pipeline(fitted_pre), handle, indent=2)
+            with open(horizon_dir / "samples.json", "w", encoding="utf-8") as handle:
+                json.dump(dict(horizon_counts), handle, indent=2)
+
         # Train per horizon
         for horizon_value in horizons:
             horizon_targets = dataset.targets.get(int(horizon_value), {})
@@ -682,9 +727,8 @@ class MultiHorizonModelingEngine:
             aligned_features = aligned_features.dropna(axis=1, how="all")
             preprocessor = self._build_preprocessor(aligned_features)
             if not any(count >= min_samples for count in horizon_counts.values()):
-                latest_timestamp = None
-                if not dataset.features.empty and isinstance(dataset.features.index, pd.DatetimeIndex):
-                    latest_timestamp = pd.to_datetime(dataset.features.index, errors="coerce").max()
+                latest_timestamp = _latest_ts(dataset.features)
+                checked_at = pd.Timestamp.now(tz="UTC")
                 LOGGER.warning(
                     "Horizon %s does not meet minimum sample requirements (max=%s, min=%s); skipping training.",
                     horizon_value,
@@ -696,27 +740,20 @@ class MultiHorizonModelingEngine:
                     "sample_counts": dict(horizon_counts),
                     "missing_targets": missing_targets.get(int(horizon_value), {}),
                     "reason": "insufficient_samples",
-                    "checked_at": latest_timestamp,
+                    "checked_at": checked_at,
                     "warning_emitted": False,
                     "not_trainable": True,
-                    "last_training_attempt": pd.Timestamp.now(tz="UTC"),
+                    "last_training_attempt": checked_at,
                 }
-                if aligned_features.empty:
-                    raise InsufficientSamplesError(
-                        "Insufficient data to fit preprocessor.",
-                        horizons=horizons,
-                        targets=tuple(sorted(requested_targets)),
-                        sample_counts=requested_counts,
-                        missing_targets=missing_targets,
-                    )
-                fitted_pre = preprocessor.fit(aligned_features)
-                horizon_dir = self.models_dir / f"horizon_{horizon_value}"
-                horizon_dir.mkdir(parents=True, exist_ok=True)
-                joblib.dump(fitted_pre, horizon_dir / "preprocessor.joblib")
-                with open(horizon_dir / "feature_names.json", "w", encoding="utf-8") as handle:
-                    json.dump(get_feature_names_from_pipeline(fitted_pre), handle, indent=2)
-                with open(horizon_dir / "samples.json", "w", encoding="utf-8") as handle:
-                    json.dump(dict(horizon_counts), handle, indent=2)
+                _persist_preprocessor(
+                    horizon_value=int(horizon_value),
+                    horizon_counts=horizon_counts,
+                    aligned_features=aligned_features,
+                )
+                LOGGER.warning(
+                    "No models trained for horizon %s due to insufficient samples; preprocessor persisted.",
+                    horizon_value,
+                )
                 continue
 
             below_threshold = {
@@ -798,34 +835,26 @@ class MultiHorizonModelingEngine:
                     "Skipping persistence for horizon %s; no models were trained (insufficient samples or targets).",
                     horizon_value,
                 )
-                if aligned_features.empty:
-                    raise InsufficientSamplesError(
-                        "Insufficient data to fit preprocessor.",
-                        horizons=horizons,
-                        targets=tuple(sorted(requested_targets)),
-                        sample_counts=requested_counts,
-                        missing_targets=missing_targets,
-                    )
+                checked_at = pd.Timestamp.now(tz="UTC")
                 self._untrainable_until[int(horizon_value)] = {
-                    "data_timestamp": pd.to_datetime(aligned_features.index, errors="coerce").max()
-                    if isinstance(aligned_features.index, pd.DatetimeIndex)
-                    else None,
+                    "data_timestamp": _latest_ts(aligned_features),
                     "sample_counts": dict(horizon_counts),
                     "missing_targets": missing_targets.get(int(horizon_value), {}),
                     "reason": "insufficient_samples",
-                    "checked_at": pd.Timestamp.now(tz="UTC"),
+                    "checked_at": checked_at,
                     "warning_emitted": False,
                     "not_trainable": True,
-                    "last_training_attempt": pd.Timestamp.now(tz="UTC"),
+                    "last_training_attempt": checked_at,
                 }
-                fitted_pre = preprocessor.fit(aligned_features)
-                horizon_dir = self.models_dir / f"horizon_{horizon_value}"
-                horizon_dir.mkdir(parents=True, exist_ok=True)
-                joblib.dump(fitted_pre, horizon_dir / "preprocessor.joblib")
-                with open(horizon_dir / "feature_names.json", "w", encoding="utf-8") as handle:
-                    json.dump(get_feature_names_from_pipeline(fitted_pre), handle, indent=2)
-                with open(horizon_dir / "samples.json", "w", encoding="utf-8") as handle:
-                    json.dump(dict(horizon_counts), handle, indent=2)
+                _persist_preprocessor(
+                    horizon_value=int(horizon_value),
+                    horizon_counts=horizon_counts,
+                    aligned_features=aligned_features,
+                )
+                LOGGER.warning(
+                    "No models trained for horizon %s due to insufficient samples; preprocessor persisted.",
+                    horizon_value,
+                )
                 continue
 
             artefacts[horizon_value] = HorizonArtifacts(
@@ -853,13 +882,17 @@ class MultiHorizonModelingEngine:
             LOGGER.warning(
                 "Kein Horizon hat genügend Samples; Training wird übersprungen."
             )
-            raise InsufficientSamplesError(
-                "Insufficient samples to train any requested horizons.",
-                horizons=horizons,
-                targets=tuple(sorted(requested_targets)),
-                sample_counts=requested_counts,
-                missing_targets=missing_targets,
-            )
+            metadata = {
+                **dataset.metadata,
+                "artefacts": {},
+            }
+            return {
+                "status": "no_data",
+                "reason": "insufficient_samples",
+                "horizons": horizons,
+                "targets": requested_targets,
+                "metadata": metadata,
+            }
 
         metadata = {
             **dataset.metadata,
