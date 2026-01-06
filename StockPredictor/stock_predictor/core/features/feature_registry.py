@@ -23,6 +23,7 @@ class FeatureBuildContext:
     macro_df: "pd.DataFrame | None"
     sentiment_enabled: bool
     technical_indicator_config: Mapping[str, Mapping[str, object]] | None
+    feature_toggles: FeatureToggles
     regime_params: Mapping[str, float] | None = None
     event_params: Mapping[str, object] | None = None
 
