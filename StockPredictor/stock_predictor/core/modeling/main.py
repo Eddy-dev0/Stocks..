@@ -64,7 +64,11 @@ from .prediction_result import FeatureUsageSummary, PredictionResult
 from ..support_levels import indicator_support_floor
 from .ensembles import EnsembleMember
 from ..models import (
+    LGBMClassifier,
+    LGBMRegressor,
     ModelFactory,
+    XGBClassifier,
+    XGBRegressor,
     classification_metrics,
     extract_feature_importance,
     model_supports_proba,
@@ -381,6 +385,16 @@ class StockPredictorAI:
         self.nextgen_engine = MultiHorizonModelingEngine(
             config, fetcher=self.fetcher, feature_assembler=self.feature_assembler
         )
+
+    def _select_boosting_model_type(self) -> str:
+        preferred = (self.config.model_type or "").strip().lower()
+        if preferred and preferred not in {"random_forest", "auto", "boosting"}:
+            return preferred
+        if LGBMRegressor is not None and LGBMClassifier is not None:
+            return "lightgbm"
+        if XGBRegressor is not None and XGBClassifier is not None:
+            return "xgboost"
+        return "hist_gb"
 
     def _refresh_feature_assembler(self) -> None:
         """Rebuild the feature assembler if the toggle state has changed."""
@@ -1374,6 +1388,14 @@ class StockPredictorAI:
         *,
         force: bool = False,
     ) -> Dict[str, Any]:
+        selected_model_type = self._select_boosting_model_type()
+        if selected_model_type != self.config.model_type:
+            LOGGER.info(
+                "Selected model type '%s' for next-gen training (previously '%s').",
+                selected_model_type,
+                self.config.model_type,
+            )
+            self.config.model_type = selected_model_type
         resolved_horizon = self._resolve_horizon(horizon)
         self.horizon = resolved_horizon
         modern_report = self.nextgen_engine.train(

@@ -14,12 +14,18 @@ from dataclasses import dataclass, field
 import math
 from pathlib import Path
 from typing import Any, Iterable, Literal, Mapping, Sequence
+import inspect
 
 import joblib
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+from sklearn.ensemble import (
+    HistGradientBoostingClassifier,
+    HistGradientBoostingRegressor,
+    RandomForestClassifier,
+    RandomForestRegressor,
+)
 from sklearn.metrics import accuracy_score, mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
 from sklearn.exceptions import NotFittedError
@@ -36,6 +42,12 @@ from ..ml_preprocessing import get_feature_names_from_pipeline
 from ..database import Database
 from .exceptions import InsufficientSamplesError
 from .prediction_result import PredictionOutcome
+from ..models import (
+    LGBMClassifier,
+    LGBMRegressor,
+    XGBClassifier,
+    XGBRegressor,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -579,11 +591,53 @@ class MultiHorizonModelingEngine:
         preprocessor = ColumnTransformer(transformers)
         return Pipeline([("pre", preprocessor)])
 
-    def _train_single_model(self, X_train: pd.DataFrame, y_train: pd.Series, task: str, random_state: int) -> Any:
-        if task == "classification":
-            model = HistGradientBoostingClassifier(random_state=random_state)
-        else:
-            model = HistGradientBoostingRegressor(random_state=random_state)
+    def _train_single_model(
+        self,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        task: str,
+        random_state: int,
+        model_type: str,
+        model_params: Mapping[str, Any],
+    ) -> Any:
+        resolved_type = (model_type or "hist_gb").strip().lower()
+        params = dict(model_params)
+        params.setdefault("random_state", random_state)
+        model: Any | None = None
+
+        def _instantiate(factory: Any) -> Any:
+            signature = inspect.signature(factory)
+            if any(param.kind == param.VAR_KEYWORD for param in signature.parameters.values()):
+                return factory(**params)
+            filtered = {key: value for key, value in params.items() if key in signature.parameters}
+            return factory(**filtered)
+
+        if resolved_type == "lightgbm":
+            if LGBMRegressor is None:
+                LOGGER.warning("LightGBM unavailable; falling back to HistGradientBoosting.")
+                resolved_type = "hist_gb"
+            else:
+                model = _instantiate(LGBMClassifier if task == "classification" else LGBMRegressor)
+        if resolved_type == "xgboost":
+            if XGBRegressor is None:
+                LOGGER.warning("XGBoost unavailable; falling back to HistGradientBoosting.")
+                resolved_type = "hist_gb"
+            else:
+                model = _instantiate(XGBClassifier if task == "classification" else XGBRegressor)
+        if resolved_type == "random_forest":
+            model = _instantiate(RandomForestClassifier if task == "classification" else RandomForestRegressor)
+        if resolved_type == "hist_gb":
+            model = _instantiate(
+                HistGradientBoostingClassifier if task == "classification" else HistGradientBoostingRegressor
+            )
+        if model is None:
+            LOGGER.warning(
+                "Model type '%s' not recognized; falling back to HistGradientBoosting.",
+                resolved_type,
+            )
+            model = _instantiate(
+                HistGradientBoostingClassifier if task == "classification" else HistGradientBoostingRegressor
+            )
         model.fit(X_train, y_train)
         return model
 
@@ -677,7 +731,16 @@ class MultiHorizonModelingEngine:
                 X_test_t = fitted_pre.transform(X_test)
 
                 task = "classification" if "direction" in target_name else "regression"
-                model = self._train_single_model(X_train_t, y_train, task, random_state)
+                model_params: dict[str, Any] = dict(self.config.model_params.get("global", {}))
+                model_params.update(self.config.model_params.get(target_name, {}))
+                model = self._train_single_model(
+                    X_train_t,
+                    y_train,
+                    task,
+                    random_state,
+                    self.config.model_type,
+                    model_params,
+                )
                 y_hat_val = model.predict(X_val_t)
                 y_hat_test = model.predict(X_test_t)
 
