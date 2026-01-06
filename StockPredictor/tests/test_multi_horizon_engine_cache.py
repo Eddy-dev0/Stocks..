@@ -75,7 +75,12 @@ def _price_frame(start: str = "2023-01-01", periods: int = 3) -> pd.DataFrame:
     return pd.DataFrame({"Date": dates, "Close": np.linspace(100, 101, periods)})
 
 
-def _engine(tmp_path: Path, price_df: pd.DataFrame) -> MultiHorizonModelingEngine:
+def _engine(
+    tmp_path: Path,
+    price_df: pd.DataFrame,
+    *,
+    min_samples_per_horizon: int | None = None,
+) -> MultiHorizonModelingEngine:
     config = PredictorConfig(
         ticker="CACHE",
         sentiment=False,
@@ -85,6 +90,8 @@ def _engine(tmp_path: Path, price_df: pd.DataFrame) -> MultiHorizonModelingEngin
         feature_toggles=FeatureToggles(),
         model_params={"global": {"random_state": 0}},
     )
+    if min_samples_per_horizon is not None:
+        setattr(config, "min_samples_per_horizon", min_samples_per_horizon)
     config.ensure_directories()
     return MultiHorizonModelingEngine(
         config,
@@ -194,13 +201,21 @@ def test_build_dataset_downgrades_repeated_insufficient_logs(tmp_path: Path, cap
 
     with caplog.at_level(logging.DEBUG):
         engine.build_dataset(horizons=(1,), targets=("close_h",))
-    first_levels = [record.levelno for record in caplog.records if "Insufficient samples for horizon" in record.message]
+    first_levels = [
+        record.levelno
+        for record in caplog.records
+        if "Targets below min_samples_per_horizon" in record.message
+    ]
     assert logging.WARNING in first_levels
 
     caplog.clear()
     with caplog.at_level(logging.DEBUG):
         engine.build_dataset(horizons=(1,), targets=("close_h",))
-    second_levels = [record.levelno for record in caplog.records if "Insufficient samples for horizon" in record.message]
+    second_levels = [
+        record.levelno
+        for record in caplog.records
+        if "Targets below min_samples_per_horizon" in record.message
+    ]
     assert logging.WARNING not in second_levels
     assert logging.DEBUG in second_levels
 
@@ -218,15 +233,39 @@ def test_build_dataset_aligns_targets_on_canonical_dates(tmp_path: Path) -> None
     engine = _engine(tmp_path, price_df)
     dataset = engine.build_dataset(horizons=(1,), targets=("close_h", "return_h", "direction_h"))
 
-    expected_index = pd.to_datetime(["2023-01-01", "2023-01-02", "2023-01-03"])
+    expected_index = pd.to_datetime(["2023-01-01", "2023-01-02"], utc=True)
     assert list(dataset.features.index) == list(expected_index)
 
     horizon_targets = dataset.targets[1]
     for name in ("close_h", "return_h"):
         aligned = horizon_targets[name]
         assert list(aligned.index) == list(expected_index)
-        assert aligned.dropna().shape[0] == len(expected_index) - 1
+        assert aligned.dropna().shape[0] == len(expected_index)
 
     direction = horizon_targets["direction_h"]
     assert list(direction.index) == list(expected_index)
-    assert direction.dropna().shape[0] == len(expected_index) - 1
+    assert direction.dropna().shape[0] == len(expected_index)
+
+
+def test_train_persists_preprocessor_with_empty_alignment(tmp_path: Path) -> None:
+    price_df = _price_frame(periods=1)
+    engine = _engine(tmp_path, price_df, min_samples_per_horizon=5)
+
+    result = engine.train(horizon=1)
+
+    preprocessor_path = tmp_path / "models" / "nextgen" / "horizon_1" / "preprocessor.joblib"
+    assert result["status"] == "no_data"
+    assert preprocessor_path.exists()
+
+
+def test_predict_latest_returns_no_data_without_models(tmp_path: Path) -> None:
+    price_df = _price_frame(periods=1)
+    engine = _engine(tmp_path, price_df, min_samples_per_horizon=5)
+
+    engine.train(horizon=1)
+    engine.fetcher._price_df = _price_frame(start="2023-01-10", periods=2)  # type: ignore[attr-defined]
+
+    result = engine.predict_latest(horizon=1)
+
+    assert result["status"] == "no_data"
+    assert result["reason"] == "insufficient_samples"
