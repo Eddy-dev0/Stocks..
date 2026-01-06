@@ -3868,10 +3868,8 @@ class StockPredictorDesktopApp:
         if status == "no_data":
             summary = f"Prediction unavailable (status={status}, reason={reason or 'unknown'})"
             LOGGER.warning(summary)
-            user_message = (
-                message
-                if message and "Horizon" not in str(message)
-                else f"Not enough historical data to generate predictions for {self.config.ticker} yet."
+            user_message = message or (
+                f"Not enough historical data to generate predictions for {self.config.ticker} yet."
             )
             LOGGER.info(user_message)
             self.current_prediction = {}
