@@ -44,7 +44,7 @@ DEFAULT_BACKTEST_STRATEGY = "rolling"
 DEFAULT_BACKTEST_WINDOW = 252
 DEFAULT_BACKTEST_STEP = 21
 DEFAULT_VOLATILITY_WINDOW = 20
-DEFAULT_MIN_SAMPLES_PER_HORIZON = 10
+DEFAULT_MIN_SAMPLES_PER_HORIZON = 5
 DEFAULT_TARGET_GAIN_PCT = 0.03
 DEFAULT_MACRO_MERGE_SYMBOLS: tuple[str, ...] = ("^VIX", "DXY", "^TNX")
 DEFAULT_MAX_EXPECTED_CHANGE_PCT = 0.1
@@ -196,7 +196,7 @@ class PredictorConfig:
     """Runtime configuration for :class:`StockPredictorAI`."""
 
     ticker: str
-    start_date: date = field(default_factory=lambda: date.today() - timedelta(days=365))
+    start_date: date = field(default_factory=lambda: date.today() - timedelta(days=365 * 5))
     end_date: Optional[date] = None
     interval: str = "1d"
     model_type: str = "random_forest"
@@ -302,7 +302,7 @@ class PredictorConfig:
     training_cache_dir: Path | None = None
     use_cached_training_data: bool = True
     min_samples_per_horizon: int = DEFAULT_MIN_SAMPLES_PER_HORIZON
-    use_max_historical_data: bool = False
+    use_max_historical_data: bool = True
     forecast_tolerance_bands: dict[int, float] = field(default_factory=dict)
     # Provide a local CSV file path to enable the CSVPriceLoader provider.
     csv_price_loader_path: Path | None = None
