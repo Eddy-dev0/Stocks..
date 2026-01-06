@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import pandas as pd
@@ -11,7 +11,7 @@ import pandas as pd
 from .config import PredictorConfig
 from .database import Database
 from .etl import MarketDataETL
-from ..core.pipeline import CACHE_MAX_AGE
+from ..core.pipeline import DEFAULT_CACHE_MAX_AGE
 
 LOGGER = logging.getLogger(__name__)
 
@@ -192,15 +192,17 @@ class DataFetcher:
     def _set_source(self, category: str, downloaded: bool) -> None:
         self._sources[category] = "remote" if downloaded else "database"
 
-    @staticmethod
-    def _is_timestamp_fresh(timestamp: datetime | None) -> bool:
+    def _cache_max_age(self) -> timedelta:
+        return getattr(self.config, "cache_expiry", DEFAULT_CACHE_MAX_AGE)
+
+    def _is_timestamp_fresh(self, timestamp: datetime | None) -> bool:
         if timestamp is None:
             return False
         if timestamp.tzinfo is None:
             timestamp = timestamp.replace(tzinfo=timezone.utc)
         else:
             timestamp = timestamp.astimezone(timezone.utc)
-        return datetime.now(timezone.utc) - timestamp <= CACHE_MAX_AGE
+        return datetime.now(timezone.utc) - timestamp <= self._cache_max_age()
 
     def _is_price_cache_stale(self) -> bool:
         refresh_ts = self.database.get_refresh_timestamp(

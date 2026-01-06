@@ -38,7 +38,7 @@ from stock_predictor.core import (
     TrendInsight,
 )
 from stock_predictor.core.pipeline import (
-    CACHE_MAX_AGE,
+    DEFAULT_CACHE_MAX_AGE,
     NoPriceDataError,
     resolve_market_timezone,
 )
@@ -3844,7 +3844,8 @@ class StockPredictorDesktopApp:
             timestamp = timestamp.replace(tzinfo=timezone.utc)
         else:
             timestamp = timestamp.astimezone(timezone.utc)
-        return reference - timestamp <= CACHE_MAX_AGE
+        cache_max_age = getattr(self.config, "cache_expiry", DEFAULT_CACHE_MAX_AGE)
+        return reference - timestamp <= cache_max_age
 
     def _display_timezone(self) -> ZoneInfo | None:
         tz = getattr(self.config, "timezone", None)

@@ -57,7 +57,7 @@ DEFAULT_MARKET_TIMEZONE = ZoneInfo("America/New_York")
 US_MARKET_OPEN = dt_time(9, 30)
 US_MARKET_CLOSE = dt_time(16, 0)
 US_MARKET_BUSINESS_DAY = CustomBusinessDay(calendar=USFederalHolidayCalendar())
-CACHE_MAX_AGE = timedelta(hours=24)
+DEFAULT_CACHE_MAX_AGE = timedelta(hours=24)
 
 _TZ_ALIAS_MAP: dict[str, str] = {
     # Central European variants (German)
@@ -278,6 +278,7 @@ class MarketDataETL:
         if ttl is None:
             ttl = self._memory_cache_default_ttl
         self._memory_cache_ttl = max(60.0, float(ttl))
+        self._cache_max_age = getattr(self.config, "cache_expiry", DEFAULT_CACHE_MAX_AGE)
 
     def _now(self) -> datetime:
         tz = self.market_timezone or DEFAULT_MARKET_TIMEZONE
@@ -520,7 +521,12 @@ class MarketDataETL:
             interval=self.config.interval,
             category="macro",
         )
-        if not force and not existing.empty:
+        existing_ts = self.database.get_refresh_timestamp(
+            self.config.ticker, self.config.interval, "macro"
+        )
+        existing_is_fresh = bool(existing_ts and self._is_cache_timestamp_fresh(existing_ts))
+        if not force and not existing.empty and existing_is_fresh:
+            self._record_source("macro", "database")
             return 0
 
         LOGGER.info("Generating cached macro proxy indicators for %s", self.config.ticker)
@@ -537,6 +543,8 @@ class MarketDataETL:
         working = price_frame.copy()
         working["Date"] = pd.to_datetime(working["Date"], errors="coerce")
         working = working.dropna(subset=["Date", "Close", "Volume"])
+        working["Date"] = working["Date"].dt.normalize()
+        working = working.sort_values("Date").drop_duplicates(subset=["Date"], keep="last")
         if working.empty:
             LOGGER.warning("Price frame missing required fields for macro proxies.")
             return 0
@@ -585,7 +593,11 @@ class MarketDataETL:
 
     def refresh_news(self, force: bool = False) -> RefreshResult:
         existing = self.database.get_news(self.config.ticker)
-        if not force and not existing.empty:
+        existing_ts = self.database.get_refresh_timestamp(
+            self.config.ticker, "global", "news"
+        )
+        existing_is_fresh = bool(existing_ts and self._is_cache_timestamp_fresh(existing_ts))
+        if not force and not existing.empty and existing_is_fresh:
             self._record_source("news", "database")
             return RefreshResult(existing, downloaded=False)
 
@@ -1430,7 +1442,7 @@ class MarketDataETL:
             timestamp = timestamp.replace(tzinfo=timezone.utc)
         else:
             timestamp = timestamp.astimezone(timezone.utc)
-        return reference - timestamp <= CACHE_MAX_AGE
+        return reference - timestamp <= self._cache_max_age
 
     def _load_local_price_cache(self) -> tuple[pd.DataFrame, datetime] | None:
         path = self.config.price_cache_path
@@ -1469,7 +1481,7 @@ class MarketDataETL:
                 "Ignoring local price cache %s with timestamp %s older than %s.",
                 path,
                 timestamp.isoformat(),
-                CACHE_MAX_AGE,
+                self._cache_max_age,
             )
             return None
         frame.attrs["cache_timestamp"] = timestamp
