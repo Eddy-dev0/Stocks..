@@ -509,7 +509,11 @@ def _build_technical_features(
     high = _get_numeric_series(df, "High", default=np.nan).fillna(close)
     low = _get_numeric_series(df, "Low", default=np.nan).fillna(close)
 
-    indicator_result = compute_indicators(df, indicator_config)
+    indicator_result = compute_indicators(
+        df,
+        indicator_config,
+        indicator_toggles=context.feature_toggles.asdict(),
+    )
     indicator_frame = indicator_result.dataframe.reset_index(drop=True)
     metadata["indicator_columns"] = list(indicator_result.columns)
 

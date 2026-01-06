@@ -9,6 +9,18 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 
+from .indicator_library import (
+    cm_williams_vix_fix,
+    fibonacci_retracement,
+    hull_suite,
+    koncorde,
+    laguerre_multi_filter,
+    lorentzian_classification,
+    resolve_indicator_toggles,
+    smart_money_concepts,
+    volume_profile,
+    williams_r_trend_exhaustion,
+)
 from .indicators import (
     IndicatorInputs,
     adx_dmi,
@@ -62,6 +74,41 @@ DEFAULT_INDICATOR_CONFIG: dict[str, dict[str, object]] = {
     "liquidity": {"window": 20},
     "composite": {"columns": None},
     "adl": {"enabled": True, "chaikin_enabled": False, "short_period": 3, "long_period": 10},
+    "fibonacci_retracement": {"window": 60},
+    "volume_profile": {"window": 50, "bins": 20},
+    "williams_r_trend_exhaustion": {"period": 14, "signal_period": 6},
+    "koncorde": {"trend_periods": (3, 5, 8, 13), "volume_window": 14},
+    "cm_williams_vix_fix": {
+        "period": 22,
+        "bollinger_period": 20,
+        "bollinger_std": 2.0,
+        "overbought": 90.0,
+        "oversold": 10.0,
+    },
+    "hull_suite": {"fast": 9, "slow": 21},
+    "laguerre_multi_filter": {
+        "mode": "ribbon",
+        "filters": 18,
+        "gamma_min": 0.05,
+        "gamma_max": 0.9,
+        "band_atr_period": 14,
+        "band_atr_multiplier": 1.5,
+        "timeframes": None,
+    },
+    "lorentzian_classification": {
+        "ema_period": 200,
+        "atr_period": 14,
+        "atr_multiplier": 1.5,
+        "supertrend_period": 10,
+        "supertrend_multiplier": 3.0,
+        "lookback": 50,
+        "backtest": False,
+    },
+    "smart_money_concepts": {
+        "swing_window": 5,
+        "range_window": 50,
+        "timeframes": None,
+    },
 }
 
 
@@ -105,6 +152,8 @@ def _bollinger(
 def compute_indicators(
     df: pd.DataFrame,
     config: Mapping[str, Mapping[str, object]] | None = None,
+    *,
+    indicator_toggles: Mapping[str, bool] | None = None,
 ) -> IndicatorResult:
     """Compute an enriched set of technical indicators for ``df``.
 
@@ -119,10 +168,7 @@ def compute_indicators(
     if "Close" not in df.columns:
         raise ValueError("The dataframe must contain a 'Close' column to compute indicators.")
 
-    config_map = {
-        name: dict(DEFAULT_INDICATOR_CONFIG[name])
-        for name in DEFAULT_INDICATOR_CONFIG
-    }
+    config_map = {name: dict(DEFAULT_INDICATOR_CONFIG[name]) for name in DEFAULT_INDICATOR_CONFIG}
     if config:
         for name, overrides in config.items():
             if name in config_map:
@@ -147,88 +193,130 @@ def compute_indicators(
 
     inputs = IndicatorInputs(high=high, low=low, close=close, volume=volume, open=open_)
 
-    ma_config = config_map.get("moving_averages", {})
-    sma_periods = set(ma_config.get("sma_periods", (20, 50, 200))) | {20, 50, 200}
-    ema_periods = set(ma_config.get("ema_periods", (12, 26))) | {12, 26}
-
-    sma_values = {period: close.rolling(window=period, min_periods=1).mean() for period in sorted(sma_periods)}
-    ema_values = {period: _ema(close, period) for period in sorted(ema_periods)}
-
-    ema12 = ema_values[12]
-    ema26 = ema_values[26]
-    macd = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False, min_periods=1).mean()
-    histogram = macd - signal
-
-    sma20, bb_upper, bb_lower, bb_bandwidth, bb_percent_b = _bollinger(close, window=20)
+    toggles = resolve_indicator_toggles(indicator_toggles)
 
     index = close.index
+    indicators = pd.DataFrame(index=index)
 
-    indicators = pd.DataFrame(
-        {
-            **{f"SMA_{period}": sma for period, sma in sma_values.items()},
-            **{f"EMA_{period}": ema_values[period] for period in sorted(ema_periods)},
-            "EMA_12": ema12,
-            "EMA_26": ema26,
-            "MACD_12_26_9_Line": macd,
-            "MACD_12_26_9_Signal": signal,
-            "MACD_12_26_9_Hist": histogram,
-            "RSI_14": _rsi(close, period=14),
-            "BB_Middle_20": sma20,
-            "BB_Upper_20": bb_upper,
-            "BB_Lower_20": bb_lower,
-            "BB_Bandwidth": bb_bandwidth.fillna(0.0),
-            "BB_Percent_B": bb_percent_b.fillna(0.5),
-        },
-        index=index,
-    )
+    if toggles.get("indicator_moving_averages", True):
+        ma_config = config_map.get("moving_averages", {})
+        sma_periods = set(ma_config.get("sma_periods", (20, 50, 200))) | {20, 50, 200}
+        ema_periods = set(ma_config.get("ema_periods", (12, 26))) | {12, 26}
 
-    atr_df = average_true_range(inputs, period=int(config_map["atr"]["period"]))
-    indicators = indicators.join(atr_df, how="outer")
+        sma_values = {period: close.rolling(window=period, min_periods=1).mean() for period in sorted(sma_periods)}
+        ema_values = {period: _ema(close, period) for period in sorted(ema_periods)}
 
-    supertrend_df = supertrend(
-        inputs,
-        period=int(config_map["supertrend"]["period"]),
-        multiplier=float(config_map["supertrend"]["multiplier"]),
-    )
-    indicators = indicators.join(supertrend_df, how="outer")
+        indicators = indicators.join(
+            pd.DataFrame(
+                {
+                    **{f"SMA_{period}": sma for period, sma in sma_values.items()},
+                    **{f"EMA_{period}": ema_values[period] for period in sorted(ema_periods)},
+                },
+                index=index,
+            ),
+            how="outer",
+        )
+    else:
+        ema_values = {12: _ema(close, 12), 26: _ema(close, 26)}
 
-    ichimoku_df = ichimoku(inputs, **config_map["ichimoku"])
-    indicators = indicators.join(ichimoku_df, how="outer")
+    if toggles.get("indicator_macd", True):
+        ema12 = ema_values[12]
+        ema26 = ema_values[26]
+        macd = ema12 - ema26
+        signal = macd.ewm(span=9, adjust=False, min_periods=1).mean()
+        histogram = macd - signal
+        indicators = indicators.join(
+            pd.DataFrame(
+                {
+                    "EMA_12": ema12,
+                    "EMA_26": ema26,
+                    "MACD_12_26_9_Line": macd,
+                    "MACD_12_26_9_Signal": signal,
+                    "MACD_12_26_9_Hist": histogram,
+                },
+                index=index,
+            ),
+            how="outer",
+        )
 
-    stochastic_df = stochastic(inputs, **config_map["stochastic"])
-    indicators = indicators.join(stochastic_df, how="outer")
+    if toggles.get("indicator_rsi", True):
+        indicators["RSI_14"] = _rsi(close, period=14)
 
-    adx_df = adx_dmi(inputs, period=int(config_map["adx"]["period"]))
-    indicators = indicators.join(adx_df, how="outer")
+    if toggles.get("indicator_bollinger_bands", True):
+        sma20, bb_upper, bb_lower, bb_bandwidth, bb_percent_b = _bollinger(close, window=20)
+        indicators = indicators.join(
+            pd.DataFrame(
+                {
+                    "BB_Middle_20": sma20,
+                    "BB_Upper_20": bb_upper,
+                    "BB_Lower_20": bb_lower,
+                    "BB_Bandwidth": bb_bandwidth.fillna(0.0),
+                    "BB_Percent_B": bb_percent_b.fillna(0.5),
+                },
+                index=index,
+            ),
+            how="outer",
+        )
 
-    parabolic_df = parabolic_sar(inputs, **config_map["parabolic_sar"])
-    indicators = indicators.join(parabolic_df, how="outer")
+    if toggles.get("indicator_atr", True):
+        atr_df = average_true_range(inputs, period=int(config_map["atr"]["period"]))
+        indicators = indicators.join(atr_df, how="outer")
 
-    pivot_df = pivot_points(inputs, **config_map["pivot_points"])
-    indicators = indicators.join(pivot_df, how="outer")
+    if toggles.get("indicator_supertrend", True):
+        supertrend_df = supertrend(
+            inputs,
+            period=int(config_map["supertrend"]["period"]),
+            multiplier=float(config_map["supertrend"]["multiplier"]),
+        )
+        indicators = indicators.join(supertrend_df, how="outer")
 
-    wavetrend_df = wavetrend(inputs, **config_map["wavetrend"])
-    indicators = indicators.join(wavetrend_df, how="outer")
+    if toggles.get("indicator_ichimoku", True):
+        ichimoku_df = ichimoku(inputs, **config_map["ichimoku"])
+        indicators = indicators.join(ichimoku_df, how="outer")
 
-    liquidity_df = liquidity_proxies(inputs, **config_map["liquidity"])
-    indicators = indicators.join(liquidity_df, how="outer")
+    if toggles.get("indicator_stochastic", True):
+        stochastic_df = stochastic(inputs, **config_map["stochastic"])
+        indicators = indicators.join(stochastic_df, how="outer")
 
-    vwap_df = volume_weighted_average_price(inputs)
-    indicators = indicators.join(vwap_df, how="outer")
+    if toggles.get("indicator_adx", True):
+        adx_df = adx_dmi(inputs, period=int(config_map["adx"]["period"]))
+        indicators = indicators.join(adx_df, how="outer")
 
-    cci_df = commodity_channel_index(inputs, period=int(config_map["cci"]["period"]))
-    indicators = indicators.join(cci_df, how="outer")
+    if toggles.get("indicator_parabolic_sar", True):
+        parabolic_df = parabolic_sar(inputs, **config_map["parabolic_sar"])
+        indicators = indicators.join(parabolic_df, how="outer")
+
+    if toggles.get("indicator_pivot_points", True):
+        pivot_df = pivot_points(inputs, **config_map["pivot_points"])
+        indicators = indicators.join(pivot_df, how="outer")
+
+    if toggles.get("indicator_wavetrend", True):
+        wavetrend_df = wavetrend(inputs, **config_map["wavetrend"])
+        indicators = indicators.join(wavetrend_df, how="outer")
+
+    if toggles.get("indicator_liquidity", True):
+        liquidity_df = liquidity_proxies(inputs, **config_map["liquidity"])
+        indicators = indicators.join(liquidity_df, how="outer")
+
+    if toggles.get("indicator_vwap", True):
+        vwap_df = volume_weighted_average_price(inputs)
+        indicators = indicators.join(vwap_df, how="outer")
+
+    if toggles.get("indicator_cci", True):
+        cci_df = commodity_channel_index(inputs, period=int(config_map["cci"]["period"]))
+        indicators = indicators.join(cci_df, how="outer")
 
     anchor = config_map["anchored_vwap"].get("anchor")
-    if anchor:
+    if anchor and toggles.get("indicator_vwap", True):
         indicators = indicators.join(anchored_vwap(inputs, anchor=anchor), how="outer")
 
-    indicators = indicators.join(on_balance_volume(inputs), how="outer")
-    indicators = indicators.join(money_flow_index(inputs, period=int(config_map["mfi"]["period"])) , how="outer")
+    if toggles.get("indicator_obv", True):
+        indicators = indicators.join(on_balance_volume(inputs), how="outer")
+    if toggles.get("indicator_mfi", True):
+        indicators = indicators.join(money_flow_index(inputs, period=int(config_map["mfi"]["period"])) , how="outer")
 
     adl_config = config_map["adl"]
-    if adl_config.get("enabled", True):
+    if adl_config.get("enabled", True) and toggles.get("indicator_adl", True):
         indicators = indicators.join(accumulation_distribution_line(inputs), how="outer")
         if adl_config.get("chaikin_enabled", False):
             indicators = indicators.join(
@@ -240,8 +328,45 @@ def compute_indicators(
                 how="outer",
             )
 
-    composite_df = composite_score(indicators, columns=config_map["composite"].get("columns"))
-    indicators = indicators.join(composite_df, how="outer")
+    if toggles.get("indicator_composite", True):
+        composite_df = composite_score(indicators, columns=config_map["composite"].get("columns"))
+        indicators = indicators.join(composite_df, how="outer")
+
+    if toggles.get("indicator_fibonacci_retracement", True):
+        fib_df = fibonacci_retracement(inputs, **config_map["fibonacci_retracement"])
+        indicators = indicators.join(fib_df, how="outer")
+
+    if toggles.get("indicator_volume_profile", True):
+        volume_profile_df = volume_profile(inputs, **config_map["volume_profile"])
+        indicators = indicators.join(volume_profile_df, how="outer")
+
+    if toggles.get("indicator_williams_r_trend_exhaustion", True):
+        wpr_df = williams_r_trend_exhaustion(inputs, **config_map["williams_r_trend_exhaustion"])
+        indicators = indicators.join(wpr_df, how="outer")
+
+    if toggles.get("indicator_koncorde", True):
+        koncorde_df = koncorde(inputs, **config_map["koncorde"])
+        indicators = indicators.join(koncorde_df, how="outer")
+
+    if toggles.get("indicator_cm_williams_vix_fix", True):
+        wvf_df = cm_williams_vix_fix(inputs, **config_map["cm_williams_vix_fix"])
+        indicators = indicators.join(wvf_df, how="outer")
+
+    if toggles.get("indicator_hull_suite", True):
+        hull_df = hull_suite(inputs, **config_map["hull_suite"])
+        indicators = indicators.join(hull_df, how="outer")
+
+    if toggles.get("indicator_laguerre_multi_filter", True):
+        laguerre_df = laguerre_multi_filter(inputs, **config_map["laguerre_multi_filter"])
+        indicators = indicators.join(laguerre_df, how="outer")
+
+    if toggles.get("indicator_lorentzian_classification", True):
+        lorentzian_df = lorentzian_classification(inputs, **config_map["lorentzian_classification"])
+        indicators = indicators.join(lorentzian_df, how="outer")
+
+    if toggles.get("indicator_smart_money_concepts", True):
+        smc_df = smart_money_concepts(inputs, **config_map["smart_money_concepts"])
+        indicators = indicators.join(smc_df, how="outer")
 
     indicators = indicators.ffill().bfill()
     return IndicatorResult(indicators, list(indicators.columns))

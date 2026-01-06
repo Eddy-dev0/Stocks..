@@ -162,6 +162,12 @@ def default_feature_toggles(
             name: bool(blueprint.get("default_enabled", False))
             for name, blueprint in REGISTRY_BLUEPRINT.items()
         }
+    try:
+        from ..indicator_library import default_indicator_toggles
+
+        defaults.update(default_indicator_toggles())
+    except Exception:  # pragma: no cover - defensive fallback
+        pass
     return FeatureToggles.from_any(defaults)
 
 
