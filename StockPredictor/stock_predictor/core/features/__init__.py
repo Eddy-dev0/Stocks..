@@ -66,6 +66,7 @@ def _technical_group_builder(context: FeatureBuildContext) -> FeatureBuildOutput
     block, metadata = _build_technical_features(
         context.price_df,
         indicator_config=context.technical_indicator_config,
+        indicator_toggles=context.feature_toggles.asdict(),
     )
     blocks = [block] if block is not None else []
     status = "executed" if blocks else "skipped_no_data"
@@ -498,6 +499,7 @@ def _build_technical_features(
     price_df: pd.DataFrame,
     *,
     indicator_config: Mapping[str, Mapping[str, object]] | None,
+    indicator_toggles: Mapping[str, bool] | None = None,
 ) -> tuple[FeatureBlock | None, dict[str, object]]:
     metadata: dict[str, object] = {}
     if price_df.empty:
@@ -512,7 +514,7 @@ def _build_technical_features(
     indicator_result = compute_indicators(
         df,
         indicator_config,
-        indicator_toggles=context.feature_toggles.asdict(),
+        indicator_toggles=indicator_toggles,
     )
     indicator_frame = indicator_result.dataframe.reset_index(drop=True)
     metadata["indicator_columns"] = list(indicator_result.columns)
