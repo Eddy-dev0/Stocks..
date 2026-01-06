@@ -225,15 +225,18 @@ def compute_indicators(
         macd = ema12 - ema26
         signal = macd.ewm(span=9, adjust=False, min_periods=1).mean()
         histogram = macd - signal
+        macd_payload = {
+            "MACD_12_26_9_Line": macd,
+            "MACD_12_26_9_Signal": signal,
+            "MACD_12_26_9_Hist": histogram,
+        }
+        if "EMA_12" not in indicators.columns:
+            macd_payload["EMA_12"] = ema12
+        if "EMA_26" not in indicators.columns:
+            macd_payload["EMA_26"] = ema26
         indicators = indicators.join(
             pd.DataFrame(
-                {
-                    "EMA_12": ema12,
-                    "EMA_26": ema26,
-                    "MACD_12_26_9_Line": macd,
-                    "MACD_12_26_9_Signal": signal,
-                    "MACD_12_26_9_Hist": histogram,
-                },
+                macd_payload,
                 index=index,
             ),
             how="outer",
