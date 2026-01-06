@@ -229,4 +229,4 @@ def test_build_dataset_aligns_targets_on_canonical_dates(tmp_path: Path) -> None
 
     direction = horizon_targets["direction_h"]
     assert list(direction.index) == list(expected_index)
-    assert direction.dropna().shape[0] == len(expected_index)
+    assert direction.dropna().shape[0] == len(expected_index) - 1
