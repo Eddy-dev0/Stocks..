@@ -209,6 +209,7 @@ class FeatureAssembler:
             macro_df=context_macro,
             sentiment_enabled=sentiment_enabled,
             technical_indicator_config=self.technical_indicator_config,
+            feature_toggles=self.feature_toggles,
             regime_params=self.regime_params,
             event_params=self.event_params,
         )
