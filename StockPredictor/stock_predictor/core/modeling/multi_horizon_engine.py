@@ -577,6 +577,20 @@ class MultiHorizonModelingEngine:
     # ------------------------------------------------------------------
     # Training and persistence
     # ------------------------------------------------------------------
+    @staticmethod
+    def _summarize_horizon_samples(
+        sample_counts: Mapping[int, Mapping[str, int]],
+        requested_targets: Iterable[str],
+    ) -> dict[int, int]:
+        target_list = list(requested_targets)
+        horizon_samples: dict[int, int] = {}
+        for horizon, counts in sample_counts.items():
+            horizon_samples[int(horizon)] = max(
+                (int(counts.get(target, 0)) for target in target_list),
+                default=0,
+            )
+        return horizon_samples
+
     def _build_preprocessor(self, features: pd.DataFrame) -> Pipeline:
         numeric_cols = [col for col in features.columns if pd.api.types.is_numeric_dtype(features[col])]
         categorical_cols = [col for col in features.columns if col not in numeric_cols]
@@ -645,23 +659,56 @@ class MultiHorizonModelingEngine:
         horizon: int | None = None,
         force: bool = False,
     ) -> dict[str, Any]:
-        horizons = (int(horizon),) if horizon else tuple(self.config.prediction_horizons)
+        requested_horizons = (int(horizon),) if horizon else tuple(self.config.prediction_horizons)
         requested_targets = set(targets) if targets else {"close_h", "direction_h", "return_h", "return_oc_h"}
-        dataset = self.build_dataset(horizons=horizons, targets=requested_targets)
+        dataset_horizons = (
+            tuple(self.config.prediction_horizons)
+            if self.config.use_max_historical_data
+            else requested_horizons
+        )
+        dataset = self.build_dataset(horizons=dataset_horizons, targets=requested_targets)
 
         sample_counts = dataset.metadata.get("target_counts") or dataset.count_targets()
-        requested_counts = {
-            int(h): {t: int(sample_counts.get(int(h), {}).get(t, 0)) for t in sorted(requested_targets)}
-            for h in horizons
-        }
+        horizon_sample_counts = self._summarize_horizon_samples(
+            sample_counts, requested_targets
+        )
         min_samples = int(
             getattr(
                 self.config, "min_samples_per_horizon", DEFAULT_MIN_SAMPLES_PER_HORIZON
             )
         )
+        effective_min_samples = min_samples
+        horizons = requested_horizons
+        if self.config.use_max_historical_data and horizon_sample_counts:
+            available_horizons = [
+                h for h, count in horizon_sample_counts.items() if count > 0
+            ]
+            if available_horizons:
+                max_available_horizon = max(available_horizons)
+                if (
+                    len(horizons) == 1
+                    and horizon_sample_counts.get(int(horizons[0]), 0) == 0
+                ):
+                    horizons = (int(max_available_horizon),)
+                    effective_min_samples = min(
+                        effective_min_samples,
+                        horizon_sample_counts.get(int(max_available_horizon), 0),
+                    )
+
+        requested_counts = {
+            int(h): {
+                t: int(sample_counts.get(int(h), {}).get(t, 0))
+                for t in sorted(requested_targets)
+            }
+            for h in horizons
+        }
         missing_targets = {}
         for horizon_value, horizon_counts in requested_counts.items():
-            missing = {t: count for t, count in horizon_counts.items() if count < min_samples}
+            missing = {
+                t: count
+                for t, count in horizon_counts.items()
+                if count < effective_min_samples
+            }
             if missing:
                 missing_targets[int(horizon_value)] = missing
 
@@ -726,14 +773,16 @@ class MultiHorizonModelingEngine:
             ]
             aligned_features = aligned_features.dropna(axis=1, how="all")
             preprocessor = self._build_preprocessor(aligned_features)
-            if not any(count >= min_samples for count in horizon_counts.values()):
+            if not any(
+                count >= effective_min_samples for count in horizon_counts.values()
+            ):
                 latest_timestamp = _latest_ts(dataset.features)
                 checked_at = pd.Timestamp.now(tz="UTC")
                 LOGGER.warning(
                     "Horizon %s does not meet minimum sample requirements (max=%s, min=%s); skipping training.",
                     horizon_value,
                     max(horizon_counts.values(), default=0),
-                    min_samples,
+                    effective_min_samples,
                 )
                 self._untrainable_until[int(horizon_value)] = {
                     "data_timestamp": latest_timestamp,
@@ -759,7 +808,7 @@ class MultiHorizonModelingEngine:
             below_threshold = {
                 target: count
                 for target, count in horizon_counts.items()
-                if 0 < count < min_samples
+                if 0 < count < effective_min_samples
             }
             for target_name, count in below_threshold.items():
                 LOGGER.warning(
@@ -767,7 +816,7 @@ class MultiHorizonModelingEngine:
                     target_name,
                     horizon_value,
                     count,
-                    min_samples,
+                    effective_min_samples,
                 )
 
             target_metrics: dict[str, Any] = {}
@@ -779,7 +828,7 @@ class MultiHorizonModelingEngine:
                 if target_name not in requested_targets:
                     continue
                 target_count = horizon_counts.get(target_name, 0)
-                if target_count < min_samples:
+                if target_count < effective_min_samples:
                     continue
                 y = series.dropna()
                 if y.empty:
@@ -935,6 +984,29 @@ class MultiHorizonModelingEngine:
         horizon: int | None = None,
     ) -> PredictionOutcome:
         resolved_horizon = int(horizon or min(self.config.prediction_horizons))
+        requested_targets = set(targets) if targets else {"close_h", "direction_h", "return_h", "return_oc_h"}
+        if self.config.use_max_historical_data:
+            try:
+                dataset = self.build_dataset(
+                    horizons=self.config.prediction_horizons,
+                    targets=requested_targets,
+                )
+            except InsufficientSamplesError:
+                dataset = None
+            if dataset is not None:
+                sample_counts = dataset.metadata.get("target_counts") or dataset.count_targets()
+                horizon_sample_counts = self._summarize_horizon_samples(
+                    sample_counts, requested_targets
+                )
+                available_horizons = [
+                    horizon_value
+                    for horizon_value, count in horizon_sample_counts.items()
+                    if count > 0
+                ]
+                if available_horizons:
+                    max_available_horizon = max(available_horizons)
+                    if horizon_sample_counts.get(resolved_horizon, 0) == 0:
+                        resolved_horizon = int(max_available_horizon)
         
         def _to_utc(timestamp: pd.Timestamp | None) -> pd.Timestamp | None:
             if timestamp is None:

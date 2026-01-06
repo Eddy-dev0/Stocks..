@@ -351,7 +351,9 @@ class StockPredictorDesktopApp:
 
     def __init__(self, root: tk.Tk, application: StockPredictorApplication | None = None) -> None:
         self.root = root
-        self.application = application or StockPredictorApplication.from_environment()
+        self.application = application or StockPredictorApplication.from_environment(
+            use_max_historical_data=True
+        )
         self.config = self.application.config
         self.market_timezone: ZoneInfo = resolve_market_timezone(self.config)
         self.root.title(f"Stock Predictor – {self.config.ticker}")
@@ -3722,7 +3724,7 @@ class StockPredictorDesktopApp:
         if status == "no_data":
             friendly_message = (
                 message
-                or f"Not enough historical data to generate predictions for {self.config.ticker} (horizon {payload_horizon or horizon_arg}) yet."
+                or "Prediction unavailable due to insufficient samples."
             )
             LOGGER.info(friendly_message)
             self._log_prediction_unavailability(
@@ -3868,9 +3870,7 @@ class StockPredictorDesktopApp:
         if status == "no_data":
             summary = f"Prediction unavailable (status={status}, reason={reason or 'unknown'})"
             LOGGER.warning(summary)
-            user_message = message or (
-                f"Not enough historical data to generate predictions for {self.config.ticker} yet."
-            )
+            user_message = message or "Prediction unavailable due to insufficient samples."
             LOGGER.info(user_message)
             self.current_prediction = {}
             self.feature_snapshot = None
@@ -3943,7 +3943,7 @@ class StockPredictorDesktopApp:
         messagebox.showwarning("No price data", detail)
 
     def _on_insufficient_samples(self, exc: InsufficientSamplesError) -> None:
-        message = "Not enough historical data to generate predictions yet."
+        message = "Prediction unavailable due to insufficient samples."
         detail_lines: list[str] = []
         min_samples = getattr(self.config, "min_samples_per_horizon", None)
         if min_samples:
@@ -6141,7 +6141,9 @@ def run_tkinter_app() -> None:
 
     root = tk.Tk()
     try:
-        application = StockPredictorApplication.from_environment()
+        application = StockPredictorApplication.from_environment(
+            use_max_historical_data=True
+        )
     except Exception as exc:  # pragma: no cover - initialisation guard
         LOGGER.exception("Failed to initialise application: %s", exc)
         messagebox.showerror("Initialisation failed", str(exc))
