@@ -48,6 +48,7 @@ from ..features import FeatureAssembler, FeatureToggles
 from ..indicator_bundle import evaluate_signal_confluence
 from ..training_data import TrainingDatasetBuilder
 from ...evaluation.backtester import BacktestConfig, Backtester
+from ...evaluation.simulation_backtester import SimulationBacktestConfig, SimulationBacktester
 from .multi_horizon_engine import MultiHorizonModelingEngine
 from ..ml_preprocessing import (
     DataFrameSimpleImputer,
@@ -6551,6 +6552,53 @@ class StockPredictorAI:
                 "reliability": result.reliability,
                 "interval_coverage": result.interval_coverage,
             },
+        )
+        return payload
+
+    def run_simulation_backtest(
+        self,
+        targets: Optional[Iterable[str]] = None,
+        horizon: Optional[int] = None,
+        *,
+        simulation_config: SimulationBacktestConfig | None = None,
+    ) -> Dict[str, Any]:
+        resolved_horizon = self._resolve_horizon(horizon)
+        requested_targets = tuple(targets) if targets else tuple(self.config.prediction_targets)
+
+        default_config = SimulationBacktestConfig(
+            horizon=resolved_horizon,
+            targets=requested_targets,
+            random_seed=getattr(self.config, "random_seed", None),
+            parallelism=max(1, int(getattr(self.config, "direction_bootstrap_workers", 1) or 1)),
+        )
+        cfg = default_config
+        if simulation_config is not None:
+            merged = {
+                **default_config.__dict__,
+                **{k: v for k, v in simulation_config.__dict__.items() if v is not None},
+            }
+            cfg = SimulationBacktestConfig(**merged)
+
+        backtester = SimulationBacktester(self.config, trainer=self)
+        result = backtester.run(targets=requested_targets, horizon=resolved_horizon, sim_config=cfg)
+
+        payload = result.as_dict()
+        payload["horizon"] = resolved_horizon
+        payload["targets"] = requested_targets
+        self.metadata["simulation_backtest"] = payload.get("summary", {})
+        self.tracker.log_run(
+            target=",".join(requested_targets),
+            run_type="simulation_backtest",
+            parameters={
+                "simulations": cfg.simulations,
+                "batch_size": cfg.batch_size,
+                "window_size": cfg.window_size,
+                "parallelism": cfg.parallelism,
+                "seed": cfg.random_seed,
+                "tolerance": cfg.tolerance,
+            },
+            metrics=payload.get("summary"),
+            context={"results": payload.get("results"), "horizon": resolved_horizon},
         )
         return payload
 
