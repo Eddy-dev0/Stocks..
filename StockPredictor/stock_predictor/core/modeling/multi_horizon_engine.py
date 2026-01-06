@@ -802,13 +802,22 @@ class MultiHorizonModelingEngine:
                 json.dump(target_sample_counts, handle, indent=2)
 
         if not artefacts:
-            raise InsufficientSamplesError(
-                "Insufficient samples to train any requested horizons.",
-                horizons=horizons,
-                targets=tuple(sorted(requested_targets)),
-                sample_counts=requested_counts,
-                missing_targets=missing_targets,
+            LOGGER.warning(
+                "Kein Horizon hat genügend Samples; Training wird übersprungen."
             )
+            metadata = {
+                **dataset.metadata,
+                "artefacts": {},
+            }
+            return {
+                "status": "no_data",
+                "reason": "insufficient_samples",
+                "horizons": horizons,
+                "targets": requested_targets,
+                "metadata": metadata,
+                "sample_counts": requested_counts,
+                "missing_targets": missing_targets,
+            }
 
         metadata = {
             **dataset.metadata,
