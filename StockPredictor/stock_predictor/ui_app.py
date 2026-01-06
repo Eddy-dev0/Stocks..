@@ -43,6 +43,7 @@ from stock_predictor.core.pipeline import (
     resolve_market_timezone,
 )
 from stock_predictor.core.features import FEATURE_REGISTRY, FeatureToggles
+from stock_predictor.core.indicator_library import default_indicator_toggles
 from stock_predictor.core.preprocessing import derive_price_feature_toggles
 from stock_predictor.core.modeling import InsufficientSamplesError
 from stock_predictor.core.support_levels import indicator_support_floor
@@ -101,6 +102,7 @@ NON_REMOTE_PROVIDER_IDS = {"database", "local", "placeholder", "unknown"}
 IMPLEMENTED_FEATURE_GROUPS: set[str] = {
     name for name, spec in FEATURE_REGISTRY.items() if spec.implemented
 }
+INDICATOR_TOGGLE_DEFAULTS = default_indicator_toggles()
 
 
 def _normalise_currency_code(value: Any) -> str | None:
@@ -457,6 +459,8 @@ class StockPredictorDesktopApp:
         self.indicator_secondary_ax: Axes | None = None
         self._indicator_extra_axes: list[Axes] = []
         self._indicator_family_colors: dict[str, str] = {}
+        self.indicator_snapshot_tree: ttk.Treeview | None = None
+        self.indicator_snapshot_label_var = tk.StringVar(value="Latest snapshot: —")
         self.feature_group_detail_tree: ttk.Treeview | None = None
         self.feature_usage_text: tk.Text | None = None
         self.feature_group_summary_text: tk.Text | None = None
@@ -984,6 +988,7 @@ class StockPredictorDesktopApp:
             ("last_close", "Last price", None),
             ("predicted_close", "Predicted close", None),
             ("expected_low", "Expected low", None),
+            ("confidence_interval", "Prediction band (10–90%)", None),
             (
                 "stop_loss",
                 "Recommended Stop-Loss Price",
@@ -992,6 +997,7 @@ class StockPredictorDesktopApp:
             ("expected_change", "Expected change", None),
             ("daily_change", "Daily change", None),
             ("direction", "Direction", None),
+            ("backtest_accuracy", "Backtest accuracy", None),
         ]
         for column in range(4):
             weight = 1 if column % 2 == 1 else 0
@@ -1221,7 +1227,8 @@ class StockPredictorDesktopApp:
     def _build_indicators_tab(self) -> None:
         frame = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(frame, text="Indicators")
-        frame.grid_rowconfigure(0, weight=1)
+        frame.grid_rowconfigure(0, weight=3)
+        frame.grid_rowconfigure(1, weight=1)
         frame.grid_columnconfigure(0, weight=3)
         frame.grid_columnconfigure(1, weight=1)
 
@@ -1246,6 +1253,38 @@ class StockPredictorDesktopApp:
         )
         self.indicator_chart_message.grid(row=0, column=0, sticky="nsew")
         self.indicator_price_canvas_widget.grid_remove()
+
+        snapshot_frame = ttk.LabelFrame(
+            frame, text="Indicator & strategy snapshot", padding=8
+        )
+        snapshot_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        snapshot_frame.grid_columnconfigure(0, weight=1)
+        snapshot_frame.grid_rowconfigure(1, weight=1)
+        snapshot_label = ttk.Label(
+            snapshot_frame,
+            textvariable=self.indicator_snapshot_label_var,
+            anchor=tk.W,
+        )
+        snapshot_label.grid(row=0, column=0, sticky="ew")
+        snapshot_tree = ttk.Treeview(
+            snapshot_frame,
+            columns=("indicator", "value", "type"),
+            show="headings",
+            height=6,
+        )
+        snapshot_tree.heading("indicator", text="Indicator / Signal")
+        snapshot_tree.heading("value", text="Value")
+        snapshot_tree.heading("type", text="Type")
+        snapshot_tree.column("indicator", width=200, anchor=tk.W)
+        snapshot_tree.column("value", width=120, anchor=tk.E)
+        snapshot_tree.column("type", width=120, anchor=tk.CENTER)
+        snapshot_tree.grid(row=1, column=0, sticky="nsew")
+        snapshot_scroll = ttk.Scrollbar(
+            snapshot_frame, orient=tk.VERTICAL, command=snapshot_tree.yview
+        )
+        snapshot_scroll.grid(row=1, column=1, sticky="ns")
+        snapshot_tree.configure(yscrollcommand=snapshot_scroll.set)
+        self.indicator_snapshot_tree = snapshot_tree
 
         sidebar = ttk.Frame(frame, padding=(12, 0, 0, 0))
         sidebar.grid(row=0, column=1, sticky="nsew")
@@ -1572,11 +1611,33 @@ class StockPredictorDesktopApp:
         toggles_box.columnconfigure(0, weight=1)
         toggles_box.columnconfigure(1, weight=1)
 
+        indicator_box = ttk.LabelFrame(frame, text="Indicator & strategy toggles", padding=8)
+        indicator_box.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
+        indicator_box.columnconfigure(0, weight=1)
+        indicator_box.columnconfigure(1, weight=1)
+        indicator_names = sorted(INDICATOR_TOGGLE_DEFAULTS)
+        for idx, name in enumerate(indicator_names):
+            enabled = bool(self.config.feature_toggles.get(name, INDICATOR_TOGGLE_DEFAULTS.get(name)))
+            var = tk.BooleanVar(value=enabled)
+            self.feature_toggle_vars[name] = var
+            label = name.replace("indicator_", "").replace("_", " ").title()
+            if "lorentzian" in name:
+                label = "Lorentzian Classification (Strategy)"
+            elif "smart_money" in name:
+                label = "Smart Money Concepts (Strategy)"
+            check = ttk.Checkbutton(
+                indicator_box,
+                text=label,
+                variable=var,
+                command=self._on_feature_toggle_changed,
+            )
+            check.grid(row=idx // 2, column=idx % 2, sticky=tk.W, padx=6, pady=4)
+
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------
     def _on_refresh(self) -> None:
-        self._run_async(self._refresh_data_only, "Refreshing market data…")
+        self._run_async(self._refresh_and_predict, "Refreshing market data…")
 
     def _on_predict(self) -> None:
         self._run_async(self._predict_only, "Generating prediction…")
@@ -2329,6 +2390,95 @@ class StockPredictorDesktopApp:
 
         confidence_display = self._compute_confidence_metric()
         self.indicator_info_vars["confidence"].set(confidence_display)
+
+    def _indicator_signal_type(self, name: str) -> str:
+        label = str(name).strip().lower()
+        if label.startswith("lorentzian") or label.startswith("smc_"):
+            return "Strategy"
+        return "Technical"
+
+    def _latest_indicator_snapshot(self) -> tuple[str | None, list[dict[str, Any]]]:
+        indicator_history = (
+            self.indicator_history_converted
+            if isinstance(self.indicator_history_converted, pd.DataFrame)
+            else self.indicator_history
+        )
+        if not isinstance(indicator_history, pd.DataFrame) or indicator_history.empty:
+            return None, []
+
+        frame = indicator_history.copy()
+        columns = {str(column).lower(): column for column in frame.columns}
+        date_col = columns.get("date") or columns.get("as_of") or columns.get("timestamp")
+        if date_col is None:
+            frame["__as_of"] = pd.to_datetime(frame.index, errors="coerce")
+            date_col = "__as_of"
+        else:
+            frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
+        frame = frame.dropna(subset=[date_col]).sort_values(date_col)
+        if frame.empty:
+            return None, []
+
+        indicator_col = columns.get("indicator")
+        value_col = columns.get("value")
+        category_col = columns.get("category")
+        if indicator_col is None or value_col is None:
+            return None, []
+
+        latest_date = frame[date_col].max()
+        latest_frame = frame[frame[date_col] == latest_date]
+        rows: list[dict[str, Any]] = []
+        for _, row in latest_frame.iterrows():
+            indicator_name = row.get(indicator_col)
+            value = row.get(value_col)
+            category = row.get(category_col) if category_col else None
+            rows.append(
+                {
+                    "indicator": indicator_name,
+                    "value": value,
+                    "type": self._indicator_signal_type(indicator_name),
+                    "category": category,
+                }
+            )
+        return (
+            latest_date.strftime("%Y-%m-%d") if hasattr(latest_date, "strftime") else str(latest_date),
+            rows,
+        )
+
+    def _format_indicator_value(self, value: Any) -> str:
+        numeric = _safe_float(value)
+        if numeric is None:
+            return "—"
+        if abs(numeric) >= 1000:
+            return f"{numeric:,.2f}"
+        if abs(numeric) >= 1:
+            return f"{numeric:.4f}"
+        return f"{numeric:.6f}"
+
+    def _update_indicator_snapshot_table(self) -> None:
+        tree = self.indicator_snapshot_tree
+        if tree is None:
+            return
+        for item in tree.get_children():
+            tree.delete(item)
+
+        latest_date, rows = self._latest_indicator_snapshot()
+        label = f"Latest snapshot: {latest_date}" if latest_date else "Latest snapshot: —"
+        self.indicator_snapshot_label_var.set(label)
+        if not rows:
+            tree.insert("", tk.END, values=("No indicators available", "—", "—"))
+            return
+
+        rows = sorted(rows, key=lambda entry: (entry["type"] != "Strategy", str(entry["indicator"])))
+        for entry in rows[:40]:
+            tree.insert(
+                "",
+                tk.END,
+                values=(
+                    entry["indicator"],
+                    self._format_indicator_value(entry.get("value")),
+                    entry.get("type") or entry.get("category") or "—",
+                ),
+            )
 
     def _render_feature_details_text(self) -> str:
         sections: list[str] = []
@@ -4381,6 +4531,64 @@ class StockPredictorDesktopApp:
             expected_low = max(expected_low, floor_value)
         return float(expected_low)
 
+    def _resolve_prediction_band(
+        self, prediction: Mapping[str, Any] | None
+    ) -> tuple[float | None, float | None]:
+        if not isinstance(prediction, Mapping):
+            return None, None
+
+        def _extract_bounds(block: Mapping[str, Any] | None) -> tuple[float | None, float | None]:
+            if not isinstance(block, Mapping):
+                return None, None
+            lower = None
+            upper = None
+            for key in ("lower", "low", "p10", "q10", "10%", "0.1"):
+                lower = _safe_float(block.get(key))
+                if lower is not None:
+                    break
+            for key in ("upper", "high", "p90", "q90", "90%", "0.9"):
+                upper = _safe_float(block.get(key))
+                if upper is not None:
+                    break
+            return lower, upper
+
+        for key in ("prediction_intervals", "quantile_forecasts", "close_quantiles"):
+            block = prediction.get(key)
+            if isinstance(block, Mapping):
+                candidate = block.get("close") if isinstance(block.get("close"), Mapping) else block
+                lower, upper = _extract_bounds(candidate)
+                if lower is not None or upper is not None:
+                    return lower, upper
+
+        lower = _safe_float(
+            prediction.get("pred_low_q10")
+            or prediction.get("pred_close_q10")
+            or prediction.get("pred_q10")
+        )
+        upper = _safe_float(
+            prediction.get("pred_high_q90")
+            or prediction.get("pred_close_q90")
+            or prediction.get("pred_q90")
+        )
+        return lower, upper
+
+    def _format_accuracy_summary(self, horizon: int | None) -> str:
+        try:
+            summary = self.application.accuracy(horizon=horizon)
+        except Exception as exc:  # pragma: no cover - depends on backtest artifacts
+            LOGGER.debug("Accuracy summary unavailable: %s", exc)
+            return "—"
+        total = summary.get("total_predictions")
+        correct_pct = summary.get("correct_pct")
+        horizon_value = summary.get("horizon") or horizon
+        if not total or correct_pct is None:
+            return "—"
+        horizon_label = f"horizon-{horizon_value}" if horizon_value else "active horizon"
+        return (
+            f"The model correctly predicted the {horizon_label} close in "
+            f"{correct_pct * 100:.1f}% of {int(total):,} simulations."
+        )
+
     def _indicator_expected_low_from_local_data(self) -> float | None:
         frames: list[pd.DataFrame] = []
         snapshot = getattr(self, "feature_snapshot", None)
@@ -4629,6 +4837,18 @@ class StockPredictorDesktopApp:
             fmt_ccy(expected_low_converted, self.currency_symbol, decimals=decimals)
         )
 
+        band_low, band_high = self._resolve_prediction_band(prediction)
+        band_low_converted = self._convert_currency(band_low)
+        band_high_converted = self._convert_currency(band_high)
+        if band_low_converted is not None and band_high_converted is not None:
+            band_display = (
+                f"{fmt_ccy(band_low_converted, self.currency_symbol, decimals=decimals)}"
+                f" to {fmt_ccy(band_high_converted, self.currency_symbol, decimals=decimals)}"
+            )
+        else:
+            band_display = "—"
+        self.metric_vars["confidence_interval"].set(band_display)
+
         predicted_volatility = None
         if isinstance(prediction, Mapping):
             predicted_volatility = _safe_float(prediction.get("predicted_volatility"))
@@ -4758,6 +4978,10 @@ class StockPredictorDesktopApp:
         if hit_prob_str != "—":
             parts.append(f"🎯 {hit_prob_str}")
         self.metric_vars["direction"].set("   ".join(parts) if parts else "—")
+
+        horizon_value = self.selected_horizon_offset if self.selected_horizon_offset > 0 else None
+        accuracy_display = self._format_accuracy_summary(horizon_value)
+        self.metric_vars["backtest_accuracy"].set(accuracy_display)
 
         sentiment_error = prediction.get("sentiment_error") if isinstance(prediction, Mapping) else None
         avg_sentiment, trend_sentiment = self._resolve_sentiment_snapshot(prediction)
@@ -5225,6 +5449,7 @@ class StockPredictorDesktopApp:
         self._update_indicator_toggle_button_state(indicator_names, selections)
         self._update_indicator_info_panel(indicator_names)
         self._update_indicator_chart(selections)
+        self._update_indicator_snapshot_table()
 
     def _update_explanation(self) -> None:
         prediction = self.current_prediction or {}

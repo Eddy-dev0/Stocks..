@@ -18,6 +18,7 @@ from stock_predictor.core.features import (
     FeatureToggles,
     default_feature_toggles,
 )
+from stock_predictor.core.indicator_library import default_indicator_toggles
 from stock_predictor.core.config import PredictorConfig
 
 DEFAULT_API_URL = os.getenv("STOCK_PREDICTOR_API_URL", "http://localhost:8000")
@@ -34,13 +35,16 @@ DEFAULT_MONTE_CARLO_THRESHOLD = PredictorConfig.__dataclass_fields__[
 IMPLEMENTED_FEATURE_GROUPS = {
     name for name, spec in FEATURE_REGISTRY.items() if getattr(spec, "implemented", False)
 }
+INDICATOR_TOGGLE_DEFAULTS = default_indicator_toggles()
+DEFAULT_TOGGLE_DEFAULTS = {
+    name: enabled
+    for name, enabled in default_feature_toggles().items()
+    if name in IMPLEMENTED_FEATURE_GROUPS or name.startswith("indicator_")
+}
+DEFAULT_TOGGLE_DEFAULTS.update(INDICATOR_TOGGLE_DEFAULTS)
 DEFAULT_FEATURE_TOGGLES = FeatureToggles.from_any(
-    {
-        name: enabled
-        for name, enabled in default_feature_toggles().items()
-        if name in IMPLEMENTED_FEATURE_GROUPS
-    },
-    defaults={name: False for name in IMPLEMENTED_FEATURE_GROUPS},
+    DEFAULT_TOGGLE_DEFAULTS,
+    defaults=DEFAULT_TOGGLE_DEFAULTS,
 )
 
 st.set_page_config(page_title="Stock Predictor Dashboard", layout="wide")
@@ -58,6 +62,7 @@ for key, value in {
     "live_price_response": None,
     "accuracy_response": None,
     "reliability_response": None,
+    "indicator_response": None,
     "feature_toggles": DEFAULT_FEATURE_TOGGLES.copy(),
 }.items():
     st.session_state.setdefault(key, value)
@@ -498,6 +503,57 @@ def _build_live_price_table(snapshot: Dict[str, Any]) -> pd.DataFrame:
         },
     ]
     return pd.DataFrame(rows)
+
+
+def _format_indicator_value(value: Any) -> str:
+    if value is None:
+        return "—"
+    try:
+        numeric = float(value)
+        if abs(numeric) >= 1000:
+            return f"{numeric:,.2f}"
+        if abs(numeric) >= 1:
+            return f"{numeric:.4f}"
+        return f"{numeric:.6f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _render_indicator_snapshot(payload: Mapping[str, Any] | None) -> None:
+    if not isinstance(payload, Mapping):
+        st.caption("Indicator snapshot unavailable.")
+        return
+    latest_records = payload.get("latest") or []
+    indicator_values = payload.get("indicator_values") or []
+    strategy_signals = payload.get("strategy_signals") or []
+    as_of = payload.get("latest_date")
+    if not (latest_records or indicator_values or strategy_signals):
+        st.caption("Indicator snapshot unavailable.")
+        return
+
+    if as_of:
+        st.caption(f"Latest snapshot: {as_of}")
+
+    def _frame(records: list[Mapping[str, Any]]) -> pd.DataFrame:
+        rows = [
+            {
+                "Indicator": entry.get("indicator"),
+                "Value": _format_indicator_value(entry.get("value")),
+                "Type": entry.get("signal_type") or entry.get("category"),
+            }
+            for entry in records
+        ]
+        return pd.DataFrame(rows)
+
+    if indicator_values:
+        st.markdown("**Technical indicators**")
+        st.dataframe(_frame(indicator_values), use_container_width=True, height=220)
+    if strategy_signals:
+        st.markdown("**Strategy signals**")
+        st.dataframe(_frame(strategy_signals), use_container_width=True, height=220)
+    if latest_records and not (indicator_values or strategy_signals):
+        st.markdown("**Indicator snapshot**")
+        st.dataframe(_frame(latest_records), use_container_width=True, height=240)
 
 
 def _beta_band_description(level: str) -> str:
@@ -1145,6 +1201,19 @@ with st.sidebar:
         feature_toggles[name] = st.checkbox(
             label, value=feature_toggles.get(name, default_value)
         )
+
+    st.header("Indicators & strategies")
+    st.caption("Toggle specific technical indicators and strategy signals.")
+    for name in sorted(INDICATOR_TOGGLE_DEFAULTS):
+        clean = name.replace("indicator_", "").replace("_", " ").title()
+        if "lorentzian" in name:
+            clean = "Lorentzian Classification (Strategy)"
+        elif "smart_money" in name:
+            clean = "Smart Money Concepts (Strategy)"
+        default_value = DEFAULT_FEATURE_TOGGLES.get(name, True)
+        feature_toggles[name] = st.checkbox(
+            clean, value=feature_toggles.get(name, default_value)
+        )
     st.session_state["feature_toggles"] = feature_toggles
 
     st.header("Chart overlays")
@@ -1338,6 +1407,12 @@ with col_data:
     if feature_usage.get("indicators"):
         st.caption("Indicators used by the latest forecast run:")
         st.table(pd.DataFrame({"Indicator": feature_usage["indicators"]}))
+    indicator_payload = (
+        (st.session_state.get("indicator_response") or {}).get("indicators")
+        if isinstance(st.session_state.get("indicator_response"), Mapping)
+        else None
+    )
+    _render_indicator_snapshot(indicator_payload)
     _render_model_input_details(forecast_block)
     if st.button("Fetch market data", type="primary"):
         with st.spinner("Loading market data..."):
@@ -1352,7 +1427,32 @@ with col_data:
             )
             if response is not None:
                 st.session_state["data_response"] = response
-                st.success("Market data loaded")
+                indicator_response = _request(
+                    f"/indicators/{ticker}",
+                    method="POST",
+                    json_payload=_with_feature_toggles(
+                        {
+                            "refresh": bool(force_refresh_market),
+                            "include_history": False,
+                        }
+                    ),
+                )
+                if indicator_response is not None:
+                    st.session_state["indicator_response"] = indicator_response
+                forecast_refresh = _request(
+                    f"/forecasts/{ticker}",
+                    method="POST",
+                    json_payload=_with_feature_toggles(
+                        {
+                            "targets": _parse_targets(targets_raw),
+                            "refresh": False,
+                            "horizon": horizon_value,
+                        }
+                    ),
+                )
+                if forecast_refresh is not None:
+                    st.session_state["forecast_response"] = forecast_refresh
+                st.success("Market data loaded and forecast refreshed")
 
     if st.button("Compute tactical buy zone", type="secondary"):
         with st.spinner("Evaluating buy zone..."):
@@ -1527,7 +1627,20 @@ with col_forecast:
             )
             if response is not None:
                 st.session_state["train_response"] = response
-                st.success("Training abgeschlossen")
+                forecast_refresh = _request(
+                    f"/forecasts/{ticker}",
+                    method="POST",
+                    json_payload=_with_feature_toggles(
+                        {
+                            "targets": _parse_targets(targets_raw),
+                            "refresh": False,
+                            "horizon": horizon_value,
+                        }
+                    ),
+                )
+                if forecast_refresh is not None:
+                    st.session_state["forecast_response"] = forecast_refresh
+                st.success("Training abgeschlossen und Vorhersage aktualisiert")
 
     train_response = st.session_state.get("train_response") or {}
     if train_response:
@@ -1554,6 +1667,18 @@ with col_forecast:
             )
             if response is not None:
                 st.session_state["forecast_response"] = response
+                indicator_response = _request(
+                    f"/indicators/{ticker}",
+                    method="POST",
+                    json_payload=_with_feature_toggles(
+                        {
+                            "refresh": False,
+                            "include_history": False,
+                        }
+                    ),
+                )
+                if indicator_response is not None:
+                    st.session_state["indicator_response"] = indicator_response
                 st.success("Trade policy refreshed")
 
     if forecast_response:
@@ -1869,6 +1994,9 @@ with col_forecast:
                 "Incorrect count",
                 f"{int(incorrect_count):,}" if isinstance(incorrect_count, (int, float)) else "—",
             )
+            summary_text = accuracy_payload.get("summary")
+            if summary_text:
+                st.caption(summary_text)
         else:
             st.info("Run a backtest and refresh accuracy to see directional hit rates.")
 
