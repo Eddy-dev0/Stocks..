@@ -422,6 +422,9 @@ class StockPredictorDesktopApp:
             "model": tk.StringVar(),
             "targets": tk.StringVar(),
         }
+        self.use_max_historical_data_var = tk.BooleanVar(
+            value=bool(self.config.use_max_historical_data)
+        )
 
         horizon_values = self.config.prediction_horizons or DEFAULT_PREDICTION_HORIZONS
         self.horizon_notice_var = tk.StringVar(value="")
@@ -1589,6 +1592,20 @@ class StockPredictorDesktopApp:
         self.dark_mode_toggle.grid(row=0, column=1, sticky=tk.W, padx=(12, 0))
 
         self._update_pnl_visibility()
+
+        training_box = ttk.LabelFrame(frame, text="Training preferences", padding=8)
+        training_box.pack(fill=tk.X, pady=(12, 0))
+        self.use_max_historical_data_toggle = ttk.Checkbutton(
+            training_box,
+            text="Use maximum available history for training",
+            variable=self.use_max_historical_data_var,
+            command=self._on_use_max_historical_data_changed,
+        )
+        self.use_max_historical_data_toggle.pack(anchor=tk.W)
+        Tooltip(
+            self.use_max_historical_data_toggle,
+            "When enabled, the model falls back to the horizon with the most data.",
+        )
 
         toggles_box = ttk.LabelFrame(frame, text="Feature toggles", padding=8)
         toggles_box.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
@@ -3577,6 +3594,18 @@ class StockPredictorDesktopApp:
         finally:
             self._set_busy(False, status_message)
 
+    def _on_use_max_historical_data_changed(self) -> None:
+        if self._busy:
+            return
+        enabled = bool(self.use_max_historical_data_var.get())
+        self.config.use_max_historical_data = enabled
+        status = (
+            "Maximum-history training enabled."
+            if enabled
+            else "Maximum-history training disabled."
+        )
+        self._set_status(status)
+
     def _apply_ticker_change(self, raw_value: str | None) -> None:
         if self._busy:
             self._set_status("Operation in progress. Please wait before changing the ticker.")
@@ -3870,7 +3899,13 @@ class StockPredictorDesktopApp:
         if status == "no_data":
             summary = f"Prediction unavailable (status={status}, reason={reason or 'unknown'})"
             LOGGER.warning(summary)
-            user_message = message or "Prediction unavailable due to insufficient samples."
+            if self.config.use_max_historical_data:
+                user_message = (
+                    message
+                    or "No data available for prediction. Maximum-history training is enabled."
+                )
+            else:
+                user_message = message or "Prediction unavailable due to insufficient samples."
             LOGGER.info(user_message)
             self.current_prediction = {}
             self.feature_snapshot = None
@@ -3944,6 +3979,8 @@ class StockPredictorDesktopApp:
 
     def _on_insufficient_samples(self, exc: InsufficientSamplesError) -> None:
         message = "Prediction unavailable due to insufficient samples."
+        if self.config.use_max_historical_data:
+            message = "No data available for prediction. Maximum-history training is enabled."
         detail_lines: list[str] = []
         min_samples = getattr(self.config, "min_samples_per_horizon", None)
         if min_samples:

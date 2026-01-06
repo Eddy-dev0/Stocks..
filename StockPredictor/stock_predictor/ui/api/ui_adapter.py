@@ -78,7 +78,7 @@ async def get_prediction(
     reason = raw_payload.get("reason")
     if status == "no_data":
         message = raw_payload.get("message")
-        log_fn = LOGGER.info if reason == "insufficient_samples" else LOGGER.warning
+        log_fn = LOGGER.info if reason == "no_data" else LOGGER.warning
         log_fn(
             "Prediction unavailable for %s (status=%s, reason=%s)",
             ticker,
