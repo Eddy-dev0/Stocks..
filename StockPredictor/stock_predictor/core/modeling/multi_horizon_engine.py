@@ -168,10 +168,30 @@ class MultiHorizonModelingEngine:
         highs = pd.to_numeric(target_frame[high_col], errors="coerce") if high_col else None
         lows = pd.to_numeric(target_frame[low_col], errors="coerce") if low_col else None
         neutral_threshold = float(getattr(self.config, "direction_neutral_threshold", 0.0))
+        available_samples = int(closes.dropna().shape[0])
+        max_horizon = max(1, available_samples - 1) if available_samples > 1 else 0
         targets: dict[int, dict[str, pd.Series]] = {}
         for horizon in horizons:
-            future_close = closes.shift(-int(horizon))
+            horizon_value = int(horizon)
+            effective_horizon = horizon_value
+            if max_horizon and horizon_value > max_horizon:
+                LOGGER.warning(
+                    "Horizon %s exceeds available samples (%s); falling back to horizon %s for target generation.",
+                    horizon_value,
+                    available_samples,
+                    max_horizon,
+                )
+                effective_horizon = max_horizon
+            elif max_horizon == 0 and available_samples > 0:
+                LOGGER.warning(
+                    "Horizon %s cannot be computed with %s samples; falling back to horizon 0 targets.",
+                    horizon_value,
+                    available_samples,
+                )
+                effective_horizon = 0
+            future_close = closes.shift(-effective_horizon)
             returns = (future_close - closes) / closes
+            valid_mask = future_close.notna() & closes.notna()
             if neutral_threshold > 0:
                 direction = np.where(
                     returns > neutral_threshold,
@@ -179,15 +199,17 @@ class MultiHorizonModelingEngine:
                     np.where(returns < -neutral_threshold, -1, 0),
                 )
             else:
-                direction = np.where(future_close > closes, 1, -1)
+                direction = np.where(returns > 0, 1, np.where(returns < 0, -1, 0))
             direction_series = pd.Series(direction, index=target_frame.index, dtype=float)
-            future_open = opens.shift(-int(horizon)) if opens is not None else None
+            direction_series = direction_series.mask(~valid_mask)
+            future_open = opens.shift(-effective_horizon) if opens is not None else None
             return_oc = None
             direction_oc_series = None
             intraday_max = None
             intraday_min = None
             if future_open is not None:
                 return_oc = (future_close - future_open) / future_open
+                valid_oc_mask = future_close.notna() & future_open.notna()
                 if neutral_threshold > 0:
                     direction_oc = np.where(
                         return_oc > neutral_threshold,
@@ -195,15 +217,17 @@ class MultiHorizonModelingEngine:
                         np.where(return_oc < -neutral_threshold, -1, 0),
                     )
                 else:
-                    direction_oc = np.where(return_oc > 0, 1, -1)
+                    direction_oc = np.where(return_oc > 0, 1, np.where(return_oc < 0, -1, 0))
                 direction_oc_series = pd.Series(
                     direction_oc, index=target_frame.index, dtype=float
                 )
+                direction_oc_series = direction_oc_series.mask(~valid_oc_mask)
+                return_oc = return_oc.mask(~valid_oc_mask)
                 if highs is not None:
-                    future_high = highs.shift(-int(horizon))
+                    future_high = highs.shift(-effective_horizon)
                     intraday_max = (future_high - future_open) / future_open
                 if lows is not None:
-                    future_low = lows.shift(-int(horizon))
+                    future_low = lows.shift(-effective_horizon)
                     intraday_min = (future_low - future_open) / future_open
             if self.config.tomorrow_mode and direction_oc_series is not None:
                 direction_series = direction_oc_series
@@ -413,11 +437,15 @@ class MultiHorizonModelingEngine:
                 ticker=ticker,
                 extra={"target_counts": target_counts},
             )
-            if any(count == 0 for horizon_counts in target_counts.values() for count in horizon_counts.values()):
-                _raise_stage_error(
-                    "target_generation",
-                    "target generation produced empty columns",
-                    details={"ticker": ticker, "target_counts": target_counts},
+            empty_targets = {
+                int(horizon): [name for name, count in horizon_counts.items() if count == 0]
+                for horizon, horizon_counts in target_counts.items()
+            }
+            empty_targets = {h: names for h, names in empty_targets.items() if names}
+            if empty_targets:
+                LOGGER.warning(
+                    "Target generation produced empty columns; continuing with available targets. %s",
+                    json.dumps({"ticker": ticker, "empty_targets": empty_targets}),
                 )
 
             if news_df is not None and not news_df.empty:
@@ -486,10 +514,9 @@ class MultiHorizonModelingEngine:
         horizon_one_targets = target_map.get(1, {})
         horizon_one_counts = {name: int(series.dropna().shape[0]) for name, series in horizon_one_targets.items() if name in requested_targets}
         if any(count == 0 for count in horizon_one_counts.values()) or not horizon_one_counts:
-            _raise_stage_error(
-                "target_alignment",
-                "horizon 1 targets are empty after alignment",
-                details={"horizon_one_counts": horizon_one_counts},
+            LOGGER.warning(
+                "Horizon 1 targets are empty after alignment; continuing with available targets. %s",
+                json.dumps({"horizon_one_counts": horizon_one_counts}),
             )
 
         dataset = MultiHorizonDataset(features=features_df, targets=target_map, metadata=metadata)
@@ -504,8 +531,7 @@ class MultiHorizonModelingEngine:
                     "Target alignment failed for horizon 1: no aligned values for "
                     f"{sorted(missing_alignment)}"
                 )
-                LOGGER.error(message)
-                raise ValueError(message)
+                LOGGER.warning(message)
         insufficient: dict[int, dict[str, int]] = {}
         threshold = int(
             getattr(
