@@ -512,14 +512,11 @@ class MultiHorizonModelingEngine:
                 },
             )
             if aligned_features_df.shape[0] < minimum_viable_rows:
-                _raise_stage_error(
-                    "final_alignment",
-                    "insufficient rows after aligning targets to features",
-                    details={
-                        "row_count": aligned_features_df.shape[0],
-                        "dropped_for_alignment": drop_count,
-                        "minimum_viable_rows": minimum_viable_rows,
-                    },
+                LOGGER.warning(
+                    "Final target alignment produced %s rows; below minimum_viable_rows=%s. "
+                    "Proceeding so downstream checks can report insufficient samples.",
+                    aligned_features_df.shape[0],
+                    minimum_viable_rows,
                 )
             features_df = aligned_features_df
 
