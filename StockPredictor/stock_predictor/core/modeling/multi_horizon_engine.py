@@ -1271,6 +1271,17 @@ class MultiHorizonModelingEngine:
                 if self.config.min_samples_per_horizon > 1:
                     self.config.min_samples_per_horizon = 1
                 return self.predict_latest(targets=targets, horizon=horizon)
+            fallback_message = (
+                "Prediction unavailable due to insufficient samples even after "
+                "falling back to the horizon with maximum data."
+            )
+            exc = InsufficientSamplesError(
+                fallback_message,
+                horizons=getattr(exc, "horizons", self.config.prediction_horizons),
+                targets=getattr(exc, "targets", requested_targets),
+                sample_counts=getattr(exc, "sample_counts", None),
+                missing_targets=getattr(exc, "missing_targets", None),
+            )
             return _handle_insufficient(exc, latest_ts=locals().get("latest_timestamp"))
 
 
