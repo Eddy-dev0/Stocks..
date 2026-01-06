@@ -805,19 +805,13 @@ class MultiHorizonModelingEngine:
             LOGGER.warning(
                 "Kein Horizon hat genügend Samples; Training wird übersprungen."
             )
-            metadata = {
-                **dataset.metadata,
-                "artefacts": {},
-            }
-            return {
-                "status": "no_data",
-                "reason": "insufficient_samples",
-                "horizons": horizons,
-                "targets": requested_targets,
-                "metadata": metadata,
-                "sample_counts": requested_counts,
-                "missing_targets": missing_targets,
-            }
+            raise InsufficientSamplesError(
+                "Insufficient samples to train any requested horizons.",
+                horizons=horizons,
+                targets=tuple(sorted(requested_targets)),
+                sample_counts=requested_counts,
+                missing_targets=missing_targets,
+            )
 
         metadata = {
             **dataset.metadata,
@@ -1052,25 +1046,15 @@ class MultiHorizonModelingEngine:
             try:
                 transformed = artefacts.preprocessor.transform(latest_row)
             except NotFittedError:
-                cached = self._untrainable_until.get(resolved_horizon)
-                if cached and cached.get("not_trainable") and not new_data_available:
-                    cache_ts = _to_utc(cached.get("data_timestamp"))
-                    if cache_ts is not None and (latest_timestamp is None or latest_timestamp <= cache_ts):
-                        return _unavailable(
-                            cached.get("reason", "insufficient_samples") or "insufficient_samples",
-                            sample_counts=cached.get("sample_counts"),
-                            missing_targets=cached.get("missing_targets"),
-                            checked_at=cache_ts,
-                            message="Preprocessor not fitted; waiting for more data before retraining.",
-                        )
-                LOGGER.warning(
-                    "Preprocessor for horizon %s is not fitted; retraining before inference.",
-                    resolved_horizon,
+                cache_ts = _to_utc(self._untrainable_until.get(resolved_horizon, {}).get("data_timestamp"))
+                checked_at = cache_ts or latest_timestamp
+                return _unavailable(
+                    "insufficient_samples",
+                    sample_counts=artefacts.sample_counts,
+                    missing_targets={},
+                    checked_at=checked_at,
+                    message="Preprocessor not fitted; waiting for more data before retraining.",
                 )
-                self.train(horizon=resolved_horizon, force=True)
-                self._untrainable_until.pop(resolved_horizon, None)
-                artefacts = self._load_horizon_artefacts(resolved_horizon)
-                transformed = artefacts.preprocessor.transform(latest_row)
 
             if not artefacts.models:
                 current_attempt = pd.Timestamp.now(tz="UTC")
