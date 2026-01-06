@@ -1266,6 +1266,11 @@ class MultiHorizonModelingEngine:
                 checked_at=latest_timestamp,
             )
         except InsufficientSamplesError as exc:
+            if (not self.config.use_max_historical_data) or self.config.min_samples_per_horizon > 1:
+                self.config.use_max_historical_data = True
+                if self.config.min_samples_per_horizon > 1:
+                    self.config.min_samples_per_horizon = 1
+                return self.predict_latest(targets=targets, horizon=horizon)
             return _handle_insufficient(exc, latest_ts=locals().get("latest_timestamp"))
 
 
