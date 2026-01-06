@@ -19,6 +19,11 @@ from stock_predictor.core import (
     build_config,
     load_environment,
 )
+from stock_predictor.core.indicator_bundle import DEFAULT_INDICATOR_CONFIG
+from stock_predictor.core.strategies.lorentzian_classification import (
+    LorentzianClassificationStrategy,
+)
+from stock_predictor.core.strategies.smart_money import SmartMoneyConceptsStrategy
 from stock_predictor.data.indicator_store import IndicatorDataStore
 from stock_predictor.features.engineer import IndicatorFeatureEngineer
 from stock_predictor.models.trainer import HorizonModelTrainer
@@ -55,6 +60,7 @@ class StockPredictorApplication:
         self.model_trainer = HorizonModelTrainer(config, self.feature_engineer)
         self.evaluator = Backtester(config, self.model_trainer)
         self.pipeline = self.model_trainer.pipeline
+        self.indicator_strategies: dict[str, object] = {}
 
     @classmethod
     def from_environment(cls, **overrides: Any) -> "StockPredictorApplication":
@@ -68,7 +74,30 @@ class StockPredictorApplication:
         )
         config = build_config(**overrides)
         LOGGER.debug("Initialised configuration for ticker %s", config.ticker)
-        return cls(config)
+        application = cls(config)
+        application._initialize_indicator_strategies()
+        return application
+
+    def _initialize_indicator_strategies(self) -> None:
+        """Instantiate indicator strategy components for orchestration hooks."""
+
+        lorentzian_config = DEFAULT_INDICATOR_CONFIG.get("lorentzian_classification", {})
+        smart_money_config = DEFAULT_INDICATOR_CONFIG.get("smart_money_concepts", {})
+        self.indicator_strategies = {
+            "lorentzian_classification": LorentzianClassificationStrategy(
+                ema_period=int(lorentzian_config.get("ema_period", 200)),
+                atr_period=int(lorentzian_config.get("atr_period", 14)),
+                atr_multiplier=float(lorentzian_config.get("atr_multiplier", 1.5)),
+                supertrend_period=int(lorentzian_config.get("supertrend_period", 10)),
+                supertrend_multiplier=float(lorentzian_config.get("supertrend_multiplier", 3.0)),
+                lookback=int(lorentzian_config.get("lookback", 50)),
+            ),
+            "smart_money_concepts": SmartMoneyConceptsStrategy(
+                swing_window=int(smart_money_config.get("swing_window", 5)),
+                range_window=int(smart_money_config.get("range_window", 50)),
+                timeframes=smart_money_config.get("timeframes"),
+            ),
+        }
 
     # ------------------------------------------------------------------
     # High level orchestration helpers

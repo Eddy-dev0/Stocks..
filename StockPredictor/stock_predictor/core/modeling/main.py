@@ -400,6 +400,7 @@ class StockPredictorAI:
     def _refresh_feature_assembler(self) -> None:
         """Rebuild the feature assembler if the toggle state has changed."""
 
+        refreshed = False
         if self.feature_assembler is None:
             self.feature_assembler = FeatureAssembler(
                 self.config.feature_toggles,
@@ -422,9 +423,8 @@ class StockPredictorAI:
                     "neutral_threshold": self.config.direction_neutral_threshold,
                 },
             )
-            return
-
-        if self.feature_assembler.feature_toggles != self.config.feature_toggles:
+            refreshed = True
+        elif self.feature_assembler.feature_toggles != self.config.feature_toggles:
             self.feature_assembler = FeatureAssembler(
                 self.config.feature_toggles,
                 self.config.prediction_horizons,
@@ -446,6 +446,10 @@ class StockPredictorAI:
                     "neutral_threshold": self.config.direction_neutral_threshold,
                 },
             )
+            refreshed = True
+
+        if refreshed and self.nextgen_engine is not None:
+            self.nextgen_engine.feature_assembler = self.feature_assembler
 
     # ------------------------------------------------------------------
     # Data acquisition
@@ -2852,6 +2856,33 @@ class StockPredictorAI:
                 aggregate[key] = float(np.mean(values))
         aggregate["folds"] = int(len(splits))
         return aggregate
+
+    def _extract_backtest_success_rates(
+        self, payload: Mapping[str, Any]
+    ) -> Dict[str, float]:
+        success_rates: Dict[str, float] = {}
+        target_payload = payload.get("targets", {})
+        if isinstance(target_payload, Mapping):
+            for target, entry in target_payload.items():
+                if not isinstance(entry, Mapping):
+                    continue
+                aggregate = entry.get("aggregate", {})
+                if not isinstance(aggregate, Mapping):
+                    continue
+                accuracy = aggregate.get("directional_accuracy")
+                if accuracy is None:
+                    accuracy = aggregate.get("accuracy")
+                if isinstance(accuracy, Real) and math.isfinite(float(accuracy)):
+                    success_rates[str(target)] = float(accuracy)
+
+        summary = payload.get("summary", {})
+        if isinstance(summary, Mapping):
+            classification = summary.get("classification", {})
+            if isinstance(classification, Mapping):
+                overall = classification.get("accuracy")
+                if isinstance(overall, Real) and math.isfinite(float(overall)):
+                    success_rates.setdefault("overall_accuracy", float(overall))
+        return success_rates
 
     # ------------------------------------------------------------------
     # Inference
@@ -6531,6 +6562,10 @@ class StockPredictorAI:
         payload["targets"] = target_breakdown
         payload["horizon"] = resolved_horizon
         self.metadata["active_horizon"] = resolved_horizon
+        self.metadata["backtest_summary"] = payload.get("summary", {})
+        success_rates = self._extract_backtest_success_rates(payload)
+        if success_rates:
+            self.metadata["backtest_success_rates"] = success_rates
         self.tracker.log_run(
             target=",".join(requested_targets),
             run_type="backtest",
