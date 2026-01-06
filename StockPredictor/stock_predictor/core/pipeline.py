@@ -525,10 +525,91 @@ class MarketDataETL:
             self.config.ticker, self.config.interval, "macro"
         )
         existing_is_fresh = bool(existing_ts and self._is_cache_timestamp_fresh(existing_ts))
-        if not force and not existing.empty and existing_is_fresh:
+        symbols = list(getattr(self.config, "macro_merge_symbols", ()) or ())
+        missing_symbols = self._macro_symbols_missing(existing, symbols)
+        if not force and not missing_symbols and not existing.empty and existing_is_fresh:
             self._record_source("macro", "database")
             return 0
 
+        symbols_to_fetch = symbols if force or not existing_is_fresh else missing_symbols
+        benchmark_inserted = self._refresh_macro_benchmarks(symbols_to_fetch)
+        proxy_inserted = self._refresh_macro_proxies()
+        total_inserted = benchmark_inserted + proxy_inserted
+        if total_inserted:
+            self.database.set_refresh_timestamp(
+                self.config.ticker, self.config.interval, "macro"
+            )
+        return total_inserted
+
+    def _macro_symbols_missing(self, existing: pd.DataFrame, symbols: Sequence[str]) -> list[str]:
+        if not symbols:
+            return []
+        if existing is None or existing.empty or "Indicator" not in existing.columns:
+            return list(symbols)
+        indicator_names = set(existing["Indicator"].astype(str))
+        missing = [
+            symbol for symbol in symbols if f"macro:{symbol}" not in indicator_names
+        ]
+        return missing
+
+    def _refresh_macro_benchmarks(self, symbols: Sequence[str]) -> int:
+        if not symbols:
+            return 0
+
+        params: Dict[str, Any] = {"interval": self.config.interval}
+        if self.config.start_date:
+            params["start"] = self.config.start_date.isoformat()
+        if self.config.end_date:
+            params["end"] = self.config.end_date.isoformat()
+
+        total_inserted = 0
+        for symbol in symbols:
+            summary = self._fetch_dataset(
+                DatasetType.PRICES, params, symbol=symbol
+            )
+            if summary.failures:
+                self._log_provider_failures("macro", summary.failures, bool(summary.results))
+            price_frame = self._coalesce_price_results(summary.results)
+            if price_frame is None or price_frame.empty:
+                continue
+            working = price_frame.copy()
+            working["Date"] = pd.to_datetime(working["Date"], errors="coerce")
+            working = working.dropna(subset=["Date"])
+            if working.empty:
+                continue
+            close_series = pd.to_numeric(working.get("Adj Close"), errors="coerce")
+            if close_series is None or close_series.dropna().empty:
+                close_series = pd.to_numeric(working.get("Close"), errors="coerce")
+            if close_series is None or close_series.dropna().empty:
+                continue
+
+            records = []
+            indicator_name = f"macro:{symbol}"
+            for date_val, value in zip(working["Date"], close_series):
+                if pd.isna(date_val) or pd.isna(value):
+                    continue
+                records.append(
+                    {
+                        "Date": date_val,
+                        "Indicator": indicator_name,
+                        "Value": float(value),
+                        "Category": "macro",
+                        "Extra": {"source": "price", "symbol": symbol},
+                    }
+                )
+            if not records:
+                continue
+            inserted = self.database.upsert_indicators(
+                ticker=self.config.ticker,
+                interval=self.config.interval,
+                records=records,
+            )
+            total_inserted += inserted
+            for provider in self._collect_providers(summary.results):
+                self._record_source("macro", provider)
+        return total_inserted
+
+    def _refresh_macro_proxies(self) -> int:
         LOGGER.info("Generating cached macro proxy indicators for %s", self.config.ticker)
         price_frame = self.database.get_prices(
             ticker=self.config.ticker,
@@ -585,9 +666,6 @@ class MarketDataETL:
             records=records,
         )
         if inserted:
-            self.database.set_refresh_timestamp(
-                self.config.ticker, self.config.interval, "macro"
-            )
             self._record_source("macro", "local")
         return inserted
 
@@ -1190,6 +1268,7 @@ class MarketDataETL:
         params: Mapping[str, Any] | None = None,
         *,
         providers: Sequence[str] | None = None,
+        symbol: str | None = None,
     ) -> ProviderFetchSummary:
         request_params = dict(params or {})
         if dataset == DatasetType.PRICES:
@@ -1199,9 +1278,10 @@ class MarketDataETL:
             cache_path = self.config.price_cache_path
             if cache_path and "local_store_path" not in request_params:
                 request_params["local_store_path"] = str(cache_path)
+        request_symbol = symbol or self.config.ticker
         request = ProviderRequest(
             dataset_type=dataset,
-            symbol=self.config.ticker,
+            symbol=request_symbol,
             params=request_params,
         )
         provider_sequence = self._resolve_provider_sequence(dataset, providers)

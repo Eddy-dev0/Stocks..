@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 
 from .features import FEATURE_REGISTRY, FeatureToggles, default_feature_toggles
+from .indicator_library import default_indicator_toggles
 from .preprocessing import default_price_feature_toggles, derive_price_feature_toggles
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -342,6 +343,10 @@ class PredictorConfig:
     def __post_init__(self) -> None:
         self.ticker = self.ticker.upper()
         self.feature_toggles = _coerce_feature_toggles(self.feature_toggles)
+        indicator_defaults = default_indicator_toggles()
+        for key, value in indicator_defaults.items():
+            if key not in self.feature_toggles.asdict():
+                self.feature_toggles[key] = value
         self.prediction_targets = self._normalise_collection(
             self.prediction_targets, DEFAULT_PREDICTION_TARGETS
         )
