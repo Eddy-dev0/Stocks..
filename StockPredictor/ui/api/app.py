@@ -301,6 +301,24 @@ class AccuracyResponse(BaseModel):
     incorrect: int = Field(..., description="Number of incorrect predictions.")
     correct_pct: float = Field(..., description="Fraction of predictions that were correct.")
     incorrect_pct: float = Field(..., description="Fraction of predictions that were incorrect.")
+    tolerance_band: float | None = Field(
+        None, description="Tolerance band applied to directional hit rate evaluation."
+    )
+    tolerance_total: int | None = Field(
+        None, description="Total predictions evaluated under tolerance criteria."
+    )
+    tolerance_hits: int | None = Field(
+        None, description="Number of predictions within the tolerance band."
+    )
+    tolerance_misses: int | None = Field(
+        None, description="Number of predictions outside the tolerance band."
+    )
+    tolerance_hit_rate: float | None = Field(
+        None, description="Share of predictions within the tolerance band."
+    )
+    summary: str | None = Field(
+        None, description="Human-friendly summary of accuracy performance."
+    )
 
 
 class AccuracyEnvelope(BaseModel):
@@ -308,6 +326,77 @@ class AccuracyEnvelope(BaseModel):
 
     status: str = Field("ok", description="Outcome of the request.")
     accuracy: AccuracyResponse
+
+
+class IndicatorRequest(BaseModel):
+    """Payload used to request indicator and strategy signal snapshots."""
+
+    refresh: bool = Field(
+        default=False,
+        description="Refresh indicators before returning the snapshot.",
+    )
+    category: str | None = Field(
+        default=None,
+        description="Optional indicator category to filter results.",
+    )
+    limit: int | None = Field(
+        default=200,
+        ge=1,
+        description="Maximum number of historical indicator rows to include.",
+    )
+    include_history: bool = Field(
+        default=False,
+        description="Include indicator history alongside the latest snapshot.",
+    )
+    feature_toggles: dict[str, bool] | None = Field(
+        default=None,
+        description=(
+            "Optional map of feature-group toggles keyed by registry name. "
+            "Supported keys: elliott, macro, sentiment, technical, volume_liquidity."
+        ),
+        example={"technical": True, "macro": False, "indicator_lorentzian_classification": True},
+    )
+
+
+class IndicatorSnapshotRecord(BaseModel):
+    """Single indicator or strategy signal reading."""
+
+    indicator: str | None = Field(None, description="Indicator or signal name.")
+    value: float | None = Field(None, description="Latest numeric reading.")
+    category: str | None = Field(None, description="Category assigned to the indicator.")
+    signal_type: str | None = Field(None, description="Indicator vs strategy signal classification.")
+    as_of: datetime | None = Field(None, description="Timestamp for the record, when applicable.")
+
+
+class IndicatorSnapshotResponse(BaseModel):
+    """Structured indicator snapshot payload."""
+
+    latest_date: datetime | None = Field(
+        None, description="Timestamp for the most recent indicator snapshot."
+    )
+    latest: list[IndicatorSnapshotRecord] = Field(
+        default_factory=list,
+        description="Latest indicator values and signals.",
+    )
+    indicator_values: list[IndicatorSnapshotRecord] = Field(
+        default_factory=list,
+        description="Latest technical indicator readings.",
+    )
+    strategy_signals: list[IndicatorSnapshotRecord] = Field(
+        default_factory=list,
+        description="Latest strategy signal readings.",
+    )
+    history: list[IndicatorSnapshotRecord] = Field(
+        default_factory=list,
+        description="Optional indicator history records.",
+    )
+
+
+class IndicatorEnvelope(BaseModel):
+    """Envelope for indicator snapshot responses."""
+
+    status: str = Field("ok", description="Outcome of the request.")
+    indicators: IndicatorSnapshotResponse
 
 
 def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
@@ -519,7 +608,40 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
         summary = await _call_with_error_handling(
             ui_adapter.get_accuracy, ticker, horizon=horizon
         )
+        summary_text = None
+        if summary.get("total_predictions") and summary.get("correct_pct") is not None:
+            horizon_label = summary.get("horizon")
+            horizon_suffix = f"horizon-{horizon_label}" if horizon_label else "active horizon"
+            summary_text = (
+                "The model correctly predicted the "
+                f"{horizon_suffix} close in "
+                f"{summary.get('correct_pct') * 100:.1f}% of "
+                f"{int(summary.get('total_predictions')):,} simulations."
+            )
+        summary["summary"] = summary_text
         return AccuracyEnvelope(status="ok", accuracy=AccuracyResponse(**summary))
+
+    @app.post(
+        "/indicators/{ticker}",
+        dependencies=[Depends(require_api_key)],
+        response_model=IndicatorEnvelope,
+    )
+    async def indicators(ticker: str, request: IndicatorRequest) -> IndicatorEnvelope:
+        result = await _call_with_error_handling(
+            ui_adapter.get_indicators,
+            ticker,
+            refresh=request.refresh,
+            category=request.category,
+            limit=request.limit,
+            include_history=request.include_history,
+            overrides={
+                "feature_toggles": request.feature_toggles,
+                "price_feature_toggles": request.feature_toggles,
+            },
+        )
+        return IndicatorEnvelope(
+            status="ok", indicators=IndicatorSnapshotResponse(**result)
+        )
 
     @app.get("/research", dependencies=[Depends(require_api_key)])
     async def research_feed(

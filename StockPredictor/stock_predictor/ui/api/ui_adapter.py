@@ -5,11 +5,47 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Iterable
 
+import pandas as pd
+
 from stock_predictor.app import StockPredictorApplication
 from stock_predictor.evaluation.backtester import BacktestConfig
 
 
 LOGGER = logging.getLogger(__name__)
+STRATEGY_PREFIXES = ("lorentzian_", "smc_")
+
+
+def _classify_indicator(name: str) -> str:
+    normalized = str(name).strip().lower()
+    if any(normalized.startswith(prefix) for prefix in STRATEGY_PREFIXES):
+        return "strategy"
+    return "technical"
+
+
+def _indicator_records(frame: "pd.DataFrame") -> list[dict[str, Any]]:
+    if frame.empty:
+        return []
+    column_map = {str(col).lower(): col for col in frame.columns}
+    indicator_col = column_map.get("indicator")
+    value_col = column_map.get("value")
+    category_col = column_map.get("category")
+    if indicator_col is None or value_col is None:
+        return []
+    records: list[dict[str, Any]] = []
+    for _, row in frame.iterrows():
+        indicator = row.get(indicator_col)
+        value = row.get(value_col)
+        category = row.get(category_col) if category_col else None
+        signal_type = _classify_indicator(indicator)
+        records.append(
+            {
+                "indicator": indicator,
+                "value": float(value) if value is not None and pd.notna(value) else None,
+                "category": category,
+                "signal_type": signal_type,
+            }
+        )
+    return records
 
 
 async def get_prediction(
@@ -219,6 +255,85 @@ async def get_accuracy(
     return application.accuracy(horizon=horizon)
 
 
+async def get_indicators(
+    ticker: str,
+    *,
+    refresh: bool = False,
+    category: str | None = None,
+    limit: int | None = None,
+    include_history: bool = False,
+    overrides: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Return indicator values and strategy signals for the requested ticker."""
+
+    application = StockPredictorApplication.from_environment(
+        ticker=ticker, **(overrides or {})
+    )
+    if refresh:
+        application.refresh_data(force=True)
+
+    fetcher = getattr(application.pipeline, "fetcher", None)
+    if fetcher is None or not hasattr(fetcher, "fetch_indicator_data"):
+        return {
+            "latest_date": None,
+            "latest": [],
+            "indicator_values": [],
+            "strategy_signals": [],
+            "history": [],
+        }
+
+    indicator_frame = fetcher.fetch_indicator_data(category=category)
+    if indicator_frame is None or indicator_frame.empty:
+        return {
+            "latest_date": None,
+            "latest": [],
+            "indicator_values": [],
+            "strategy_signals": [],
+            "history": [],
+        }
+
+    frame = indicator_frame.copy()
+    column_map = {str(col).lower(): col for col in frame.columns}
+    date_col = column_map.get("date") or column_map.get("as_of") or column_map.get("timestamp")
+    if date_col is None:
+        frame["__as_of"] = pd.to_datetime(frame.index, errors="coerce")
+        date_col = "__as_of"
+    else:
+        frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
+    frame = frame.dropna(subset=[date_col]).sort_values(date_col)
+    if frame.empty:
+        return {
+            "latest_date": None,
+            "latest": [],
+            "indicator_values": [],
+            "strategy_signals": [],
+            "history": [],
+        }
+
+    latest_date = frame[date_col].max()
+    latest_frame = frame[frame[date_col] == latest_date]
+    latest_records = _indicator_records(latest_frame)
+    indicator_values = [row for row in latest_records if row["signal_type"] == "technical"]
+    strategy_signals = [row for row in latest_records if row["signal_type"] == "strategy"]
+
+    history_records: list[dict[str, Any]] = []
+    if include_history:
+        history_frame = frame
+        if limit is not None and limit > 0:
+            history_frame = history_frame.tail(int(limit))
+        history_records = _indicator_records(history_frame)
+        for entry, (_, row) in zip(history_records, history_frame.iterrows()):
+            entry["as_of"] = row.get(date_col)
+
+    return {
+        "latest_date": latest_date.isoformat() if hasattr(latest_date, "isoformat") else str(latest_date),
+        "latest": latest_records,
+        "indicator_values": indicator_values,
+        "strategy_signals": strategy_signals,
+        "history": history_records,
+    }
+
+
 __all__ = [
     "get_prediction",
     "run_backtest",
@@ -226,4 +341,5 @@ __all__ = [
     "train_models",
     "refresh_data",
     "get_accuracy",
+    "get_indicators",
 ]
