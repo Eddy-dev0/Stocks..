@@ -369,10 +369,10 @@ class MultiHorizonModelingEngine:
             canonical_price_df = price_df.copy()
             if "Date" in canonical_price_df.columns:
                 canonical_price_df = canonical_price_df.sort_values("Date").drop_duplicates("Date", keep="last")
-                canonical_index = pd.to_datetime(canonical_price_df["Date"])
+                canonical_index = pd.to_datetime(canonical_price_df["Date"], utc=True)
             else:
                 canonical_price_df = canonical_price_df.sort_index()
-                canonical_index = pd.to_datetime(canonical_price_df.index)
+                canonical_index = pd.to_datetime(canonical_price_df.index, utc=True)
             canonical_price_df.index = canonical_index
 
             _log_stage(
