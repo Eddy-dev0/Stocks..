@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -573,6 +574,7 @@ class StockPredictorDesktopApp:
 
         self._busy = False
         self._availability_log_state: dict[str, bool] = {}
+        self._availability_dialog_state: set[str] = set()
 
         self._build_layout(horizon_values)
         self.apply_theme(self.dark_mode_var.get())
@@ -3725,6 +3727,32 @@ class StockPredictorDesktopApp:
         )
         self._availability_log_state[key] = True
 
+    def _should_show_unavailable_dialog(
+        self,
+        *,
+        status: str | None,
+        reason: str | None,
+        horizon: Any,
+        checked_at: Any | None,
+        message: str | None,
+        sample_counts: Mapping[str, Any] | None = None,
+        missing_targets: Mapping[str, Any] | None = None,
+    ) -> bool:
+        payload = {
+            "status": status,
+            "reason": reason,
+            "horizon": horizon,
+            "checked_at": str(checked_at) if checked_at is not None else None,
+            "message": message,
+            "sample_counts": sample_counts or {},
+            "missing_targets": missing_targets or {},
+        }
+        key = json.dumps(payload, sort_keys=True, default=str)
+        if key in self._availability_dialog_state:
+            return False
+        self._availability_dialog_state.add(key)
+        return True
+
     def _predict_payload(self, *, refresh: bool = False) -> dict[str, Any]:
         horizon_arg: Any
         if self.selected_horizon_code:
@@ -3907,13 +3935,25 @@ class StockPredictorDesktopApp:
             else:
                 user_message = message or "Prediction unavailable due to insufficient samples."
             LOGGER.info(user_message)
+            checked_at = prediction.get("checked_at") if isinstance(prediction, Mapping) else None
+            sample_counts = prediction.get("sample_counts") if isinstance(prediction, Mapping) else None
+            missing_targets = prediction.get("missing_targets") if isinstance(prediction, Mapping) else None
             self.current_prediction = {}
             self.feature_snapshot = None
             self.feature_history = None
             self.price_history = None
             self.indicator_history = None
             self._set_busy(False, user_message)
-            messagebox.showinfo("Predictions unavailable", user_message)
+            if self._should_show_unavailable_dialog(
+                status=status,
+                reason=reason,
+                horizon=prediction.get("horizon") if isinstance(prediction, Mapping) else None,
+                checked_at=checked_at,
+                message=user_message,
+                sample_counts=sample_counts,
+                missing_targets=missing_targets,
+            ):
+                messagebox.showinfo("Predictions unavailable", user_message)
             return
         if status == "error":
             message = message or "An error occurred while generating predictions."
@@ -4000,7 +4040,16 @@ class StockPredictorDesktopApp:
         detail_lines.append("Try expanding the date range or adding more price history.")
         self._set_busy(False, message)
         display_message = f"{message}\n\n" + "\n".join(detail_lines)
-        messagebox.showinfo("Predictions unavailable", display_message)
+        if self._should_show_unavailable_dialog(
+            status="no_data",
+            reason="insufficient_samples",
+            horizon="auto",
+            checked_at=None,
+            message=message,
+            sample_counts=exc.sample_counts,
+            missing_targets=exc.missing_targets,
+        ):
+            messagebox.showinfo("Predictions unavailable", display_message)
 
     def _set_busy(self, busy: bool, status: str | None = None) -> None:
         self._busy = busy
