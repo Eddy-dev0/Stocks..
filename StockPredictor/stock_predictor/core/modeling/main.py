@@ -2894,7 +2894,6 @@ class StockPredictorAI:
         horizon: Optional[int] = None,
     ) -> PredictionResult:
         resolved_horizon = self._resolve_horizon(horizon)
-        self.horizon = resolved_horizon
         modern_predictions = self.nextgen_engine.predict_latest(
             targets=list(targets) if targets else None,
             horizon=resolved_horizon,
@@ -2904,6 +2903,10 @@ class StockPredictorAI:
             if hasattr(modern_predictions, "to_dict")
             else dict(modern_predictions or {})
         )
+        payload_horizon = modern_payload.get("horizon")
+        if isinstance(payload_horizon, int):
+            resolved_horizon = payload_horizon
+        self.horizon = resolved_horizon
         status = modern_payload.get("status")
         reason = modern_payload.get("reason")
         message = modern_payload.get("message")

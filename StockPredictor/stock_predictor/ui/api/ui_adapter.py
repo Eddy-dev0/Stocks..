@@ -15,6 +15,12 @@ LOGGER = logging.getLogger(__name__)
 STRATEGY_PREFIXES = ("lorentzian_", "smc_")
 
 
+def _merge_overrides(overrides: Dict[str, Any] | None) -> Dict[str, Any]:
+    merged = dict(overrides or {})
+    merged.setdefault("use_max_historical_data", True)
+    return merged
+
+
 def _classify_indicator(name: str) -> str:
     normalized = str(name).strip().lower()
     if any(normalized.startswith(prefix) for prefix in STRATEGY_PREFIXES):
@@ -59,7 +65,7 @@ async def get_prediction(
     """Return a simplified prediction payload for UI consumption."""
 
     application = StockPredictorApplication.from_environment(
-        ticker=ticker, **(overrides or {})
+        ticker=ticker, **_merge_overrides(overrides)
     )
     prediction = application.predict(targets=targets, refresh=refresh, horizon=horizon)
     raw_payload: Dict[str, Any] = {}
@@ -71,7 +77,7 @@ async def get_prediction(
     status = raw_payload.get("status")
     reason = raw_payload.get("reason")
     if status == "no_data":
-        message = raw_payload.get("message") or "Not enough historical data to generate predictions yet"
+        message = raw_payload.get("message")
         log_fn = LOGGER.info if reason == "insufficient_samples" else LOGGER.warning
         log_fn(
             "Prediction unavailable for %s (status=%s, reason=%s)",
@@ -181,6 +187,7 @@ async def live_price_snapshot(
         merged_overrides["expected_low_sigma"] = expected_low_multiplier
     if stop_loss_multiplier is not None:
         merged_overrides["k_stop"] = stop_loss_multiplier
+    merged_overrides = _merge_overrides(merged_overrides)
     application = StockPredictorApplication.from_environment(
         ticker=ticker, **merged_overrides
     )
@@ -195,7 +202,7 @@ async def run_backtest(
     backtest_config: BacktestConfig | None = None,
 ) -> Dict[str, Any]:
     application = StockPredictorApplication.from_environment(
-        ticker=ticker, **(overrides or {})
+        ticker=ticker, **_merge_overrides(overrides)
     )
     return application.backtest(targets=targets, backtest_config=backtest_config)
 
@@ -212,7 +219,7 @@ async def run_reliability_backtest(
     step_size: int | None = None,
 ) -> Dict[str, Any]:
     application = StockPredictorApplication.from_environment(
-        ticker=ticker, **(overrides or {})
+        ticker=ticker, **_merge_overrides(overrides)
     )
     return application.reliability_backtest(
         targets=targets,
@@ -232,7 +239,7 @@ async def train_models(
     overrides: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     application = StockPredictorApplication.from_environment(
-        ticker=ticker, **(overrides or {})
+        ticker=ticker, **_merge_overrides(overrides)
     )
     return application.train(targets=targets, horizon=horizon)
 
@@ -241,7 +248,7 @@ async def refresh_data(
     ticker: str, *, refresh: bool = True, overrides: Dict[str, Any] | None = None
 ) -> Dict[str, Any]:
     application = StockPredictorApplication.from_environment(
-        ticker=ticker, **(overrides or {})
+        ticker=ticker, **_merge_overrides(overrides)
     )
     return application.refresh_data(force=refresh)
 
@@ -250,7 +257,7 @@ async def get_accuracy(
     ticker: str, *, horizon: int | None = None, overrides: Dict[str, Any] | None = None
 ) -> Dict[str, Any]:
     application = StockPredictorApplication.from_environment(
-        ticker=ticker, **(overrides or {})
+        ticker=ticker, **_merge_overrides(overrides)
     )
     return application.accuracy(horizon=horizon)
 
@@ -267,7 +274,7 @@ async def get_indicators(
     """Return indicator values and strategy signals for the requested ticker."""
 
     application = StockPredictorApplication.from_environment(
-        ticker=ticker, **(overrides or {})
+        ticker=ticker, **_merge_overrides(overrides)
     )
     if refresh:
         application.refresh_data(force=True)

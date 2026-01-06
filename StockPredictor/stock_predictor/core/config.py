@@ -302,6 +302,7 @@ class PredictorConfig:
     training_cache_dir: Path | None = None
     use_cached_training_data: bool = True
     min_samples_per_horizon: int = DEFAULT_MIN_SAMPLES_PER_HORIZON
+    use_max_historical_data: bool = False
     forecast_tolerance_bands: dict[int, float] = field(default_factory=dict)
     # Provide a local CSV file path to enable the CSVPriceLoader provider.
     csv_price_loader_path: Path | None = None
@@ -353,6 +354,7 @@ class PredictorConfig:
         self.prediction_horizons = self._normalise_horizons(self.prediction_horizons)
         self.model_params = self._normalise_model_params(self.model_params)
         self.shuffle_training = bool(self.shuffle_training)
+        self.use_max_historical_data = bool(self.use_max_historical_data)
         self.backtest_strategy = (
             str(self.backtest_strategy).strip().lower() or DEFAULT_BACKTEST_STRATEGY
         )
@@ -987,6 +989,7 @@ def build_config(
     direction_bootstrap_workers: Optional[int] = None,
     direction_bootstrap_blend: Optional[float] = None,
     min_samples_per_horizon: Optional[int] = None,
+    use_max_historical_data: Optional[bool] = None,
     forecast_tolerance_bands: Optional[Mapping[int, Any] | str] = None,
     target_price_basis: Optional[str] = None,
     tomorrow_mode: Optional[bool] = None,
@@ -1134,6 +1137,18 @@ def build_config(
     min_samples_int: int | None = None
     if min_samples_value is not None:
         min_samples_int = _coerce_min_samples_per_horizon(min_samples_value)
+
+    use_max_value = use_max_historical_data
+    if use_max_value is None:
+        use_max_env = os.getenv("STOCK_PREDICTOR_USE_MAX_HISTORICAL_DATA")
+        if isinstance(use_max_env, str):
+            use_max_value = use_max_env.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            }
 
     target_basis_value = target_price_basis or os.getenv(
         "STOCK_PREDICTOR_TARGET_PRICE_BASIS"
@@ -1283,6 +1298,10 @@ def build_config(
         config_kwargs["k_stop"] = stop_loss_value
     if min_samples_int is not None:
         config_kwargs["min_samples_per_horizon"] = min_samples_int
+    if use_max_value is not None:
+        config_kwargs["use_max_historical_data"] = _coerce_bool(
+            use_max_value, default=False
+        )
     if tolerance_bands:
         config_kwargs["forecast_tolerance_bands"] = tolerance_bands
     if target_basis_str:
@@ -1452,6 +1471,10 @@ def load_config_from_mapping(payload: Mapping[str, Any]) -> PredictorConfig:
         data["sentiment"] = _coerce_bool(data["sentiment"], default=True)
     if "shuffle_training" in data:
         data["shuffle_training"] = _coerce_bool(data["shuffle_training"], default=False)
+    if "use_max_historical_data" in data:
+        data["use_max_historical_data"] = _coerce_bool(
+            data["use_max_historical_data"], default=False
+        )
 
     if "start_date" in data and isinstance(data["start_date"], str) and data["start_date"]:
         data["start_date"] = date.fromisoformat(data["start_date"])
