@@ -118,6 +118,16 @@ def _coerce_price_feature_toggles(
     return derive_price_feature_toggles(toggles)
 
 
+def _normalize_dates(frame: pd.DataFrame, column: str = "Date") -> pd.DataFrame:
+    if frame.empty or column not in frame.columns:
+        return frame
+    normalized = frame.copy()
+    normalized[column] = pd.to_datetime(normalized[column], errors="coerce")
+    normalized = normalized.dropna(subset=[column])
+    normalized[column] = normalized[column].dt.normalize()
+    return normalized
+
+
 def compute_price_features(
     price_df: pd.DataFrame,
     *,
@@ -142,6 +152,7 @@ def compute_price_features(
     # Remove rows where we could not parse the date; they cannot be used in time
     # series calculations and would otherwise propagate NaT values.
     df = df.dropna(subset=["Date"])
+    df["Date"] = df["Date"].dt.normalize()
 
     # Coerce numeric columns to floats/ints so downstream math works as expected.
     numeric_columns = {
@@ -166,7 +177,9 @@ def compute_price_features(
 
     toggles = _coerce_price_feature_toggles(feature_toggles)
 
-    df = df.sort_values("Date").reset_index(drop=True)
+    df = df.sort_values("Date").drop_duplicates(subset=["Date"], keep="last").reset_index(
+        drop=True
+    )
     df["Return_1d"] = df["Close"].pct_change()
     df["LogReturn_1d"] = np.log(df["Close"]).diff()
     df["SMA_5"] = df["Close"].rolling(window=5, min_periods=1).mean()
@@ -240,7 +253,10 @@ def _merge_macro_series(
     if "Date" not in macro_df.columns:
         return base_df
     macro_df["Date"] = pd.to_datetime(macro_df["Date"], errors="coerce")
-    macro_df = macro_df.dropna(subset=["Date"]).sort_values("Date")
+    macro_df = macro_df.dropna(subset=["Date"])
+    macro_df["Date"] = macro_df["Date"].dt.normalize()
+    macro_df = macro_df.sort_values("Date")
+    macro_df = macro_df[macro_df["Date"].isin(base_df["Date"])]
 
     macro_features: dict[str, pd.Series] = {"Date": base_df["Date"]}
     for symbol in symbols:
@@ -296,7 +312,13 @@ def merge_with_sentiment(
 
     scored = attach_sentiment(news_df)
     aggregated = aggregate_daily_sentiment(scored)
-    merged = price_df.merge(aggregated, on="Date", how="left")
+    if not aggregated.empty:
+        aggregated = _normalize_dates(aggregated, "Date")
+        aggregated = aggregated.drop_duplicates(subset=["Date"], keep="last")
+    aligned_prices = _normalize_dates(price_df, "Date")
+    if not aggregated.empty:
+        aggregated = aggregated[aggregated["Date"].isin(aligned_prices["Date"])]
+    merged = aligned_prices.merge(aggregated, on="Date", how="left")
     merged["sentiment"] = merged["sentiment"].fillna(0.0)
     return merged, aggregated
 

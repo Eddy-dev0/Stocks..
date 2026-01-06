@@ -312,6 +312,7 @@ class PredictorConfig:
     price_provider_priority: tuple[str, ...] = field(default_factory=tuple)
     disabled_providers: tuple[str, ...] = field(default_factory=tuple)
     memory_cache_seconds: float | None = None
+    cache_expiry_hours: float = 24.0
     timezone: ZoneInfo | str | None = None
     market_timezone: str | None = None
     # Select the anchor price source for return-based calculations ("close", "live", "open", "vwap_5m").
@@ -550,6 +551,12 @@ class PredictorConfig:
             raise ValueError("target_price_basis must be 'adj_close' or 'close'.")
         if self.memory_cache_seconds is not None:
             self.memory_cache_seconds = max(60.0, float(self.memory_cache_seconds))
+        try:
+            self.cache_expiry_hours = float(self.cache_expiry_hours)
+        except (TypeError, ValueError):
+            self.cache_expiry_hours = 24.0
+        if not math.isfinite(self.cache_expiry_hours) or self.cache_expiry_hours <= 0:
+            self.cache_expiry_hours = 24.0
         if self.timezone is None and self.market_timezone is not None:
             self.timezone = self.market_timezone
         if isinstance(self.timezone, ZoneInfo):
@@ -697,6 +704,12 @@ class PredictorConfig:
             Path(self.database_url.replace("sqlite:///", "")).parent.mkdir(
                 parents=True, exist_ok=True
             )
+
+    @property
+    def cache_expiry(self) -> timedelta:
+        """Return the configured cache expiry window."""
+
+        return timedelta(hours=self.cache_expiry_hours)
 
     @property
     def price_cache_path(self) -> Path:
@@ -943,7 +956,10 @@ def build_config(
     price_provider_priority: Optional[Iterable[str] | str] = None,
     disabled_providers: Optional[Iterable[str] | str] = None,
     memory_cache_seconds: Optional[float] = None,
+    cache_expiry_hours: Optional[float] = None,
     anchor_price_source: Optional[str] = None,
+    csv_price_loader_path: Optional[str] = None,
+    parquet_price_loader_path: Optional[str] = None,
     k_stop: Optional[float] = None,
     time_series_baselines: Optional[Iterable[str] | str] = None,
     time_series_params: Optional[Mapping[str, Mapping[str, Any]] | str] = None,
@@ -1018,6 +1034,16 @@ def build_config(
             memory_cache_float = float(memory_cache_value)
         except (TypeError, ValueError):
             memory_cache_float = None
+
+    cache_expiry_value = cache_expiry_hours or os.getenv(
+        "STOCK_PREDICTOR_CACHE_EXPIRY_HOURS"
+    )
+    cache_expiry_float: float | None = None
+    if cache_expiry_value is not None:
+        try:
+            cache_expiry_float = float(cache_expiry_value)
+        except (TypeError, ValueError):
+            cache_expiry_float = None
 
     anchor_price_value = anchor_price_source or os.getenv(
         "STOCK_PREDICTOR_ANCHOR_PRICE_SOURCE"
@@ -1212,7 +1238,12 @@ def build_config(
         "price_provider_priority": _coerce_provider_tokens(provider_priority_value),
         "disabled_providers": _coerce_provider_tokens(disabled_providers_value),
         "memory_cache_seconds": memory_cache_float,
+        "cache_expiry_hours": cache_expiry_float or 24.0,
         "anchor_price_source": anchor_price_value,
+        "csv_price_loader_path": csv_price_loader_path
+        or os.getenv("STOCK_PREDICTOR_CSV_PRICE_LOADER_PATH"),
+        "parquet_price_loader_path": parquet_price_loader_path
+        or os.getenv("STOCK_PREDICTOR_PARQUET_PRICE_LOADER_PATH"),
         "time_series_baselines": baseline_models,
         "time_series_params": baseline_params,
         "buy_zone": buy_zone,
