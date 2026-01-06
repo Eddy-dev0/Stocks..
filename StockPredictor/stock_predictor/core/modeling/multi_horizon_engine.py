@@ -673,13 +673,26 @@ class MultiHorizonModelingEngine:
             horizon_targets = dataset.targets.get(int(horizon_value), {})
             horizon_counts = requested_counts.get(int(horizon_value), {})
             if not any(count >= min_samples for count in horizon_counts.values()):
-                raise InsufficientSamplesError(
-                    f"Horizon {horizon_value} does not meet minimum sample requirements.",
-                    horizons=horizons,
-                    targets=tuple(sorted(requested_targets)),
-                    sample_counts=requested_counts,
-                    missing_targets=missing_targets,
+                latest_timestamp = None
+                if not dataset.features.empty and isinstance(dataset.features.index, pd.DatetimeIndex):
+                    latest_timestamp = pd.to_datetime(dataset.features.index, errors="coerce").max()
+                LOGGER.warning(
+                    "Horizon %s does not meet minimum sample requirements (max=%s, min=%s); skipping training.",
+                    horizon_value,
+                    max(horizon_counts.values(), default=0),
+                    min_samples,
                 )
+                self._untrainable_until[int(horizon_value)] = {
+                    "data_timestamp": latest_timestamp,
+                    "sample_counts": dict(horizon_counts),
+                    "missing_targets": missing_targets.get(int(horizon_value), {}),
+                    "reason": "insufficient_samples",
+                    "checked_at": latest_timestamp,
+                    "warning_emitted": False,
+                    "not_trainable": True,
+                    "last_training_attempt": pd.Timestamp.now(tz="UTC"),
+                }
+                continue
 
             below_threshold = {
                 target: count
@@ -994,7 +1007,23 @@ class MultiHorizonModelingEngine:
                     resolved_horizon,
                 )
                 self.train(horizon=resolved_horizon, force=True)
-                artefacts = self._load_horizon_artefacts(resolved_horizon)
+                try:
+                    artefacts = self._load_horizon_artefacts(resolved_horizon)
+                except FileNotFoundError:
+                    cache = self._untrainable_until.get(resolved_horizon) or {}
+                    message = (
+                        f"Horizon {resolved_horizon} has insufficient samples; training skipped."
+                        if cache.get("reason") == "insufficient_samples"
+                        else f"No trained artifacts available for horizon {resolved_horizon}."
+                    )
+                    return _unavailable(
+                        cache.get("reason", "insufficient_samples"),
+                        sample_counts=cache.get("sample_counts"),
+                        missing_targets=cache.get("missing_targets"),
+                        checked_at=_to_utc(cache.get("data_timestamp")) or latest_timestamp,
+                        message=message,
+                        last_training_attempt=_to_utc(cache.get("last_training_attempt")),
+                    )
 
             news_df = self.fetcher.fetch_news_data() if self.config.sentiment else pd.DataFrame()
             macro_df = pd.DataFrame()
