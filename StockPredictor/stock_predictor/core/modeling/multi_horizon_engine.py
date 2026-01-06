@@ -672,6 +672,15 @@ class MultiHorizonModelingEngine:
         for horizon_value in horizons:
             horizon_targets = dataset.targets.get(int(horizon_value), {})
             horizon_counts = requested_counts.get(int(horizon_value), {})
+            aligned_features = dataset.features.copy()
+            aligned_features = aligned_features.loc[
+                horizon_targets.get(
+                    "close_h",
+                    pd.Series(index=aligned_features.index),
+                ).index
+            ]
+            aligned_features = aligned_features.dropna(axis=1, how="all")
+            preprocessor = self._build_preprocessor(aligned_features)
             if not any(count >= min_samples for count in horizon_counts.values()):
                 latest_timestamp = None
                 if not dataset.features.empty and isinstance(dataset.features.index, pd.DatetimeIndex):
@@ -692,6 +701,22 @@ class MultiHorizonModelingEngine:
                     "not_trainable": True,
                     "last_training_attempt": pd.Timestamp.now(tz="UTC"),
                 }
+                if aligned_features.empty:
+                    raise InsufficientSamplesError(
+                        "Insufficient data to fit preprocessor.",
+                        horizons=horizons,
+                        targets=tuple(sorted(requested_targets)),
+                        sample_counts=requested_counts,
+                        missing_targets=missing_targets,
+                    )
+                fitted_pre = preprocessor.fit(aligned_features)
+                horizon_dir = self.models_dir / f"horizon_{horizon_value}"
+                horizon_dir.mkdir(parents=True, exist_ok=True)
+                joblib.dump(fitted_pre, horizon_dir / "preprocessor.joblib")
+                with open(horizon_dir / "feature_names.json", "w", encoding="utf-8") as handle:
+                    json.dump(get_feature_names_from_pipeline(fitted_pre), handle, indent=2)
+                with open(horizon_dir / "samples.json", "w", encoding="utf-8") as handle:
+                    json.dump(dict(horizon_counts), handle, indent=2)
                 continue
 
             below_threshold = {
@@ -707,11 +732,6 @@ class MultiHorizonModelingEngine:
                     count,
                     min_samples,
                 )
-
-            aligned_features = dataset.features.copy()
-            aligned_features = aligned_features.loc[horizon_targets.get("close_h", pd.Series(index=aligned_features.index)).index]
-            aligned_features = aligned_features.dropna(axis=1, how="all")
-            preprocessor = self._build_preprocessor(aligned_features)
 
             target_metrics: dict[str, Any] = {}
             target_sample_counts: dict[str, int] = {}
@@ -778,6 +798,34 @@ class MultiHorizonModelingEngine:
                     "Skipping persistence for horizon %s; no models were trained (insufficient samples or targets).",
                     horizon_value,
                 )
+                if aligned_features.empty:
+                    raise InsufficientSamplesError(
+                        "Insufficient data to fit preprocessor.",
+                        horizons=horizons,
+                        targets=tuple(sorted(requested_targets)),
+                        sample_counts=requested_counts,
+                        missing_targets=missing_targets,
+                    )
+                self._untrainable_until[int(horizon_value)] = {
+                    "data_timestamp": pd.to_datetime(aligned_features.index, errors="coerce").max()
+                    if isinstance(aligned_features.index, pd.DatetimeIndex)
+                    else None,
+                    "sample_counts": dict(horizon_counts),
+                    "missing_targets": missing_targets.get(int(horizon_value), {}),
+                    "reason": "insufficient_samples",
+                    "checked_at": pd.Timestamp.now(tz="UTC"),
+                    "warning_emitted": False,
+                    "not_trainable": True,
+                    "last_training_attempt": pd.Timestamp.now(tz="UTC"),
+                }
+                fitted_pre = preprocessor.fit(aligned_features)
+                horizon_dir = self.models_dir / f"horizon_{horizon_value}"
+                horizon_dir.mkdir(parents=True, exist_ok=True)
+                joblib.dump(fitted_pre, horizon_dir / "preprocessor.joblib")
+                with open(horizon_dir / "feature_names.json", "w", encoding="utf-8") as handle:
+                    json.dump(get_feature_names_from_pipeline(fitted_pre), handle, indent=2)
+                with open(horizon_dir / "samples.json", "w", encoding="utf-8") as handle:
+                    json.dump(dict(horizon_counts), handle, indent=2)
                 continue
 
             artefacts[horizon_value] = HorizonArtifacts(
@@ -1046,15 +1094,24 @@ class MultiHorizonModelingEngine:
             try:
                 transformed = artefacts.preprocessor.transform(latest_row)
             except NotFittedError:
-                cache_ts = _to_utc(self._untrainable_until.get(resolved_horizon, {}).get("data_timestamp"))
-                checked_at = cache_ts or latest_timestamp
-                return _unavailable(
-                    "insufficient_samples",
-                    sample_counts=artefacts.sample_counts,
-                    missing_targets={},
-                    checked_at=checked_at,
-                    message="Preprocessor not fitted; waiting for more data before retraining.",
+                LOGGER.info(
+                    "Preprocessor not fitted for horizon %s; triggering retrain.",
+                    resolved_horizon,
                 )
+                self.train(horizon=resolved_horizon, force=True)
+                try:
+                    artefacts = self._load_horizon_artefacts(resolved_horizon)
+                    transformed = artefacts.preprocessor.transform(latest_row)
+                except (FileNotFoundError, NotFittedError):
+                    cache_ts = _to_utc(self._untrainable_until.get(resolved_horizon, {}).get("data_timestamp"))
+                    checked_at = cache_ts or latest_timestamp
+                    return _unavailable(
+                        "insufficient_samples",
+                        sample_counts=artefacts.sample_counts,
+                        missing_targets={},
+                        checked_at=checked_at,
+                        message="Preprocessor not fitted; retraining did not yield usable artefacts.",
+                    )
 
             if not artefacts.models:
                 current_attempt = pd.Timestamp.now(tz="UTC")
