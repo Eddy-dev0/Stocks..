@@ -3943,10 +3943,26 @@ class StockPredictorDesktopApp:
         messagebox.showwarning("No price data", detail)
 
     def _on_insufficient_samples(self, exc: InsufficientSamplesError) -> None:
-        message = "Not enough historical data to generate predictions yet"
-        detail = str(exc).strip()
+        message = "Not enough historical data to generate predictions yet."
+        detail_lines: list[str] = []
+        min_samples = getattr(self.config, "min_samples_per_horizon", None)
+        if min_samples:
+            detail_lines.append(f"Minimum required samples per horizon: {min_samples}.")
+        if exc.missing_targets:
+            for horizon, targets in sorted(exc.missing_targets.items()):
+                missing = ", ".join(
+                    f"{name} ({count})" for name, count in sorted(targets.items())
+                )
+                detail_lines.append(f"Horizon {horizon} missing: {missing}.")
+        elif exc.sample_counts:
+            for horizon, targets in sorted(exc.sample_counts.items()):
+                counts = ", ".join(
+                    f"{name} ({count})" for name, count in sorted(targets.items())
+                )
+                detail_lines.append(f"Horizon {horizon} available: {counts}.")
+        detail_lines.append("Try expanding the date range or adding more price history.")
         self._set_busy(False, message)
-        display_message = f"{message}\n\n{detail}" if detail and detail != message else message
+        display_message = f"{message}\n\n" + "\n".join(detail_lines)
         messagebox.showinfo("Predictions unavailable", display_message)
 
     def _set_busy(self, busy: bool, status: str | None = None) -> None:
