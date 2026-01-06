@@ -80,15 +80,18 @@ def _engine(
     price_df: pd.DataFrame,
     *,
     min_samples_per_horizon: int | None = None,
+    prediction_horizons: tuple[int, ...] | None = None,
+    use_max_historical_data: bool = False,
 ) -> MultiHorizonModelingEngine:
     config = PredictorConfig(
         ticker="CACHE",
         sentiment=False,
-        prediction_horizons=(1,),
+        prediction_horizons=prediction_horizons or (1,),
         data_dir=tmp_path,
         models_dir=tmp_path / "models",
         feature_toggles=FeatureToggles(),
         model_params={"global": {"random_state": 0}},
+        use_max_historical_data=use_max_historical_data,
     )
     if min_samples_per_horizon is not None:
         setattr(config, "min_samples_per_horizon", min_samples_per_horizon)
@@ -247,6 +250,27 @@ def test_build_dataset_aligns_targets_on_canonical_dates(tmp_path: Path) -> None
     assert direction.dropna().shape[0] == len(expected_index)
 
 
+def test_use_max_historical_data_trains_with_limited_samples(tmp_path: Path) -> None:
+    price_df = _price_frame(periods=6)
+    engine = _engine(
+        tmp_path,
+        price_df,
+        min_samples_per_horizon=100,
+        prediction_horizons=(1, 5),
+        use_max_historical_data=True,
+    )
+
+    result = engine.train(horizon=5)
+
+    model_path = tmp_path / "models" / "nextgen" / "horizon_1" / "close_h_model.joblib"
+    assert result["status"] == "trained"
+    assert model_path.exists()
+
+    prediction = engine.predict_latest(horizon=5)
+    assert prediction["status"] == "ok"
+    assert prediction["horizon"] == 1
+
+
 def test_train_persists_preprocessor_with_empty_alignment(tmp_path: Path) -> None:
     price_df = _price_frame(periods=1)
     engine = _engine(tmp_path, price_df, min_samples_per_horizon=5)
@@ -254,18 +278,15 @@ def test_train_persists_preprocessor_with_empty_alignment(tmp_path: Path) -> Non
     result = engine.train(horizon=1)
 
     preprocessor_path = tmp_path / "models" / "nextgen" / "horizon_1" / "preprocessor.joblib"
-    assert result["status"] == "no_data"
+    assert result["status"] == "trained"
     assert preprocessor_path.exists()
 
 
-def test_predict_latest_returns_no_data_without_models(tmp_path: Path) -> None:
-    price_df = _price_frame(periods=1)
+def test_predict_latest_returns_no_data_without_price_history(tmp_path: Path) -> None:
+    price_df = pd.DataFrame(columns=["Date", "Close"])
     engine = _engine(tmp_path, price_df, min_samples_per_horizon=5)
-
-    engine.train(horizon=1)
-    engine.fetcher._price_df = _price_frame(start="2023-01-10", periods=2)  # type: ignore[attr-defined]
 
     result = engine.predict_latest(horizon=1)
 
     assert result["status"] == "no_data"
-    assert result["reason"] == "insufficient_samples"
+    assert result["reason"] == "no_data"

@@ -677,23 +677,33 @@ class MultiHorizonModelingEngine:
                 self.config, "min_samples_per_horizon", DEFAULT_MIN_SAMPLES_PER_HORIZON
             )
         )
-        effective_min_samples = min_samples
-        horizons = requested_horizons
+        max_sample_count = max(horizon_sample_counts.values(), default=0)
+        if max_sample_count < 1:
+            raise InsufficientSamplesError(
+                "Unable to train: no target samples available for the requested horizons.",
+                horizons=requested_horizons,
+                targets=tuple(sorted(requested_targets)),
+                sample_counts=sample_counts,
+                missing_targets=sample_counts,
+            )
+        horizons = list(requested_horizons)
         if self.config.use_max_historical_data and horizon_sample_counts:
-            available_horizons = [
-                h for h, count in horizon_sample_counts.items() if count > 0
-            ]
-            if available_horizons:
-                max_available_horizon = max(available_horizons)
-                if (
-                    len(horizons) == 1
-                    and horizon_sample_counts.get(int(horizons[0]), 0) == 0
-                ):
-                    horizons = (int(max_available_horizon),)
-                    effective_min_samples = min(
-                        effective_min_samples,
-                        horizon_sample_counts.get(int(max_available_horizon), 0),
-                    )
+            max_available_horizon = max(
+                horizon_sample_counts, key=horizon_sample_counts.get
+            )
+            updated_horizons: list[int] = []
+            for horizon_value in horizons:
+                if horizon_sample_counts.get(int(horizon_value), 0) < min_samples:
+                    updated_horizons.append(int(max_available_horizon))
+                else:
+                    updated_horizons.append(int(horizon_value))
+            horizons = updated_horizons
+        seen: set[int] = set()
+        horizons = tuple(
+            horizon_value
+            for horizon_value in horizons
+            if not (horizon_value in seen or seen.add(horizon_value))
+        )
 
         requested_counts = {
             int(h): {
@@ -707,7 +717,7 @@ class MultiHorizonModelingEngine:
             missing = {
                 t: count
                 for t, count in horizon_counts.items()
-                if count < effective_min_samples
+                if count < min_samples
             }
             if missing:
                 missing_targets[int(horizon_value)] = missing
@@ -773,37 +783,8 @@ class MultiHorizonModelingEngine:
             ]
             aligned_features = aligned_features.dropna(axis=1, how="all")
             preprocessor = self._build_preprocessor(aligned_features)
-            if not any(
-                count >= effective_min_samples for count in horizon_counts.values()
-            ):
-                latest_timestamp = _latest_ts(dataset.features)
-                checked_at = pd.Timestamp.now(tz="UTC")
-                LOGGER.warning(
-                    "Horizon %s does not meet minimum sample requirements (max=%s, min=%s); skipping training.",
-                    horizon_value,
-                    max(horizon_counts.values(), default=0),
-                    effective_min_samples,
-                )
-                self._untrainable_until[int(horizon_value)] = {
-                    "data_timestamp": latest_timestamp,
-                    "sample_counts": dict(horizon_counts),
-                    "missing_targets": missing_targets.get(int(horizon_value), {}),
-                    "reason": "insufficient_samples",
-                    "checked_at": checked_at,
-                    "warning_emitted": False,
-                    "not_trainable": True,
-                    "last_training_attempt": checked_at,
-                }
-                _persist_preprocessor(
-                    horizon_value=int(horizon_value),
-                    horizon_counts=horizon_counts,
-                    aligned_features=aligned_features,
-                )
-                LOGGER.warning(
-                    "No models trained for horizon %s due to insufficient samples; preprocessor persisted.",
-                    horizon_value,
-                )
-                continue
+            horizon_sample_count = horizon_sample_counts.get(int(horizon_value), 0)
+            effective_min_samples = max(horizon_sample_count, 1)
 
             below_threshold = {
                 target: count
@@ -834,17 +815,26 @@ class MultiHorizonModelingEngine:
                 if y.empty:
                     continue
                 X = aligned_features.loc[y.index]
-                # chronological split
-                X_train, X_temp, y_train, y_temp = train_test_split(
-                    X, y, test_size=0.3, shuffle=False
-                )
-                X_val, X_test, y_val, y_test = train_test_split(
-                    X_temp, y_temp, test_size=0.5, shuffle=False
-                )
-                fitted_pre = preprocessor.fit(X_train)
-                X_train_t = fitted_pre.transform(X_train)
-                X_val_t = fitted_pre.transform(X_val)
-                X_test_t = fitted_pre.transform(X_test)
+                if len(y) < 4:
+                    fitted_pre = preprocessor.fit(X)
+                    X_train_t = fitted_pre.transform(X)
+                    X_val_t = None
+                    X_test_t = None
+                    y_train = y
+                    y_val = None
+                    y_test = None
+                else:
+                    # chronological split
+                    X_train, X_temp, y_train, y_temp = train_test_split(
+                        X, y, test_size=0.3, shuffle=False
+                    )
+                    X_val, X_test, y_val, y_test = train_test_split(
+                        X_temp, y_temp, test_size=0.5, shuffle=False
+                    )
+                    fitted_pre = preprocessor.fit(X_train)
+                    X_train_t = fitted_pre.transform(X_train)
+                    X_val_t = fitted_pre.transform(X_val)
+                    X_test_t = fitted_pre.transform(X_test)
 
                 task = "classification" if "direction" in target_name else "regression"
                 model_params: dict[str, Any] = dict(self.config.model_params.get("global", {}))
@@ -857,54 +847,51 @@ class MultiHorizonModelingEngine:
                     self.config.model_type,
                     model_params,
                 )
-                y_hat_val = model.predict(X_val_t)
-                y_hat_test = model.predict(X_test_t)
+                metric_value: dict[str, float] = {}
+                if X_val_t is not None and y_val is not None:
+                    y_hat_val = model.predict(X_val_t)
+                else:
+                    y_hat_val = None
+                if X_test_t is not None and y_test is not None:
+                    y_hat_test = model.predict(X_test_t)
+                else:
+                    y_hat_test = None
 
                 if task == "classification":
-                    metric_value = {
-                        "val_accuracy": float(accuracy_score(y_val, y_hat_val)),
-                        "test_accuracy": float(accuracy_score(y_test, y_hat_test)),
-                    }
+                    if y_hat_val is not None and y_val is not None:
+                        metric_value["val_accuracy"] = float(
+                            accuracy_score(y_val, y_hat_val)
+                        )
+                    if y_hat_test is not None and y_test is not None:
+                        metric_value["test_accuracy"] = float(
+                            accuracy_score(y_test, y_hat_test)
+                        )
                 else:
-                    mse_val = mean_squared_error(y_val, y_hat_val)
-                    mse_test = mean_squared_error(y_test, y_hat_test)
-                    metric_value = {
-                        "val_mae": float(mean_absolute_error(y_val, y_hat_val)),
-                        "val_rmse": float(math.sqrt(mse_val)),
-                        "test_mae": float(mean_absolute_error(y_test, y_hat_test)),
-                        "test_rmse": float(math.sqrt(mse_test)),
-                    }
+                    if y_hat_val is not None and y_val is not None:
+                        mse_val = mean_squared_error(y_val, y_hat_val)
+                        metric_value["val_mae"] = float(
+                            mean_absolute_error(y_val, y_hat_val)
+                        )
+                        metric_value["val_rmse"] = float(math.sqrt(mse_val))
+                    if y_hat_test is not None and y_test is not None:
+                        mse_test = mean_squared_error(y_test, y_hat_test)
+                        metric_value["test_mae"] = float(
+                            mean_absolute_error(y_test, y_hat_test)
+                        )
+                        metric_value["test_rmse"] = float(math.sqrt(mse_test))
 
                 target_metrics[target_name] = metric_value
                 target_sample_counts[target_name] = int(len(y_train))
                 trained_models[target_name] = model
 
             if fitted_pre is None or not trained_models:
-                LOGGER.warning(
-                    "Skipping persistence for horizon %s; no models were trained (insufficient samples or targets).",
-                    horizon_value,
+                raise InsufficientSamplesError(
+                    f"No trainable targets available for horizon {horizon_value}.",
+                    horizons=horizons,
+                    targets=tuple(sorted(requested_targets)),
+                    sample_counts=sample_counts,
+                    missing_targets=missing_targets,
                 )
-                checked_at = pd.Timestamp.now(tz="UTC")
-                self._untrainable_until[int(horizon_value)] = {
-                    "data_timestamp": _latest_ts(aligned_features),
-                    "sample_counts": dict(horizon_counts),
-                    "missing_targets": missing_targets.get(int(horizon_value), {}),
-                    "reason": "insufficient_samples",
-                    "checked_at": checked_at,
-                    "warning_emitted": False,
-                    "not_trainable": True,
-                    "last_training_attempt": checked_at,
-                }
-                _persist_preprocessor(
-                    horizon_value=int(horizon_value),
-                    horizon_counts=horizon_counts,
-                    aligned_features=aligned_features,
-                )
-                LOGGER.warning(
-                    "No models trained for horizon %s due to insufficient samples; preprocessor persisted.",
-                    horizon_value,
-                )
-                continue
 
             artefacts[horizon_value] = HorizonArtifacts(
                 horizon=horizon_value,
@@ -928,20 +915,13 @@ class MultiHorizonModelingEngine:
                 json.dump(target_sample_counts, handle, indent=2)
 
         if not artefacts:
-            LOGGER.warning(
-                "Kein Horizon hat genügend Samples; Training wird übersprungen."
+            raise InsufficientSamplesError(
+                "No trained artefacts could be produced.",
+                horizons=horizons,
+                targets=tuple(sorted(requested_targets)),
+                sample_counts=sample_counts,
+                missing_targets=missing_targets,
             )
-            metadata = {
-                **dataset.metadata,
-                "artefacts": {},
-            }
-            return {
-                "status": "no_data",
-                "reason": "insufficient_samples",
-                "horizons": horizons,
-                "targets": requested_targets,
-                "metadata": metadata,
-            }
 
         metadata = {
             **dataset.metadata,
@@ -1004,8 +984,17 @@ class MultiHorizonModelingEngine:
                     if count > 0
                 ]
                 if available_horizons:
-                    max_available_horizon = max(available_horizons)
-                    if horizon_sample_counts.get(resolved_horizon, 0) == 0:
+                    max_available_horizon = max(
+                        horizon_sample_counts, key=horizon_sample_counts.get
+                    )
+                    min_samples = int(
+                        getattr(
+                            self.config,
+                            "min_samples_per_horizon",
+                            DEFAULT_MIN_SAMPLES_PER_HORIZON,
+                        )
+                    )
+                    if horizon_sample_counts.get(resolved_horizon, 0) < min_samples:
                         resolved_horizon = int(max_available_horizon)
         
         def _to_utc(timestamp: pd.Timestamp | None) -> pd.Timestamp | None:
@@ -1115,14 +1104,14 @@ class MultiHorizonModelingEngine:
                 "data_timestamp": latest_ts,
                 "sample_counts": getattr(exc, "sample_counts", None) or {},
                 "missing_targets": getattr(exc, "missing_targets", None) or {},
-                "reason": "insufficient_samples",
+                "reason": "no_data",
                 "checked_at": latest_ts,
                 "warning_emitted": False,
                 "not_trainable": True,
                 "last_training_attempt": current_attempt,
             }
             return _unavailable(
-                "insufficient_samples",
+                "no_data",
                 sample_counts=getattr(exc, "sample_counts", None),
                 missing_targets=getattr(exc, "missing_targets", None),
                 checked_at=latest_ts,
@@ -1144,11 +1133,11 @@ class MultiHorizonModelingEngine:
                 self._untrainable_until[resolved_horizon] = cache
             if cache and cache.get("not_trainable") and not new_data_available:
                 if cache_ts is None or (latest_timestamp is None or latest_timestamp <= cache_ts):
-                    msg = f"Horizon {resolved_horizon} still below min samples; waiting for more data"
+                    msg = f"Horizon {resolved_horizon} has no data available yet; waiting for more data"
                     LOGGER.info(msg)
                     LOGGER.debug("%s (latest_ts=%s, cache_ts=%s)", msg, latest_timestamp, cache_ts)
                     return _unavailable(
-                        cache.get("reason", "insufficient_samples") or "insufficient_samples",
+                        cache.get("reason", "no_data") or "no_data",
                         sample_counts=cache.get("sample_counts"),
                         missing_targets=cache.get("missing_targets"),
                         checked_at=cache_ts,
@@ -1168,12 +1157,12 @@ class MultiHorizonModelingEngine:
                 except FileNotFoundError:
                     cache = self._untrainable_until.get(resolved_horizon) or {}
                     message = (
-                        f"Horizon {resolved_horizon} has insufficient samples; training skipped."
-                        if cache.get("reason") == "insufficient_samples"
+                        f"No data available for horizon {resolved_horizon}; training skipped."
+                        if cache.get("reason") == "no_data"
                         else f"No trained artifacts available for horizon {resolved_horizon}."
                     )
                     return _unavailable(
-                        cache.get("reason", "insufficient_samples"),
+                        cache.get("reason", "no_data"),
                         sample_counts=cache.get("sample_counts"),
                         missing_targets=cache.get("missing_targets"),
                         checked_at=_to_utc(cache.get("data_timestamp")) or latest_timestamp,
@@ -1211,7 +1200,7 @@ class MultiHorizonModelingEngine:
                     cache_ts = _to_utc(self._untrainable_until.get(resolved_horizon, {}).get("data_timestamp"))
                     checked_at = cache_ts or latest_timestamp
                     return _unavailable(
-                        "insufficient_samples",
+                        "no_data",
                         sample_counts=artefacts.sample_counts,
                         missing_targets={},
                         checked_at=checked_at,
@@ -1220,18 +1209,8 @@ class MultiHorizonModelingEngine:
 
             if not artefacts.models:
                 current_attempt = pd.Timestamp.now(tz="UTC")
-                self._untrainable_until[resolved_horizon] = {
-                    "data_timestamp": latest_timestamp,
-                    "sample_counts": artefacts.sample_counts,
-                    "missing_targets": {},
-                    "reason": "insufficient_samples",
-                    "checked_at": latest_timestamp,
-                    "warning_emitted": False,
-                    "not_trainable": True,
-                    "last_training_attempt": current_attempt,
-                }
                 return _unavailable(
-                    "insufficient_samples",
+                    "no_data",
                     sample_counts=artefacts.sample_counts,
                     missing_targets={},
                     checked_at=latest_timestamp,
