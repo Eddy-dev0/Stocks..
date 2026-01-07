@@ -481,6 +481,7 @@ class StockPredictorDesktopApp:
         self._latest_feature_usage_entries: list[Any] = []
         self._latest_indicator_report: list[str] = []
         self.feature_toggle_vars: dict[str, tk.BooleanVar] = {}
+        self._pending_feature_toggle_refresh = False
         self.forecast_date_var = tk.StringVar(value="Forecast date: —")
         self.current_forecast_date: pd.Timestamp | None = None
         self.market_holidays: list[pd.Timestamp] = []
@@ -3571,30 +3572,8 @@ class StockPredictorDesktopApp:
         toggles_obj = FeatureToggles.from_any(toggles, defaults=self.config.feature_toggles)
         self.config.feature_toggles = toggles_obj
         self.config.price_feature_toggles = derive_price_feature_toggles(toggles_obj)
-        self.application.pipeline = StockPredictorAI(self.config)
-        status_message = "Feature toggles updated."
-        self._set_busy(True, "Recomputing indicators for updated feature toggles…")
-        try:
-            indicators_built = self.application.pipeline.refresh_indicators(force=True)
-            indicators: pd.DataFrame | None = None
-            try:
-                indicators = self.application.pipeline.fetcher.fetch_indicator_data()
-            except Exception as exc:  # pragma: no cover - optional data source
-                LOGGER.debug("Indicator dataset unavailable after refresh: %s", exc)
-            self.indicator_history = indicators if isinstance(indicators, pd.DataFrame) else None
-            self.indicator_history_converted = None
-            self._indicator_selection_cache = set()
-            self._indicator_user_override = False
-            self._update_indicator_view()
-            if indicators_built:
-                status_message = f"Feature toggles updated. {indicators_built} indicators refreshed."
-            else:
-                status_message = "Feature toggles updated. No indicators available for this selection."
-        except Exception as exc:  # pragma: no cover - defensive UI update
-            LOGGER.exception("Failed to refresh indicators after toggling features: %s", exc)
-            status_message = "Feature toggles updated. Re-run prediction to apply changes."
-        finally:
-            self._set_busy(False, status_message)
+        self._pending_feature_toggle_refresh = True
+        self._set_status("Feature toggles updated. Run prediction or refresh data to apply changes.")
 
     def _on_use_max_historical_data_changed(self) -> None:
         if self._busy:
@@ -3652,7 +3631,18 @@ class StockPredictorDesktopApp:
     def _initialise_prediction(self) -> None:
         self._on_predict()
 
+    def _apply_pending_feature_toggles(self) -> None:
+        if not self._pending_feature_toggle_refresh:
+            return
+        self.application.pipeline = StockPredictorAI(self.config)
+        try:
+            self.application.pipeline.refresh_indicators(force=True)
+        except Exception as exc:  # pragma: no cover - optional data sources
+            LOGGER.debug("Failed to refresh indicators after feature toggle update: %s", exc)
+        self._pending_feature_toggle_refresh = False
+
     def _refresh_and_predict(self) -> dict[str, Any]:
+        self._apply_pending_feature_toggles()
         self.application.refresh_data(force=True)
         return self._predict_payload(refresh=True)
 
@@ -3754,6 +3744,7 @@ class StockPredictorDesktopApp:
         return True
 
     def _predict_payload(self, *, refresh: bool = False) -> dict[str, Any]:
+        self._apply_pending_feature_toggles()
         horizon_arg: Any
         if self.selected_horizon_code:
             horizon_arg = self.selected_horizon_code
