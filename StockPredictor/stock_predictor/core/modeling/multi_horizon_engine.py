@@ -322,6 +322,29 @@ class MultiHorizonModelingEngine:
                 payload.update(dict(extra))
             LOGGER.info("dataset_build_stage", extra={"dataset_stage": payload})
 
+        def _has_usable_close(frame: pd.DataFrame) -> bool:
+            if frame is None or frame.empty:
+                return False
+            lower_columns = {column.lower(): column for column in frame.columns}
+            basis = getattr(self.config, "target_price_basis", "adj_close")
+            basis = str(basis or "adj_close").strip().lower()
+            if basis == "adj_close":
+                close_col = (
+                    lower_columns.get("adj close")
+                    or lower_columns.get("adj_close")
+                    or lower_columns.get("close")
+                )
+            else:
+                close_col = (
+                    lower_columns.get("close")
+                    or lower_columns.get("adj close")
+                    or lower_columns.get("adj_close")
+                )
+            if close_col is None:
+                return False
+            closes = pd.to_numeric(frame[close_col], errors="coerce")
+            return bool(closes.notna().any())
+
         def _raise_stage_error(stage: str, reason: str, *, details: Mapping[str, Any] | None = None) -> None:
             detail_payload = {"stage": stage, "reason": reason}
             if details:
@@ -354,8 +377,35 @@ class MultiHorizonModelingEngine:
                 start=self.config.start_date,
                 end=self.config.end_date,
             )
+            if price_df.empty or not _has_usable_close(price_df):
+                fetcher = getattr(self, "fetcher", None)
+                if fetcher is not None and hasattr(fetcher, "fetch_price_data"):
+                    LOGGER.info(
+                        "Price history missing or invalid for %s; forcing refresh before dataset build.",
+                        ticker,
+                    )
+                    try:
+                        refreshed = fetcher.fetch_price_data(force=True)
+                    except Exception as exc:  # pragma: no cover - defensive fallback
+                        LOGGER.warning(
+                            "Failed to refresh price data for %s: %s",
+                            ticker,
+                            exc,
+                        )
+                    else:
+                        if isinstance(refreshed, pd.DataFrame) and not refreshed.empty:
+                            price_df = refreshed
+                            _log_stage(
+                                "price_refresh",
+                                price_df,
+                                ticker=ticker,
+                                extra={"forced_refresh": True},
+                            )
             if price_df.empty:
                 LOGGER.warning("No price data available for %s; skipping", ticker)
+                continue
+            if not _has_usable_close(price_df):
+                LOGGER.warning("Price data for %s contains no usable close values; skipping", ticker)
                 continue
 
             _log_stage("price_fetch", price_df, ticker=ticker)
