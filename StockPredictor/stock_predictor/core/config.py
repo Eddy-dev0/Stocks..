@@ -196,7 +196,7 @@ class PredictorConfig:
     """Runtime configuration for :class:`StockPredictorAI`."""
 
     ticker: str
-    start_date: date = field(default_factory=lambda: date.today() - timedelta(days=365 * 5))
+    start_date: date = field(default_factory=lambda: date.today() - timedelta(days=365 * 10))
     end_date: Optional[date] = None
     interval: str = "1d"
     model_type: str = "random_forest"
