@@ -3199,6 +3199,14 @@ class StockPredictorAI:
                     label = f"{target}>{event_threshold}"
                 event_probabilities.setdefault(target, {})[label] = float(event_prob)
 
+        if status == "no_data" and predictions:
+            prediction_warnings.append(
+                "Next-gen model artifacts unavailable; using legacy predictions."
+            )
+            status = "ok"
+            reason = None
+            message = None
+
         confluence_block = None
         combined_confidence = None
         confluence_score = None
