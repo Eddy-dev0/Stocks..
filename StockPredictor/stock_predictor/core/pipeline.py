@@ -1474,12 +1474,14 @@ class MarketDataETL:
     def _price_loader_path(self) -> str | None:
         """Return the configured path for local price loaders, if any."""
 
-        for path in (
-            self.config.csv_price_loader_path,
-            self.config.parquet_price_loader_path,
-        ):
-            if path:
+        csv_path = self.config.csv_price_loader_path
+        parquet_path = self.config.parquet_price_loader_path
+        for path in (csv_path, parquet_path):
+            if not path:
+                continue
+            if path.exists():
                 return str(path)
+            LOGGER.warning("Price loader path not found; ignoring %s", path)
         return None
 
     def _log_provider_failures(
