@@ -723,6 +723,10 @@ class PredictorConfig:
         return self.data_dir / f"{self.ticker}_{self.interval}_prices.csv"
 
     @property
+    def legacy_price_cache_path(self) -> Path:
+        return self.data_dir / f"{self.ticker}.csv"
+
+    @property
     def news_cache_path(self) -> Path:
         return self.data_dir / f"{self.ticker}_news.csv"
 
