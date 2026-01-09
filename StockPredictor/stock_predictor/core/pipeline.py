@@ -1584,10 +1584,6 @@ class MarketDataETL:
             legacy_path = self.config.legacy_price_cache_path
             if legacy_path != path:
                 payload.to_csv(legacy_path, index=False)
-            csv_loader_path = self.config.csv_price_loader_path
-            if csv_loader_path and csv_loader_path != path and csv_loader_path != legacy_path:
-                csv_loader_path.parent.mkdir(parents=True, exist_ok=True)
-                payload.to_csv(csv_loader_path, index=False)
             frame.attrs["cache_timestamp"] = timestamp
         except Exception as exc:  # pragma: no cover - defensive
             LOGGER.debug("Unable to persist price cache to %s: %s", path, exc)
