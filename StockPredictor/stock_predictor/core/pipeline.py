@@ -1474,12 +1474,14 @@ class MarketDataETL:
     def _price_loader_path(self) -> str | None:
         """Return the configured path for local price loaders, if any."""
 
-        for path in (
-            self.config.csv_price_loader_path,
-            self.config.parquet_price_loader_path,
-        ):
-            if path:
+        csv_path = self.config.csv_price_loader_path
+        parquet_path = self.config.parquet_price_loader_path
+        for path in (csv_path, parquet_path):
+            if not path:
+                continue
+            if path.exists():
                 return str(path)
+            LOGGER.warning("Price loader path not found; ignoring %s", path)
         return None
 
     def _log_provider_failures(
@@ -1526,9 +1528,13 @@ class MarketDataETL:
 
     def _load_local_price_cache(self) -> tuple[pd.DataFrame, datetime] | None:
         path = self.config.price_cache_path
+        legacy_path = self.config.legacy_price_cache_path
         self._last_price_cache_warning = None
         if not path.exists():
-            return None
+            if legacy_path.exists():
+                path = legacy_path
+            else:
+                return None
         try:
             frame = pd.read_csv(path)
         except Exception as exc:  # pragma: no cover - defensive
@@ -1575,6 +1581,13 @@ class MarketDataETL:
             payload = frame.copy()
             payload["CacheTimestamp"] = timestamp.isoformat()
             payload.to_csv(path, index=False)
+            legacy_path = self.config.legacy_price_cache_path
+            if legacy_path != path:
+                payload.to_csv(legacy_path, index=False)
+            csv_loader_path = self.config.csv_price_loader_path
+            if csv_loader_path and csv_loader_path != path and csv_loader_path != legacy_path:
+                csv_loader_path.parent.mkdir(parents=True, exist_ok=True)
+                payload.to_csv(csv_loader_path, index=False)
             frame.attrs["cache_timestamp"] = timestamp
         except Exception as exc:  # pragma: no cover - defensive
             LOGGER.debug("Unable to persist price cache to %s: %s", path, exc)
