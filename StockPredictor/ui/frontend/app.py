@@ -1434,17 +1434,22 @@ col_live_action, col_live_table = st.columns([1, 3])
 with col_live_action:
     if st.button("Refresh live snapshot", type="primary"):
         with st.spinner("Fetching live pricing..."):
+            snapshot_payload = {
+                "expected_change_pct_model": expected_change_pct_model,
+                "expected_low_pct_model": expected_low_pct_model,
+                "expected_low_multiplier": expected_low_multiplier,
+                "stop_loss_multiplier": stop_loss_multiplier,
+                "stop_loss_pct": stop_loss_pct,
+                "prob_up": prob_up,
+            }
+            if isinstance(effective_start_date, date):
+                snapshot_payload["start_date"] = effective_start_date.isoformat()
+            if isinstance(effective_end_date, date):
+                snapshot_payload["end_date"] = effective_end_date.isoformat()
             response = _request(
                 f"/live-price/{ticker}",
                 method="POST",
-                json_payload={
-                    "expected_change_pct_model": expected_change_pct_model,
-                    "expected_low_pct_model": expected_low_pct_model,
-                    "expected_low_multiplier": expected_low_multiplier,
-                    "stop_loss_multiplier": stop_loss_multiplier,
-                    "stop_loss_pct": stop_loss_pct,
-                    "prob_up": prob_up,
-                },
+                json_payload=snapshot_payload,
             )
             if response is not None:
                 st.session_state["live_price_response"] = response

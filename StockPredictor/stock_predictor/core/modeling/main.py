@@ -11,7 +11,7 @@ import os
 import re
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timedelta, time as dt_time
+from datetime import date, datetime, timedelta, time as dt_time
 from itertools import repeat
 from pathlib import Path
 from numbers import Real
@@ -4956,8 +4956,79 @@ class StockPredictorAI:
         resolved_horizon = self._resolve_horizon(horizon)
         self.horizon = resolved_horizon
 
-        last_price, timestamp = self.fetcher.fetch_live_price(force=True)
-        anchor_price = self._safe_float(last_price)
+        anchor_price: float | None = None
+        timestamp: pd.Timestamp | None = None
+        end_date = self.config.end_date
+
+        def _resolve_historical_anchor(
+            price_df: pd.DataFrame | None, cutoff: date
+        ) -> tuple[float | None, pd.Timestamp | None]:
+            if price_df is None or price_df.empty:
+                return None, None
+
+            frame = price_df.copy()
+            column_map = {str(col).lower(): col for col in frame.columns}
+            date_col = (
+                column_map.get("date")
+                or column_map.get("datetime")
+                or column_map.get("timestamp")
+            )
+            if date_col:
+                frame["_snapshot_date"] = pd.to_datetime(
+                    frame[date_col], errors="coerce"
+                )
+            else:
+                frame["_snapshot_date"] = pd.to_datetime(frame.index, errors="coerce")
+
+            frame = frame.dropna(subset=["_snapshot_date"]).sort_values("_snapshot_date")
+            frame = frame[frame["_snapshot_date"].dt.date <= cutoff]
+            if frame.empty:
+                return None, None
+
+            close_col = None
+            for candidate in (
+                "Close",
+                "close",
+                "Adj Close",
+                "adj close",
+                "adj_close",
+                "Last",
+                "last",
+                "Price",
+                "price",
+            ):
+                if candidate in frame.columns:
+                    close_col = candidate
+                    break
+            if close_col is None:
+                numeric_cols = frame.select_dtypes(include=["number"]).columns
+                if len(numeric_cols) > 0:
+                    close_col = numeric_cols[0]
+
+            last_row = frame.iloc[-1]
+            last_timestamp = pd.to_datetime(last_row["_snapshot_date"], errors="coerce")
+            if (
+                last_timestamp is not None
+                and not pd.isna(last_timestamp)
+                and last_timestamp.tzinfo is None
+                and self.market_timezone
+            ):
+                last_timestamp = last_timestamp.tz_localize(self.market_timezone)
+
+            last_price_value = (
+                self._safe_float(last_row.get(close_col)) if close_col else None
+            )
+            return last_price_value, last_timestamp
+
+        if end_date and end_date != date.today():
+            historical_frame = self.fetcher.fetch_price_data(force=False)
+            anchor_price, timestamp = _resolve_historical_anchor(
+                historical_frame, end_date
+            )
+
+        if anchor_price is None and (end_date is None or end_date == date.today()):
+            last_price, timestamp = self.fetcher.fetch_live_price(force=True)
+            anchor_price = self._safe_float(last_price)
 
         prediction_output = self.nextgen_engine.predict_latest(
             horizon=resolved_horizon,
