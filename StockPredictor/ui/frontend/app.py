@@ -19,6 +19,7 @@ from stock_predictor.core.features import (
     default_feature_toggles,
 )
 from stock_predictor.core.indicator_library import default_indicator_toggles
+from stock_predictor.core.clock import app_clock
 from stock_predictor.core.config import PredictorConfig
 
 DEFAULT_API_URL = os.getenv("STOCK_PREDICTOR_API_URL", "http://localhost:8000")
@@ -138,6 +139,9 @@ def _set_analysis_date_override() -> None:
     st.session_state["analysis_date_override"] = st.session_state.get(
         "analysis_date_picker"
     )
+    override = st.session_state.get("analysis_date_override")
+    if isinstance(override, date):
+        app_clock.set_test_date(override)
 
 
 def _render_feature_toggle_summary(block: Mapping[str, Any] | None) -> None:
@@ -1060,9 +1064,9 @@ with st.sidebar:
     st.header("Query Parameters")
     ticker_input = st.text_input("Ticker symbol", value=DEFAULT_TICKER)
     ticker = (ticker_input or DEFAULT_TICKER).upper().strip()
-    start_default = date.today() - timedelta(days=365)
+    start_default = app_clock.today() - timedelta(days=365)
     start_date = st.date_input("Start date", value=start_default)
-    end_date = st.date_input("End date", value=date.today())
+    end_date = st.date_input("End date", value=app_clock.today())
     interval = st.selectbox("Interval", options=["1d", "1wk", "1mo"], index=0)
     targets_raw = st.text_input("Prediction targets", help="Comma separated list of targets")
     force_refresh_market = st.checkbox("Refresh market data on fetch", value=True)
@@ -1396,13 +1400,14 @@ with time_controls[0]:
     if st.button("Aktuelle Zeit"):
         st.session_state["use_current_time"] = True
         st.session_state["analysis_date_override"] = None
-        st.session_state["analysis_date_picker"] = date.today()
+        st.session_state["analysis_date_picker"] = app_clock.system_today()
         analysis_date_override = None
         use_current_time = True
+        app_clock.clear_test_date()
 with time_controls[1]:
     st.date_input(
         "Testdatum",
-        value=analysis_date_override or date.today(),
+        value=analysis_date_override or app_clock.today(),
         key="analysis_date_picker",
         on_change=_set_analysis_date_override,
     )
@@ -1419,7 +1424,13 @@ if use_current_time or not analysis_date_override:
     st.session_state["analysis_end_date"] = None
 else:
     effective_end_date = analysis_date_override
-    effective_start_date = analysis_date_override - timedelta(days=365)
+    system_today = app_clock.system_today()
+    start_anchor = (
+        analysis_date_override
+        if analysis_date_override <= system_today
+        else system_today
+    )
+    effective_start_date = start_anchor - timedelta(days=365)
     st.session_state["analysis_start_date"] = effective_start_date
     st.session_state["analysis_end_date"] = effective_end_date
     st.caption(

@@ -13,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from stock_predictor.core.clock import app_clock
 from stock_predictor.core.config import PredictorConfig
 from stock_predictor.core.data_pipeline import AsyncDataPipeline, PRICE_LOOKBACK_DAYS
 from stock_predictor.core.pipeline import MarketDataETL, NoPriceDataError
@@ -118,7 +119,7 @@ def test_refresh_prices_raises_when_database_cache_expired(monkeypatch, tmp_path
         }
     )
     database.upsert_prices("MSFT", "1d", cached_prices)
-    expired_timestamp = datetime.now(timezone.utc) - timedelta(days=2)
+    expired_timestamp = app_clock.system_now(timezone.utc) - timedelta(days=2)
     database.set_refresh_timestamp(
         "MSFT", "1d", "prices", timestamp=expired_timestamp.replace(tzinfo=None)
     )
@@ -147,7 +148,7 @@ def test_refresh_prices_raises_when_local_cache_expired(monkeypatch, tmp_path) -
 
     cache_path = config.price_cache_path
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    expired_timestamp = datetime.now(timezone.utc) - timedelta(days=2)
+    expired_timestamp = app_clock.system_now(timezone.utc) - timedelta(days=2)
     cached_dates = pd.date_range(start="2024-03-18", end="2024-03-19", freq="B")
     cache_frame = pd.DataFrame(
         {

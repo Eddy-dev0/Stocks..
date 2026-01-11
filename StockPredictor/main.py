@@ -9,7 +9,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import timezone
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,7 @@ from stock_predictor.api_app import run_api
 from stock_predictor.dashboard_app import run_streamlit_app
 from stock_predictor import dashboard_app as dashboard_module
 from stock_predictor.app import StockPredictorApplication
+from stock_predictor.core.clock import app_clock
 from stock_predictor.ui_app import run_tkinter_app
 
 
@@ -320,7 +321,7 @@ def _run_live_loop_mode(args: argparse.Namespace) -> int:
 
     try:
         while True:
-            timestamp = datetime.now(timezone.utc)
+            timestamp = app_clock.system_now(timezone.utc)
             try:
                 payload = _run_live_analysis(application)
                 LOGGER.info("Live analysis at %s: %s", timestamp.isoformat(), payload)

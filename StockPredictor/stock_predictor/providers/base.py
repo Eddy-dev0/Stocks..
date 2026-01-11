@@ -27,6 +27,8 @@ except ImportError:  # pragma: no cover - fallback for older interpreters
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
+from stock_predictor.core.clock import app_clock
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..core.config import PredictorConfig
 
@@ -206,7 +208,7 @@ class ProviderResult(BaseModel):
     dataset_type: DatasetType
     source: str
     records: List[RecordModel]
-    retrieved_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    retrieved_at: datetime = Field(default_factory=lambda: app_clock.now(timezone.utc))
     metadata: Dict[str, Any] = Field(default_factory=dict)
     from_cache: bool = False
 
@@ -552,7 +554,7 @@ class BaseProvider(abc.ABC):
                 if retry_time is not None:
                     return max(
                         0.0,
-                        (retry_time - datetime.now(timezone.utc)).total_seconds(),
+                        (retry_time - app_clock.system_now(timezone.utc)).total_seconds(),
                     )
 
         reset_headers = (
@@ -561,7 +563,7 @@ class BaseProvider(abc.ABC):
             "X-RateLimit-Reset-Minute",
             "X-Finnhub-RateLimit-Reset",
         )
-        now_ts = datetime.now(timezone.utc).timestamp()
+        now_ts = app_clock.system_now(timezone.utc).timestamp()
         for header_name in reset_headers:
             raw_value = response.headers.get(header_name)
             if not raw_value:
