@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-from ui.api import create_app as create_api_app
-from ui.api.main import app as deployment_app
 
-app = deployment_app
+def create_api_app():
+    """Create the FastAPI application on demand to avoid circular imports."""
 
-__all__ = ["app", "create_api_app"]
+    from ui.api.app import create_app
+
+    return create_app()
+
+
+__all__ = ["create_api_app"]

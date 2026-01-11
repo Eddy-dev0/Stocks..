@@ -43,7 +43,7 @@ class FeatureToggles(MutableMapping[str, bool]):
         *,
         defaults: Mapping[str, bool] | None = None,
     ) -> "FeatureToggles":
-        base_fields: dict[str, bool] = {name: True for name in _FEATURE_FIELDS}
+        base_fields: dict[str, bool] = {name: False for name in _FEATURE_FIELDS}
         extras: dict[str, bool] = {}
 
         if defaults is not None:

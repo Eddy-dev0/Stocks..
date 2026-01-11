@@ -164,7 +164,11 @@ class FeatureAssembler:
         self.technical_indicator_config = self._build_indicator_config(technical_indicator_config)
 
         self.feature_toggles = self._normalise_toggles(feature_toggles)
-        self.enabled_groups = [name for name, enabled in self.feature_toggles.items() if enabled]
+        self.enabled_groups = [
+            name
+            for name, enabled in self.feature_toggles.items()
+            if enabled and name in self.registry
+        ]
         if not self.enabled_groups:
             if "technical" in self.feature_toggles:
                 self.feature_toggles["technical"] = True

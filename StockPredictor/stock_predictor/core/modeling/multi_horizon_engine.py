@@ -282,6 +282,19 @@ class MultiHorizonModelingEngine:
             targets[int(horizon)] = label_map
         return targets
 
+    @staticmethod
+    def _normalize_target_labels(targets: Iterable[str]) -> set[str]:
+        normalized: set[str] = set()
+        for target in targets:
+            label = str(target).strip()
+            if not label:
+                continue
+            if label.endswith("_h"):
+                normalized.add(label)
+            else:
+                normalized.add(f"{label}_h")
+        return normalized
+
     def build_dataset(
         self,
         *,
@@ -292,7 +305,11 @@ class MultiHorizonModelingEngine:
     ) -> MultiHorizonDataset:
         horizons = tuple(horizons) if horizons is not None else tuple(self.config.prediction_horizons)
         ticker_universe = list(tickers) if tickers else [self.config.ticker]
-        requested_targets = set(targets) if targets else {"close_h", "direction_h", "return_h", "return_oc_h"}
+        requested_targets = (
+            self._normalize_target_labels(targets)
+            if targets
+            else {"close_h", "direction_h", "return_h", "return_oc_h"}
+        )
         minimum_viable_rows = max(1, int(getattr(self.config, "minimum_viable_rows", 1)))
         if self._interval_is_intraday() and 1 in horizons:
             LOGGER.warning(
@@ -385,7 +402,10 @@ class MultiHorizonModelingEngine:
                         ticker,
                     )
                     try:
-                        refreshed = fetcher.fetch_price_data(force=True)
+                        try:
+                            refreshed = fetcher.fetch_price_data(force=True)
+                        except TypeError:
+                            refreshed = fetcher.fetch_price_data()
                     except Exception as exc:  # pragma: no cover - defensive fallback
                         LOGGER.warning(
                             "Failed to refresh price data for %s: %s",
@@ -710,7 +730,11 @@ class MultiHorizonModelingEngine:
         force: bool = False,
     ) -> dict[str, Any]:
         requested_horizons = (int(horizon),) if horizon else tuple(self.config.prediction_horizons)
-        requested_targets = set(targets) if targets else {"close_h", "direction_h", "return_h", "return_oc_h"}
+        requested_targets = (
+            self._normalize_target_labels(targets)
+            if targets
+            else {"close_h", "direction_h", "return_h", "return_oc_h"}
+        )
         dataset_horizons = (
             tuple(self.config.prediction_horizons)
             if self.config.use_max_historical_data
@@ -1014,7 +1038,11 @@ class MultiHorizonModelingEngine:
         horizon: int | None = None,
     ) -> PredictionOutcome:
         resolved_horizon = int(horizon or min(self.config.prediction_horizons))
-        requested_targets = set(targets) if targets else {"close_h", "direction_h", "return_h", "return_oc_h"}
+        requested_targets = (
+            self._normalize_target_labels(targets)
+            if targets
+            else {"close_h", "direction_h", "return_h", "return_oc_h"}
+        )
         if self.config.use_max_historical_data:
             try:
                 dataset = self.build_dataset(
@@ -1169,6 +1197,7 @@ class MultiHorizonModelingEngine:
                 last_training_attempt=current_attempt,
             )
 
+        training_attempted = False
         try:
             price_df = self.fetcher.fetch_price_data()
             latest_timestamp = _latest_timestamp(price_df)
@@ -1201,6 +1230,7 @@ class MultiHorizonModelingEngine:
                     "No persisted artefacts found for horizon %s; triggering training run.",
                     resolved_horizon,
                 )
+                training_attempted = True
                 self.train(horizon=resolved_horizon, force=True)
                 try:
                     artefacts = self._load_horizon_artefacts(resolved_horizon)
@@ -1242,6 +1272,7 @@ class MultiHorizonModelingEngine:
                     "Preprocessor not fitted for horizon %s; triggering retrain.",
                     resolved_horizon,
                 )
+                training_attempted = True
                 self.train(horizon=resolved_horizon, force=True)
                 try:
                     artefacts = self._load_horizon_artefacts(resolved_horizon)
@@ -1316,6 +1347,8 @@ class MultiHorizonModelingEngine:
                 checked_at=latest_timestamp,
             )
         except InsufficientSamplesError as exc:
+            if training_attempted:
+                return _handle_insufficient(exc, latest_ts=locals().get("latest_timestamp"))
             if (not self.config.use_max_historical_data) or self.config.min_samples_per_horizon > 1:
                 self.config.use_max_historical_data = True
                 if self.config.min_samples_per_horizon > 1:

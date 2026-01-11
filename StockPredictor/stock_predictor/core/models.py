@@ -109,6 +109,10 @@ class ModelFactory:
             )
             params.pop("class_weight", None)
 
+        if self.model_type == "hist_gb" and "n_estimators" in params:
+            params.setdefault("max_iter", params["n_estimators"])
+            params.pop("n_estimators", None)
+
         def _instantiate(factory: Any, arguments: Dict[str, Any]) -> Any:
             try:
                 return factory(**arguments)
