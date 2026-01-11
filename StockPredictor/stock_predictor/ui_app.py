@@ -572,6 +572,11 @@ class StockPredictorDesktopApp:
         self.position_size_var.trace_add("write", self._on_position_size_changed)
         self.sentiment_label_var = tk.StringVar(value="Sentiment unavailable")
         self.sentiment_score_var = tk.StringVar(value="—")
+        self.fabio_stop_loss_var = tk.StringVar(value="—")
+        self.fabio_entry_var = tk.StringVar(value="—")
+        self.fabio_exit_var = tk.StringVar(value="—")
+        self.fabio_chart_frame: ttk.Frame | None = None
+        self.fabio_live_data: list[dict[str, Any]] = []
 
         self._busy = False
         self._availability_log_state: dict[str, bool] = {}
@@ -946,6 +951,7 @@ class StockPredictorDesktopApp:
         self._build_indicators_tab()
         self._build_explanation_tab()
         self._build_settings_tab()
+        self._build_fabio_tab()
 
     def _build_statusbar(self) -> None:
         status_frame = ttk.Frame(self.root, padding=(12, 4))
@@ -1117,6 +1123,49 @@ class StockPredictorDesktopApp:
         self.price_chart_message = ttk.Label(
             chart_frame, text="No data loaded yet", anchor=tk.CENTER, justify=tk.CENTER
         )
+
+    def _build_fabio_tab(self) -> None:
+        frame = ttk.Frame(self.notebook, padding=12)
+        self.notebook.add(frame, text="Fabio Valentino")
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(1, weight=1)
+
+        info_panel = ttk.LabelFrame(frame, text="Scalping analysis", padding=8)
+        info_panel.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        for index in range(3):
+            info_panel.grid_columnconfigure(index * 2, weight=0)
+            info_panel.grid_columnconfigure(index * 2 + 1, weight=1)
+
+        metrics = [
+            ("Stop-Loss", self.fabio_stop_loss_var),
+            ("Einstiegspunkt", self.fabio_entry_var),
+            ("Prognostizierter Ausstiegspunkt", self.fabio_exit_var),
+        ]
+        for idx, (label, var) in enumerate(metrics):
+            caption = ttk.Label(info_panel, text=f"{label}:")
+            caption.grid(row=0, column=idx * 2, sticky=tk.W, padx=(0, 6), pady=2)
+            value = ttk.Label(
+                info_panel,
+                textvariable=var,
+                font=("TkDefaultFont", 10, "bold"),
+            )
+            value.grid(row=0, column=idx * 2 + 1, sticky=tk.W, padx=(0, 12), pady=2)
+
+        chart_panel = ttk.LabelFrame(frame, text="Live-Chart", padding=8)
+        chart_panel.grid(row=1, column=0, sticky="nsew")
+        chart_panel.grid_rowconfigure(0, weight=1)
+        chart_panel.grid_columnconfigure(0, weight=1)
+        self.fabio_chart_frame = ttk.Frame(chart_panel)
+        self.fabio_chart_frame.grid(row=0, column=0, sticky="nsew")
+        placeholder = ttk.Label(
+            self.fabio_chart_frame,
+            text="Fabio-Valentino-Scalping-Analyse wird hier angezeigt.",
+            anchor=tk.CENTER,
+            justify=tk.CENTER,
+        )
+        placeholder.grid(row=0, column=0, sticky="nsew")
+        self.fabio_chart_frame.grid_rowconfigure(0, weight=1)
+        self.fabio_chart_frame.grid_columnconfigure(0, weight=1)
 
     def _build_trend_finder_tab(self) -> None:
         frame = ttk.Frame(self.notebook, padding=12)
