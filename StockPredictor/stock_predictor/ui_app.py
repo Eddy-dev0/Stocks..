@@ -347,6 +347,93 @@ class Tooltip:
             self.tip_window = None
 
 
+class LiveDataFeed:
+    """Fetch live OHLCV candles on a timer for UI consumption."""
+
+    def __init__(
+        self,
+        *,
+        symbol: str = "NQ=F",
+        refresh_seconds: int = 20,
+        interval: str = "1m",
+        lookback_minutes: int = 30,
+    ) -> None:
+        self.symbol = symbol
+        self.refresh_seconds = max(5, int(refresh_seconds))
+        self.interval = interval
+        self.lookback_minutes = max(1, int(lookback_minutes))
+        self._callbacks: list[Callable[[list[dict[str, Any]]], None]] = []
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+
+    def subscribe(self, callback: Callable[[list[dict[str, Any]]], None]) -> None:
+        self._callbacks.append(callback)
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, name="LiveDataFeed", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                candles = self._fetch_recent_candles()
+            except Exception:
+                LOGGER.exception("Failed to fetch live data for %s", self.symbol)
+                candles = []
+            if candles:
+                for callback in self._callbacks:
+                    try:
+                        callback(candles)
+                    except Exception:
+                        LOGGER.exception("Live data callback failed.")
+            self._stop_event.wait(self.refresh_seconds)
+
+    def _fetch_recent_candles(self) -> list[dict[str, Any]]:
+        ticker = yf.Ticker(self.symbol)
+        history = ticker.history(interval=self.interval, period="1d")
+        if history.empty:
+            return []
+        history = history.rename(
+            columns={
+                "Open": "open",
+                "High": "high",
+                "Low": "low",
+                "Close": "close",
+                "Volume": "volume",
+            }
+        )
+        history = history.dropna(subset=["open", "high", "low", "close"])
+        if history.empty:
+            return []
+        index = pd.to_datetime(history.index)
+        if index.tz is None:
+            index = index.tz_localize(timezone.utc)
+        history.index = index
+        cutoff = pd.Timestamp.now(tz=timezone.utc) - pd.Timedelta(minutes=self.lookback_minutes)
+        recent = history.loc[history.index >= cutoff]
+        if recent.empty:
+            recent = history.tail(self.lookback_minutes)
+        candles: list[dict[str, Any]] = []
+        for timestamp, row in recent.iterrows():
+            candles.append(
+                {
+                    "timestamp": timestamp,
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                    "volume": float(row.get("volume", 0.0)),
+                }
+            )
+        return candles
+
+
 class StockPredictorDesktopApp:
     """Manage the lifecycle of the Tkinter desktop interface."""
 
@@ -576,6 +663,14 @@ class StockPredictorDesktopApp:
         self.fabio_entry_var = tk.StringVar(value="—")
         self.fabio_exit_var = tk.StringVar(value="—")
         self.fabio_chart_frame: ttk.Frame | None = None
+        self.fabio_chart_figure: Figure | None = None
+        self.fabio_chart_ax: Axes | None = None
+        self.fabio_chart_canvas: FigureCanvasTkAgg | None = None
+        self.fabio_chart_message: ttk.Label | None = None
+        self.fabio_tab_id: str | None = None
+        self.fabio_live_feed: LiveDataFeed | None = None
+        self.fabio_feed_symbol = os.environ.get("STOCK_PREDICTOR_FABIO_SYMBOL", "NQ=F")
+        self.fabio_live_max_minutes = 30
         self.fabio_live_data: list[dict[str, Any]] = []
 
         self._busy = False
@@ -952,6 +1047,7 @@ class StockPredictorDesktopApp:
         self._build_explanation_tab()
         self._build_settings_tab()
         self._build_fabio_tab()
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
     def _build_statusbar(self) -> None:
         status_frame = ttk.Frame(self.root, padding=(12, 4))
@@ -1127,6 +1223,7 @@ class StockPredictorDesktopApp:
     def _build_fabio_tab(self) -> None:
         frame = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(frame, text="Fabio Valentino")
+        self.fabio_tab_id = str(frame)
         frame.grid_columnconfigure(0, weight=1)
         frame.grid_rowconfigure(1, weight=1)
 
@@ -1157,15 +1254,104 @@ class StockPredictorDesktopApp:
         chart_panel.grid_columnconfigure(0, weight=1)
         self.fabio_chart_frame = ttk.Frame(chart_panel)
         self.fabio_chart_frame.grid(row=0, column=0, sticky="nsew")
-        placeholder = ttk.Label(
+        self.fabio_chart_figure = Figure(figsize=(8, 4.5), dpi=100, constrained_layout=True)
+        self.fabio_chart_figure.patch.set_facecolor("white")
+        self.fabio_chart_ax = self.fabio_chart_figure.add_subplot(111)
+        self.fabio_chart_ax.set_facecolor("white")
+        self.fabio_chart_canvas = FigureCanvasTkAgg(self.fabio_chart_figure, master=self.fabio_chart_frame)
+        self.fabio_chart_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.fabio_chart_message = ttk.Label(
             self.fabio_chart_frame,
-            text="Fabio-Valentino-Scalping-Analyse wird hier angezeigt.",
+            text="Warte auf Live-Daten…",
             anchor=tk.CENTER,
             justify=tk.CENTER,
         )
-        placeholder.grid(row=0, column=0, sticky="nsew")
+        self.fabio_chart_message.grid(row=0, column=0, sticky="nsew")
         self.fabio_chart_frame.grid_rowconfigure(0, weight=1)
         self.fabio_chart_frame.grid_columnconfigure(0, weight=1)
+        self._render_fabio_chart([])
+
+    def _on_tab_changed(self, _event: tk.Event) -> None:
+        if self.fabio_tab_id is None:
+            return
+        selected = self.notebook.select()
+        if selected == self.fabio_tab_id:
+            self._start_fabio_live_feed()
+        else:
+            self._stop_fabio_live_feed()
+
+    def _start_fabio_live_feed(self) -> None:
+        if self.fabio_live_feed is None:
+            self.fabio_live_feed = LiveDataFeed(
+                symbol=self.fabio_feed_symbol,
+                refresh_seconds=20,
+                interval="1m",
+                lookback_minutes=self.fabio_live_max_minutes,
+            )
+            self.fabio_live_feed.subscribe(self._on_fabio_live_data_thread)
+        self.fabio_live_feed.start()
+
+    def _stop_fabio_live_feed(self) -> None:
+        if self.fabio_live_feed is not None:
+            self.fabio_live_feed.stop()
+
+    def _on_fabio_live_data_thread(self, candles: list[dict[str, Any]]) -> None:
+        self.root.after(0, self._on_fabio_live_data, candles)
+
+    def _on_fabio_live_data(self, candles: list[dict[str, Any]]) -> None:
+        if not candles:
+            return
+        cutoff = pd.Timestamp.now(tz=timezone.utc) - pd.Timedelta(minutes=self.fabio_live_max_minutes)
+        trimmed = [candle for candle in candles if candle["timestamp"] >= cutoff]
+        self.fabio_live_data = trimmed
+        self._render_fabio_chart(trimmed)
+
+    def _render_fabio_chart(self, candles: list[dict[str, Any]]) -> None:
+        if self.fabio_chart_ax is None or self.fabio_chart_canvas is None:
+            return
+        ax = self.fabio_chart_ax
+        ax.clear()
+        if not candles:
+            ax.set_title("Live-Chart")
+            ax.grid(True, linestyle="--", alpha=0.4)
+            if self.fabio_chart_message is not None:
+                self.fabio_chart_message.grid()
+            self._style_figure(self.fabio_chart_figure)
+            self.fabio_chart_canvas.draw_idle()
+            return
+
+        frame = pd.DataFrame(candles).set_index("timestamp").sort_index()
+        date_numbers = date2num(frame.index.to_pydatetime())
+        unique_steps = np.diff(np.unique(date_numbers))
+        base_width = float(unique_steps.min()) if len(unique_steps) else 1.0
+        candle_width = max(min(base_width * 0.6, 0.8), 0.15)
+        for date_num, row in zip(date_numbers, frame.itertuples()):
+            open_ = row.open
+            high_ = row.high
+            low_ = row.low
+            close_ = row.close
+            color = "tab:green" if close_ >= open_ else "tab:red"
+            ax.vlines(date_num, low_, high_, color=color, linewidth=1)
+            body_bottom = min(open_, close_)
+            body_height = max(abs(close_ - open_), 1e-9)
+            rect = Rectangle(
+                (date_num - candle_width / 2, body_bottom),
+                candle_width,
+                body_height,
+                facecolor=color,
+                edgecolor=color,
+                alpha=0.9,
+            )
+            ax.add_patch(rect)
+        ax.set_title(f"Nasdaq Futures {self.fabio_feed_symbol} (1m)")
+        ax.set_xlabel("Time")
+        ax.set_ylabel("Price")
+        ax.xaxis.set_major_formatter(DateFormatter("%H:%M"))
+        ax.grid(True, linestyle="--", alpha=0.4)
+        if self.fabio_chart_message is not None:
+            self.fabio_chart_message.grid_remove()
+        self._style_figure(self.fabio_chart_figure)
+        self.fabio_chart_canvas.draw_idle()
 
     def _build_trend_finder_tab(self) -> None:
         frame = ttk.Frame(self.notebook, padding=12)
@@ -6154,12 +6340,14 @@ class StockPredictorDesktopApp:
             getattr(self, "price_figure", None),
             getattr(self, "indicator_price_figure", None),
             getattr(self, "feature_figure", None),
+            getattr(self, "fabio_chart_figure", None),
         ):
             self._style_figure(figure)
         for canvas in (
             getattr(self, "price_canvas", None),
             getattr(self, "indicator_price_canvas", None),
             getattr(self, "feature_canvas", None),
+            getattr(self, "fabio_chart_canvas", None),
         ):
             if canvas is not None:
                 canvas.draw_idle()
