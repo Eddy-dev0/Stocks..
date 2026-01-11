@@ -31,6 +31,7 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 
 from stock_predictor.app import StockPredictorApplication
+from stock_predictor.fabio_ai import FabioAIModel, extract_features
 from stock_predictor.fabio_indicators import (
     calculate_cvd,
     calculate_volume_profile,
@@ -669,6 +670,8 @@ class StockPredictorDesktopApp:
         self.fabio_stop_loss_var = tk.StringVar(value="—")
         self.fabio_entry_var = tk.StringVar(value="—")
         self.fabio_exit_var = tk.StringVar(value="—")
+        self.fabio_long_prob_var = tk.StringVar(value="—")
+        self.fabio_short_prob_var = tk.StringVar(value="—")
         self.fabio_chart_frame: ttk.Frame | None = None
         self.fabio_chart_figure: Figure | None = None
         self.fabio_chart_ax: Axes | None = None
@@ -680,6 +683,7 @@ class StockPredictorDesktopApp:
         self.fabio_feed_symbol = os.environ.get("STOCK_PREDICTOR_FABIO_SYMBOL", "NQ=F")
         self.fabio_live_max_minutes = 30
         self.fabio_live_data: list[dict[str, Any]] = []
+        self.fabio_ai_model = FabioAIModel()
 
         self._busy = False
         self._availability_log_state: dict[str, bool] = {}
@@ -1242,19 +1246,23 @@ class StockPredictorDesktopApp:
             info_panel.grid_columnconfigure(index * 2 + 1, weight=1)
 
         metrics = [
+            ("Long-Wahrscheinlichkeit", self.fabio_long_prob_var),
+            ("Short-Wahrscheinlichkeit", self.fabio_short_prob_var),
             ("Stop-Loss", self.fabio_stop_loss_var),
             ("Einstiegspunkt", self.fabio_entry_var),
             ("Prognostizierter Ausstiegspunkt", self.fabio_exit_var),
         ]
         for idx, (label, var) in enumerate(metrics):
+            row = idx // 3
+            col = idx % 3
             caption = ttk.Label(info_panel, text=f"{label}:")
-            caption.grid(row=0, column=idx * 2, sticky=tk.W, padx=(0, 6), pady=2)
+            caption.grid(row=row, column=col * 2, sticky=tk.W, padx=(0, 6), pady=2)
             value = ttk.Label(
                 info_panel,
                 textvariable=var,
                 font=("TkDefaultFont", 10, "bold"),
             )
-            value.grid(row=0, column=idx * 2 + 1, sticky=tk.W, padx=(0, 12), pady=2)
+            value.grid(row=row, column=col * 2 + 1, sticky=tk.W, padx=(0, 12), pady=2)
 
         chart_panel = ttk.LabelFrame(frame, text="Live-Chart", padding=8)
         chart_panel.grid(row=1, column=0, sticky="nsew")
@@ -1340,6 +1348,8 @@ class StockPredictorDesktopApp:
             self.fabio_stop_loss_var.set("—")
             self.fabio_entry_var.set("—")
             self.fabio_exit_var.set("—")
+            self.fabio_long_prob_var.set("—")
+            self.fabio_short_prob_var.set("—")
             self._style_figure(self.fabio_chart_figure)
             self.fabio_chart_canvas.draw_idle()
             return
@@ -1459,15 +1469,33 @@ class StockPredictorDesktopApp:
             stop_loss = last_close - max(range_span * 0.3, 0.01)
         if target is None:
             target = last_close + max(range_span * 0.3, 0.01)
+
+        ai_stop_loss = stop_loss
+        ai_target = target
+        long_prob = None
+        short_prob = None
+        try:
+            features = extract_features(candles, lvn_zones, market_structure)
+            signals = self.fabio_ai_model.predict_signals(features)
+            ai_stop_loss = signals.stop_loss if signals.stop_loss is not None else stop_loss
+            ai_target = signals.target if signals.target is not None else target
+            long_prob = signals.long_probability
+            short_prob = signals.short_probability
+        except Exception:
+            long_prob = None
+            short_prob = None
+
         self.fabio_stop_loss_var.set(
-            fmt_ccy(stop_loss, self.currency_symbol, decimals=self.price_decimal_places)
+            fmt_ccy(ai_stop_loss, self.currency_symbol, decimals=self.price_decimal_places)
         )
         self.fabio_entry_var.set(
             fmt_ccy(last_close, self.currency_symbol, decimals=self.price_decimal_places)
         )
         self.fabio_exit_var.set(
-            fmt_ccy(target, self.currency_symbol, decimals=self.price_decimal_places)
+            fmt_ccy(ai_target, self.currency_symbol, decimals=self.price_decimal_places)
         )
+        self.fabio_long_prob_var.set(fmt_pct(long_prob, decimals=1) if long_prob is not None else "—")
+        self.fabio_short_prob_var.set(fmt_pct(short_prob, decimals=1) if short_prob is not None else "—")
         if self.fabio_chart_message is not None:
             self.fabio_chart_message.grid_remove()
         self._style_figure(self.fabio_chart_figure)
