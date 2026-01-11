@@ -31,6 +31,13 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 
 from stock_predictor.app import StockPredictorApplication
+from stock_predictor.fabio_indicators import (
+    calculate_cvd,
+    calculate_volume_profile,
+    detect_market_structure,
+    identify_lvn_zones,
+    simulate_orderflow_signals,
+)
 from stock_predictor.core import (
     DEFAULT_PREDICTION_HORIZONS,
     PredictionResult,
@@ -665,6 +672,7 @@ class StockPredictorDesktopApp:
         self.fabio_chart_frame: ttk.Frame | None = None
         self.fabio_chart_figure: Figure | None = None
         self.fabio_chart_ax: Axes | None = None
+        self.fabio_cvd_ax: Axes | None = None
         self.fabio_chart_canvas: FigureCanvasTkAgg | None = None
         self.fabio_chart_message: ttk.Label | None = None
         self.fabio_tab_id: str | None = None
@@ -1256,8 +1264,13 @@ class StockPredictorDesktopApp:
         self.fabio_chart_frame.grid(row=0, column=0, sticky="nsew")
         self.fabio_chart_figure = Figure(figsize=(8, 4.5), dpi=100, constrained_layout=True)
         self.fabio_chart_figure.patch.set_facecolor("white")
-        self.fabio_chart_ax = self.fabio_chart_figure.add_subplot(111)
+        gridspec = self.fabio_chart_figure.add_gridspec(2, 1, height_ratios=(3, 1))
+        self.fabio_chart_ax = self.fabio_chart_figure.add_subplot(gridspec[0, 0])
+        self.fabio_cvd_ax = self.fabio_chart_figure.add_subplot(
+            gridspec[1, 0], sharex=self.fabio_chart_ax
+        )
         self.fabio_chart_ax.set_facecolor("white")
+        self.fabio_cvd_ax.set_facecolor("white")
         self.fabio_chart_canvas = FigureCanvasTkAgg(self.fabio_chart_figure, master=self.fabio_chart_frame)
         self.fabio_chart_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
         self.fabio_chart_message = ttk.Label(
@@ -1307,15 +1320,26 @@ class StockPredictorDesktopApp:
         self._render_fabio_chart(trimmed)
 
     def _render_fabio_chart(self, candles: list[dict[str, Any]]) -> None:
-        if self.fabio_chart_ax is None or self.fabio_chart_canvas is None:
+        if (
+            self.fabio_chart_ax is None
+            or self.fabio_cvd_ax is None
+            or self.fabio_chart_canvas is None
+        ):
             return
         ax = self.fabio_chart_ax
+        cvd_ax = self.fabio_cvd_ax
         ax.clear()
+        cvd_ax.clear()
         if not candles:
             ax.set_title("Live-Chart")
             ax.grid(True, linestyle="--", alpha=0.4)
+            cvd_ax.set_title("CVD")
+            cvd_ax.grid(True, linestyle="--", alpha=0.4)
             if self.fabio_chart_message is not None:
                 self.fabio_chart_message.grid()
+            self.fabio_stop_loss_var.set("—")
+            self.fabio_entry_var.set("—")
+            self.fabio_exit_var.set("—")
             self._style_figure(self.fabio_chart_figure)
             self.fabio_chart_canvas.draw_idle()
             return
@@ -1325,6 +1349,11 @@ class StockPredictorDesktopApp:
         unique_steps = np.diff(np.unique(date_numbers))
         base_width = float(unique_steps.min()) if len(unique_steps) else 1.0
         candle_width = max(min(base_width * 0.6, 0.8), 0.15)
+        volume_profile = calculate_volume_profile(candles, bin_count=40)
+        lvn_zones = identify_lvn_zones(volume_profile)
+        market_structure = detect_market_structure(candles)
+        cvd_values = calculate_cvd(candles)
+        orderflow_signals = simulate_orderflow_signals(candles, lvn_zones)
         for date_num, row in zip(date_numbers, frame.itertuples()):
             open_ = row.open
             high_ = row.high
@@ -1343,11 +1372,102 @@ class StockPredictorDesktopApp:
                 alpha=0.9,
             )
             ax.add_patch(rect)
+        for zone in lvn_zones:
+            ax.axhspan(zone[0], zone[1], color="tab:blue", alpha=0.08)
+        for zone in market_structure["balance_zones"]:
+            start_idx = int(zone["start"])
+            end_idx = int(zone["end"])
+            if start_idx >= len(date_numbers) or end_idx >= len(date_numbers):
+                continue
+            start = date_numbers[start_idx]
+            end = date_numbers[end_idx]
+            rect = Rectangle(
+                (start, zone["low"]),
+                end - start,
+                zone["high"] - zone["low"],
+                facecolor="tab:gray",
+                edgecolor="none",
+                alpha=0.12,
+                zorder=0,
+            )
+            ax.add_patch(rect)
+        for zone in market_structure["breakout_zones"]:
+            start_idx = int(zone["start"])
+            end_idx = int(zone["end"])
+            if start_idx >= len(date_numbers) or end_idx >= len(date_numbers):
+                continue
+            start = date_numbers[start_idx]
+            end = date_numbers[end_idx]
+            rect = Rectangle(
+                (start, zone["low"]),
+                end - start,
+                zone["high"] - zone["low"],
+                facecolor="tab:orange",
+                edgecolor="none",
+                alpha=0.12,
+                zorder=0,
+            )
+            ax.add_patch(rect)
+        for bos in market_structure["bos_events"]:
+            idx = int(bos["index"])
+            if idx >= len(date_numbers):
+                continue
+            ax.axvline(date_numbers[idx], color="tab:purple", linestyle="--", alpha=0.7)
+        for signal in orderflow_signals:
+            idx = int(signal["index"])
+            if idx >= len(date_numbers):
+                continue
+            color = "tab:green" if signal["direction"] > 0 else "tab:red"
+            size = 60 if signal.get("strength", 1) > 1 else 40
+            ax.scatter(
+                date_numbers[idx],
+                signal["price"],
+                s=size,
+                marker="o",
+                color=color,
+                edgecolor="black",
+                linewidth=0.4,
+                zorder=5,
+            )
         ax.set_title(f"Nasdaq Futures {self.fabio_feed_symbol} (1m)")
-        ax.set_xlabel("Time")
         ax.set_ylabel("Price")
         ax.xaxis.set_major_formatter(DateFormatter("%H:%M"))
         ax.grid(True, linestyle="--", alpha=0.4)
+        ax.tick_params(axis="x", labelbottom=False)
+
+        cvd_ax.plot(date_numbers, cvd_values, color="tab:blue", linewidth=1.4)
+        cvd_ax.set_ylabel("CVD")
+        cvd_ax.set_xlabel("Time")
+        cvd_ax.xaxis.set_major_formatter(DateFormatter("%H:%M"))
+        cvd_ax.grid(True, linestyle="--", alpha=0.4)
+
+        last_close = _safe_float(frame["close"].iloc[-1]) or 0.0
+        range_span = _safe_float(frame["high"].max() - frame["low"].min()) or 0.0
+        stop_loss = None
+        target = None
+        below = [zone for zone in lvn_zones if zone[1] < last_close]
+        above = [zone for zone in lvn_zones if zone[0] > last_close]
+        if below:
+            stop_loss = max(below, key=lambda zone: zone[1])[0]
+        if above:
+            target = min(above, key=lambda zone: zone[0])[1]
+        if stop_loss is None and market_structure["balance_zones"]:
+            stop_loss = market_structure["balance_zones"][-1]["low"]
+        if target is None and market_structure["balance_zones"]:
+            target = market_structure["balance_zones"][-1]["high"]
+        if stop_loss is None:
+            stop_loss = last_close - max(range_span * 0.3, 0.01)
+        if target is None:
+            target = last_close + max(range_span * 0.3, 0.01)
+        self.fabio_stop_loss_var.set(
+            fmt_ccy(stop_loss, self.currency_symbol, decimals=self.price_decimal_places)
+        )
+        self.fabio_entry_var.set(
+            fmt_ccy(last_close, self.currency_symbol, decimals=self.price_decimal_places)
+        )
+        self.fabio_exit_var.set(
+            fmt_ccy(target, self.currency_symbol, decimals=self.price_decimal_places)
+        )
         if self.fabio_chart_message is not None:
             self.fabio_chart_message.grid_remove()
         self._style_figure(self.fabio_chart_figure)
