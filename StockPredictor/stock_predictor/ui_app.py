@@ -4788,7 +4788,18 @@ class StockPredictorDesktopApp:
         cache_fresh = False
         self.market_timestamp_live_estimate = False
         if app_clock.is_override:
-            live_timestamp = None
+            if isinstance(self.current_prediction, Mapping):
+                latest_timestamp = (
+                    self.current_prediction.get("market_data_as_of")
+                    or self.current_prediction.get("as_of")
+                )
+            if latest_timestamp is None and has_history:
+                _, latest_timestamp = self._extract_latest_price_point(self.price_history)
+            localized = self._localize_market_timestamp(latest_timestamp)
+            self.market_timestamp_stale = localized is None
+            if localized is not None:
+                self.current_market_timestamp = localized
+            return localized
         if (
             not app_clock.is_override
             and self.last_price_cached is False
@@ -5417,7 +5428,11 @@ class StockPredictorDesktopApp:
             "fetcher",
             None,
         )
-        if fetcher is not None and hasattr(fetcher, "fetch_live_price"):
+        if (
+            not app_clock.is_override
+            and fetcher is not None
+            and hasattr(fetcher, "fetch_live_price")
+        ):
             try:
                 live_price, live_timestamp = fetcher.fetch_live_price(force=False)
             except Exception:  # pragma: no cover - defensive
@@ -5572,7 +5587,9 @@ class StockPredictorDesktopApp:
         as_of_display = (
             localized_as_of.strftime("%Y-%m-%d %H:%M %Z") if localized_as_of is not None else "—"
         )
-        if self.market_timestamp_live_estimate and as_of_display != "—":
+        if app_clock.is_override and as_of_display != "—":
+            as_of_display = f"{as_of_display} (historical close)"
+        elif self.market_timestamp_live_estimate and as_of_display != "—":
             as_of_display = f"{as_of_display} (live estimate)"
         self.metric_vars["as_of"].set(as_of_display)
 

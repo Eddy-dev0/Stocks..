@@ -259,7 +259,7 @@ class MarketDataETL:
     """
 
     _memory_cache: ClassVar[
-        dict[tuple[str, str, DatasetType], tuple[float, ProviderFetchSummary]]
+        dict[tuple[str, str, DatasetType, str], tuple[float, ProviderFetchSummary]]
     ] = {}
     _memory_cache_default_ttl: ClassVar[float] = 900.0
 
@@ -288,6 +288,45 @@ class MarketDataETL:
     def _today(self) -> date:
         return self._now().date()
 
+    def _effective_end_date(self) -> date | None:
+        if self.config.end_date:
+            return self.config.end_date
+        if app_clock.is_override:
+            return app_clock.today(self.market_timezone)
+        return None
+
+    def _apply_asof_limit(
+        self, frame: pd.DataFrame, as_of: date | None
+    ) -> pd.DataFrame:
+        if as_of is None or frame.empty:
+            return frame
+        working = frame.copy()
+        if "Date" in working.columns:
+            timestamps = pd.to_datetime(working["Date"], errors="coerce")
+            valid = pd.notna(timestamps)
+            if not valid.any():
+                return working
+            if getattr(timestamps.dt, "tz", None) is None:
+                localized = timestamps.dt.tz_localize(self.market_timezone)
+            else:
+                localized = timestamps.dt.tz_convert(self.market_timezone)
+            working = working.loc[valid]
+            localized = localized.loc[valid]
+            working = working.loc[localized.dt.date <= as_of]
+            return working
+        index = pd.to_datetime(working.index, errors="coerce")
+        valid = pd.notna(index)
+        if not valid.any():
+            return working
+        localized_index = pd.DatetimeIndex(index[valid])
+        if getattr(localized_index, "tz", None) is None:
+            localized_index = localized_index.tz_localize(self.market_timezone)
+        else:
+            localized_index = localized_index.tz_convert(self.market_timezone)
+        working = working.loc[valid]
+        working = working.loc[localized_index.date <= as_of]
+        return working
+
     # ------------------------------------------------------------------
     # Public refresh API
     # ------------------------------------------------------------------
@@ -299,12 +338,14 @@ class MarketDataETL:
     ) -> RefreshResult:
         stale_notes: list[str] = []
         price_source: str | None = None
+        effective_end = self._effective_end_date()
         existing = self.database.get_prices(
             ticker=self.config.ticker,
             interval=self.config.interval,
             start=self.config.start_date,
-            end=self.config.end_date,
+            end=effective_end or self.config.end_date,
         )
+        existing = self._apply_asof_limit(existing, effective_end)
         existing_ts = self.database.get_refresh_timestamp(
             self.config.ticker, self.config.interval, "prices"
         )
@@ -341,7 +382,7 @@ class MarketDataETL:
                         self.config.ticker,
                         cache_timestamp.isoformat(),
                     )
-                    existing = cached_frame
+                    existing = self._apply_asof_limit(cached_frame, effective_end)
                     existing_ts = cache_timestamp
                     existing_is_fresh = True
                     price_source = "local"
@@ -381,13 +422,15 @@ class MarketDataETL:
             "Downloading price data for %s (%s - %s)",
             self.config.ticker,
             self.config.start_date,
-            self.config.end_date or "today",
+            effective_end or self.config.end_date or "today",
         )
         params: Dict[str, Any] = {"interval": self.config.interval}
         if self.config.start_date:
             params["start"] = self.config.start_date.isoformat()
-        if self.config.end_date:
-            params["end"] = self.config.end_date.isoformat()
+        if effective_end:
+            params["end"] = (effective_end + timedelta(days=1)).isoformat()
+        elif self.config.end_date:
+            params["end"] = (self.config.end_date + timedelta(days=1)).isoformat()
 
         summary = self._fetch_dataset(DatasetType.PRICES, params, providers=providers)
         if summary.failures:
@@ -397,6 +440,8 @@ class MarketDataETL:
 
         providers = self._collect_providers(summary.results)
         downloaded = self._coalesce_price_results(summary.results)
+        if downloaded is not None:
+            downloaded = self._apply_asof_limit(downloaded, effective_end)
 
         if downloaded is None or downloaded.empty:
             if not existing.empty and existing_is_fresh:
@@ -431,13 +476,14 @@ class MarketDataETL:
             ticker=self.config.ticker,
             interval=self.config.interval,
             start=self.config.start_date,
-            end=self.config.end_date,
+            end=effective_end or self.config.end_date,
         )
         if refreshed.empty:
             raise NoPriceDataError(
                 self.config.ticker,
                 self._compose_error_message("Cached dataset is empty after refresh."),
             )
+        refreshed = self._apply_asof_limit(refreshed, effective_end)
         prepared = self._apply_provider_timestamps(refreshed, downloaded)
         return RefreshResult(prepared, downloaded=True)
 
@@ -1414,11 +1460,13 @@ class MarketDataETL:
         )
         return cached
 
-    def _memory_cache_key(self, dataset: DatasetType) -> tuple[str, str, DatasetType]:
-        return (self.config.ticker, self.config.interval, dataset)
+    def _memory_cache_key(self, dataset: DatasetType) -> tuple[str, str, DatasetType, str]:
+        effective_end = self._effective_end_date()
+        as_of_key = effective_end.isoformat() if effective_end else "live"
+        return (self.config.ticker, self.config.interval, dataset, as_of_key)
 
     def _get_memory_cache(
-        self, key: tuple[str, str, DatasetType]
+        self, key: tuple[str, str, DatasetType, str]
     ) -> ProviderFetchSummary | None:
         entry = self._memory_cache.get(key)
         if not entry:
@@ -1430,7 +1478,7 @@ class MarketDataETL:
         return self._clone_summary(cached_summary, mark_cached=True)
 
     def _store_memory_cache(
-        self, key: tuple[str, str, DatasetType], summary: ProviderFetchSummary
+        self, key: tuple[str, str, DatasetType, str], summary: ProviderFetchSummary
     ) -> None:
         self._memory_cache[key] = (
             time.monotonic() + self._memory_cache_ttl,
@@ -1792,7 +1840,7 @@ class MarketDataETL:
         if frame.empty:
             return False
         start = self.config.start_date
-        end = self.config.end_date
+        end = self._effective_end_date() or self.config.end_date
         try:
             date_values = pd.to_datetime(frame["Date"], errors="coerce").dropna()
         except Exception:  # pragma: no cover - defensive

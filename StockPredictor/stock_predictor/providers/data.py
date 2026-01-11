@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import pandas as pd
@@ -11,7 +11,7 @@ import pandas as pd
 from .config import PredictorConfig
 from .database import Database
 from .etl import MarketDataETL
-from ..core.clock import app_clock
+from ..core.clock import app_clock, resolve_asof_trading_day
 from ..core.pipeline import DEFAULT_CACHE_MAX_AGE
 
 LOGGER = logging.getLogger(__name__)
@@ -43,7 +43,26 @@ class DataFetcher:
 
         result = self.etl.refresh_prices(force=force)
         self._set_source("prices", result.downloaded or force)
-        return result.data
+        frame = result.data
+        if app_clock.is_override:
+            requested_date = self.config.end_date or app_clock.today()
+            available_dates: list[date] = []
+            if isinstance(frame, pd.DataFrame) and not frame.empty:
+                date_col = "Date" if "Date" in frame.columns else None
+                if date_col:
+                    series = pd.to_datetime(frame[date_col], errors="coerce").dropna()
+                else:
+                    series = pd.to_datetime(frame.index, errors="coerce").dropna()
+                available_dates = [value.date() for value in series]
+            market_data_as_of = resolve_asof_trading_day(requested_date, available_dates)
+            LOGGER.info(
+                "As-of mode active: requested=%s, market_data_as_of=%s, latest_row=%s, rows=%s",
+                requested_date.isoformat() if requested_date else None,
+                market_data_as_of.isoformat() if market_data_as_of else None,
+                max(available_dates).isoformat() if available_dates else None,
+                len(frame.index) if isinstance(frame, pd.DataFrame) else 0,
+            )
+        return frame
 
     def fetch_news_data(self, force: bool = False) -> pd.DataFrame:
         """Return cached news articles, refreshing via the API when necessary."""
@@ -119,11 +138,14 @@ class DataFetcher:
             price_frame = price_result.data
             self._set_source("prices", price_result.downloaded or force)
         else:
+            effective_end = self.config.end_date or (
+                app_clock.today() if app_clock.is_override else None
+            )
             price_frame = self.database.get_prices(
                 ticker=self.config.ticker,
                 interval=self.config.interval,
                 start=self.config.start_date,
-                end=self.config.end_date,
+                end=effective_end or self.config.end_date,
             )
             self._set_source("prices", False)
 
@@ -140,6 +162,8 @@ class DataFetcher:
     def fetch_live_price(self, force: bool = False) -> tuple[float | None, pd.Timestamp | None]:
         """Fetch the most recent intraday price and timestamp."""
 
+        if app_clock.is_override:
+            return None, None
         price, timestamp = self.etl.fetch_live_price(force=force)
         self._set_source("prices", True)
         return price, timestamp
