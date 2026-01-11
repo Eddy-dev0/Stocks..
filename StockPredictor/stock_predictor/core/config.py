@@ -721,7 +721,9 @@ class PredictorConfig:
 
     @property
     def price_cache_path(self) -> Path:
-        return self.data_dir / f"{self.ticker}_{self.interval}_prices.csv"
+        as_of = self.end_date or (app_clock.today() if app_clock.is_override else None)
+        suffix = f"_{as_of.isoformat()}" if as_of else ""
+        return self.data_dir / f"{self.ticker}_{self.interval}_prices{suffix}.csv"
 
     @property
     def legacy_price_cache_path(self) -> Path:

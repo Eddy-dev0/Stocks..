@@ -11,6 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from stock_predictor.core.clock import app_clock
 from stock_predictor.ui_app import StockPredictorDesktopApp
 
 
@@ -73,6 +74,7 @@ def _build_stubbed_app() -> StockPredictorDesktopApp:
     app.price_decimal_places = 2
     app.expected_low_multiplier = 1.0
     app.current_forecast_date = None
+    app.analysis_override_date = None
     app.current_prediction = {
         "ticker": "TSLA",
         "market_data_as_of": pd.Timestamp("2024-05-01 15:00"),
@@ -132,6 +134,31 @@ def test_market_timestamp_live_estimate_for_stale_cache() -> None:
 
     assert app.metric_vars["as_of"].value == "2024-05-01 11:00 EDT (live estimate)"
     assert "live estimate" in app.status_var.value
+
+
+def test_market_timestamp_override_uses_historical_close() -> None:
+    app = _build_stubbed_app()
+    app.current_market_timestamp = None
+    app.price_history = pd.DataFrame(
+        {
+            "Date": pd.date_range(
+                "2024-04-29 15:00", periods=2, freq="D", tz=ZoneInfo("UTC")
+            ),
+            "Close": [100.0, 101.0],
+        }
+    )
+    app.price_history.attrs["cache_timestamp"] = pd.Timestamp(
+        "2024-04-01 12:00", tz=ZoneInfo("UTC")
+    )
+
+    app_clock.set_test_date(pd.Timestamp("2024-05-02").date())
+    try:
+        app._update_metrics()
+    finally:
+        app_clock.clear_test_date()
+
+    assert "historical close" in app.metric_vars["as_of"].value
+    assert "live estimate" not in (app.status_var.value or "")
 
 
 def test_last_price_prefers_price_history() -> None:
