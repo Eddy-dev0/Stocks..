@@ -681,7 +681,13 @@ class StockPredictorDesktopApp:
         self.fabio_tab_id: str | None = None
         self.fabio_live_feed: LiveDataFeed | None = None
         self.fabio_feed_symbol = os.environ.get("STOCK_PREDICTOR_FABIO_SYMBOL", "NQ=F")
+        self.fabio_live_interval = "1m"
         self.fabio_live_max_minutes = 30
+        self.fabio_risk_percent = 1.0
+        self.fabio_symbol_var = tk.StringVar(value=self.fabio_feed_symbol)
+        self.fabio_interval_var = tk.StringVar(value=self.fabio_live_interval)
+        self.fabio_lookback_var = tk.IntVar(value=self.fabio_live_max_minutes)
+        self.fabio_risk_var = tk.DoubleVar(value=self.fabio_risk_percent)
         self.fabio_live_data: list[dict[str, Any]] = []
         self.fabio_ai_model = FabioAIModel()
 
@@ -1237,7 +1243,7 @@ class StockPredictorDesktopApp:
         self.notebook.add(frame, text="Fabio Valentino")
         self.fabio_tab_id = str(frame)
         frame.grid_columnconfigure(0, weight=1)
-        frame.grid_rowconfigure(1, weight=1)
+        frame.grid_rowconfigure(2, weight=1)
 
         info_panel = ttk.LabelFrame(frame, text="Scalping analysis", padding=8)
         info_panel.grid(row=0, column=0, sticky="ew", pady=(0, 12))
@@ -1264,8 +1270,92 @@ class StockPredictorDesktopApp:
             )
             value.grid(row=row, column=col * 2 + 1, sticky=tk.W, padx=(0, 12), pady=2)
 
+        settings_panel = ttk.LabelFrame(frame, text="Einstellungen", padding=8)
+        settings_panel.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        for index in range(6):
+            settings_panel.grid_columnconfigure(index, weight=0)
+        settings_panel.grid_columnconfigure(1, weight=1)
+        settings_panel.grid_columnconfigure(3, weight=1)
+        settings_panel.grid_columnconfigure(5, weight=1)
+
+        symbol_label = ttk.Label(settings_panel, text="Symbol:")
+        symbol_label.grid(row=0, column=0, sticky=tk.W, padx=(0, 6), pady=2)
+        symbol_choices = ("NQ=F", "ES=F", "YM=F", "AAPL", "MSFT", "TSLA")
+        symbol_box = ttk.Combobox(
+            settings_panel,
+            textvariable=self.fabio_symbol_var,
+            values=symbol_choices,
+            width=12,
+        )
+        symbol_box.grid(row=0, column=1, sticky=tk.W, padx=(0, 12), pady=2)
+        Tooltip(
+            symbol_box,
+            "Wähle das Ticker-Symbol für die Live-Daten. "
+            "Du kannst Futures (z. B. NQ=F) oder Aktien-Ticker eingeben.",
+        )
+
+        interval_label = ttk.Label(settings_panel, text="Datenintervall:")
+        interval_label.grid(row=0, column=2, sticky=tk.W, padx=(0, 6), pady=2)
+        interval_choices = ("1m", "2m", "5m", "15m", "30m", "60m")
+        interval_box = ttk.Combobox(
+            settings_panel,
+            textvariable=self.fabio_interval_var,
+            values=interval_choices,
+            width=8,
+            state="readonly",
+        )
+        interval_box.grid(row=0, column=3, sticky=tk.W, padx=(0, 12), pady=2)
+        Tooltip(
+            interval_box,
+            "Legt fest, wie granular die Kerzen für den Live-Chart geladen werden.",
+        )
+
+        lookback_label = ttk.Label(settings_panel, text="Lookback (Minuten):")
+        lookback_label.grid(row=0, column=4, sticky=tk.W, padx=(0, 6), pady=2)
+        lookback_spin = ttk.Spinbox(
+            settings_panel,
+            from_=5,
+            to=240,
+            increment=5,
+            textvariable=self.fabio_lookback_var,
+            width=6,
+        )
+        lookback_spin.grid(row=0, column=5, sticky=tk.W, padx=(0, 12), pady=2)
+        Tooltip(
+            lookback_spin,
+            "Anzahl der Minuten, die für Indikatoren und Strukturzonen "
+            "im Live-Chart berücksichtigt werden.",
+        )
+
+        risk_label = ttk.Label(settings_panel, text="Risiko (%):")
+        risk_label.grid(row=1, column=0, sticky=tk.W, padx=(0, 6), pady=2)
+        risk_spin = ttk.Spinbox(
+            settings_panel,
+            from_=0.1,
+            to=10.0,
+            increment=0.1,
+            textvariable=self.fabio_risk_var,
+            width=6,
+        )
+        risk_spin.grid(row=1, column=1, sticky=tk.W, padx=(0, 12), pady=2)
+        Tooltip(
+            risk_spin,
+            "Legt den Risikoprozentsatz fest, der für das Setup berücksichtigt wird.",
+        )
+
+        apply_button = ttk.Button(
+            settings_panel,
+            text="Einstellungen übernehmen",
+            command=self._on_fabio_settings_applied,
+        )
+        apply_button.grid(row=1, column=2, columnspan=2, sticky=tk.W, pady=2)
+        Tooltip(
+            apply_button,
+            "Aktualisiert die Live-Datenquelle mit den gewählten Einstellungen.",
+        )
+
         chart_panel = ttk.LabelFrame(frame, text="Live-Chart", padding=8)
-        chart_panel.grid(row=1, column=0, sticky="nsew")
+        chart_panel.grid(row=2, column=0, sticky="nsew")
         chart_panel.grid_rowconfigure(0, weight=1)
         chart_panel.grid_columnconfigure(0, weight=1)
         self.fabio_chart_frame = ttk.Frame(chart_panel)
@@ -1290,7 +1380,104 @@ class StockPredictorDesktopApp:
         self.fabio_chart_message.grid(row=0, column=0, sticky="nsew")
         self.fabio_chart_frame.grid_rowconfigure(0, weight=1)
         self.fabio_chart_frame.grid_columnconfigure(0, weight=1)
+
+        legend_panel = ttk.LabelFrame(frame, text="Chart-Legende", padding=8)
+        legend_panel.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        legend_panel.grid_columnconfigure(0, weight=1)
+        legend_panel.grid_columnconfigure(1, weight=1)
+        legend_panel.grid_columnconfigure(2, weight=1)
+
+        lvn_label = ttk.Label(legend_panel, text="LVN-Zonen: Niedriges Volumen (blaue Bereiche).")
+        lvn_label.grid(row=0, column=0, sticky=tk.W, padx=(0, 12), pady=2)
+        Tooltip(
+            lvn_label,
+            "LVN (Low Volume Nodes) markieren Preisbereiche mit dünner Liquidität. "
+            "Sie dienen als potenzielle Unterstützungs- oder Widerstandsbereiche.",
+        )
+
+        bos_label = ttk.Label(legend_panel, text="BoS-Marker: Strukturbruch (violette Linien).")
+        bos_label.grid(row=0, column=1, sticky=tk.W, padx=(0, 12), pady=2)
+        Tooltip(
+            bos_label,
+            "BoS (Break of Structure) zeigt den Moment, in dem der Markt eine "
+            "vorherige Struktur bricht und ein neues Momentum einsetzt.",
+        )
+
+        cvd_label = ttk.Label(legend_panel, text="CVD-Kurve: Kumulatives Volumen-Delta.")
+        cvd_label.grid(row=0, column=2, sticky=tk.W, pady=2)
+        Tooltip(
+            cvd_label,
+            "CVD (Cumulative Volume Delta) zeigt den Nettofluss aggressiver Käufe "
+            "minus Verkäufe und hilft, Orderflow-Trends zu erkennen.",
+        )
+
+        disclaimer = ttk.Label(
+            frame,
+            text=(
+                "Hinweis: Alle Anzeigen dienen ausschließlich Bildungs- und "
+                "Analysezwecken und stellen keine Anlageberatung dar."
+            ),
+            anchor=tk.CENTER,
+            justify=tk.CENTER,
+            foreground="#8b0000",
+            wraplength=720,
+        )
+        disclaimer.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+
         self._render_fabio_chart([])
+
+    def _on_fabio_settings_applied(self) -> None:
+        raw_symbol = (self.fabio_symbol_var.get() or "").strip()
+        if not raw_symbol:
+            messagebox.showwarning("Fabio Valentino", "Bitte ein Symbol angeben.")
+            return
+        symbol = raw_symbol.upper()
+        interval = (self.fabio_interval_var.get() or "1m").strip()
+        try:
+            lookback = int(self.fabio_lookback_var.get())
+        except (TypeError, ValueError):
+            lookback = self.fabio_live_max_minutes
+        lookback = max(5, min(240, lookback))
+        try:
+            risk_percent = float(self.fabio_risk_var.get())
+        except (TypeError, ValueError):
+            risk_percent = self.fabio_risk_percent
+        risk_percent = max(0.1, min(10.0, risk_percent))
+
+        self.fabio_symbol_var.set(symbol)
+        self.fabio_interval_var.set(interval)
+        self.fabio_lookback_var.set(lookback)
+        self.fabio_risk_var.set(risk_percent)
+
+        settings_changed = (
+            symbol != self.fabio_feed_symbol
+            or interval != self.fabio_live_interval
+            or lookback != self.fabio_live_max_minutes
+            or risk_percent != self.fabio_risk_percent
+        )
+        self.fabio_feed_symbol = symbol
+        self.fabio_live_interval = interval
+        self.fabio_live_max_minutes = lookback
+        self.fabio_risk_percent = risk_percent
+
+        LOGGER.info(
+            "Fabio settings updated: symbol=%s interval=%s lookback=%s risk=%.2f%%",
+            symbol,
+            interval,
+            lookback,
+            risk_percent,
+        )
+
+        if settings_changed:
+            self._restart_fabio_live_feed()
+
+    def _restart_fabio_live_feed(self) -> None:
+        self._stop_fabio_live_feed()
+        self.fabio_live_feed = None
+        if self.fabio_tab_id is None:
+            return
+        if self.notebook.select() == self.fabio_tab_id:
+            self._start_fabio_live_feed()
 
     def _on_tab_changed(self, _event: tk.Event) -> None:
         if self.fabio_tab_id is None:
@@ -1306,7 +1493,7 @@ class StockPredictorDesktopApp:
             self.fabio_live_feed = LiveDataFeed(
                 symbol=self.fabio_feed_symbol,
                 refresh_seconds=20,
-                interval="1m",
+                interval=self.fabio_live_interval,
                 lookback_minutes=self.fabio_live_max_minutes,
             )
             self.fabio_live_feed.subscribe(self._on_fabio_live_data_thread)
@@ -1439,7 +1626,7 @@ class StockPredictorDesktopApp:
                 linewidth=0.4,
                 zorder=5,
             )
-        ax.set_title(f"Nasdaq Futures {self.fabio_feed_symbol} (1m)")
+        ax.set_title(f"Live-Chart {self.fabio_feed_symbol} ({self.fabio_live_interval})")
         ax.set_ylabel("Price")
         ax.xaxis.set_major_formatter(DateFormatter("%H:%M"))
         ax.grid(True, linestyle="--", alpha=0.4)
