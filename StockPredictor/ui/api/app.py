@@ -256,6 +256,12 @@ class BuyZoneEnvelope(BaseModel):
 class LivePriceRequest(BaseModel):
     """Payload describing live price context options."""
 
+    start_date: str | None = Field(
+        default=None, description="Optional ISO start date for historical window."
+    )
+    end_date: str | None = Field(
+        default=None, description="Optional ISO end date for historical window."
+    )
     horizon: int | None = Field(
         default=None,
         description="Optional override for the forecast horizon to evaluate.",
@@ -630,6 +636,10 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
             horizon=request.horizon,
             expected_low_multiplier=request.expected_low_multiplier,
             stop_loss_multiplier=request.stop_loss_multiplier,
+            overrides={
+                "start_date": request.start_date,
+                "end_date": request.end_date,
+            },
         )
 
         snapshot = LivePriceResponse(**snapshot_payload)
