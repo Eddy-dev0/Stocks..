@@ -10,7 +10,7 @@ import re
 import threading
 import tkinter as tk
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from tkinter import messagebox, ttk
@@ -580,6 +580,11 @@ class StockPredictorDesktopApp:
         self.forecast_date_var = tk.StringVar(value="Forecast date: —")
         self.current_forecast_date: pd.Timestamp | None = None
         self.market_holidays: list[pd.Timestamp] = []
+        self.analysis_date_var = tk.StringVar(value="")
+        self.analysis_status_var = tk.StringVar(value="Live-Modus aktiv")
+        self.analysis_override_date: datetime.date | None = None
+        self.base_start_date = self.config.start_date
+        self.base_end_date = self.config.end_date
 
         self.currency_mode_var = tk.StringVar(value="local")
         self.currency_button_text = tk.StringVar(value=self.currency_symbol)
@@ -1006,6 +1011,33 @@ class StockPredictorDesktopApp:
         self.chart_type_box.bind("<<ComboboxSelected>>", self._on_chart_type_changed)
         Tooltip(self.chart_type_box, "Choose the price chart style.")
 
+        self.analysis_date_label = ttk.Label(toolbar, text="Testdatum")
+        self.analysis_date_entry = ttk.Entry(
+            toolbar,
+            width=12,
+            textvariable=self.analysis_date_var,
+        )
+        self.analysis_date_apply_button = ttk.Button(
+            toolbar,
+            text="Setzen",
+            command=self._on_apply_analysis_date,
+        )
+        self.analysis_date_reset_button = ttk.Button(
+            toolbar,
+            text="Aktuelle Zeit",
+            command=self._on_use_current_time,
+        )
+        self.analysis_status_label = ttk.Label(
+            toolbar,
+            textvariable=self.analysis_status_var,
+        )
+        Tooltip(
+            self.analysis_date_entry,
+            "ISO-Datum eingeben (YYYY-MM-DD) und auf 'Setzen' klicken.",
+        )
+        Tooltip(self.analysis_date_apply_button, "Testdatum anwenden und neu laden.")
+        Tooltip(self.analysis_date_reset_button, "Zurück zum Live-Modus wechseln.")
+
         self.refresh_button = ttk.Button(toolbar, text="Refresh data", command=self._on_refresh)
         self.predict_button = ttk.Button(toolbar, text="Run prediction", command=self._on_predict)
 
@@ -1018,8 +1050,13 @@ class StockPredictorDesktopApp:
             self.position_spinbox,
             self.currency_menu_button,
             self.chart_type_box,
+            self.analysis_date_label,
+            self.analysis_date_entry,
+            self.analysis_date_apply_button,
+            self.analysis_date_reset_button,
             self.refresh_button,
             self.predict_button,
+            self.analysis_status_label,
         ]
 
         for column, widget in enumerate(widgets_in_order):
@@ -2228,6 +2265,72 @@ class StockPredictorDesktopApp:
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------
+    def _analysis_window_length(self) -> timedelta:
+        if self.base_end_date and self.base_start_date:
+            delta = self.base_end_date - self.base_start_date
+            if delta.days > 0:
+                return delta
+        return timedelta(days=365)
+
+    def _update_analysis_status(self) -> None:
+        if self.analysis_override_date:
+            self.analysis_status_var.set(
+                f"Testdatum aktiv: {self.analysis_override_date:%Y-%m-%d}"
+            )
+        else:
+            self.analysis_status_var.set("Live-Modus aktiv")
+
+    def _apply_analysis_window(self, *, start_date: datetime.date, end_date: datetime.date | None) -> None:
+        if (
+            self.config.start_date == start_date
+            and self.config.end_date == end_date
+        ):
+            return
+        updated_config = replace(
+            self.config,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        self.application.update_config(updated_config)
+        self.config = self.application.config
+        self._refresh_settings_labels()
+        if self.trend_finder is not None:
+            self.trend_finder.update_base_config(self.config)
+
+    def _on_apply_analysis_date(self) -> None:
+        raw_value = (self.analysis_date_var.get() or "").strip()
+        if not raw_value:
+            self._on_use_current_time()
+            return
+        try:
+            selected = datetime.fromisoformat(raw_value).date()
+        except ValueError:
+            messagebox.showerror(
+                "Ungültiges Datum",
+                "Bitte ein gültiges Datum im Format YYYY-MM-DD eingeben.",
+            )
+            return
+
+        window = self._analysis_window_length()
+        start_date = selected - window
+        self.analysis_override_date = selected
+        self.analysis_date_var.set(selected.isoformat())
+        self._update_analysis_status()
+        self._apply_analysis_window(start_date=start_date, end_date=selected)
+        self._set_status(f"Testdatum angewendet ({selected:%Y-%m-%d}).")
+        self._on_refresh()
+
+    def _on_use_current_time(self) -> None:
+        self.analysis_override_date = None
+        self.analysis_date_var.set("")
+        self._update_analysis_status()
+        self._apply_analysis_window(
+            start_date=self.base_start_date,
+            end_date=self.base_end_date,
+        )
+        self._set_status("Live-Modus aktiviert.")
+        self._on_refresh()
+
     def _on_refresh(self) -> None:
         self._run_async(self._refresh_and_predict, "Refreshing market data…")
 
@@ -4623,6 +4726,9 @@ class StockPredictorDesktopApp:
             self.ticker_apply_button,
             self.position_spinbox,
             self.currency_menu_button,
+            self.analysis_date_entry,
+            self.analysis_date_apply_button,
+            self.analysis_date_reset_button,
         ):
             widget.configure(state=state)
         if not busy:
