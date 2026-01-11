@@ -1251,6 +1251,33 @@ with st.sidebar:
     show_vwap = overlay_flags["show_vwap"]
     show_volume = overlay_flags["show_volume"]
 
+    forecast_response = st.session_state.get("forecast_response") or {}
+    forecast_payload = forecast_response.get("forecasts", forecast_response)
+    summary_block: Mapping[str, Any] = {}
+    distribution_block: Mapping[str, Any] = {}
+    raw_forecast: Mapping[str, Any] = {}
+    forecast_block: Mapping[str, Any] | None = None
+    if isinstance(forecast_payload, Mapping):
+        summary_candidate = forecast_payload.get("summary")
+        if isinstance(summary_candidate, Mapping):
+            summary_block = summary_candidate
+        elif any(
+            key in forecast_payload
+            for key in ("predicted_close", "expected_low", "expected_change_abs")
+        ):
+            summary_block = forecast_payload
+        distribution_candidate = forecast_payload.get("distribution")
+        if isinstance(distribution_candidate, Mapping):
+            distribution_block = distribution_candidate
+        raw_candidate = forecast_payload.get("raw")
+        if isinstance(raw_candidate, Mapping):
+            raw_forecast = raw_candidate
+        forecast_block = {**raw_forecast, **summary_block, **distribution_block}
+    else:
+        forecast_block = forecast_payload if isinstance(forecast_payload, Mapping) else {}
+
+    feature_usage = _extract_feature_usage(forecast_block)
+
     st.header("Insights & Risk Panel")
     st.caption("Aggregated probabilities, beta, volatility, and sentiment signals.")
     insights_refresh = st.checkbox(
@@ -1336,33 +1363,6 @@ feature_toggles = FeatureToggles.from_any(
     st.session_state.get("feature_toggles") or DEFAULT_FEATURE_TOGGLES,
     defaults=DEFAULT_FEATURE_TOGGLES.asdict(),
 )
-
-forecast_response = st.session_state.get("forecast_response") or {}
-forecast_payload = forecast_response.get("forecasts", forecast_response)
-summary_block: Mapping[str, Any] = {}
-distribution_block: Mapping[str, Any] = {}
-raw_forecast: Mapping[str, Any] = {}
-forecast_block: Mapping[str, Any] | None = None
-if isinstance(forecast_payload, Mapping):
-    summary_candidate = forecast_payload.get("summary")
-    if isinstance(summary_candidate, Mapping):
-        summary_block = summary_candidate
-    elif any(
-        key in forecast_payload
-        for key in ("predicted_close", "expected_low", "expected_change_abs")
-    ):
-        summary_block = forecast_payload
-    distribution_candidate = forecast_payload.get("distribution")
-    if isinstance(distribution_candidate, Mapping):
-        distribution_block = distribution_candidate
-    raw_candidate = forecast_payload.get("raw")
-    if isinstance(raw_candidate, Mapping):
-        raw_forecast = raw_candidate
-    forecast_block = {**raw_forecast, **summary_block, **distribution_block}
-else:
-    forecast_block = forecast_payload if isinstance(forecast_payload, Mapping) else {}
-
-feature_usage = _extract_feature_usage(forecast_block)
 
 st.title("Stock Predictor Dashboard")
 st.caption("Explore model forecasts, historical indicators, and curated research notes.")

@@ -36,7 +36,8 @@ from sklearn.base import clone
 from sklearn.calibration import calibration_curve
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import brier_score_loss, r2_score
-from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
+from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold, TimeSeriesSplit
+from sklearn.dummy import DummyClassifier
 from sklearn.pipeline import Pipeline
 
 from ..backtesting import Backtester as LegacyBacktester
@@ -351,7 +352,7 @@ class StockPredictorAI:
     def __init__(self, config: PredictorConfig, *, horizon: Optional[int] = None) -> None:
         self.config = config
         self.horizon = self.config.resolve_horizon(horizon)
-        self.fetcher = DataFetcher(config)
+        self._fetcher = DataFetcher(config)
         self.feature_assembler = FeatureAssembler(
             config.feature_toggles,
             config.prediction_horizons,
@@ -372,7 +373,7 @@ class StockPredictorAI:
             direction_params={"neutral_threshold": config.direction_neutral_threshold},
         )
         self.training_builder = TrainingDatasetBuilder(
-            config, database=getattr(self.fetcher, "database", None)
+            config, database=getattr(self._fetcher, "database", None)
         )
         self.market_timezone: ZoneInfo | None = resolve_market_timezone(self.config)
         self.tracker = ExperimentTracker(config)
@@ -384,8 +385,20 @@ class StockPredictorAI:
         self.preprocess_options: dict[str, Any] = {}
         self.metadata: Dict[str, Any] = {}
         self.nextgen_engine = MultiHorizonModelingEngine(
-            config, fetcher=self.fetcher, feature_assembler=self.feature_assembler
+            config, fetcher=self._fetcher, feature_assembler=self.feature_assembler
         )
+
+    @property
+    def fetcher(self):
+        return self._fetcher
+
+    @fetcher.setter
+    def fetcher(self, value):
+        self._fetcher = value
+        if getattr(self, "nextgen_engine", None) is not None:
+            self.nextgen_engine.fetcher = value
+        if getattr(self, "training_builder", None) is not None:
+            self.training_builder.database = getattr(value, "database", None)
 
     def _select_boosting_model_type(self) -> str:
         preferred = (self.config.model_type or "").strip().lower()
@@ -494,15 +507,21 @@ class StockPredictorAI:
         dataset_flag = (
             self.config.use_cached_training_data if use_cached_dataset is None else use_cached_dataset
         )
+        if use_cached_dataset is None and (price_df is not None or news_df is not None):
+            dataset_flag = False
         if dataset_flag:
             self.training_builder = TrainingDatasetBuilder(
                 self.config, database=getattr(self.fetcher, "database", None)
             )
-            dataset = self.training_builder.build(force=force_live_price)
-            self.metadata = dataset.metadata
-            self.preprocessor_templates = dataset.preprocessors
-            self.metadata.setdefault("active_horizon", self.horizon)
-            return dataset.features, dataset.targets, dataset.preprocessors
+            try:
+                dataset = self.training_builder.build(force=force_live_price)
+            except ValueError as exc:
+                LOGGER.info("Cached training data unavailable; rebuilding features. %s", exc)
+            else:
+                self.metadata = dataset.metadata
+                self.preprocessor_templates = dataset.preprocessors
+                self.metadata.setdefault("active_horizon", self.horizon)
+                return dataset.features, dataset.targets, dataset.preprocessors
 
         feature_toggles = self.config.feature_toggles
         sentiment_enabled = bool(
@@ -1393,6 +1412,11 @@ class StockPredictorAI:
         *,
         force: bool = False,
     ) -> Dict[str, Any]:
+        requested_targets = list(targets) if targets else list(self.config.prediction_targets)
+        use_nextgen = bool(
+            requested_targets
+            and all(str(target).strip().endswith("_h") for target in requested_targets)
+        )
         selected_model_type = self._select_boosting_model_type()
         if selected_model_type != self.config.model_type:
             LOGGER.info(
@@ -1403,19 +1427,19 @@ class StockPredictorAI:
             self.config.model_type = selected_model_type
         resolved_horizon = self._resolve_horizon(horizon)
         self.horizon = resolved_horizon
-        modern_report = self.nextgen_engine.train(
-            targets=list(targets) if targets else None,
-            horizon=resolved_horizon,
-            force=force,
-        )
-        self.metadata = modern_report.get("metadata", {})
-        return modern_report
+        if use_nextgen:
+            modern_report = self.nextgen_engine.train(
+                targets=requested_targets or None,
+                horizon=resolved_horizon,
+                force=force,
+            )
+            self.metadata = modern_report.get("metadata", {})
+            return modern_report
         resolved_horizon = self._resolve_horizon(horizon)
         self.horizon = resolved_horizon
         X, targets_by_horizon, _ = self.prepare_features()
         raw_feature_columns = self.metadata.get("raw_feature_columns", list(X.columns))
 
-        requested_targets = list(targets) if targets else list(self.config.prediction_targets)
         supported_targets: list[str] = []
         for target in requested_targets:
             if target not in SUPPORTED_TARGETS:
@@ -1491,7 +1515,7 @@ class StockPredictorAI:
                     resolved_horizon,
                 )
                 continue
-            aligned_X = X.loc[y_clean.index]
+            aligned_X = X.loc[y_clean.index].dropna(axis=1, how="all")
             self._log_target_distribution(target, resolved_horizon, y_clean)
             self._validate_no_nans(target, resolved_horizon, aligned_X, y_clean)
 
@@ -1520,6 +1544,49 @@ class StockPredictorAI:
                 calibrate_flag = bool(calibrate_override)
             if task == "classification" and not self.config.probability_calibration_enabled:
                 calibrate_flag = False
+            if calibrate_flag and task == "classification":
+                class_counts = y_clean.value_counts(dropna=True)
+                min_class_count = int(class_counts.min()) if not class_counts.empty else 0
+                folds = int(self.config.probability_calibration_folds)
+                if min_class_count >= 2:
+                    folds = max(2, min(folds, min_class_count))
+                    calibration_params["cv"] = StratifiedKFold(
+                        n_splits=folds, shuffle=True, random_state=seed
+                    )
+            if (
+                calibrate_flag
+                and task == "classification"
+                and self.config.evaluation_strategy == "holdout"
+            ):
+                split_idx = max(1, int(len(y_clean) * (1 - self.config.test_size)))
+                split_idx = min(split_idx, len(y_clean) - 1)
+                if y_clean.iloc[:split_idx].nunique() < 2:
+                    LOGGER.info(
+                        "Disabling probability calibration for target '%s' due to single-class holdout split.",
+                        target,
+                    )
+                    calibrate_flag = False
+                    calibration_enabled = False
+            if calibrate_flag and task == "classification":
+                cv_spec = calibration_params.get("cv")
+                splitter = None
+                if isinstance(cv_spec, TimeSeriesSplit):
+                    splitter = cv_spec
+                elif isinstance(cv_spec, int):
+                    splitter = TimeSeriesSplit(n_splits=cv_spec)
+                if splitter is not None:
+                    for train_idx, test_idx in splitter.split(np.arange(len(y_clean))):
+                        if (
+                            y_clean.iloc[train_idx].nunique() < 2
+                            or y_clean.iloc[test_idx].nunique() < 2
+                        ):
+                            LOGGER.info(
+                                "Disabling probability calibration for target '%s' due to single-class CV split.",
+                                target,
+                            )
+                            calibrate_flag = False
+                            calibration_enabled = False
+                            break
 
             if ensemble_config.get("enabled"):
                 members = self._build_ensemble_members(
@@ -1910,7 +1977,7 @@ class StockPredictorAI:
         global_params: Mapping[str, Any],
         model_params: Mapping[str, Any],
         calibrate_flag: bool,
-        calibration_params: Mapping[str, Any] | None,
+        calibration_params: Mapping[str, Any] | None = None,
         weights: Mapping[str, float],
     ) -> list[EnsembleMember]:
         members: list[EnsembleMember] = []
@@ -2017,7 +2084,7 @@ class StockPredictorAI:
         factory: ModelFactory,
         template: Pipeline | None,
         calibrate_flag: bool,
-        calibration_params: Mapping[str, Any] | None,
+        calibration_params: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if task != "classification" or not self.config.regime_models_enabled:
             return {}
@@ -2261,7 +2328,7 @@ class StockPredictorAI:
         task: str,
         target_name: str,
         calibrate_flag: bool,
-        calibration_params: Mapping[str, Any] | None,
+        calibration_params: Mapping[str, Any] | None = None,
         preprocessor: Optional[Pipeline] = None,
         *,
         collect_predictions: bool = False,
@@ -2277,6 +2344,29 @@ class StockPredictorAI:
         validation_pred: list[float] = []
         directional_totals = DirectionalStats()
         directional_summary: Dict[str, Any] = {}
+
+        def _fit_with_calibration_fallback(model: Pipeline, X_train, y_train) -> Pipeline:
+            if pd.Series(y_train).nunique(dropna=True) < 2:
+                dummy = Pipeline([("estimator", DummyClassifier(strategy="most_frequent"))])
+                dummy.fit(X_train, y_train)
+                return dummy
+            try:
+                model.fit(X_train, y_train)
+                return model
+            except ValueError as exc:
+                if task == "classification" and calibrate_flag:
+                    LOGGER.warning(
+                        "Calibration failed during evaluation; retrying without calibration: %s",
+                        exc,
+                    )
+                    fallback = factory.create(
+                        task,
+                        calibrate=False,
+                        calibration_params=dict(calibration_params or {}),
+                    )
+                    fallback.fit(X_train, y_train)
+                    return fallback
+                raise
 
         def _purged_splits() -> Iterable[tuple[np.ndarray, np.ndarray]]:
             n_samples = len(features)
@@ -2338,8 +2428,18 @@ class StockPredictorAI:
                 calibrate=calibrate_flag,
                 calibration_params=dict(calibration_params or {}),
             )
-            model.fit(X_train_transformed, y_train)
-            y_pred = model.predict(X_test_transformed)
+            model = _fit_with_calibration_fallback(
+                model, X_train_transformed, y_train
+            )
+            if (
+                isinstance(model, Pipeline)
+                and len(model.steps) == 1
+                and "estimator" in model.named_steps
+                and not hasattr(model.named_steps["estimator"], "__sklearn_tags__")
+            ):
+                y_pred = model.named_steps["estimator"].predict(X_test_transformed)
+            else:
+                y_pred = model.predict(X_test_transformed)
             proba = None
             estimator = model.named_steps.get("estimator")
             if task == "classification" and model_supports_proba(model):
@@ -2404,7 +2504,9 @@ class StockPredictorAI:
                     calibrate=calibrate_flag,
                     calibration_params=dict(calibration_params or {}),
                 )
-                model.fit(X_train_transformed, y_train)
+                model = _fit_with_calibration_fallback(
+                    model, X_train_transformed, y_train
+                )
                 y_pred = model.predict(X_test_transformed)
                 proba = None
                 estimator = model.named_steps.get("estimator")
@@ -2466,7 +2568,9 @@ class StockPredictorAI:
                     calibrate=calibrate_flag,
                     calibration_params=dict(calibration_params or {}),
                 )
-                model.fit(X_train_transformed, y_train)
+                model = _fit_with_calibration_fallback(
+                    model, X_train_transformed, y_train
+                )
                 y_pred = model.predict(X_test_transformed)
                 proba = None
                 estimator = model.named_steps.get("estimator")
@@ -4756,8 +4860,9 @@ class StockPredictorAI:
 
         resolved_sigma = max(sigma_values) if sigma_values else fallback_sigma_value
         max_move = resolved_sigma * sigma_multiplier_value * math.sqrt(horizon_days)
-        max_expected_change_pct = self._safe_float(
-            getattr(self.config, "max_expected_change_pct", DEFAULT_MAX_EXPECTED_CHANGE_PCT)
+        max_expected_change_pct = getattr(self.config, "max_expected_change_pct", None)
+        max_expected_change_pct = (
+            self._safe_float(max_expected_change_pct) if max_expected_change_pct is not None else None
         )
         if max_expected_change_pct is not None and max_expected_change_pct > 0:
             max_move = min(max_move, max_expected_change_pct * math.sqrt(horizon_days))

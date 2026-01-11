@@ -4659,7 +4659,8 @@ class StockPredictorDesktopApp:
         return reference - timestamp <= cache_max_age
 
     def _display_timezone(self) -> ZoneInfo | None:
-        tz = getattr(self.config, "timezone", None)
+        config = getattr(self, "config", None)
+        tz = getattr(config, "timezone", None)
         if isinstance(tz, ZoneInfo):
             return tz
         if tz:
@@ -4667,7 +4668,7 @@ class StockPredictorDesktopApp:
                 return ZoneInfo(str(tz))
             except Exception:  # pragma: no cover - defensive fallback
                 return self.market_timezone
-        return self.market_timezone
+        return getattr(self, "market_timezone", ZoneInfo("UTC"))
 
     def _resolve_market_timestamp(self) -> pd.Timestamp | None:
         latest_timestamp: pd.Timestamp | None = None
@@ -4841,6 +4842,17 @@ class StockPredictorDesktopApp:
             if target_date is not None
             else None
         )
+        if parsed is not None:
+            if base_date.tzinfo is None and parsed.tzinfo is not None:
+                try:
+                    base_date = base_date.tz_localize(parsed.tzinfo)
+                except Exception:  # pragma: no cover - defensive fallback
+                    base_date = base_date.tz_localize("UTC")
+            elif base_date.tzinfo is not None and parsed.tzinfo is not None:
+                try:
+                    base_date = base_date.tz_convert(parsed.tzinfo)
+                except Exception:  # pragma: no cover - defensive fallback
+                    pass
         holidays = self.market_holidays or self._resolve_market_holidays()
         if not self.market_holidays and holidays:
             self.market_holidays = list(holidays)
@@ -5508,7 +5520,9 @@ class StockPredictorDesktopApp:
             )
         else:
             band_display = "—"
-        self.metric_vars["confidence_interval"].set(band_display)
+        confidence_var = self.metric_vars.get("confidence_interval")
+        if confidence_var is not None:
+            confidence_var.set(band_display)
 
         predicted_volatility = None
         if isinstance(prediction, Mapping):
@@ -5640,9 +5654,12 @@ class StockPredictorDesktopApp:
             parts.append(f"🎯 {hit_prob_str}")
         self.metric_vars["direction"].set("   ".join(parts) if parts else "—")
 
-        horizon_value = self.selected_horizon_offset if self.selected_horizon_offset > 0 else None
+        horizon_offset = getattr(self, "selected_horizon_offset", 0)
+        horizon_value = horizon_offset if horizon_offset > 0 else None
         accuracy_display = self._format_accuracy_summary(horizon_value)
-        self.metric_vars["backtest_accuracy"].set(accuracy_display)
+        accuracy_var = self.metric_vars.get("backtest_accuracy")
+        if accuracy_var is not None:
+            accuracy_var.set(accuracy_display)
 
         sentiment_error = prediction.get("sentiment_error") if isinstance(prediction, Mapping) else None
         avg_sentiment, trend_sentiment = self._resolve_sentiment_snapshot(prediction)
