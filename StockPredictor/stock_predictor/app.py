@@ -154,6 +154,20 @@ class StockPredictorApplication:
         self.pipeline = self.model_trainer.pipeline
         LOGGER.info("Switched application context to ticker %s", new_ticker)
 
+    def update_config(self, config: PredictorConfig) -> None:
+        """Replace the active configuration and rebuild dependent components."""
+
+        if config == self.config:
+            return
+        config.ensure_directories()
+        self.config = config
+        self.indicator_store = IndicatorDataStore(config)
+        self.feature_engineer = IndicatorFeatureEngineer(self.indicator_store)
+        self.model_trainer = HorizonModelTrainer(config, self.feature_engineer)
+        self.evaluator = Backtester(config, self.model_trainer)
+        self.pipeline = self.model_trainer.pipeline
+        LOGGER.info("Updated application configuration for ticker %s", config.ticker)
+
     def backtest(
         self,
         *,
