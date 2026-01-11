@@ -46,6 +46,7 @@ from stock_predictor.core import (
     TrendFinder,
     TrendInsight,
 )
+from stock_predictor.core.clock import app_clock
 from stock_predictor.core.pipeline import (
     DEFAULT_CACHE_MAX_AGE,
     NoPriceDataError,
@@ -2312,8 +2313,11 @@ class StockPredictorDesktopApp:
             return
 
         window = self._analysis_window_length()
-        start_date = selected - window
+        system_today = app_clock.system_today(self.market_timezone)
+        start_anchor = selected if selected <= system_today else system_today
+        start_date = start_anchor - window
         self.analysis_override_date = selected
+        app_clock.set_test_date(selected, tz=self.market_timezone)
         self.analysis_date_var.set(selected.isoformat())
         self._update_analysis_status()
         self._apply_analysis_window(start_date=start_date, end_date=selected)
@@ -2322,6 +2326,7 @@ class StockPredictorDesktopApp:
 
     def _on_use_current_time(self) -> None:
         self.analysis_override_date = None
+        app_clock.clear_test_date()
         self.analysis_date_var.set("")
         self._update_analysis_status()
         self._apply_analysis_window(
@@ -4744,7 +4749,7 @@ class StockPredictorDesktopApp:
         self.status_var.set(message)
 
     def _now(self) -> pd.Timestamp:
-        return pd.Timestamp.now(tz=self.market_timezone)
+        return pd.Timestamp(app_clock.now(self.market_timezone))
 
     def _today(self) -> pd.Timestamp:
         return self._now().normalize()
@@ -4756,7 +4761,7 @@ class StockPredictorDesktopApp:
             return False
         if isinstance(timestamp, pd.Timestamp):
             timestamp = timestamp.to_pydatetime()
-        reference = datetime.now(timezone.utc)
+        reference = app_clock.now(timezone.utc)
         if timestamp.tzinfo is None:
             timestamp = timestamp.replace(tzinfo=timezone.utc)
         else:
@@ -4782,7 +4787,13 @@ class StockPredictorDesktopApp:
         has_history = isinstance(self.price_history, pd.DataFrame) and not self.price_history.empty
         cache_fresh = False
         self.market_timestamp_live_estimate = False
-        if self.last_price_cached is False and self.last_price_timestamp is not None:
+        if app_clock.is_override:
+            live_timestamp = None
+        if (
+            not app_clock.is_override
+            and self.last_price_cached is False
+            and self.last_price_timestamp is not None
+        ):
             live_timestamp = self.last_price_timestamp
         if has_history:
             cache_timestamp = self.price_history.attrs.get("cache_timestamp")
@@ -4793,16 +4804,17 @@ class StockPredictorDesktopApp:
                 latest_timestamp = live_timestamp
                 self.market_timestamp_live_estimate = True
             else:
-                fetcher = getattr(
-                    getattr(getattr(self, "application", None), "pipeline", None),
-                    "fetcher",
-                    None,
-                )
-                if fetcher is not None and hasattr(fetcher, "fetch_live_price"):
-                    try:
-                        _, live_timestamp = fetcher.fetch_live_price(force=False)
-                    except Exception:  # pragma: no cover - defensive
-                        live_timestamp = None
+                if not app_clock.is_override:
+                    fetcher = getattr(
+                        getattr(getattr(self, "application", None), "pipeline", None),
+                        "fetcher",
+                        None,
+                    )
+                    if fetcher is not None and hasattr(fetcher, "fetch_live_price"):
+                        try:
+                            _, live_timestamp = fetcher.fetch_live_price(force=False)
+                        except Exception:  # pragma: no cover - defensive
+                            live_timestamp = None
                 latest_timestamp = live_timestamp or self._now()
                 self.market_timestamp_live_estimate = True
         elif live_timestamp is not None:
@@ -4925,6 +4937,8 @@ class StockPredictorDesktopApp:
             return self._today()
 
         base_date = last_market_date.normalize()
+        if app_clock.is_override:
+            return base_date
         holidays = self.market_holidays or self._resolve_market_holidays()
         if not self.market_holidays and holidays:
             self.market_holidays = list(holidays)
@@ -5572,6 +5586,21 @@ class StockPredictorDesktopApp:
                 if as_of_display != "—"
                 else "Market data timestamp unavailable."
             )
+
+        if (
+            self.analysis_override_date
+            and localized_as_of is not None
+            and as_of_display != "—"
+        ):
+            system_today = app_clock.system_today(self.market_timezone)
+            requested_date = self.analysis_override_date
+            as_of_date = localized_as_of.date()
+            if requested_date > system_today and requested_date > as_of_date:
+                status_message = (
+                    f"Testdatum liegt in der Zukunft; Daten bis {as_of_display}."
+                    if status_message
+                    else f"Testdatum liegt in der Zukunft; Daten bis {as_of_display}."
+                )
 
         confluence_info = prediction.get("signal_confluence") if isinstance(prediction, Mapping) else None
         if isinstance(confluence_info, Mapping):

@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+from stock_predictor.core.clock import app_clock
 from stock_predictor.core.config import (
     PredictorConfig,
     build_config,
@@ -64,7 +65,7 @@ class BacktestingJob:
         backtest_results = pipeline.run_backtest(targets=self.targets, horizon=self.horizon)
         resolved_horizon = pipeline.horizon
 
-        timestamp = datetime.now(timezone.utc)
+        timestamp = app_clock.now(timezone.utc)
         report = {
             "ticker": self.config.ticker,
             "horizon": resolved_horizon,

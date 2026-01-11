@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import timezone
 from pathlib import Path
 import sys
 
@@ -15,6 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from stock_predictor.core.clock import app_clock
 from stock_predictor.providers.adapters import StooqProvider, YahooFinanceProvider
 from stock_predictor.providers.base import (
     DEFAULT_YAHOO_RATE_LIMIT_PER_SEC,
@@ -166,7 +167,7 @@ def test_retry_uses_full_retry_after_delay(monkeypatch: pytest.MonkeyPatch) -> N
                 )
             bar = PriceBar(
                 symbol="MSFT",
-                timestamp=datetime.now(timezone.utc),
+                timestamp=app_clock.system_now(timezone.utc),
                 open=1.0,
                 high=1.1,
                 low=0.9,
@@ -204,7 +205,7 @@ def test_retry_after_header_supports_vendor_specific_hints() -> None:
 
     request = httpx.Request("GET", "https://example.com")
 
-    absolute_reset = datetime.now(timezone.utc).timestamp() + 42
+    absolute_reset = app_clock.system_now(timezone.utc).timestamp() + 42
     absolute_response = httpx.Response(
         429,
         request=request,
@@ -241,7 +242,7 @@ def test_registry_respects_global_cooldown(
         async def _stooq_success(self: StooqProvider, request: ProviderRequest) -> ProviderResult:
             bar = PriceBar(
                 symbol=request.symbol,
-                timestamp=datetime.now(timezone.utc),
+                timestamp=app_clock.system_now(timezone.utc),
                 open=1.0,
                 high=1.5,
                 low=0.9,

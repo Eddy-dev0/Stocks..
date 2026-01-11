@@ -11,6 +11,7 @@ import pandas as pd
 from .config import PredictorConfig
 from .database import Database
 from .etl import MarketDataETL
+from ..core.clock import app_clock
 from ..core.pipeline import DEFAULT_CACHE_MAX_AGE
 
 LOGGER = logging.getLogger(__name__)
@@ -202,7 +203,7 @@ class DataFetcher:
             timestamp = timestamp.replace(tzinfo=timezone.utc)
         else:
             timestamp = timestamp.astimezone(timezone.utc)
-        return datetime.now(timezone.utc) - timestamp <= self._cache_max_age()
+        return app_clock.now(timezone.utc) - timestamp <= self._cache_max_age()
 
     def _is_price_cache_stale(self) -> bool:
         refresh_ts = self.database.get_refresh_timestamp(

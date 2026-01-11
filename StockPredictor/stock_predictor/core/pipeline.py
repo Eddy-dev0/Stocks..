@@ -31,6 +31,7 @@ from pandas.tseries.holiday import USFederalHolidayCalendar
 from pandas.tseries.offsets import CustomBusinessDay
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .clock import app_clock
 from .config import PredictorConfig
 from .database import Database
 from .preprocessing import compute_price_features
@@ -115,7 +116,7 @@ def resolve_market_timezone(config: PredictorConfig | None = None) -> ZoneInfo:
     if timezone is not None:
         return timezone
 
-    local_timezone = datetime.now().astimezone().tzinfo
+    local_timezone = app_clock.system_now().astimezone().tzinfo
     timezone = _coerce_zoneinfo(_tz_name(local_timezone))
     if timezone is not None:
         return timezone
@@ -174,9 +175,9 @@ def _tz_name(tz: tzinfo | None) -> str | None:
         if isinstance(name, str) and name:
             return name
     try:
-        now = datetime.now(tz)
+        now = app_clock.system_now(tz)
     except Exception:  # pragma: no cover - defensive guard
-        now = datetime.now()
+        now = app_clock.system_now()
     name = tz.tzname(now)
     if isinstance(name, str) and name:
         return name
@@ -282,7 +283,7 @@ class MarketDataETL:
 
     def _now(self) -> datetime:
         tz = self.market_timezone or DEFAULT_MARKET_TIMEZONE
-        return datetime.now(tz)
+        return app_clock.now(tz)
 
     def _today(self) -> date:
         return self._now().date()

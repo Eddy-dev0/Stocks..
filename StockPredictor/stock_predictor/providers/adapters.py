@@ -12,6 +12,8 @@ from typing import Any, List
 
 import pandas as pd
 
+from stock_predictor.core.clock import app_clock
+
 from .base import (
     BaseProvider,
     DatasetType,
@@ -203,8 +205,14 @@ class FinnhubProvider(BaseProvider):
             params = {
                 "symbol": request.symbol,
                 "resolution": request.params.get("interval", "D"),
-                "from": int(pd.Timestamp(request.params.get("start", datetime.now() - timedelta(days=365))).timestamp()),
-                "to": int(pd.Timestamp(request.params.get("end", datetime.now())).timestamp()),
+                "from": int(
+                    pd.Timestamp(
+                        request.params.get("start", app_clock.now() - timedelta(days=365))
+                    ).timestamp()
+                ),
+                "to": int(
+                    pd.Timestamp(request.params.get("end", app_clock.now())).timestamp()
+                ),
                 "token": self._api_key,
             }
             response = await self.client.get("https://finnhub.io/api/v1/stock/candle", params=params)
@@ -252,7 +260,7 @@ class FinnhubProvider(BaseProvider):
                     symbol=request.symbol,
                     provider=self.name,
                     signal_type=key,
-                    as_of=datetime.now(timezone.utc),
+                    as_of=app_clock.now(timezone.utc),
                     score=float(value),
                 )
             )
@@ -278,8 +286,8 @@ class PolygonProvider(BaseProvider):
             multiplier = request.params.get("multiplier", 1)
             timespan = request.params.get("timespan", "day")
             start = request.params.get("start")
-            end = request.params.get("end") or datetime.now().date().isoformat()
-            start = start or (datetime.now().date() - timedelta(days=365)).isoformat()
+            end = request.params.get("end") or app_clock.today().isoformat()
+            start = start or (app_clock.today() - timedelta(days=365)).isoformat()
             url = f"https://api.polygon.io/v2/aggs/ticker/{request.symbol}/range/{multiplier}/{timespan}/{start}/{end}"
             params = {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": self._api_key}
             response = await self.client.get(url, params=params)
@@ -571,7 +579,7 @@ class GDELTProvider(BaseProvider):
                         symbol=request.symbol,
                         provider=self.name,
                         signal_type="tone",
-                        as_of=datetime.now(timezone.utc),
+                        as_of=app_clock.now(timezone.utc),
                         score=score,
                         payload={"source": row.get("source")},
                     )

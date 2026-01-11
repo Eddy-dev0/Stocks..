@@ -16,6 +16,7 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 
+from .clock import app_clock
 from .features import FEATURE_REGISTRY, FeatureToggles, default_feature_toggles
 from .indicator_library import default_indicator_toggles
 from .preprocessing import default_price_feature_toggles, derive_price_feature_toggles
@@ -196,7 +197,7 @@ class PredictorConfig:
     """Runtime configuration for :class:`StockPredictorAI`."""
 
     ticker: str
-    start_date: date = field(default_factory=lambda: date.today() - timedelta(days=365 * 10))
+    start_date: date = field(default_factory=lambda: app_clock.today() - timedelta(days=365 * 10))
     end_date: Optional[date] = None
     interval: str = "1d"
     model_type: str = "random_forest"
@@ -1003,7 +1004,7 @@ def build_config(
     start_dt = (
         date.fromisoformat(start_date)
         if start_date
-        else date.today() - timedelta(days=365)
+        else app_clock.today() - timedelta(days=365)
     )
     end_dt = date.fromisoformat(end_date) if end_date else None
 

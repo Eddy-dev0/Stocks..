@@ -42,6 +42,7 @@ from sklearn.pipeline import Pipeline
 
 from ..backtesting import Backtester as LegacyBacktester
 from ..config import PredictorConfig
+from ..clock import app_clock, resolve_asof_trading_day
 from ..data_fetcher import DataFetcher
 from ..database import ExperimentTracker
 from ..directional import DirectionalStats, evaluate_directional_predictions
@@ -591,18 +592,19 @@ class StockPredictorAI:
                 metadata["latest_date"] = latest_date
                 metadata.setdefault("market_data_as_of", latest_date)
 
-        try:
-            live_price, live_timestamp = self.fetcher.fetch_live_price(
-                force=force_live_price
-            )
-        except Exception as exc:  # pragma: no cover - optional live quote path
-            LOGGER.debug("Live price fetch failed: %s", exc)
-        else:
-            if live_price is not None:
-                metadata["latest_price"] = float(live_price)
-                if live_timestamp is not None:
-                    metadata["market_data_as_of"] = live_timestamp
-                    metadata["latest_price_timestamp"] = live_timestamp
+        if not app_clock.is_override:
+            try:
+                live_price, live_timestamp = self.fetcher.fetch_live_price(
+                    force=force_live_price
+                )
+            except Exception as exc:  # pragma: no cover - optional live quote path
+                LOGGER.debug("Live price fetch failed: %s", exc)
+            else:
+                if live_price is not None:
+                    metadata["latest_price"] = float(live_price)
+                    if live_timestamp is not None:
+                        metadata["market_data_as_of"] = live_timestamp
+                        metadata["latest_price_timestamp"] = live_timestamp
 
         volatility_spec = TARGET_SPECS.get("volatility")
         if volatility_spec and volatility_spec.label_fn:
@@ -827,7 +829,7 @@ class StockPredictorAI:
         frame = frame.sort_values("Date")
         available_dates = frame["Date"].dt.date
         earliest_date = available_dates.min()
-        now = datetime.now(market_tz)
+        now = app_clock.now(market_tz)
         session_date = now.date()
         if (now.hour, now.minute, now.second) < (
             US_MARKET_CLOSE.hour,
@@ -852,6 +854,8 @@ class StockPredictorAI:
         """Update cached live price metadata in-place when available."""
 
         if not isinstance(self.metadata, dict):
+            return
+        if app_clock.is_override:
             return
         try:
             live_price, live_timestamp = self.fetcher.fetch_live_price(force=force)
@@ -3351,7 +3355,7 @@ class StockPredictorAI:
             last_price_value = latest_close
 
         market_tz = self.market_timezone or DEFAULT_MARKET_TIMEZONE
-        prediction_timestamp = datetime.now(market_tz)
+        prediction_timestamp = app_clock.now(market_tz)
         market_session = self._resolve_market_session(prediction_timestamp)
         anchor_price, anchor_price_source = self._resolve_anchor_price(
             price_df,
@@ -4959,6 +4963,7 @@ class StockPredictorAI:
         anchor_price: float | None = None
         timestamp: pd.Timestamp | None = None
         end_date = self.config.end_date
+        requested_date = end_date or app_clock.today(self.market_timezone)
 
         def _resolve_historical_anchor(
             price_df: pd.DataFrame | None, cutoff: date
@@ -5020,13 +5025,40 @@ class StockPredictorAI:
             )
             return last_price_value, last_timestamp
 
-        if end_date and end_date != date.today():
+        def _available_dates(frame: pd.DataFrame | None) -> list[date]:
+            if frame is None or frame.empty:
+                return []
+            column_map = {str(col).lower(): col for col in frame.columns}
+            date_col = (
+                column_map.get("date")
+                or column_map.get("datetime")
+                or column_map.get("timestamp")
+            )
+            if date_col:
+                series = pd.to_datetime(frame[date_col], errors="coerce")
+            else:
+                series = pd.to_datetime(frame.index, errors="coerce")
+            series = series.dropna()
+            if series.empty:
+                return []
+            return [value.date() for value in series]
+
+        if app_clock.is_override or (
+            end_date and end_date != app_clock.today(self.market_timezone)
+        ):
             historical_frame = self.fetcher.fetch_price_data(force=False)
+            available_dates = _available_dates(historical_frame)
+            effective_cutoff = resolve_asof_trading_day(
+                requested_date, available_dates
+            ) or requested_date
             anchor_price, timestamp = _resolve_historical_anchor(
-                historical_frame, end_date
+                historical_frame, effective_cutoff
             )
 
-        if anchor_price is None and (end_date is None or end_date == date.today()):
+        if anchor_price is None and (
+            not app_clock.is_override
+            and (end_date is None or end_date == app_clock.today(self.market_timezone))
+        ):
             last_price, timestamp = self.fetcher.fetch_live_price(force=True)
             anchor_price = self._safe_float(last_price)
 

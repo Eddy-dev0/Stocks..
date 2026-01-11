@@ -10,6 +10,7 @@ from typing import Iterable, Mapping, Sequence
 
 import pandas as pd
 
+from stock_predictor.core.clock import app_clock
 from stock_predictor.core.config import PredictorConfig
 from stock_predictor.providers.base import (
     DatasetType,
@@ -199,7 +200,7 @@ class AsyncDataPipeline:
         if end_param:
             end_date = date.fromisoformat(str(end_param))
         else:
-            end_date = date.today()
+            end_date = app_clock.today()
 
         window_days = getattr(self.config, "price_backfill_page_days", DEFAULT_PRICE_BACKFILL_DAYS)
         try:
@@ -233,7 +234,7 @@ class AsyncDataPipeline:
         if self.config.start_date:
             return self.config.start_date
 
-        conservative_start = date.today() - timedelta(days=DEFAULT_PRICE_BACKFILL_DAYS)
+        conservative_start = app_clock.today() - timedelta(days=DEFAULT_PRICE_BACKFILL_DAYS)
         return conservative_start
 
     def _price_loader_path(self) -> str | None:
