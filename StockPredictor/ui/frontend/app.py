@@ -64,6 +64,10 @@ for key, value in {
     "reliability_response": None,
     "indicator_response": None,
     "feature_toggles": DEFAULT_FEATURE_TOGGLES.copy(),
+    "analysis_date_override": None,
+    "use_current_time": True,
+    "analysis_start_date": None,
+    "analysis_end_date": None,
 }.items():
     st.session_state.setdefault(key, value)
 
@@ -112,7 +116,28 @@ def _with_feature_toggles(payload: Dict[str, Any] | None = None) -> Dict[str, An
         updated["feature_toggles"] = toggles.asdict()
     else:
         updated["feature_toggles"] = dict(toggles)
+    analysis_start = st.session_state.get("analysis_start_date")
+    analysis_end = st.session_state.get("analysis_end_date")
+    if analysis_start:
+        updated["start_date"] = (
+            analysis_start.isoformat()
+            if isinstance(analysis_start, date)
+            else analysis_start
+        )
+    if analysis_end:
+        updated["end_date"] = (
+            analysis_end.isoformat()
+            if isinstance(analysis_end, date)
+            else analysis_end
+        )
     return updated
+
+
+def _set_analysis_date_override() -> None:
+    st.session_state["use_current_time"] = False
+    st.session_state["analysis_date_override"] = st.session_state.get(
+        "analysis_date_picker"
+    )
 
 
 def _render_feature_toggle_summary(block: Mapping[str, Any] | None) -> None:
@@ -1364,6 +1389,43 @@ feature_toggles = FeatureToggles.from_any(
     defaults=DEFAULT_FEATURE_TOGGLES.asdict(),
 )
 
+analysis_date_override = st.session_state.get("analysis_date_override")
+use_current_time = st.session_state.get("use_current_time", True)
+time_controls = st.columns([1, 2, 3])
+with time_controls[0]:
+    if st.button("Aktuelle Zeit"):
+        st.session_state["use_current_time"] = True
+        st.session_state["analysis_date_override"] = None
+        st.session_state["analysis_date_picker"] = date.today()
+        analysis_date_override = None
+        use_current_time = True
+with time_controls[1]:
+    st.date_input(
+        "Testdatum",
+        value=analysis_date_override or date.today(),
+        key="analysis_date_picker",
+        on_change=_set_analysis_date_override,
+    )
+with time_controls[2]:
+    if use_current_time or not analysis_date_override:
+        st.caption("Live-Modus aktiv.")
+    else:
+        st.caption(f"Testdatum aktiv: {analysis_date_override:%Y-%m-%d}")
+
+if use_current_time or not analysis_date_override:
+    effective_start_date = start_date
+    effective_end_date = end_date
+    st.session_state["analysis_start_date"] = None
+    st.session_state["analysis_end_date"] = None
+else:
+    effective_end_date = analysis_date_override
+    effective_start_date = analysis_date_override - timedelta(days=365)
+    st.session_state["analysis_start_date"] = effective_start_date
+    st.session_state["analysis_end_date"] = effective_end_date
+    st.caption(
+        f"Historischer Testmodus: Datenfenster {effective_start_date:%Y-%m-%d} bis {effective_end_date:%Y-%m-%d}."
+    )
+
 st.title("Stock Predictor Dashboard")
 st.caption("Explore model forecasts, historical indicators, and curated research notes.")
 
@@ -1420,8 +1482,12 @@ with col_data:
                 f"/data/{ticker}",
                 params={
                     "refresh": bool(force_refresh_market),
-                    "start_date": start_date.isoformat() if isinstance(start_date, date) else None,
-                    "end_date": end_date.isoformat() if isinstance(end_date, date) else None,
+                    "start_date": effective_start_date.isoformat()
+                    if isinstance(effective_start_date, date)
+                    else None,
+                    "end_date": effective_end_date.isoformat()
+                    if isinstance(effective_end_date, date)
+                    else None,
                     "interval": interval,
                 },
             )
@@ -1459,10 +1525,11 @@ with col_data:
             response = _request(
                 f"/buy-zone/{ticker}",
                 method="POST",
-                json_payload={
-                    "refresh": bool(refresh_before_buy_zone),
-                    "feature_toggles": feature_toggles.asdict(),
-                },
+                json_payload=_with_feature_toggles(
+                    {
+                        "refresh": bool(refresh_before_buy_zone),
+                    }
+                ),
             )
             if response is not None:
                 st.session_state["buy_zone_response"] = response
@@ -1615,15 +1682,18 @@ with col_forecast:
             response = _request(
                 f"/train/{ticker}",
                 method="POST",
-                json_payload={
-                    "targets": _parse_targets(targets_raw),
-                    "horizon": horizon_value,
-                    "feature_toggles": feature_toggles.asdict(),
-                    "evaluation_strategy": evaluation_strategy,
-                    "evaluation_folds": int(evaluation_folds) if evaluation_strategy == "time_series" else None,
-                    "tuning_enabled": bool(tuning_enabled),
-                    "tuning_iterations": int(tuning_iterations),
-                },
+                json_payload=_with_feature_toggles(
+                    {
+                        "targets": _parse_targets(targets_raw),
+                        "horizon": horizon_value,
+                        "evaluation_strategy": evaluation_strategy,
+                        "evaluation_folds": int(evaluation_folds)
+                        if evaluation_strategy == "time_series"
+                        else None,
+                        "tuning_enabled": bool(tuning_enabled),
+                        "tuning_iterations": int(tuning_iterations),
+                    }
+                ),
             )
             if response is not None:
                 st.session_state["train_response"] = response
@@ -1658,12 +1728,13 @@ with col_forecast:
             response = _request(
                 f"/forecasts/{ticker}",
                 method="POST",
-                json_payload={
-                    "targets": _parse_targets(targets_raw),
-                    "refresh": bool(refresh_before_forecast),
-                    "horizon": horizon_value,
-                    "feature_toggles": feature_toggles.asdict(),
-                },
+                json_payload=_with_feature_toggles(
+                    {
+                        "targets": _parse_targets(targets_raw),
+                        "refresh": bool(refresh_before_forecast),
+                        "horizon": horizon_value,
+                    }
+                ),
             )
             if response is not None:
                 st.session_state["forecast_response"] = response
@@ -2159,10 +2230,11 @@ with col_forecast:
             response = _request(
                 f"/backtests/{ticker}",
                 method="POST",
-                json_payload={
-                    "targets": _parse_targets(targets_raw),
-                    "feature_toggles": feature_toggles.asdict(),
-                },
+                json_payload=_with_feature_toggles(
+                    {
+                        "targets": _parse_targets(targets_raw),
+                    }
+                ),
             )
             if response is not None:
                 st.session_state["backtest_response"] = response

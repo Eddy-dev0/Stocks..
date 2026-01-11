@@ -60,6 +60,12 @@ class ForecastRequest(BaseModel):
         ge=1,
         description="Optional number of periods ahead to forecast.",
     )
+    start_date: str | None = Field(
+        default=None, description="Optional ISO start date for historical window."
+    )
+    end_date: str | None = Field(
+        default=None, description="Optional ISO end date for historical window."
+    )
     feature_toggles: dict[str, bool] | None = Field(
         default=None,
         description=(
@@ -76,6 +82,12 @@ class BacktestRequest(BaseModel):
     targets: list[str] | None = Field(
         default=None,
         description="Optional list of targets to include in the backtest.",
+    )
+    start_date: str | None = Field(
+        default=None, description="Optional ISO start date for historical window."
+    )
+    end_date: str | None = Field(
+        default=None, description="Optional ISO end date for historical window."
     )
     feature_toggles: dict[str, bool] | None = Field(
         default=None,
@@ -137,6 +149,12 @@ class TrainRequest(BaseModel):
         ge=1,
         description="Optional forecast horizon to train against.",
     )
+    start_date: str | None = Field(
+        default=None, description="Optional ISO start date for historical window."
+    )
+    end_date: str | None = Field(
+        default=None, description="Optional ISO end date for historical window."
+    )
     feature_toggles: dict[str, bool] | None = Field(
         default=None,
         description=(
@@ -171,6 +189,12 @@ class BuyZoneRequest(BaseModel):
     refresh: bool = Field(
         default=True,
         description="Refresh underlying data sources before computing the buy zone.",
+    )
+    start_date: str | None = Field(
+        default=None, description="Optional ISO start date for historical window."
+    )
+    end_date: str | None = Field(
+        default=None, description="Optional ISO end date for historical window."
     )
     feature_toggles: dict[str, bool] | None = Field(
         default=None,
@@ -348,6 +372,12 @@ class IndicatorRequest(BaseModel):
         default=False,
         description="Include indicator history alongside the latest snapshot.",
     )
+    start_date: str | None = Field(
+        default=None, description="Optional ISO start date for historical window."
+    )
+    end_date: str | None = Field(
+        default=None, description="Optional ISO end date for historical window."
+    )
     feature_toggles: dict[str, bool] | None = Field(
         default=None,
         description=(
@@ -500,6 +530,8 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
             refresh=request.refresh,
             targets=request.targets,
             overrides={
+                "start_date": request.start_date,
+                "end_date": request.end_date,
                 "feature_toggles": request.feature_toggles,
                 "price_feature_toggles": request.feature_toggles,
             },
@@ -513,6 +545,8 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
             ticker,
             targets=request.targets,
             overrides={
+                "start_date": request.start_date,
+                "end_date": request.end_date,
                 "feature_toggles": request.feature_toggles,
                 "price_feature_toggles": request.feature_toggles,
             },
@@ -542,6 +576,8 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
     @app.post("/train/{ticker}", dependencies=[Depends(require_api_key)])
     async def retrain(ticker: str, request: TrainRequest) -> Dict[str, Any]:
         overrides = {
+            "start_date": request.start_date,
+            "end_date": request.end_date,
             "feature_toggles": request.feature_toggles,
             "price_feature_toggles": request.feature_toggles,
             "evaluation_strategy": request.evaluation_strategy,
@@ -570,6 +606,8 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
         application = await _build_application(
             ticker,
             {
+                "start_date": request.start_date,
+                "end_date": request.end_date,
                 "feature_toggles": request.feature_toggles,
                 "price_feature_toggles": request.feature_toggles,
             },
@@ -635,6 +673,8 @@ def create_app(default_overrides: Dict[str, Any] | None = None) -> FastAPI:
             limit=request.limit,
             include_history=request.include_history,
             overrides={
+                "start_date": request.start_date,
+                "end_date": request.end_date,
                 "feature_toggles": request.feature_toggles,
                 "price_feature_toggles": request.feature_toggles,
             },
