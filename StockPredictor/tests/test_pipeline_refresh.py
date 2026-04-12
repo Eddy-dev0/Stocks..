@@ -192,6 +192,65 @@ def test_latest_trading_session_with_midday_utc_reference_returns_previous_day()
     assert session == date(2024, 3, 26)
 
 
+def test_fetch_with_rotation_continues_after_empty_provider_results(monkeypatch) -> None:
+    """Price rotation should continue when a provider responds with zero records."""
+
+    config = PredictorConfig(ticker="AAPL")
+    etl = MarketDataETL(config)
+
+    requested: list[str] = []
+
+    async def fake_fetch_all(request, providers=None):
+        provider_name = (providers or [None])[0]
+        requested.append(provider_name)
+        if provider_name == "stable_price_store":
+            return ProviderFetchSummary(
+                results=[
+                    ProviderResult(
+                        dataset_type=DatasetType.PRICES,
+                        source="stable_price_store",
+                        records=[],
+                        metadata={"reason": "missing"},
+                    )
+                ],
+                failures=[],
+            )
+        if provider_name == "yahoo_finance":
+            return ProviderFetchSummary(
+                results=[
+                    ProviderResult(
+                        dataset_type=DatasetType.PRICES,
+                        source="yahoo_finance",
+                        records=[
+                            PriceBar(
+                                symbol="AAPL",
+                                timestamp=pd.Timestamp("2024-03-27", tz="UTC").to_pydatetime(),
+                                close=100.0,
+                            )
+                        ],
+                    )
+                ],
+                failures=[],
+            )
+        return ProviderFetchSummary(results=[], failures=[])
+
+    monkeypatch.setattr(etl._registry, "fetch_all", fake_fetch_all)
+
+    summary = etl._fetch_with_rotation(
+        request=type(
+            "Req",
+            (),
+            {"dataset_type": DatasetType.PRICES, "symbol": "AAPL", "params": {}},
+        )(),
+        providers=["stable_price_store", "yahoo_finance"],
+    )
+
+    assert requested[:2] == ["stable_price_store", "yahoo_finance"]
+    assert len(summary.results) == 2
+    assert summary.results[-1].source == "yahoo_finance"
+    assert len(summary.results[-1].records) == 1
+
+
 class _NullRegistry:
     async def aclose(self) -> None:  # pragma: no cover - helper
         return None
