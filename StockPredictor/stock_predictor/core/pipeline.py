@@ -116,7 +116,7 @@ def resolve_market_timezone(config: PredictorConfig | None = None) -> ZoneInfo:
     if timezone is not None:
         return timezone
 
-    local_timezone = app_clock.system_now().astimezone().tzinfo
+    local_timezone = datetime.now().astimezone().tzinfo
     timezone = _coerce_zoneinfo(_tz_name(local_timezone))
     if timezone is not None:
         return timezone
@@ -174,11 +174,14 @@ def _tz_name(tz: tzinfo | None) -> str | None:
         name = getattr(tz, attr, None)
         if isinstance(name, str) and name:
             return name
+    name = tz.tzname(None)
+    if isinstance(name, str) and name:
+        return name
     try:
-        now = app_clock.system_now(tz)
+        now = datetime.now(tz)
+        name = tz.tzname(now)
     except Exception:  # pragma: no cover - defensive guard
-        now = app_clock.system_now()
-    name = tz.tzname(now)
+        name = None
     if isinstance(name, str) and name:
         return name
     return None

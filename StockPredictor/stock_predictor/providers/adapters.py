@@ -422,7 +422,8 @@ class StooqProvider(BaseProvider):
         url = f"https://stooq.com/q/d/l/?s={normalized_symbol}&i=d"
         response = await self.client.get(url)
         response.raise_for_status()
-        frame = pd.read_csv(StringIO(response.text)) if response.text else pd.DataFrame()
+
+        frame = self._parse_price_csv(response.text)
         if not frame.empty:
             frame = frame.dropna(how="any")
         bars: list[PriceBar] = []
@@ -440,6 +441,36 @@ class StooqProvider(BaseProvider):
                 )
             )
         return ProviderResult(dataset_type=request.dataset_type, source=self.name, records=bars)
+
+    def _parse_price_csv(self, payload: str) -> pd.DataFrame:
+        """Parse Stooq CSV payloads while tolerating transient malformed lines."""
+
+        if not payload:
+            return pd.DataFrame()
+
+        lines = [line.strip() for line in payload.splitlines() if line.strip()]
+        header = "Date,Open,High,Low,Close,Volume"
+        header_index = next(
+            (idx for idx, line in enumerate(lines) if line.lower() == header.lower()),
+            None,
+        )
+
+        if header_index is None:
+            return pd.DataFrame()
+
+        csv_lines = [header]
+        for line in lines[header_index + 1 :]:
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) < 6:
+                continue
+            if pd.isna(pd.to_datetime(parts[0], errors="coerce")):
+                continue
+            csv_lines.append(",".join(parts[:6]))
+
+        if len(csv_lines) == 1:
+            return pd.DataFrame(columns=header.split(","))
+
+        return pd.read_csv(StringIO("\n".join(csv_lines)), engine="python")
 
 
 class FREDProvider(BaseProvider):
