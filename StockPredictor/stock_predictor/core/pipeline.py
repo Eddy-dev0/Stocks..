@@ -1410,7 +1410,8 @@ class MarketDataETL:
                 aggregate_results.extend(summary.results)
                 aggregate_failures.extend(summary.failures)
                 cycle_failures.extend(summary.failures)
-                if summary.results:
+                has_records = any(bool(result.records) for result in summary.results)
+                if has_records:
                     return ProviderFetchSummary(aggregate_results, aggregate_failures)
 
             if not cycle_failures:
