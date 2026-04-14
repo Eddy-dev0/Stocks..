@@ -12,7 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from stock_predictor.providers.adapters import StooqProvider
-from stock_predictor.providers.base import DatasetType, PriceBar, ProviderRequest
+from stock_predictor.providers.base import DatasetType, PriceBar, ProviderError, ProviderRequest
 
 
 class _DummyResponse:
@@ -116,6 +116,27 @@ Date,Open,High,Low,Close,Volume
             "2024-01-02",
             "2024-01-03",
         ]
+
+        await provider.aclose()
+
+    asyncio.run(_runner())
+
+
+def test_stooq_raises_for_non_csv_payloads() -> None:
+    """HTML/error payloads should raise a provider error instead of returning empty data."""
+
+    async def _runner() -> None:
+        provider = StooqProvider()
+        url_log: list[str] = []
+        provider._client = _DummyClient("<html><body>Access denied</body></html>", url_log)
+
+        request = ProviderRequest(dataset_type=DatasetType.PRICES, symbol="AAPL", params={})
+
+        try:
+            await provider._fetch(request)
+            assert False, "Expected ProviderError for malformed payload"
+        except ProviderError as exc:
+            assert "unexpected or empty CSV payload" in str(exc)
 
         await provider.aclose()
 

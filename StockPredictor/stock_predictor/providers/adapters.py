@@ -20,6 +20,7 @@ from .base import (
     EconomicIndicator,
     NewsArticle,
     PriceBar,
+    ProviderError,
     ProviderRequest,
     ProviderResult,
     SentimentSignal,
@@ -424,8 +425,13 @@ class StooqProvider(BaseProvider):
         response.raise_for_status()
 
         frame = self._parse_price_csv(response.text)
-        if not frame.empty:
-            frame = frame.dropna(how="any")
+        if frame.empty:
+            payload_preview = " ".join(response.text.split())[:160]
+            raise ProviderError(
+                "Stooq returned an unexpected or empty CSV payload"
+                f" for {request.symbol}: {payload_preview!r}"
+            )
+        frame = frame.dropna(how="any")
         bars: list[PriceBar] = []
         for _, row in frame.iterrows():
             timestamp = pd.Timestamp(row["Date"]).to_pydatetime().replace(tzinfo=timezone.utc)
