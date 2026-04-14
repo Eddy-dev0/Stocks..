@@ -383,16 +383,17 @@ class BaseProvider(abc.ABC):
                 attempt_errors.append(f"HTTP {status}")
                 retry_after_hint = self._retry_after_header(exc.response)
                 wait = self._retry_delay(attempt, exc, retry_after=retry_after_hint)
-                if status == 429 and attempt >= self._retries:
+                if status == 429:
                     cooldown_delay = self._cooldown_delay(wait, retry_after_hint)
                     await self._schedule_cooldown(request, cooldown_delay)
                     await self._schedule_global_cooldown(cooldown_delay)
                     LOGGER.warning(
-                        "Provider %s hit rate limits for %s after %s attempts; "
+                        "Provider %s hit rate limits for %s after %s attempt%s; "
                         "cooling down for %.0fs.",
                         self.name,
                         request.symbol,
                         attempt,
+                        "" if attempt == 1 else "s",
                         cooldown_delay,
                     )
                     raise ProviderCooldownError(

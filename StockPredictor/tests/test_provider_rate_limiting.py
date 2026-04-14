@@ -136,8 +136,8 @@ def test_429_retry_hint_overrides_default_cooldown(
     asyncio.run(_runner())
 
 
-def test_retry_uses_full_retry_after_delay(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Providers should respect long Retry-After hints when retrying."""
+def test_429_short_circuits_without_retry_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HTTP 429 responses should immediately enter cooldown without retry sleeping."""
 
     async def _runner() -> None:
         provider = YahooFinanceProvider(
@@ -155,30 +155,14 @@ def test_retry_uses_full_retry_after_delay(monkeypatch: pytest.MonkeyPatch) -> N
         async def _fetch(self: YahooFinanceProvider, _: ProviderRequest) -> ProviderResult:
             nonlocal call_count
             call_count += 1
-            if call_count == 1:
-                request_obj = httpx.Request("GET", "https://example.com")
-                response = httpx.Response(
-                    429,
-                    request=request_obj,
-                    headers={"Retry-After": "120"},
-                )
-                raise httpx.HTTPStatusError(
-                    "Too Many Requests", request=request_obj, response=response
-                )
-            bar = PriceBar(
-                symbol="MSFT",
-                timestamp=app_clock.system_now(timezone.utc),
-                open=1.0,
-                high=1.1,
-                low=0.9,
-                close=1.05,
-                volume=5,
+            request_obj = httpx.Request("GET", "https://example.com")
+            response = httpx.Response(
+                429,
+                request=request_obj,
+                headers={"Retry-After": "120"},
             )
-            return ProviderResult(
-                dataset_type=DatasetType.PRICES,
-                source=self.name,
-                records=[bar],
-                metadata={"symbol": "MSFT"},
+            raise httpx.HTTPStatusError(
+                "Too Many Requests", request=request_obj, response=response
             )
 
         sleep_calls: list[float] = []
@@ -190,10 +174,12 @@ def test_retry_uses_full_retry_after_delay(monkeypatch: pytest.MonkeyPatch) -> N
         monkeypatch.setattr(YahooFinanceProvider, "_fetch", _fetch, raising=False)
         monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
 
-        await provider.fetch(request)
+        with pytest.raises(ProviderCooldownError) as excinfo:
+            await provider.fetch(request)
 
-        assert sleep_calls
-        assert sleep_calls[0] == pytest.approx(120.0)
+        assert excinfo.value.retry_after == pytest.approx(120.0)
+        assert call_count == 1
+        assert not sleep_calls
 
         await provider.aclose()
 
