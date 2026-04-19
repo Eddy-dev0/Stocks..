@@ -311,6 +311,7 @@ class BaseProvider(abc.ABC):
     ) -> None:
         self._client = client
         self._client_owner = client is None
+        self._client_loop: asyncio.AbstractEventLoop | None = None
         self._rate_limiter = _AsyncRateLimiter(rate_limit_per_sec)
         self._cache = _TTLCache()
         self._cache_ttl = cache_ttl
@@ -327,9 +328,14 @@ class BaseProvider(abc.ABC):
     def client(self) -> httpx.AsyncClient:
         if self._client is None:
             self._client = httpx.AsyncClient(timeout=30.0)
+            try:
+                self._client_loop = asyncio.get_running_loop()
+            except RuntimeError:  # pragma: no cover - defensive guard
+                self._client_loop = None
         return self._client
 
     async def fetch(self, request: ProviderRequest) -> ProviderResult:
+        await self._ensure_client_for_loop()
         if request.dataset_type not in self.supported_datasets:
             raise ProviderConfigurationError(
                 f"Provider {self.name} does not support dataset {request.dataset_type}."
@@ -459,12 +465,43 @@ class BaseProvider(abc.ABC):
     async def aclose(self) -> None:
         if self._client_owner and self._client is not None:
             await self._client.aclose()
+            self._client = None
+            self._client_loop = None
 
     async def __aenter__(self) -> "BaseProvider":
         return self
 
     async def __aexit__(self, *exc_info: Any) -> None:
         await self.aclose()
+
+    async def _ensure_client_for_loop(self) -> None:
+        """Recreate owned clients when fetches move across event loops."""
+
+        if not self._client_owner:
+            return
+
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - defensive guard
+            return
+
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=30.0)
+            self._client_loop = current_loop
+            return
+
+        if self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=30.0)
+            self._client_loop = current_loop
+            return
+
+        if self._client_loop is current_loop:
+            return
+
+        old_client = self._client
+        self._client = httpx.AsyncClient(timeout=30.0)
+        self._client_loop = current_loop
+        await old_client.aclose()
 
     def _cache_key(self, request: ProviderRequest) -> str:
         params = dict(sorted(request.params.items()))

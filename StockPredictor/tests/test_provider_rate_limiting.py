@@ -19,6 +19,7 @@ from stock_predictor.core.clock import app_clock
 from stock_predictor.providers.adapters import StooqProvider, YahooFinanceProvider
 from stock_predictor.providers.base import (
     DEFAULT_YAHOO_RATE_LIMIT_PER_SEC,
+    BaseProvider,
     DatasetType,
     PriceBar,
     ProviderCooldownError,
@@ -279,3 +280,29 @@ def test_registry_respects_global_cooldown(
         await stooq.aclose()
 
     asyncio.run(_runner())
+
+
+def test_base_provider_recreates_owned_client_across_event_loops() -> None:
+    """Owned AsyncClients should be recreated when calls cross closed loops."""
+
+    class _LoopSwitchProvider(BaseProvider):
+        name = "loop_switch"
+        supported_datasets = (DatasetType.PRICES,)
+
+        async def _fetch(self, request: ProviderRequest) -> ProviderResult:
+            _ = self.client
+            return ProviderResult(dataset_type=request.dataset_type, source=self.name, records=[])
+
+    provider = _LoopSwitchProvider(retries=1)
+    request = ProviderRequest(dataset_type=DatasetType.PRICES, symbol="AAPL", params={})
+
+    async def _run_fetch() -> int:
+        await provider.fetch(request)
+        return id(provider.client)
+
+    first_client = asyncio.run(_run_fetch())
+    second_client = asyncio.run(_run_fetch())
+
+    assert first_client != second_client
+
+    asyncio.run(provider.aclose())
