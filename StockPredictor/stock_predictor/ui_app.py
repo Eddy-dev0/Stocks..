@@ -108,6 +108,25 @@ CURRENCY_CODE_TO_SYMBOL: dict[str, str] = {
 
 NON_REMOTE_PROVIDER_IDS = {"database", "local", "placeholder", "unknown"}
 
+SCREENER_PATTERN_CHOICES: tuple[str, ...] = (
+    "Double Bottom",
+    "Double Top",
+    "Triple Bottom",
+    "Triple Top",
+    "Head and Shoulders",
+    "Inverted Head and Shoulders",
+    "Ascending Triangle",
+    "Descending Triangle",
+    "Pennant",
+    "Flag",
+    "Bearish Flag",
+    "Channel",
+    "Channel Up",
+    "Channel Down",
+    "Cup and Handle",
+    "Diamond",
+)
+
 
 IMPLEMENTED_FEATURE_GROUPS: set[str] = {
     name for name, spec in FEATURE_REGISTRY.items() if spec.implemented
@@ -192,6 +211,15 @@ class HorizonOption:
     code: str
     business_days: int
     summary: str = ""
+
+
+@dataclass(slots=True)
+class ScreenerSignal:
+    """Represents a detected chart pattern signal."""
+
+    idx: int
+    confidence: float
+    direction: str
 
 
 DEFAULT_HORIZON_PRESETS: tuple[HorizonOption, ...] = (
@@ -658,6 +686,19 @@ class StockPredictorDesktopApp:
         self.trend_placeholder: ttk.Label | None = None
         self.trend_progress: ttk.Progressbar | None = None
         self._trend_placeholder_default = "Run a scan to discover new opportunities."
+        self.screener_status_var = tk.StringVar(
+            value="Select patterns and click “Scan now” to view live detections."
+        )
+        self.screener_note_var = tk.StringVar(
+            value=(
+                "The screener reuses your loaded market data and checks pattern structure "
+                "in rolling windows. Confidence is derived from geometric consistency."
+            )
+        )
+        self.screener_pattern_listbox: tk.Listbox | None = None
+        self.screener_tree: ttk.Treeview | None = None
+        self.screener_placeholder: ttk.Label | None = None
+        self.screener_last_scan_var = tk.StringVar(value="Last scan: —")
         self.decimal_display_map = {value: label for label, value in self.decimal_option_map.items()}
         self.currency_default_var = tk.StringVar(
             value=self.currency_display_map.get(self.currency_mode, "Local")
@@ -1101,6 +1142,7 @@ class StockPredictorDesktopApp:
         self._build_trend_finder_tab()
         self._build_indicators_tab()
         self._build_explanation_tab()
+        self._build_screener_tab()
         self._build_settings_tab()
         self._build_fabio_tab()
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
@@ -2103,6 +2145,106 @@ class StockPredictorDesktopApp:
         self.feature_canvas = FigureCanvasTkAgg(self.feature_figure, master=figure_container)
         self.feature_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
+    def _build_screener_tab(self) -> None:
+        frame = ttk.Frame(self.notebook, padding=12)
+        self.notebook.add(frame, text="Screener")
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(3, weight=1)
+
+        intro_box = ttk.LabelFrame(frame, text="Pattern screener", padding=8)
+        intro_box.grid(row=0, column=0, sticky="ew")
+        intro_box.grid_columnconfigure(0, weight=1)
+        ttk.Label(
+            intro_box,
+            text=(
+                "Live pattern scan for your current ticker. The screener checks "
+                "rolling windows and highlights the latest actionable formations."
+            ),
+            justify=tk.LEFT,
+            wraplength=860,
+        ).grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(
+            intro_box,
+            textvariable=self.screener_note_var,
+            justify=tk.LEFT,
+            wraplength=860,
+        ).grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
+
+        control_row = ttk.Frame(frame)
+        control_row.grid(row=1, column=0, sticky="ew", pady=(10, 6))
+        control_row.grid_columnconfigure(1, weight=1)
+        ttk.Label(control_row, text="Patterns:").grid(row=0, column=0, sticky=tk.W, padx=(0, 8))
+        list_frame = ttk.Frame(control_row)
+        list_frame.grid(row=0, column=1, sticky="ew")
+        list_frame.grid_columnconfigure(0, weight=1)
+        pattern_listbox = tk.Listbox(
+            list_frame,
+            selectmode=tk.MULTIPLE,
+            exportselection=False,
+            height=6,
+        )
+        for pattern in SCREENER_PATTERN_CHOICES:
+            pattern_listbox.insert(tk.END, pattern)
+        for idx, pattern in enumerate(SCREENER_PATTERN_CHOICES):
+            if pattern in {"Double Bottom", "Double Top", "Ascending Triangle", "Descending Triangle"}:
+                pattern_listbox.selection_set(idx)
+        pattern_listbox.grid(row=0, column=0, sticky="ew")
+        pattern_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=pattern_listbox.yview)
+        pattern_scroll.grid(row=0, column=1, sticky="ns")
+        pattern_listbox.configure(yscrollcommand=pattern_scroll.set)
+        self.screener_pattern_listbox = pattern_listbox
+
+        ttk.Button(
+            control_row,
+            text="Scan now",
+            command=self._on_screener_scan,
+        ).grid(row=0, column=2, sticky=tk.W, padx=(10, 0))
+        ttk.Label(control_row, textvariable=self.screener_last_scan_var).grid(
+            row=0, column=3, sticky=tk.E, padx=(12, 0)
+        )
+
+        ttk.Label(frame, textvariable=self.screener_status_var, anchor=tk.W).grid(
+            row=2, column=0, sticky="ew", pady=(0, 6)
+        )
+
+        table_frame = ttk.Frame(frame)
+        table_frame.grid(row=3, column=0, sticky="nsew")
+        table_frame.grid_columnconfigure(0, weight=1)
+        table_frame.grid_rowconfigure(0, weight=1)
+        columns = ("pattern", "direction", "confidence", "signal_time", "close", "comment")
+        self.screener_tree = ttk.Treeview(
+            table_frame,
+            columns=columns,
+            show="headings",
+            height=12,
+            selectmode="browse",
+        )
+        self.screener_tree.heading("pattern", text="Pattern")
+        self.screener_tree.heading("direction", text="Direction")
+        self.screener_tree.heading("confidence", text="Confidence")
+        self.screener_tree.heading("signal_time", text="Signal time")
+        self.screener_tree.heading("close", text="Close")
+        self.screener_tree.heading("comment", text="How it works")
+        self.screener_tree.column("pattern", width=190, anchor=tk.W)
+        self.screener_tree.column("direction", width=90, anchor=tk.CENTER)
+        self.screener_tree.column("confidence", width=100, anchor=tk.E)
+        self.screener_tree.column("signal_time", width=150, anchor=tk.CENTER)
+        self.screener_tree.column("close", width=120, anchor=tk.E)
+        self.screener_tree.column("comment", width=360, anchor=tk.W)
+        self.screener_tree.grid(row=0, column=0, sticky="nsew")
+        screener_scroll = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.screener_tree.yview)
+        screener_scroll.grid(row=0, column=1, sticky="ns")
+        self.screener_tree.configure(yscrollcommand=screener_scroll.set)
+
+        self.screener_placeholder = ttk.Label(
+            table_frame,
+            text="No screener signals yet. Run a prediction and click “Scan now”.",
+            anchor=tk.CENTER,
+            justify=tk.CENTER,
+        )
+        self.screener_placeholder.grid(row=0, column=0, sticky="nsew")
+        self.screener_tree.grid_remove()
+
     def _build_settings_tab(self) -> None:
         frame = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(frame, text="Settings")
@@ -2549,6 +2691,267 @@ class StockPredictorDesktopApp:
             return (confidence_key, composite_key)
 
         return sorted(self.trend_results, key=sort_key, reverse=True)
+
+    def _on_screener_scan(self) -> None:
+        self._update_screener_view(force_refresh_data=True)
+
+    def _selected_screener_patterns(self) -> list[str]:
+        if self.screener_pattern_listbox is None:
+            return []
+        selected = self.screener_pattern_listbox.curselection()
+        patterns: list[str] = []
+        for index in selected:
+            try:
+                patterns.append(str(self.screener_pattern_listbox.get(index)))
+            except tk.TclError:  # pragma: no cover - widget race guard
+                continue
+        return patterns
+
+    def _update_screener_view(self, *, force_refresh_data: bool = False) -> None:
+        if self.screener_tree is None:
+            return
+        for item in self.screener_tree.get_children():
+            self.screener_tree.delete(item)
+
+        patterns = self._selected_screener_patterns()
+        if not patterns:
+            self.screener_status_var.set("Please select at least one pattern.")
+            if self.screener_placeholder is not None:
+                self.screener_placeholder.configure(text="Select one or more patterns to run the screener.")
+                self.screener_placeholder.grid()
+            self.screener_tree.grid_remove()
+            return
+
+        frame = self._screener_source_frame(force_refresh_data=force_refresh_data)
+        if frame is None or frame.empty:
+            self.screener_status_var.set("No OHLC data available for screener scan.")
+            if self.screener_placeholder is not None:
+                self.screener_placeholder.configure(text="No market data available yet. Run refresh/prediction first.")
+                self.screener_placeholder.grid()
+            self.screener_tree.grid_remove()
+            return
+
+        rows: list[tuple[str, str, float, str, str, str]] = []
+        for pattern in patterns:
+            signals = self._scan_pattern_signals(frame, pattern, lookback=40)
+            if not signals:
+                continue
+            latest = signals[-1]
+            signal_row = frame.iloc[latest.idx]
+            timestamp_value = signal_row["time"] if "time" in signal_row else None
+            if pd.notna(timestamp_value):
+                timestamp_text = pd.Timestamp(timestamp_value).strftime("%Y-%m-%d %H:%M")
+            else:
+                timestamp_text = "—"
+            close_value = fmt_ccy(
+                signal_row.get("close"), self.currency_symbol, decimals=self.price_decimal_places
+            )
+            direction_text = "Bullish" if latest.direction == "up" else "Bearish"
+            comment = self._pattern_description(pattern, latest.direction)
+            rows.append(
+                (
+                    pattern,
+                    direction_text,
+                    latest.confidence,
+                    timestamp_text,
+                    close_value,
+                    comment,
+                )
+            )
+
+        if not rows:
+            self.screener_status_var.set(
+                f"No active signals found for {len(patterns)} selected pattern(s)."
+            )
+            if self.screener_placeholder is not None:
+                self.screener_placeholder.configure(text="No current pattern setup detected.")
+                self.screener_placeholder.grid()
+            self.screener_tree.grid_remove()
+            return
+
+        rows.sort(key=lambda row: row[2], reverse=True)
+        for pattern, direction, confidence, signal_time, close_text, comment in rows:
+            self.screener_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    pattern,
+                    direction,
+                    fmt_pct(confidence, decimals=1),
+                    signal_time,
+                    close_text,
+                    comment,
+                ),
+            )
+        self.screener_status_var.set(
+            f"Detected {len(rows)} live pattern signal(s) for {self.config.ticker}."
+        )
+        self.screener_last_scan_var.set(
+            f"Last scan: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        if self.screener_placeholder is not None:
+            self.screener_placeholder.grid_remove()
+        self.screener_tree.grid(row=0, column=0, sticky="nsew")
+
+    def _screener_source_frame(self, *, force_refresh_data: bool) -> pd.DataFrame | None:
+        base = self._normalise_screener_ohlc(self.price_history)
+        if base is not None and not base.empty and not force_refresh_data:
+            return base
+
+        ticker = (self.config.ticker or "").strip().upper()
+        if not ticker:
+            return base
+        try:
+            fetched = yf.Ticker(ticker).history(period="6mo", interval="1d")
+        except Exception:  # pragma: no cover - network/provider path
+            fetched = None
+        fetched_frame = self._normalise_screener_ohlc(fetched)
+        if fetched_frame is not None and not fetched_frame.empty:
+            return fetched_frame
+        return base
+
+    def _normalise_screener_ohlc(self, frame: pd.DataFrame | None) -> pd.DataFrame | None:
+        if frame is None or frame.empty:
+            return None
+        local = frame.copy()
+        rename_map: dict[str, str] = {}
+        for column in local.columns:
+            lowered = str(column).strip().lower()
+            if lowered in {"date", "datetime", "timestamp", "time"}:
+                rename_map[column] = "time"
+            elif lowered in {"open", "o"}:
+                rename_map[column] = "open"
+            elif lowered in {"high", "h"}:
+                rename_map[column] = "high"
+            elif lowered in {"low", "l"}:
+                rename_map[column] = "low"
+            elif lowered in {"close", "adj close", "adj_close", "c"}:
+                rename_map[column] = "close"
+        local = local.rename(columns=rename_map)
+        required = {"high", "low", "close"}
+        if not required.issubset(local.columns):
+            return None
+        if "time" not in local.columns:
+            local["time"] = local.index
+        local["time"] = pd.to_datetime(local["time"], errors="coerce")
+        local = local.sort_values("time")
+        for name in ("open", "high", "low", "close"):
+            if name in local.columns:
+                local[name] = pd.to_numeric(local[name], errors="coerce")
+        local = local.dropna(subset=["time", "high", "low", "close"])
+        return local[["time", "open", "high", "low", "close"]].reset_index(drop=True)
+
+    def _scan_pattern_signals(
+        self, frame: pd.DataFrame, pattern: str, *, lookback: int = 40
+    ) -> list[ScreenerSignal]:
+        signals: list[ScreenerSignal] = []
+        if len(frame) < lookback + 5:
+            return signals
+        for idx in range(lookback, len(frame)):
+            window = frame.iloc[idx - lookback : idx + 1]
+            detected, confidence, direction = self._detect_pattern(pattern, window)
+            if detected:
+                signals.append(ScreenerSignal(idx=idx, confidence=confidence, direction=direction))
+        return signals
+
+    def _detect_pattern(self, pattern: str, window: pd.DataFrame) -> tuple[bool, float, str]:
+        close = window["close"].to_numpy(dtype=float)
+        high = window["high"].to_numpy(dtype=float)
+        low = window["low"].to_numpy(dtype=float)
+        mins, maxs = self._pattern_extrema(window["close"], window=2)
+
+        if len(close) < 20:
+            return False, 0.0, "up"
+        if pattern in {"Double Bottom", "Triple Bottom", "Inverted Head and Shoulders", "Cup and Handle"}:
+            if len(mins) < 2:
+                return False, 0.0, "up"
+            recent = mins[-3:] if pattern == "Triple Bottom" else mins[-2:]
+            lows = close[recent]
+            tolerance = np.std(lows) / max(np.mean(lows), 1e-6)
+            confidence = max(0.0, 1.0 - tolerance * 6)
+            return confidence > 0.35 and close[-1] > np.mean(lows), float(confidence), "up"
+        if pattern in {"Double Top", "Triple Top", "Head and Shoulders"}:
+            if len(maxs) < 2:
+                return False, 0.0, "down"
+            recent = maxs[-3:] if pattern == "Triple Top" else maxs[-2:]
+            highs = close[recent]
+            tolerance = np.std(highs) / max(np.mean(highs), 1e-6)
+            confidence = max(0.0, 1.0 - tolerance * 6)
+            return confidence > 0.35 and close[-1] < np.mean(highs), float(confidence), "down"
+        if pattern in {"Ascending Triangle", "Descending Triangle", "Pennant"}:
+            top_slope = self._linear_slope(high[-14:])
+            low_slope = self._linear_slope(low[-14:])
+            if pattern == "Ascending Triangle":
+                confidence = max(0.0, min(1.0, (low_slope * 20) + max(0.0, 0.08 - abs(top_slope))))
+                return confidence > 0.3, float(confidence), "up"
+            if pattern == "Descending Triangle":
+                confidence = max(0.0, min(1.0, ((-top_slope) * 20) + max(0.0, 0.08 - abs(low_slope))))
+                return confidence > 0.3, float(confidence), "down"
+            confidence = max(0.0, 1.0 - abs(top_slope - (-low_slope)) * 30)
+            direction = "up" if close[-1] >= close[-4] else "down"
+            return confidence > 0.35, float(confidence), direction
+        if pattern in {"Flag", "Bearish Flag"}:
+            pole_move = (close[8] - close[0]) / max(close[0], 1e-6)
+            consolidation = np.std(close[8:]) / max(np.mean(close[8:]), 1e-6)
+            confidence = max(0.0, min(1.0, abs(pole_move) * 6 + (0.15 - consolidation)))
+            bullish = pattern == "Flag"
+            valid_direction = pole_move > 0 if bullish else pole_move < 0
+            return valid_direction and confidence > 0.25, float(confidence), "up" if bullish else "down"
+        if pattern in {"Channel", "Channel Up", "Channel Down"}:
+            slope = self._linear_slope(close[-20:])
+            width = (np.max(high[-20:]) - np.min(low[-20:])) / max(np.mean(close[-20:]), 1e-6)
+            confidence = max(0.0, 1.0 - abs(width - 0.08) * 4)
+            direction = "up" if slope > 0 else "down"
+            if pattern == "Channel Up":
+                return slope > 0 and confidence > 0.2, float(confidence), "up"
+            if pattern == "Channel Down":
+                return slope < 0 and confidence > 0.2, float(confidence), "down"
+            return confidence > 0.2, float(confidence), direction
+        if pattern == "Diamond":
+            first = close[: len(close) // 2]
+            second = close[len(close) // 2 :]
+            first_vol = np.std(first) / max(np.mean(first), 1e-6)
+            second_vol = np.std(second) / max(np.mean(second), 1e-6)
+            confidence = max(0.0, min(1.0, (first_vol - second_vol) * 15 + 0.4))
+            direction = "down" if close[-1] < close[-3] else "up"
+            return confidence > 0.25, float(confidence), direction
+        return False, 0.0, "up"
+
+    def _pattern_extrema(self, series: pd.Series, *, window: int = 3) -> tuple[np.ndarray, np.ndarray]:
+        values = series.to_numpy(dtype=float)
+        if len(values) < window * 2 + 1:
+            return np.array([], dtype=int), np.array([], dtype=int)
+        mins: list[int] = []
+        maxs: list[int] = []
+        for idx in range(window, len(values) - window):
+            sample = values[idx - window : idx + window + 1]
+            if values[idx] == np.nanmin(sample):
+                mins.append(idx)
+            if values[idx] == np.nanmax(sample):
+                maxs.append(idx)
+        return np.array(mins, dtype=int), np.array(maxs, dtype=int)
+
+    def _linear_slope(self, values: np.ndarray) -> float:
+        if len(values) < 2:
+            return 0.0
+        x_values = np.arange(len(values))
+        slope, _ = np.polyfit(x_values, values, 1)
+        return float(slope)
+
+    def _pattern_description(self, pattern: str, direction: str) -> str:
+        if pattern in {"Double Bottom", "Triple Bottom", "Inverted Head and Shoulders", "Cup and Handle"}:
+            return "Repeated lows held and price reclaimed the neckline."
+        if pattern in {"Double Top", "Triple Top", "Head and Shoulders"}:
+            return "Repeated highs rejected and downside pressure is increasing."
+        if pattern in {"Ascending Triangle", "Descending Triangle", "Pennant"}:
+            return "Trend lines are converging; breakout direction drives the bias."
+        if pattern in {"Flag", "Bearish Flag"}:
+            return "Impulse move + tight consolidation suggests continuation."
+        if pattern in {"Channel", "Channel Up", "Channel Down"}:
+            return "Price is respecting parallel trend boundaries."
+        if pattern == "Diamond":
+            return "Volatility widened then compressed, signaling a potential reversal."
+        return f"Pattern suggests a {'bullish' if direction == 'up' else 'bearish'} setup."
 
     def _get_trend_finder(self) -> TrendFinder:
         if self.trend_finder is None:
@@ -4670,6 +5073,7 @@ class StockPredictorDesktopApp:
         self._update_price_chart()
         self._update_indicator_view()
         self._update_explanation()
+        self._update_screener_view()
         if payload.get("refresh_only"):
             self._set_busy(False, "Market data refreshed.")
         else:
@@ -6392,6 +6796,8 @@ class StockPredictorDesktopApp:
             self._update_price_chart()
         if hasattr(self, "indicator_price_ax"):
             self._update_indicator_view()
+        if hasattr(self, "screener_tree"):
+            self._update_screener_view()
         if not overview_refreshed and hasattr(self, "pnl_label"):
             self._recompute_pnl()
 
