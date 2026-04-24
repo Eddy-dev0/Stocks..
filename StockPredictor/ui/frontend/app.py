@@ -13,6 +13,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from ui.frontend.screener import render_screener
 from stock_predictor.core.features import (
     FEATURE_REGISTRY,
     FeatureToggles,
@@ -1060,6 +1061,12 @@ with st.sidebar:
     st.header("Configuration")
     st.text_input("API base URL", key="api_base")
     st.text_input("API key", key="api_key")
+    view_mode = st.selectbox(
+        "Fenster",
+        options=["Dashboard", "Screener"],
+        index=0,
+        help="Zwischen dem klassischen Dashboard und dem Live-Pattern-Screener wechseln.",
+    )
 
     st.header("Query Parameters")
     ticker_input = st.text_input("Ticker symbol", value=DEFAULT_TICKER)
@@ -1439,6 +1446,13 @@ else:
 
 st.title("Stock Predictor Dashboard")
 st.caption("Explore model forecasts, historical indicators, and curated research notes.")
+
+if view_mode == "Screener":
+    render_screener(
+        _request,
+        default_end_date=effective_end_date if isinstance(effective_end_date, date) else app_clock.today(),
+    )
+    st.stop()
 
 st.subheader("Live price snapshot")
 col_live_action, col_live_table = st.columns([1, 3])
