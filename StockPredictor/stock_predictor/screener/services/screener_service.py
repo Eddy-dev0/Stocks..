@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import datetime
+from typing import Callable
 
 from ..market_data.provider import MarketDataProvider
+from ..market_data.symbol_universe import SymbolInfo, SymbolUniverseService
 from ..pattern_engine.detect_pattern import detect_pattern
 from ..pattern_engine.score_pattern import score_pattern
 from ..pattern_engine.trade_quality import TradeQualityOptions, calculate_trade_quality
@@ -20,82 +22,147 @@ class ScreenerFilters:
     status: str = "all"
 
 
+@dataclass(frozen=True)
+class ScanOptions:
+    pattern_type: PatternType
+    market_filter: str = "all"
+    timeframe: str = "1h"
+    min_confidence: float = 60.0
+    min_trade_quality: int = 0
+    lookback_bars: int = 500
+    max_symbols: int | None = None
+    include_futures: bool = True
+
+
 class ScreenerService:
-    def __init__(self, provider: MarketDataProvider, cache: BacktestCache | None = None) -> None:
+    def __init__(
+        self,
+        provider: MarketDataProvider,
+        cache: BacktestCache | None = None,
+        universe_service: SymbolUniverseService | None = None,
+    ) -> None:
         self.provider = provider
         self.cache = cache or BacktestCache()
+        self.universe_service = universe_service or SymbolUniverseService()
+
+    def _resolve_universe(self, options: ScanOptions) -> list[SymbolInfo]:
+        market_filter = options.market_filter
+        if market_filter not in {"all", "stock", "future"}:
+            market_filter = "all"
+        universe = self.universe_service.get_universe(market_filter)
+        if not options.include_futures:
+            universe = [item for item in universe if item.market_type != "future"]
+        if options.max_symbols is not None and options.max_symbols > 0:
+            return universe[: options.max_symbols]
+        return universe
 
     def scan_market(
         self,
         pattern_type: PatternType,
         market_type: str,
         *,
-        start_date: date,
-        end_date: date,
-        filters: ScreenerFilters,
+        start_date: object | None = None,
+        end_date: object | None = None,
+        filters: ScreenerFilters | None = None,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+        max_symbols: int | None = None,
     ) -> list[dict[str, object]]:
-        symbols = self.provider.get_universe(market_type)
+        """Backwards-compatible API that now performs a market-wide scan."""
+        active_filters = filters or ScreenerFilters()
+        options = ScanOptions(
+            pattern_type=pattern_type,
+            market_filter=market_type,
+            min_confidence=active_filters.min_score,
+            min_trade_quality=active_filters.min_occurrences,
+            max_symbols=max_symbols,
+        )
+        return self.scan_market_wide(options, filters=active_filters, progress_callback=progress_callback)
 
-        def scan_symbol(symbol: str) -> dict[str, object] | None:
-            candles = self.provider.get_historical_bars(symbol, "1h", start_date, end_date)
-            if len(candles) < 80:
-                return None
-            detection = detect_pattern(candles, pattern_type)
-            if not detection:
-                return None
-            final_score = score_pattern(detection, candles)
-            if final_score < filters.min_score:
-                return None
-            if filters.status != "all" and detection.status != filters.status:
-                return None
-            if candles[-1].volume < filters.min_volume:
-                return None
-            cache_key = f"{symbol}:{pattern_type}:{filters.min_occurrences}"
-            quality = self.cache.get(cache_key)
-            if quality is None:
-                quality = calculate_trade_quality(
-                    candles,
-                    pattern_type,
-                    detection.direction,
-                    TradeQualityOptions(min_occurrences=filters.min_occurrences),
-                )
-                self.cache.set(cache_key, quality)
-            meta = self.provider.get_symbol_metadata(symbol)
-            return {
-                "id": f"{symbol}-{pattern_type}-{detection.end_index}",
-                "symbol": symbol,
-                "name": meta.get("name", symbol),
-                "marketType": meta.get("market_type", "stock"),
-                "patternType": detection.pattern_type,
-                "status": detection.status,
-                "timeframe": "1h",
-                "detectedAt": candles[-1].timestamp.strftime("%Y-%m-%d %H:%M"),
-                "score": round(final_score, 1),
-                "tradeQuality": {
-                    "rating": quality.rating,
-                    "successes": quality.successes,
-                    "occurrences": quality.occurrences,
-                    "successRate": round(quality.success_rate, 4),
-                    "averageMovePercent": round(quality.average_move_percent, 2),
-                    "medianMovePercent": round(quality.median_move_percent, 2),
-                    "sampleWarning": quality.sample_warning,
-                },
-                "levels": {
-                    "breakout": detection.breakout_level,
-                    "invalidation": detection.invalidation_level,
-                    "neckline": detection.neckline_level,
-                },
-                "volume": candles[-1].volume,
-                "lastPrice": candles[-1].close,
-                "lastUpdated": datetime.utcnow().strftime("%H:%M:%S"),
-            }
+    def scan_market_wide(
+        self,
+        options: ScanOptions,
+        *,
+        filters: ScreenerFilters | None = None,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> list[dict[str, object]]:
+        active_filters = filters or ScreenerFilters(
+            min_score=options.min_confidence,
+            min_occurrences=options.min_trade_quality,
+        )
+        universe = self._resolve_universe(options)
+        total = len(universe)
+        if total == 0:
+            return []
 
-        rows = [item for item in parallel_map(symbols, scan_symbol) if item is not None]
+        progress_state = {"done": 0}
+
+        def scan_symbol(info: SymbolInfo) -> dict[str, object] | None:
+            try:
+                candles = self.provider.get_historical_bars(info.symbol, options.timeframe, options.lookback_bars)
+                if len(candles) < 80:
+                    return None
+                detection = detect_pattern(candles, options.pattern_type)
+                if not detection:
+                    return None
+                final_score = score_pattern(detection, candles)
+                if final_score < active_filters.min_score:
+                    return None
+                if active_filters.status != "all" and detection.status != active_filters.status:
+                    return None
+                if candles[-1].volume < active_filters.min_volume:
+                    return None
+                cache_key = f"{info.symbol}:{options.pattern_type}:{active_filters.min_occurrences}"
+                quality = self.cache.get(cache_key)
+                if quality is None:
+                    quality = calculate_trade_quality(
+                        candles,
+                        options.pattern_type,
+                        detection.direction,
+                        TradeQualityOptions(min_occurrences=active_filters.min_occurrences),
+                    )
+                    self.cache.set(cache_key, quality)
+                if quality.occurrences < options.min_trade_quality:
+                    return None
+                return {
+                    "id": f"{info.symbol}-{options.pattern_type}-{detection.end_index}",
+                    "symbol": info.symbol,
+                    "name": info.name,
+                    "marketType": info.market_type,
+                    "patternType": detection.pattern_type,
+                    "direction": detection.direction.capitalize(),
+                    "status": detection.status,
+                    "timeframe": options.timeframe,
+                    "signalTime": candles[-1].timestamp.strftime("%Y-%m-%d %H:%M"),
+                    "detectedAt": candles[-1].timestamp.strftime("%Y-%m-%d %H:%M"),
+                    "confidence": round(final_score, 1),
+                    "score": round(final_score, 1),
+                    "tradeQuality": {
+                        "rating": quality.rating,
+                        "successes": quality.successes,
+                        "occurrences": quality.occurrences,
+                        "successRate": round(quality.success_rate, 4),
+                        "averageMovePercent": round(quality.average_move_percent, 2),
+                        "medianMovePercent": round(quality.median_move_percent, 2),
+                        "sampleWarning": quality.sample_warning,
+                    },
+                    "close": candles[-1].close,
+                    "lastPrice": candles[-1].close,
+                    "volume": candles[-1].volume,
+                    "explanation": f"{detection.pattern_type} detected on {options.timeframe} candles.",
+                    "lastUpdated": datetime.utcnow().strftime("%H:%M:%S"),
+                }
+            except Exception:
+                return None
+            finally:
+                progress_state["done"] += 1
+                if progress_callback:
+                    progress_callback(progress_state["done"], total, f"Scanning {progress_state['done']} / {total} symbols")
+
+        rows = [item for item in parallel_map(universe, scan_symbol, max_workers=8) if item is not None]
         rows.sort(
             key=lambda x: (
-                1 if x["status"] == "confirmed" else 0,
-                x["tradeQuality"]["successes"],
-                x["score"],
+                x["tradeQuality"]["successRate"],
+                x["confidence"],
                 x["volume"],
             ),
             reverse=True,
