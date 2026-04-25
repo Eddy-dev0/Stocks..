@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable
@@ -11,7 +12,6 @@ from ..pattern_engine.score_pattern import score_pattern
 from ..pattern_engine.trade_quality import TradeQualityOptions, calculate_trade_quality
 from ..pattern_engine.types import PatternType
 from .backtest_cache import BacktestCache
-from .pattern_scan_scheduler import parallel_map
 
 
 @dataclass(frozen=True)
@@ -94,8 +94,6 @@ class ScreenerService:
         if total == 0:
             return []
 
-        progress_state = {"done": 0}
-
         def scan_symbol(info: SymbolInfo) -> dict[str, object] | None:
             try:
                 candles = self.provider.get_historical_bars(info.symbol, options.timeframe, options.lookback_bars)
@@ -153,12 +151,16 @@ class ScreenerService:
                 }
             except Exception:
                 return None
-            finally:
-                progress_state["done"] += 1
-                if progress_callback:
-                    progress_callback(progress_state["done"], total, f"Scanning {progress_state['done']} / {total} symbols")
 
-        rows = [item for item in parallel_map(universe, scan_symbol, max_workers=8) if item is not None]
+        rows: list[dict[str, object]] = []
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(scan_symbol, info) for info in universe]
+            for done_count, future in enumerate(as_completed(futures), start=1):
+                item = future.result()
+                if item is not None:
+                    rows.append(item)
+                if progress_callback:
+                    progress_callback(done_count, total, f"Scanning {done_count} / {total} symbols")
         rows.sort(
             key=lambda x: (
                 x["tradeQuality"]["successRate"],
