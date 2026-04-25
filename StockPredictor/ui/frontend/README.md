@@ -29,3 +29,20 @@ Example payload:
 
 When omitted, server defaults are used for the feature groups. The UI can use
 this shape directly to submit user selections to the backend.
+
+## Screener tab
+
+Der neue **Screener**-Tab scannt automatisch den 1h-Markt (Aktien/Futures) nach gewähltem Pattern, ohne manuelle Symbol-Eingabe.
+
+### Provider-Konfiguration
+
+- Der Screener verwendet aktuell den bestehenden API-Endpunkt `GET /data/{symbol}` als Datenabstraktion (`FrontendAPIMarketDataProvider`).
+- Keine API-Keys werden hartcodiert; Schlüssel bleiben in Umgebungsvariablen (`STOCK_PREDICTOR_UI_API_KEY`, Backend-Provider-Konfiguration).
+- Wenn kein externer Marktprovider hinter der API konfiguriert ist, zeigt die UI einen Hinweis auf eingeschränkte/fehlende Live-Daten.
+
+### Features
+
+- Pattern-Dropdown mit 16 Chart-Pattern.
+- Filter: Markt, Mindestscore, Minimum Sample Size, Mindestvolumen, Pattern-Status, Sortierung.
+- Tabelle mit Trade-Qualität im Format `Rating successes/occurrences`, Durchschnitts- und Median-Move.
+- CSV-Export der Ergebnisse.
