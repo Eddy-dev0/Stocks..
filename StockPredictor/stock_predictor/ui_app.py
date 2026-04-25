@@ -57,6 +57,9 @@ from stock_predictor.core.indicator_library import default_indicator_toggles
 from stock_predictor.core.preprocessing import derive_price_feature_toggles
 from stock_predictor.core.modeling import InsufficientSamplesError
 from stock_predictor.core.support_levels import indicator_support_floor
+from stock_predictor.screener.market_data.symbol_universe import SymbolUniverseService
+from stock_predictor.screener.pattern_engine.types import Candle
+from stock_predictor.screener.services import ScreenerFilters, ScreenerService
 
 LOGGER = logging.getLogger(__name__)
 
@@ -220,6 +223,74 @@ class ScreenerSignal:
     idx: int
     confidence: float
     direction: str
+
+
+class YahooMarketDataProvider:
+    """Market data adapter used by the desktop screener for broad scans."""
+
+    def get_universe(self, market_type: str) -> list[str]:
+        universe = SymbolUniverseService().get_universe(market_type)
+        return [item.symbol for item in universe]
+
+    def get_historical_bars(self, symbol: str, timeframe: str, lookback: int) -> list[Candle]:
+        interval = "1h" if timeframe == "1h" else timeframe
+        period = "6mo" if lookback >= 300 else "3mo"
+        try:
+            frame = yf.Ticker(symbol).history(period=period, interval=interval)
+        except Exception:  # pragma: no cover - provider/network path
+            return []
+        if frame is None or frame.empty:
+            return []
+        normalized = frame.reset_index()
+        if "Datetime" in normalized.columns:
+            normalized = normalized.rename(columns={"Datetime": "timestamp"})
+        elif "Date" in normalized.columns:
+            normalized = normalized.rename(columns={"Date": "timestamp"})
+        out: list[Candle] = []
+        for row in normalized.itertuples(index=False):
+            timestamp = pd.to_datetime(getattr(row, "timestamp", None), errors="coerce")
+            if pd.isna(timestamp):
+                continue
+            try:
+                out.append(
+                    Candle(
+                        timestamp=timestamp.to_pydatetime(),
+                        open=float(getattr(row, "Open")),
+                        high=float(getattr(row, "High")),
+                        low=float(getattr(row, "Low")),
+                        close=float(getattr(row, "Close")),
+                        volume=float(getattr(row, "Volume", 0.0)),
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+        return out[-lookback:] if lookback > 0 else out
+
+    def get_historical_bars_batch(
+        self, symbols: list[str], timeframe: str, lookback: int
+    ) -> dict[str, list[Candle]]:
+        return {symbol: self.get_historical_bars(symbol, timeframe, lookback) for symbol in symbols}
+
+    def subscribe_live_bars(
+        self, symbols: list[str], timeframe: str, callback: Callable[[str, Candle], None]
+    ) -> None:
+        return None
+
+    def normalize_symbol(self, symbol: str) -> str:
+        return symbol.strip().upper()
+
+    def get_symbol_metadata(self, symbol: str) -> dict[str, Any]:
+        universe = SymbolUniverseService().get_combined_universe()
+        symbol_upper = self.normalize_symbol(symbol)
+        for item in universe:
+            if item.symbol == symbol_upper:
+                return {
+                    "symbol": item.symbol,
+                    "name": item.name,
+                    "market_type": item.market_type,
+                    "exchange": item.exchange,
+                }
+        return {"symbol": symbol_upper, "name": symbol_upper, "market_type": "stock"}
 
 
 DEFAULT_HORIZON_PRESETS: tuple[HorizonOption, ...] = (
@@ -687,18 +758,21 @@ class StockPredictorDesktopApp:
         self.trend_progress: ttk.Progressbar | None = None
         self._trend_placeholder_default = "Run a scan to discover new opportunities."
         self.screener_status_var = tk.StringVar(
-            value="Select patterns and click “Scan now” to view live detections."
+            value="Select patterns and click “Scan now” to run a market-wide 1h scan."
         )
         self.screener_note_var = tk.StringVar(
             value=(
-                "The screener reuses your loaded market data and checks pattern structure "
-                "in rolling windows. Confidence is derived from geometric consistency."
+                "Market-wide 1h pattern screener. Select a chart pattern to find all stocks "
+                "and futures currently matching it."
             )
         )
+        self.screener_progress_var = tk.StringVar(value="")
         self.screener_pattern_listbox: tk.Listbox | None = None
         self.screener_tree: ttk.Treeview | None = None
         self.screener_placeholder: ttk.Label | None = None
         self.screener_last_scan_var = tk.StringVar(value="Last scan: —")
+        self.screener_row_symbol_map: dict[str, str] = {}
+        self.screener_service = ScreenerService(YahooMarketDataProvider())
         self.decimal_display_map = {value: label for label, value in self.decimal_option_map.items()}
         self.currency_default_var = tk.StringVar(
             value=self.currency_display_map.get(self.currency_mode, "Local")
@@ -2149,7 +2223,7 @@ class StockPredictorDesktopApp:
         frame = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(frame, text="Screener")
         frame.grid_columnconfigure(0, weight=1)
-        frame.grid_rowconfigure(3, weight=1)
+        frame.grid_rowconfigure(4, weight=1)
 
         intro_box = ttk.LabelFrame(frame, text="Pattern screener", padding=8)
         intro_box.grid(row=0, column=0, sticky="ew")
@@ -2157,8 +2231,8 @@ class StockPredictorDesktopApp:
         ttk.Label(
             intro_box,
             text=(
-                "Live pattern scan for your current ticker. The screener checks "
-                "rolling windows and highlights the latest actionable formations."
+                "Market-wide 1h pattern screener. Select a chart pattern to find all stocks "
+                "and futures currently matching it."
             ),
             justify=tk.LEFT,
             wraplength=860,
@@ -2206,12 +2280,15 @@ class StockPredictorDesktopApp:
         ttk.Label(frame, textvariable=self.screener_status_var, anchor=tk.W).grid(
             row=2, column=0, sticky="ew", pady=(0, 6)
         )
+        ttk.Label(frame, textvariable=self.screener_progress_var, anchor=tk.W).grid(
+            row=3, column=0, sticky="ew", pady=(0, 6)
+        )
 
         table_frame = ttk.Frame(frame)
-        table_frame.grid(row=3, column=0, sticky="nsew")
+        table_frame.grid(row=4, column=0, sticky="nsew")
         table_frame.grid_columnconfigure(0, weight=1)
         table_frame.grid_rowconfigure(0, weight=1)
-        columns = ("pattern", "direction", "confidence", "signal_time", "close", "comment")
+        columns = ("name", "symbol", "market", "pattern", "direction", "confidence", "trade_quality", "signal_time")
         self.screener_tree = ttk.Treeview(
             table_frame,
             columns=columns,
@@ -2219,18 +2296,23 @@ class StockPredictorDesktopApp:
             height=12,
             selectmode="browse",
         )
+        self.screener_tree.heading("name", text="Name")
+        self.screener_tree.heading("symbol", text="Symbol")
+        self.screener_tree.heading("market", text="Market")
         self.screener_tree.heading("pattern", text="Pattern")
         self.screener_tree.heading("direction", text="Direction")
         self.screener_tree.heading("confidence", text="Confidence")
+        self.screener_tree.heading("trade_quality", text="Trade quality")
         self.screener_tree.heading("signal_time", text="Signal time")
-        self.screener_tree.heading("close", text="Close")
-        self.screener_tree.heading("comment", text="How it works")
+        self.screener_tree.column("name", width=200, anchor=tk.W)
+        self.screener_tree.column("symbol", width=80, anchor=tk.CENTER)
+        self.screener_tree.column("market", width=90, anchor=tk.CENTER)
         self.screener_tree.column("pattern", width=190, anchor=tk.W)
         self.screener_tree.column("direction", width=90, anchor=tk.CENTER)
         self.screener_tree.column("confidence", width=100, anchor=tk.E)
+        self.screener_tree.column("trade_quality", width=130, anchor=tk.CENTER)
         self.screener_tree.column("signal_time", width=150, anchor=tk.CENTER)
-        self.screener_tree.column("close", width=120, anchor=tk.E)
-        self.screener_tree.column("comment", width=360, anchor=tk.W)
+        self.screener_tree.bind("<<TreeviewSelect>>", self._on_screener_row_selected)
         self.screener_tree.grid(row=0, column=0, sticky="nsew")
         screener_scroll = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.screener_tree.yview)
         screener_scroll.grid(row=0, column=1, sticky="ns")
@@ -2238,7 +2320,7 @@ class StockPredictorDesktopApp:
 
         self.screener_placeholder = ttk.Label(
             table_frame,
-            text="No screener signals yet. Run a prediction and click “Scan now”.",
+            text="No symbols currently match this pattern in the selected universe.",
             anchor=tk.CENTER,
             justify=tk.CENTER,
         )
@@ -2695,6 +2777,12 @@ class StockPredictorDesktopApp:
     def _on_screener_scan(self) -> None:
         self._update_screener_view(force_refresh_data=True)
 
+    def _selected_primary_screener_pattern(self) -> str | None:
+        patterns = self._selected_screener_patterns()
+        if not patterns:
+            return None
+        return patterns[0]
+
     def _selected_screener_patterns(self) -> list[str]:
         if self.screener_pattern_listbox is None:
             return []
@@ -2710,82 +2798,74 @@ class StockPredictorDesktopApp:
     def _update_screener_view(self, *, force_refresh_data: bool = False) -> None:
         if self.screener_tree is None:
             return
+        self.screener_row_symbol_map = {}
         for item in self.screener_tree.get_children():
             self.screener_tree.delete(item)
 
         patterns = self._selected_screener_patterns()
         if not patterns:
             self.screener_status_var.set("Please select at least one pattern.")
+            self.screener_progress_var.set("")
             if self.screener_placeholder is not None:
                 self.screener_placeholder.configure(text="Select one or more patterns to run the screener.")
                 self.screener_placeholder.grid()
             self.screener_tree.grid_remove()
             return
 
-        frame = self._screener_source_frame(force_refresh_data=force_refresh_data)
-        if frame is None or frame.empty:
-            self.screener_status_var.set("No OHLC data available for screener scan.")
-            if self.screener_placeholder is not None:
-                self.screener_placeholder.configure(text="No market data available yet. Run refresh/prediction first.")
-                self.screener_placeholder.grid()
-            self.screener_tree.grid_remove()
-            return
+        primary_pattern = patterns[0]
+        self.screener_status_var.set(
+            f"Scanning market universe for {primary_pattern} on the 1h timeframe..."
+        )
+        self.screener_progress_var.set("")
+        self.root.update_idletasks()
 
-        rows: list[tuple[str, str, float, str, str, str]] = []
-        for pattern in patterns:
-            signals = self._scan_pattern_signals(frame, pattern, lookback=40)
-            if not signals:
-                continue
-            latest = signals[-1]
-            signal_row = frame.iloc[latest.idx]
-            timestamp_value = signal_row["time"] if "time" in signal_row else None
-            if pd.notna(timestamp_value):
-                timestamp_text = pd.Timestamp(timestamp_value).strftime("%Y-%m-%d %H:%M")
-            else:
-                timestamp_text = "—"
-            close_value = fmt_ccy(
-                signal_row.get("close"), self.currency_symbol, decimals=self.price_decimal_places
-            )
-            direction_text = "Bullish" if latest.direction == "up" else "Bearish"
-            comment = self._pattern_description(pattern, latest.direction)
-            rows.append(
-                (
-                    pattern,
-                    direction_text,
-                    latest.confidence,
-                    timestamp_text,
-                    close_value,
-                    comment,
-                )
-            )
+        def on_progress(done: int, total: int, message: str) -> None:
+            self.screener_progress_var.set(message)
+            self.root.update_idletasks()
+
+        rows = self.screener_service.scan_market(
+            primary_pattern, "all", filters=ScreenerFilters(min_score=60.0), progress_callback=on_progress
+        )
 
         if not rows:
-            self.screener_status_var.set(
-                f"No active signals found for {len(patterns)} selected pattern(s)."
-            )
+            self.screener_status_var.set("No symbols currently match this pattern in the selected universe.")
+            self.screener_progress_var.set("")
             if self.screener_placeholder is not None:
-                self.screener_placeholder.configure(text="No current pattern setup detected.")
+                self.screener_placeholder.configure(
+                    text="No symbols currently match this pattern in the selected universe."
+                )
                 self.screener_placeholder.grid()
             self.screener_tree.grid_remove()
             return
 
-        rows.sort(key=lambda row: row[2], reverse=True)
-        for pattern, direction, confidence, signal_time, close_text, comment in rows:
-            self.screener_tree.insert(
+        for row in rows:
+            tq = row.get("tradeQuality", {})
+            rating = str(tq.get("rating", "—"))
+            successes = int(tq.get("successes", 0))
+            occurrences = int(tq.get("occurrences", 0))
+            quality_text = f"{successes}/{occurrences} {rating}"
+            direction = str(row.get("direction") or "Neutral")
+            iid = self.screener_tree.insert(
                 "",
                 tk.END,
                 values=(
-                    pattern,
+                    row.get("name", row.get("symbol", "—")),
+                    row.get("symbol", "—"),
+                    str(row.get("marketType", "stock")).title(),
+                    row.get("patternType", primary_pattern),
                     direction,
-                    fmt_pct(confidence, decimals=1),
-                    signal_time,
-                    close_text,
-                    comment,
+                    fmt_pct(row.get("confidence", 0) / 100.0, decimals=1),
+                    quality_text,
+                    row.get("signalTime", "—"),
                 ),
             )
+            symbol = str(row.get("symbol", "")).strip().upper()
+            if symbol:
+                self.screener_row_symbol_map[iid] = symbol
         self.screener_status_var.set(
-            f"Detected {len(rows)} live pattern signal(s) for {self.config.ticker}."
+            f"Detected {len(rows)} symbols matching {primary_pattern} on the 1h timeframe."
         )
+        self.screener_progress_var.set("")
         self.screener_last_scan_var.set(
             f"Last scan: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
@@ -2793,22 +2873,28 @@ class StockPredictorDesktopApp:
             self.screener_placeholder.grid_remove()
         self.screener_tree.grid(row=0, column=0, sticky="nsew")
 
-    def _screener_source_frame(self, *, force_refresh_data: bool) -> pd.DataFrame | None:
-        base = self._normalise_screener_ohlc(self.price_history)
-        if base is not None and not base.empty and not force_refresh_data:
-            return base
+    def _on_screener_row_selected(self, _event: Any) -> None:
+        if self.screener_tree is None:
+            return
+        selection = self.screener_tree.selection()
+        if not selection:
+            return
+        symbol = self.screener_row_symbol_map.get(selection[0])
+        if not symbol:
+            values = self.screener_tree.item(selection[0], "values")
+            if len(values) > 1:
+                symbol = str(values[1]).strip().upper()
+        if symbol:
+            self._open_symbol_from_screener(symbol)
 
-        ticker = (self.config.ticker or "").strip().upper()
-        if not ticker:
-            return base
-        try:
-            fetched = yf.Ticker(ticker).history(period="6mo", interval="1d")
-        except Exception:  # pragma: no cover - network/provider path
-            fetched = None
-        fetched_frame = self._normalise_screener_ohlc(fetched)
-        if fetched_frame is not None and not fetched_frame.empty:
-            return fetched_frame
-        return base
+    def _open_symbol_from_screener(self, symbol: str) -> None:
+        if not symbol:
+            return
+        self.ticker_var.set(symbol)
+        self._set_status(
+            f"Loaded {symbol} from screener result. Chart and overlays now follow the selected symbol."
+        )
+        self._on_refresh()
 
     def _normalise_screener_ohlc(self, frame: pd.DataFrame | None) -> pd.DataFrame | None:
         if frame is None or frame.empty:
