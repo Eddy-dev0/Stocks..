@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+import threading
 import sys
 from pathlib import Path
 
@@ -115,3 +116,46 @@ def test_scan_market_returns_only_matching_symbols(monkeypatch) -> None:
 
     symbols = {row["symbol"] for row in rows}
     assert symbols == {"AAPL", "MSFT"}
+
+
+def test_progress_callback_runs_on_caller_thread(monkeypatch) -> None:
+    candles = {
+        "AAPL": _candles_from_close([110, 106, 101, 104, 108, 103, 101.2, 105, 109, 112, 114, 116] * 8),
+        "MSFT": _candles_from_close([115, 110, 104, 108, 111, 106, 103.8, 107, 110, 113, 116, 118] * 8),
+    }
+    provider = _Provider(candles)
+    service = ScreenerService(provider, universe_service=_Universe())
+
+    monkeypatch.setattr(
+        "stock_predictor.screener.services.screener_service.calculate_trade_quality",
+        lambda *_args, **_kwargs: _Quality(),
+    )
+    monkeypatch.setattr(
+        "stock_predictor.screener.services.screener_service.detect_pattern",
+        lambda _candles, _pattern: SimpleNamespace(
+            pattern_type="Double Bottom",
+            status="confirmed",
+            direction="bullish",
+            end_index=10,
+        ),
+    )
+    monkeypatch.setattr(
+        "stock_predictor.screener.services.screener_service.score_pattern",
+        lambda _detection, _candles: 88.0,
+    )
+
+    caller_thread = threading.get_ident()
+    callback_threads: list[int] = []
+
+    def _on_progress(_done: int, _total: int, _message: str) -> None:
+        callback_threads.append(threading.get_ident())
+
+    service.scan_market(
+        "Double Bottom",
+        "stock",
+        filters=ScreenerFilters(min_score=0, min_occurrences=0),
+        progress_callback=_on_progress,
+    )
+
+    assert callback_threads
+    assert set(callback_threads) == {caller_thread}
