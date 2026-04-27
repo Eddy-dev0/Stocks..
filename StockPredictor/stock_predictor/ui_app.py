@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tkinter as tk
 from datetime import datetime
+from threading import Lock
 from tkinter import ttk
 from types import SimpleNamespace
 from typing import Any
@@ -35,6 +36,10 @@ SCREENER_PATTERN_CHOICES: tuple[str, ...] = (
 
 class YahooMarketDataProvider:
     """Market data adapter used by the desktop screener for broad scans."""
+    serial_scan = True
+
+    def __init__(self) -> None:
+        self._download_lock = Lock()
 
     def get_universe(self, market_type: str) -> list[str]:
         universe = SymbolUniverseService().get_universe(market_type)
@@ -47,8 +52,10 @@ class YahooMarketDataProvider:
 
         interval = "1h" if timeframe == "1h" else timeframe
         period = "6mo" if lookback >= 300 else "3mo"
+        normalized_symbol = symbol.strip().upper().replace(".", "-")
         try:
-            frame = yf.Ticker(symbol).history(period=period, interval=interval)
+            with self._download_lock:
+                frame = yf.Ticker(normalized_symbol).history(period=period, interval=interval, auto_adjust=False)
         except Exception:
             return []
         if frame is None or frame.empty:

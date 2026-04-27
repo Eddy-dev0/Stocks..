@@ -53,6 +53,10 @@ class _Provider:
         return {"symbol": symbol, "name": symbol, "market_type": "stock"}
 
 
+class _SerialProvider(_Provider):
+    serial_scan = True
+
+
 class _Universe:
     def get_universe(self, market_filter: str) -> list[SymbolInfo]:
         return [
@@ -159,3 +163,47 @@ def test_progress_callback_runs_on_caller_thread(monkeypatch) -> None:
 
     assert callback_threads
     assert set(callback_threads) == {caller_thread}
+
+
+def test_serial_scan_provider_uses_single_thread(monkeypatch) -> None:
+    candles = {
+        "AAPL": _candles_from_close([110, 106, 101, 104, 108, 103, 101.2, 105, 109, 112, 114, 116] * 8),
+        "MSFT": _candles_from_close([115, 110, 104, 108, 111, 106, 103.8, 107, 110, 113, 116, 118] * 8),
+    }
+    provider = _SerialProvider(candles)
+    service = ScreenerService(provider, universe_service=_Universe())
+
+    monkeypatch.setattr(
+        "stock_predictor.screener.services.screener_service.calculate_trade_quality",
+        lambda *_args, **_kwargs: _Quality(),
+    )
+
+    caller_thread = threading.get_ident()
+    detector_threads: list[int] = []
+
+    def _detect(_candles, _pattern):
+        detector_threads.append(threading.get_ident())
+        return SimpleNamespace(
+            pattern_type="Double Bottom",
+            status="confirmed",
+            direction="bullish",
+            end_index=10,
+        )
+
+    monkeypatch.setattr(
+        "stock_predictor.screener.services.screener_service.detect_pattern",
+        _detect,
+    )
+    monkeypatch.setattr(
+        "stock_predictor.screener.services.screener_service.score_pattern",
+        lambda _detection, _candles: 88.0,
+    )
+
+    service.scan_market(
+        "Double Bottom",
+        "stock",
+        filters=ScreenerFilters(min_score=0, min_occurrences=0),
+    )
+
+    assert detector_threads
+    assert set(detector_threads) == {caller_thread}

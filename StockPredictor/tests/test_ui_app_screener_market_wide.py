@@ -10,6 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from stock_predictor.ui_app import StockPredictorDesktopApp
+from stock_predictor.ui_app import YahooMarketDataProvider
 
 
 class _DummyVar:
@@ -142,3 +143,36 @@ def test_screener_row_click_sets_main_ticker() -> None:
 
     assert app.ticker_var.value == "MSFT"
     assert app._on_refresh_called is True
+
+
+def test_yahoo_provider_normalizes_dot_ticker(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class _FakeTicker:
+        def __init__(self, symbol: str) -> None:
+            calls.append(symbol)
+
+        def history(self, **_kwargs):
+            import pandas as pd
+
+            return pd.DataFrame(
+                {
+                    "Open": [1.0],
+                    "High": [1.1],
+                    "Low": [0.9],
+                    "Close": [1.05],
+                    "Volume": [1000],
+                },
+                index=pd.Index([pd.Timestamp("2026-04-25 10:00:00+00:00")], name="Datetime"),
+            )
+
+    class _FakeYFinance:
+        Ticker = _FakeTicker
+
+    monkeypatch.setitem(sys.modules, "yfinance", _FakeYFinance())
+
+    provider = YahooMarketDataProvider()
+    bars = provider.get_historical_bars("MOG.A", "1h", 500)
+
+    assert bars
+    assert calls == ["MOG-A"]
