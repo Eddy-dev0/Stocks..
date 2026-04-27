@@ -2282,6 +2282,25 @@ class StockPredictorAI:
             return {}
 
         pipeline = self._combine_pipelines(preprocessor, base_model)
+        valid_params = set(pipeline.get_params(deep=True).keys())
+        filtered_search_space = {
+            key: values for key, values in search_space.items() if key in valid_params
+        }
+        dropped_params = sorted(set(search_space.keys()) - set(filtered_search_space.keys()))
+        if dropped_params:
+            LOGGER.debug(
+                "Skipping unsupported tuning params for %s: %s",
+                factory.model_type,
+                ", ".join(dropped_params),
+            )
+        if not filtered_search_space:
+            LOGGER.debug(
+                "No supported tuning parameters remain for %s (%s); skipping tuning.",
+                factory.model_type,
+                task,
+            )
+            return {}
+
         folds = self.config.tuning_folds or self.config.evaluation_folds
         if folds <= 1:
             return {}
@@ -2297,7 +2316,7 @@ class StockPredictorAI:
         scoring = "f1_weighted" if task == "classification" else "neg_mean_absolute_error"
         search = RandomizedSearchCV(
             pipeline,
-            search_space,
+            filtered_search_space,
             n_iter=int(self.config.tuning_iterations),
             cv=splitter,
             random_state=42,

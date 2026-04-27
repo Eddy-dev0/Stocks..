@@ -60,15 +60,19 @@ class YahooFinanceProvider(BaseProvider):
 
     async def _fetch(self, request: ProviderRequest) -> ProviderResult:
         params = {
-            "range": request.params.get("range", "1y"),
             "interval": request.params.get("interval", "1d"),
         }
         start = request.params.get("start")
         end = request.params.get("end")
-        if start and not params.get("period1"):
+        # Yahoo's chart API should receive either a relative `range` or absolute
+        # `period1`/`period2` timestamps. Supplying both can produce incomplete
+        # payloads (for example a single in-progress bar with no usable close).
+        if start:
             params["period1"] = int(pd.Timestamp(start).timestamp())
-        if end and not params.get("period2"):
+        if end:
             params["period2"] = int(pd.Timestamp(end).timestamp())
+        if "period1" not in params and "period2" not in params:
+            params["range"] = request.params.get("range", "1y")
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{request.symbol}"
         response = await self.client.get(url, params=params)
         response.raise_for_status()
