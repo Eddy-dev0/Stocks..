@@ -1,45 +1,80 @@
 from __future__ import annotations
 
+from ..swing_points import compute_atr, find_swing_points
 from ..types import Candle, PatternDetection
-from .common import make_detection
+from .common import fit_trendline, make_detection
 
 
-def _slope(values: list[float]) -> float:
-    n = len(values)
-    if n < 2:
-        return 0.0
-    return (values[-1] - values[0]) / n
+def _detect_channel_core(candles: list[Candle], mode: str) -> PatternDetection | None:
+    if len(candles) < 30:
+        return None
+    window = candles[-60:] if len(candles) >= 60 else candles
+    swings = find_swing_points(window, left_bars=2, right_bars=2, min_move_atr=0.2)
+    highs = [s for s in swings if s.kind == "high"]
+    lows = [s for s in swings if s.kind == "low"]
+    if len(highs) < 2 or len(lows) < 2:
+        return None
+    upper = fit_trendline(highs)
+    lower = fit_trendline(lows)
+    if upper is None or lower is None:
+        return None
+    parallel_diff = abs(upper.slope - lower.slope)
+    if parallel_diff > max(abs(upper.slope), abs(lower.slope), 1e-9) * 0.35:
+        return None
+    atr = compute_atr(window)
+    inside = 0
+    width_sum = 0.0
+    for i, c in enumerate(window):
+        up = upper.slope * i + upper.intercept
+        lo = lower.slope * i + lower.intercept
+        width_sum += up - lo
+        if lo <= c.close <= up:
+            inside += 1
+    inside_ratio = inside / len(window)
+    width = width_sum / len(window)
+    if inside_ratio < 0.7 or width < atr * 2:
+        return None
+
+    if mode == "up" and not (upper.slope > 0 and lower.slope > 0):
+        return None
+    if mode == "down" and not (upper.slope < 0 and lower.slope < 0):
+        return None
+
+    direction = "neutral"
+    ptype = "Channel"
+    explanation = "Price is respecting parallel upper and lower trend boundaries."
+    if mode == "up":
+        direction = "bullish"
+        ptype = "Channel Up"
+        explanation = "Price is forming higher highs and higher lows in a rising parallel channel."
+    elif mode == "down":
+        direction = "bearish"
+        ptype = "Channel Down"
+        explanation = "Price is forming lower highs and lower lows in a falling parallel channel."
+
+    return make_detection(
+        ptype,
+        window,
+        highs[-2:] + lows[-2:],
+        upper.end_price,
+        lower.end_price,
+        direction,
+        80.0,
+        trendline_upper=upper,
+        trendline_lower=lower,
+        support_level=lower.end_price,
+        resistance_level=upper.end_price,
+        explanation=explanation,
+    )
 
 
 def detect_channel(candles: list[Candle]) -> PatternDetection | None:
-    if len(candles) < 30:
-        return None
-    highs = [c.high for c in candles[-20:]]
-    lows = [c.low for c in candles[-20:]]
-    width = (max(highs) - min(lows)) / max(candles[-1].close, 1e-9)
-    if width > 0.2:
-        return None
-    direction = "neutral"
-    if _slope([c.close for c in candles[-20:]]) > 0:
-        direction = "bullish"
-    elif _slope([c.close for c in candles[-20:]]) < 0:
-        direction = "bearish"
-    return make_detection("Channel", candles, [], max(highs), min(lows), direction, 60.0)
+    return _detect_channel_core(candles, "neutral")
 
 
 def detect_channel_up(candles: list[Candle]) -> PatternDetection | None:
-    if len(candles) < 20:
-        return None
-    close = [c.close for c in candles[-20:]]
-    if _slope(close) <= 0:
-        return None
-    return make_detection("Channel Up", candles, [], max(c.high for c in candles[-20:]), min(c.low for c in candles[-20:]), "bullish", 62.0)
+    return _detect_channel_core(candles, "up")
 
 
 def detect_channel_down(candles: list[Candle]) -> PatternDetection | None:
-    if len(candles) < 20:
-        return None
-    close = [c.close for c in candles[-20:]]
-    if _slope(close) >= 0:
-        return None
-    return make_detection("Channel Down", candles, [], min(c.low for c in candles[-20:]), max(c.high for c in candles[-20:]), "bearish", 62.0)
+    return _detect_channel_core(candles, "down")
