@@ -112,6 +112,16 @@ class ModelFactory:
         if self.model_type == "hist_gb" and "n_estimators" in params:
             params.setdefault("max_iter", params["n_estimators"])
             params.pop("n_estimators", None)
+        if (
+            task == "classification"
+            and self.model_type == "hist_gb"
+            and isinstance(params.get("class_weight"), dict)
+        ):
+            LOGGER.warning(
+                "Replacing explicit class_weight mapping with 'balanced' for HistGradientBoostingClassifier "
+                "to avoid class-key mismatches across CV/calibration folds."
+            )
+            params["class_weight"] = "balanced"
 
         def _instantiate(factory: Any, arguments: Dict[str, Any]) -> Any:
             try:
