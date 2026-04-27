@@ -14,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from stock_predictor.screener.market_data.symbol_universe import SymbolInfo
 from stock_predictor.screener.pattern_engine.types import Candle
 from stock_predictor.screener.services.screener_service import (
+    ScanOptions,
     ScreenerFilters,
     ScreenerService,
 )
@@ -97,15 +98,21 @@ def test_scan_market_returns_only_matching_symbols(monkeypatch) -> None:
         lambda *_args, **_kwargs: _Quality(),
     )
     monkeypatch.setattr(
-        "stock_predictor.screener.services.screener_service.detect_pattern",
-        lambda _candles, _pattern: SimpleNamespace(
-            pattern_type="Double Bottom",
-            status="confirmed",
-            direction="bullish",
-            end_index=10,
-        )
-        if _candles is not candles["TSLA"]
-        else None,
+        "stock_predictor.screener.services.screener_service.detect_patterns",
+        lambda _candles, _pattern, _opts: []
+        if _candles[-1].close == 104
+        else [
+            SimpleNamespace(
+                pattern_type="Double Bottom",
+                status="confirmed",
+                direction="bullish",
+                end_index=90,
+                breakout_index=90,
+                score=88.0,
+                explanation="",
+                score_breakdown=SimpleNamespace(structure=0, total=88),
+            )
+        ],
     )
     monkeypatch.setattr(
         "stock_predictor.screener.services.screener_service.score_pattern",
@@ -135,13 +142,17 @@ def test_progress_callback_runs_on_caller_thread(monkeypatch) -> None:
         lambda *_args, **_kwargs: _Quality(),
     )
     monkeypatch.setattr(
-        "stock_predictor.screener.services.screener_service.detect_pattern",
-        lambda _candles, _pattern: SimpleNamespace(
+        "stock_predictor.screener.services.screener_service.detect_patterns",
+        lambda _candles, _pattern, _opts: [SimpleNamespace(
             pattern_type="Double Bottom",
             status="confirmed",
             direction="bullish",
-            end_index=10,
-        ),
+            end_index=90,
+            breakout_index=90,
+            score=88.0,
+            explanation="",
+            score_breakdown=SimpleNamespace(structure=0, total=88),
+        )],
     )
     monkeypatch.setattr(
         "stock_predictor.screener.services.screener_service.score_pattern",
@@ -181,17 +192,21 @@ def test_serial_scan_provider_uses_single_thread(monkeypatch) -> None:
     caller_thread = threading.get_ident()
     detector_threads: list[int] = []
 
-    def _detect(_candles, _pattern):
+    def _detect(_candles, _pattern, _opts):
         detector_threads.append(threading.get_ident())
-        return SimpleNamespace(
+        return [SimpleNamespace(
             pattern_type="Double Bottom",
             status="confirmed",
             direction="bullish",
-            end_index=10,
-        )
+            end_index=90,
+            breakout_index=90,
+            score=88.0,
+            explanation="",
+            score_breakdown=SimpleNamespace(structure=0, total=88),
+        )]
 
     monkeypatch.setattr(
-        "stock_predictor.screener.services.screener_service.detect_pattern",
+        "stock_predictor.screener.services.screener_service.detect_patterns",
         _detect,
     )
     monkeypatch.setattr(
@@ -207,3 +222,44 @@ def test_serial_scan_provider_uses_single_thread(monkeypatch) -> None:
 
     assert detector_threads
     assert set(detector_threads) == {caller_thread}
+
+
+def test_empty_provider_data_is_reported_in_debug_stats() -> None:
+    provider = _Provider({"AAPL": [], "MSFT": []})
+    service = ScreenerService(provider, universe_service=_Universe())
+    rows = service.scan_market("Double Bottom", "stock")
+    debug = service.get_last_debug_stats()
+    assert rows == []
+    assert debug.rejectedByReason.get("NO_DATA", 0) >= 2
+
+
+def test_pattern_without_breakout_can_be_forming(monkeypatch) -> None:
+    candles = {"AAPL": _candles_from_close([100 + ((-1) ** i) for i in range(140)])}
+    provider = _Provider(candles)
+    service = ScreenerService(provider, universe_service=_Universe())
+    monkeypatch.setattr(
+        "stock_predictor.screener.services.screener_service.detect_patterns",
+        lambda *_args, **_kwargs: [
+            SimpleNamespace(
+                pattern_type="Double Bottom",
+                status="forming",
+                direction="bullish",
+                end_index=130,
+                breakout_index=None,
+                score=55.0,
+                explanation="",
+                score_breakdown=SimpleNamespace(structure=55, total=55),
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        "stock_predictor.screener.services.screener_service.score_pattern",
+        lambda _d, _c: 55.0,
+    )
+    monkeypatch.setattr(
+        "stock_predictor.screener.services.screener_service.calculate_trade_quality",
+        lambda *_args, **_kwargs: _Quality(),
+    )
+    rows = service.scan_market("Double Bottom", "stock", filters=ScreenerFilters(min_score=50, min_occurrences=0))
+    assert rows
+    assert rows[0]["status"] == "forming"

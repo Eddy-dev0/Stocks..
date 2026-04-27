@@ -210,9 +210,11 @@ class StockPredictorDesktopApp:
             "name",
             "symbol",
             "pattern",
+            "status",
             "direction",
             "confidence",
             "quality",
+            "close",
             "signal",
         )
         self.screener_tree = ttk.Treeview(table_frame, columns=columns, show="headings")
@@ -220,14 +222,16 @@ class StockPredictorDesktopApp:
             "name": "Name",
             "symbol": "Symbol",
             "pattern": "Pattern",
+            "status": "Status",
             "direction": "Direction",
             "confidence": "Confidence",
             "quality": "Trade Quality",
+            "close": "Close",
             "signal": "Signal Time",
         }
         for column in columns:
             self.screener_tree.heading(column, text=labels[column])
-            self.screener_tree.column(column, width=150 if column not in {"name", "pattern"} else 220)
+            self.screener_tree.column(column, width=130 if column not in {"name", "pattern"} else 220)
 
         self.screener_tree.grid(row=0, column=0, sticky="nsew")
         self.screener_tree.bind("<<TreeviewSelect>>", self._on_screener_row_selected)
@@ -272,10 +276,17 @@ class StockPredictorDesktopApp:
             total_scanned = len(rows)
             self.screener_progress_var.set(f"{total_scanned} von {total_scanned} Aktien gescannt")
 
+        debug = self.screener_service.get_last_debug_stats()
+
         if not rows:
-            self.screener_status_var.set(f"No symbols matching {pattern} on the 1h timeframe.")
+            self.screener_status_var.set(
+                f"No active patterns found. Debug: {debug.scannedSymbols} scanned, "
+                f"{debug.symbolsWithData} with data, {debug.symbolsWithEnoughCandles} enough candles, "
+                f"{debug.pipeline.get('rawDetections', 0)} candidates, "
+                f"{debug.pipeline.get('afterConfidenceFilter', 0)} after confidence filter."
+            )
             if self.screener_placeholder is not None:
-                self.screener_placeholder.configure(text="No matches for selected filters.")
+                self.screener_placeholder.configure(text="No matches for selected filters. Open debug stats in status line.")
                 self.screener_placeholder.grid()
             self.screener_tree.grid_remove()
             return
@@ -290,9 +301,11 @@ class StockPredictorDesktopApp:
                     row.get("name", "—"),
                     row.get("symbol", "—"),
                     row.get("patternType", "—"),
+                    row.get("status", "—"),
                     row.get("direction", "—"),
                     f"{float(row.get('confidence', 0.0)):.1f}%",
                     quality_text,
+                    f"{float(row.get('close', 0.0)):.2f}",
                     row.get("signalTime") or row.get("detectedAt") or "—",
                 ),
             )
@@ -301,7 +314,9 @@ class StockPredictorDesktopApp:
                 self.screener_row_symbol_map[iid] = symbol
 
         self.screener_status_var.set(
-            f"Detected {len(rows)} symbols matching {pattern} on the 1h timeframe."
+            f"Detected {len(rows)} symbols matching {pattern} on the 1h timeframe. "
+            f"Pipeline raw/active/displayed: {debug.pipeline.get('rawDetections', 0)}/"
+            f"{debug.pipeline.get('activeDetections', 0)}/{debug.pipeline.get('displayedResults', 0)}."
         )
         self.screener_progress_var.set(f"{len(rows)} Treffer, {total_scanned} Aktien gescannt")
         self.screener_last_scan_var.set(

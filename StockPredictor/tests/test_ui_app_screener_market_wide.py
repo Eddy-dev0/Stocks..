@@ -102,6 +102,14 @@ class _ServiceStub:
             progress_callback(3, 10, "Scanning 3 / 10 symbols")
         return list(self.rows)
 
+    def get_last_debug_stats(self):
+        return SimpleNamespace(
+            scannedSymbols=10,
+            symbolsWithData=9,
+            symbolsWithEnoughCandles=8,
+            pipeline={"rawDetections": 7, "activeDetections": 4, "displayedResults": len(self.rows), "afterConfidenceFilter": 3},
+        )
+
 
 def _build_app_with_rows(rows) -> StockPredictorDesktopApp:
     app = StockPredictorDesktopApp.__new__(StockPredictorDesktopApp)
@@ -132,7 +140,7 @@ def test_screener_status_is_market_wide_not_current_ticker() -> None:
 
     app._update_screener_view(force_refresh_data=True)
 
-    assert app.screener_status_var.value == "Detected 2 symbols matching Double Bottom on the 1h timeframe."
+    assert app.screener_status_var.value.startswith("Detected 2 symbols matching Double Bottom on the 1h timeframe.")
     assert app.screener_progress_var.value == "2 Treffer, 10 Aktien gescannt"
     assert "AAPL" not in app.screener_status_var.value
 
