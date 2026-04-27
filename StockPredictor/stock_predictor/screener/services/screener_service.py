@@ -157,14 +157,23 @@ class ScreenerService:
                 return None
 
         rows: list[dict[str, object]] = []
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            futures = [pool.submit(scan_symbol, info) for info in universe]
-            for done_count, future in enumerate(as_completed(futures), start=1):
-                item = future.result()
+        serial_scan = bool(getattr(self.provider, "serial_scan", False))
+        if serial_scan:
+            for done_count, info in enumerate(universe, start=1):
+                item = scan_symbol(info)
                 if item is not None:
                     rows.append(item)
                 if progress_callback:
                     progress_callback(done_count, total, f"Scanning {done_count} / {total} symbols")
+        else:
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = [pool.submit(scan_symbol, info) for info in universe]
+                for done_count, future in enumerate(as_completed(futures), start=1):
+                    item = future.result()
+                    if item is not None:
+                        rows.append(item)
+                    if progress_callback:
+                        progress_callback(done_count, total, f"Scanning {done_count} / {total} symbols")
         rows.sort(
             key=lambda x: (
                 x["tradeQuality"]["successRate"],
