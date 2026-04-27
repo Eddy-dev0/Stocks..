@@ -98,7 +98,9 @@ class StockPredictorDesktopApp:
         )
         self.screener_progress_var = tk.StringVar(value="")
         self.screener_last_scan_var = tk.StringVar(value="Last scan: —")
+        self.selected_pattern_var = tk.StringVar(value=SCREENER_PATTERN_CHOICES[0])
         self.screener_row_symbol_map: dict[str, str] = {}
+        self.screener_pattern_buttons: dict[str, tk.Button] = {}
         self.screener_service = ScreenerService(YahooMarketDataProvider())
 
         self._build_screener_tab()
@@ -125,18 +127,36 @@ class StockPredictorDesktopApp:
 
         control_row = ttk.Frame(frame)
         control_row.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        control_row.grid_columnconfigure(1, weight=1)
+        control_row.grid_columnconfigure(0, weight=1)
 
-        ttk.Label(control_row, text="Pattern").grid(row=0, column=0, sticky="w", padx=(0, 6))
-        self.screener_pattern_listbox = tk.Listbox(control_row, height=1, exportselection=False)
-        for name in SCREENER_PATTERN_CHOICES:
-            self.screener_pattern_listbox.insert(tk.END, name)
-        self.screener_pattern_listbox.selection_set(0)
-        self.screener_pattern_listbox.grid(row=0, column=1, sticky="ew")
+        ttk.Label(control_row, text="Pattern").grid(row=0, column=0, sticky="w", pady=(0, 6))
 
-        ttk.Button(control_row, text="Scan now", command=self._on_refresh).grid(
-            row=0, column=2, padx=(8, 0)
-        )
+        pattern_grid = ttk.Frame(control_row)
+        pattern_grid.grid(row=1, column=0, sticky="ew")
+        columns = 8
+        for idx, name in enumerate(SCREENER_PATTERN_CHOICES):
+            row_idx = idx // columns
+            col_idx = idx % columns
+            pattern_grid.grid_columnconfigure(col_idx, weight=1)
+            button = tk.Button(
+                pattern_grid,
+                text=name,
+                command=lambda pattern=name: self._select_pattern(pattern),
+                width=18,
+                height=2,
+                relief="ridge",
+                borderwidth=2,
+                font=("TkDefaultFont", 9, "bold"),
+                wraplength=125,
+                justify="center",
+            )
+            button.grid(row=row_idx, column=col_idx, padx=4, pady=4, sticky="nsew")
+            self.screener_pattern_buttons[name] = button
+
+        action_row = ttk.Frame(control_row)
+        action_row.grid(row=2, column=0, sticky="e", pady=(8, 0))
+        ttk.Button(action_row, text="Scan now", command=self._on_refresh).grid(row=0, column=0)
+        self._refresh_pattern_button_styles()
 
         status_row = ttk.Frame(frame)
         status_row.grid(row=3, column=0, sticky="ew", pady=(0, 6))
@@ -183,18 +203,17 @@ class StockPredictorDesktopApp:
         self.screener_placeholder.grid(row=0, column=0, sticky="nsew")
 
     def _update_screener_view(self, force_refresh_data: bool = True) -> None:
-        if self.screener_tree is None or self.screener_pattern_listbox is None:
+        if self.screener_tree is None:
             return
 
         for item in self.screener_tree.get_children():
             self.screener_tree.delete(item)
         self.screener_row_symbol_map.clear()
 
-        selection = self.screener_pattern_listbox.curselection()
-        if not selection:
-            self.screener_status_var.set("Please select at least one pattern.")
+        pattern = self._get_selected_pattern()
+        if not pattern:
+            self.screener_status_var.set("Please select a pattern.")
             return
-        pattern = self.screener_pattern_listbox.get(selection[0])
 
         rows = self.screener_service.scan_market(
             pattern,
@@ -240,6 +259,36 @@ class StockPredictorDesktopApp:
         self.screener_tree.grid()
         if self.screener_placeholder is not None:
             self.screener_placeholder.grid_remove()
+
+    def _select_pattern(self, pattern: str) -> None:
+        if pattern not in SCREENER_PATTERN_CHOICES:
+            return
+        self.selected_pattern_var.set(pattern)
+        self._refresh_pattern_button_styles()
+
+    def _get_selected_pattern(self) -> str:
+        if hasattr(self, "selected_pattern_var") and self.selected_pattern_var is not None:
+            pattern = str(self.selected_pattern_var.get()).strip()
+            if pattern:
+                return pattern
+        if hasattr(self, "screener_pattern_listbox") and self.screener_pattern_listbox is not None:
+            selection = self.screener_pattern_listbox.curselection()
+            if selection:
+                return str(self.screener_pattern_listbox.get(selection[0])).strip()
+        return ""
+
+    def _refresh_pattern_button_styles(self) -> None:
+        selected_pattern = self.selected_pattern_var.get()
+        for pattern, button in self.screener_pattern_buttons.items():
+            is_selected = pattern == selected_pattern
+            button.configure(
+                bg="#1d4ed8" if is_selected else "#f3f4f6",
+                fg="white" if is_selected else "#111827",
+                activebackground="#1e40af" if is_selected else "#e5e7eb",
+                activeforeground="white" if is_selected else "#111827",
+                highlightbackground="#1d4ed8" if is_selected else "#d1d5db",
+                highlightthickness=2,
+            )
 
     def _on_screener_row_selected(self, _event: tk.Event | None) -> None:
         if self.screener_tree is None or self.ticker_var is None:
