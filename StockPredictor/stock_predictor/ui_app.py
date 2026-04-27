@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import tkinter as tk
 from datetime import datetime
-from threading import Lock
 from tkinter import ttk
 from types import SimpleNamespace
 from typing import Any
+import logging
 
 from stock_predictor.screener.market_data.symbol_universe import SymbolUniverseService
 from stock_predictor.screener.pattern_engine.types import Candle
@@ -36,10 +36,13 @@ SCREENER_PATTERN_CHOICES: tuple[str, ...] = (
 
 class YahooMarketDataProvider:
     """Market data adapter used by the desktop screener for broad scans."""
-    serial_scan = True
+    serial_scan = False
 
     def __init__(self) -> None:
-        self._download_lock = Lock()
+        self._failed_symbols_until: dict[str, datetime] = {}
+        self._failure_cooldown_seconds = 30 * 60
+        logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+        logging.getLogger("yfinance.shared").setLevel(logging.CRITICAL)
 
     def get_universe(self, market_type: str) -> list[str]:
         universe = SymbolUniverseService().get_universe(market_type)
@@ -49,16 +52,42 @@ class YahooMarketDataProvider:
         # Loaded lazily so launching the UI does not require yfinance unless scanning.
         import pandas as pd
         import yfinance as yf
+        from datetime import timedelta
 
         interval = "1h" if timeframe == "1h" else timeframe
         period = "6mo" if lookback >= 300 else "3mo"
         normalized_symbol = symbol.strip().upper().replace(".", "-")
+        blocked_until = self._failed_symbols_until.get(normalized_symbol)
+        now = datetime.utcnow()
+        if blocked_until is not None and blocked_until > now:
+            return []
+        if blocked_until is not None and blocked_until <= now:
+            self._failed_symbols_until.pop(normalized_symbol, None)
         try:
-            with self._download_lock:
-                frame = yf.Ticker(normalized_symbol).history(period=period, interval=interval, auto_adjust=False)
+            if hasattr(yf, "download"):
+                frame = yf.download(
+                    tickers=normalized_symbol,
+                    period=period,
+                    interval=interval,
+                    auto_adjust=False,
+                    progress=False,
+                    threads=False,
+                )
+            else:
+                frame = yf.Ticker(normalized_symbol).history(
+                    period=period,
+                    interval=interval,
+                    auto_adjust=False,
+                )
         except Exception:
+            self._failed_symbols_until[normalized_symbol] = datetime.utcnow() + timedelta(
+                seconds=self._failure_cooldown_seconds
+            )
             return []
         if frame is None or frame.empty:
+            self._failed_symbols_until[normalized_symbol] = datetime.utcnow() + timedelta(
+                seconds=self._failure_cooldown_seconds
+            )
             return []
 
         normalized = frame.reset_index()

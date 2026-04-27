@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from statistics import mean
 
 from ..swing_points import compute_atr, find_swing_points
 from ..types import Candle, PatternDetection
@@ -41,11 +40,23 @@ def _slope(values: list[float]) -> float:
     return num / denom
 
 
-def _avg_volume(candles: list[Candle], start: int, end: int) -> float:
+def _prefix_sums(values: list[float]) -> list[float]:
+    running = 0.0
+    out: list[float] = [0.0]
+    for value in values:
+        running += float(value)
+        out.append(running)
+    return out
+
+
+def _range_average(prefix: list[float], start: int, end: int) -> float:
     if end < start:
         return 0.0
-    vols = [candles[idx].volume for idx in range(start, end + 1)]
-    return float(mean(vols)) if vols else 0.0
+    count = end - start + 1
+    if count <= 0:
+        return 0.0
+    total = prefix[end + 1] - prefix[start]
+    return total / count
 
 
 def _timestamp_text(candle: Candle) -> str:
@@ -211,12 +222,31 @@ def detect_cup_and_handle_candidates(
     detections: list[dict[str, float | int | str | None]] = []
     atr = compute_atr(working)
     closes = [c.close for c in working]
+    highs_by_index = sorted(highs, key=lambda s: s.index)
+    lows_by_index = sorted(lows, key=lambda s: s.index)
+    high_values = [c.high for c in working]
+    low_values = [c.low for c in working]
+    volume_prefix = _prefix_sums([c.volume for c in working])
 
-    for left in highs:
-        for bottom in lows:
+    for left in highs_by_index:
+        min_bottom_idx = left.index + 1
+        max_bottom_idx = min(len(working) - 2, left.index + cfg.max_cup_bars - 1)
+        if max_bottom_idx < min_bottom_idx:
+            continue
+        candidate_bottoms = [
+            swing for swing in lows_by_index if min_bottom_idx <= swing.index <= max_bottom_idx
+        ]
+        for bottom in candidate_bottoms:
             if bottom.index <= left.index:
                 continue
-            for right in highs:
+            min_right_idx = max(bottom.index + 1, left.index + cfg.min_cup_bars)
+            max_right_idx = min(len(working) - 1, left.index + cfg.max_cup_bars)
+            if min_right_idx > max_right_idx:
+                continue
+            candidate_rights = [
+                swing for swing in highs_by_index if min_right_idx <= swing.index <= max_right_idx
+            ]
+            for right in candidate_rights:
                 if right.index <= bottom.index:
                     continue
                 cup_bars = right.index - left.index
@@ -294,8 +324,8 @@ def detect_cup_and_handle_candidates(
                     if handle_bars > cup_bars * 0.50:
                         break
 
-                    handle_high = max(c.high for c in working[handle_search_start : handle_end + 1])
-                    handle_low = min(c.low for c in working[handle_search_start : handle_end + 1])
+                    handle_high = max(high_values[handle_search_start : handle_end + 1])
+                    handle_low = min(low_values[handle_search_start : handle_end + 1])
                     handle_depth = handle_high - handle_low
                     handle_retrace = handle_depth / max(cup_depth, 1e-9)
                     if handle_retrace > cfg.max_handle_retrace_of_cup:
@@ -332,12 +362,12 @@ def detect_cup_and_handle_candidates(
                     else:
                         status = "forming"
 
-                    average_volume_cup = _avg_volume(working, left.index, right.index)
-                    average_volume_handle = _avg_volume(working, handle_search_start, handle_end)
+                    average_volume_cup = _range_average(volume_prefix, left.index, right.index)
+                    average_volume_handle = _range_average(volume_prefix, handle_search_start, handle_end)
                     breakout_volume_ratio: float | None = None
                     if breakout_index is not None:
                         vol_lookback_start = max(0, breakout_index - 20)
-                        avg20 = _avg_volume(working, vol_lookback_start, breakout_index - 1)
+                        avg20 = _range_average(volume_prefix, vol_lookback_start, breakout_index - 1)
                         if avg20 > 0:
                             breakout_volume_ratio = working[breakout_index].volume / avg20
                     lower_handle_volume = average_volume_handle > 0 and average_volume_handle < average_volume_cup
