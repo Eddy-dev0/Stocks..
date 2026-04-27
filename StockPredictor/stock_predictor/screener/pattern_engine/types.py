@@ -23,7 +23,7 @@ PatternType = Literal[
     "Diamond",
 ]
 
-PatternStatus = Literal["forming", "confirmed", "failed", "expired"]
+PatternStatus = Literal["candidate", "forming", "confirmed", "failed", "expired"]
 PatternDirection = Literal["bullish", "bearish", "neutral"]
 
 
@@ -62,6 +62,21 @@ class PatternKeyPoint:
     type: str
 
 
+
+
+@dataclass(frozen=True)
+class ScoreBreakdown:
+    structure: float = 0.0
+    symmetry: float = 0.0
+    trend: float = 0.0
+    neckline: float = 0.0
+    compression: float = 0.0
+    breakout: float = 0.0
+    volume: float = 0.0
+    penalties: float = 0.0
+    total: float = 0.0
+
+
 @dataclass(frozen=True)
 class PatternDetection:
     pattern_type: PatternType
@@ -82,6 +97,7 @@ class PatternDetection:
     trendline_neckline: Trendline | None = None
     key_points: tuple[PatternKeyPoint, ...] = field(default_factory=tuple)
     explanation: str = ""
+    score_breakdown: ScoreBreakdown = field(default_factory=ScoreBreakdown)
 
 
 @dataclass(frozen=True)

@@ -10,6 +10,7 @@ from ..types import (
     PatternKeyPoint,
     PatternStatus,
     PatternType,
+    ScoreBreakdown,
     SwingPoint,
     Trendline,
 )
@@ -122,6 +123,7 @@ def make_detection(
     support_level: float | None = None,
     resistance_level: float | None = None,
     breakout_index: int | None = None,
+    score_breakdown: ScoreBreakdown | None = None,
 ) -> PatternDetection:
     start_index = points[0].index if points else max(0, len(candles) - 40)
     end_index = points[-1].index if points else len(candles) - 1
@@ -135,6 +137,20 @@ def make_detection(
     )
     vs, _ = volume_score(candles, resolved_breakout)
     final_score = max(0.0, min(100.0, score + vs))
+    if score_breakdown is None:
+        score_breakdown = ScoreBreakdown(structure=score, volume=vs, total=final_score)
+    else:
+        score_breakdown = ScoreBreakdown(
+            structure=score_breakdown.structure,
+            symmetry=score_breakdown.symmetry,
+            trend=score_breakdown.trend,
+            neckline=score_breakdown.neckline,
+            compression=score_breakdown.compression,
+            breakout=score_breakdown.breakout,
+            volume=score_breakdown.volume + vs,
+            penalties=score_breakdown.penalties,
+            total=final_score,
+        )
     kp = tuple(PatternKeyPoint(index=p.index, price=p.price, type=p.kind) for p in points)
     return PatternDetection(
         pattern_type=pattern_type,
@@ -155,6 +171,7 @@ def make_detection(
         trendline_neckline=trendline_neckline,
         key_points=kp,
         explanation=explanation,
+        score_breakdown=score_breakdown,
     )
 
 
@@ -163,7 +180,7 @@ def dedupe_detections(detections: list[PatternDetection]) -> list[PatternDetecti
         return []
 
     def rank(d: PatternDetection) -> tuple[int, float, int]:
-        status_rank = {"confirmed": 3, "forming": 2, "failed": 1, "expired": 0}.get(d.status, 0)
+        status_rank = {"confirmed": 4, "forming": 3, "candidate": 2, "failed": 1, "expired": 0}.get(d.status, 0)
         return status_rank, d.score, d.end_index
 
     ordered = sorted(detections, key=rank, reverse=True)
