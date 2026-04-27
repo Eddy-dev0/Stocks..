@@ -163,6 +163,7 @@ class StockPredictorDesktopApp:
         action_row = ttk.Frame(control_row)
         action_row.grid(row=2, column=0, sticky="e", pady=(8, 0))
         ttk.Button(action_row, text="Scan now", command=self._on_refresh).grid(row=0, column=0)
+        ttk.Label(action_row, textvariable=self.screener_progress_var).grid(row=0, column=1, sticky="w", padx=(10, 0))
         self._refresh_pattern_button_styles()
 
         status_row = ttk.Frame(frame)
@@ -222,12 +223,25 @@ class StockPredictorDesktopApp:
             self.screener_status_var.set("Please select a pattern.")
             return
 
+        self.screener_progress_var.set("0 von 0 Aktien gescannt")
+
+        def _on_progress(done_count: int, total: int, _message: str) -> None:
+            self.screener_progress_var.set(f"{done_count} von {total} Aktien gescannt")
+            if self.root is not None:
+                self.root.update_idletasks()
+
         rows = self.screener_service.scan_market(
             pattern,
             "stock",
             timeframe="1h",
             force_refresh_data=force_refresh_data,
+            progress_callback=_on_progress,
         )
+
+        total_scanned = self._extract_total_scanned(self.screener_progress_var.get())
+        if total_scanned is None:
+            total_scanned = len(rows)
+            self.screener_progress_var.set(f"{total_scanned} von {total_scanned} Aktien gescannt")
 
         if not rows:
             self.screener_status_var.set(f"No symbols matching {pattern} on the 1h timeframe.")
@@ -260,6 +274,7 @@ class StockPredictorDesktopApp:
         self.screener_status_var.set(
             f"Detected {len(rows)} symbols matching {pattern} on the 1h timeframe."
         )
+        self.screener_progress_var.set(f"{len(rows)} Treffer, {total_scanned} Aktien gescannt")
         self.screener_last_scan_var.set(
             f"Last scan: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
         )
@@ -296,6 +311,16 @@ class StockPredictorDesktopApp:
                 highlightbackground="#1d4ed8" if is_selected else "#d1d5db",
                 highlightthickness=2,
             )
+
+    @staticmethod
+    def _extract_total_scanned(progress_text: str) -> int | None:
+        parts = progress_text.strip().split()
+        if len(parts) >= 3 and parts[1] == "von":
+            try:
+                return int(parts[2])
+            except ValueError:
+                return None
+        return None
 
     def _on_screener_row_selected(self, _event: tk.Event | None) -> None:
         if self.screener_tree is None or self.ticker_var is None:

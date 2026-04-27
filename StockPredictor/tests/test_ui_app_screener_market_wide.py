@@ -20,6 +20,9 @@ class _DummyVar:
     def set(self, value: object) -> None:
         self.value = value
 
+    def get(self) -> object:
+        return self.value
+
 
 class _DummyRoot:
     def update_idletasks(self) -> None:
@@ -93,7 +96,10 @@ class _ServiceStub:
     def __init__(self, rows):
         self.rows = rows
 
-    def scan_market(self, *_args, **_kwargs):
+    def scan_market(self, *_args, **kwargs):
+        progress_callback = kwargs.get("progress_callback")
+        if progress_callback is not None:
+            progress_callback(3, 10, "Scanning 3 / 10 symbols")
         return list(self.rows)
 
 
@@ -127,6 +133,7 @@ def test_screener_status_is_market_wide_not_current_ticker() -> None:
     app._update_screener_view(force_refresh_data=True)
 
     assert app.screener_status_var.value == "Detected 2 symbols matching Double Bottom on the 1h timeframe."
+    assert app.screener_progress_var.value == "2 Treffer, 10 Aktien gescannt"
     assert "AAPL" not in app.screener_status_var.value
 
 
