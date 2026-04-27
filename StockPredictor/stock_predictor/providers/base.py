@@ -464,7 +464,7 @@ class BaseProvider(abc.ABC):
 
     async def aclose(self) -> None:
         if self._client_owner and self._client is not None:
-            await self._client.aclose()
+            await self._close_client_safely(self._client)
             self._client = None
             self._client_loop = None
 
@@ -501,7 +501,16 @@ class BaseProvider(abc.ABC):
         old_client = self._client
         self._client = httpx.AsyncClient(timeout=30.0)
         self._client_loop = current_loop
-        await old_client.aclose()
+        await self._close_client_safely(old_client)
+
+    async def _close_client_safely(self, client: httpx.AsyncClient) -> None:
+        """Close an async client while tolerating loop-shutdown edge cases."""
+
+        try:
+            await client.aclose()
+        except RuntimeError as exc:
+            if "event loop is closed" not in str(exc).lower():
+                raise
 
     def _cache_key(self, request: ProviderRequest) -> str:
         params = dict(sorted(request.params.items()))
@@ -827,6 +836,7 @@ def build_default_registry(
         StooqProvider,
         TiingoProvider,
         TwitterProvider,
+        YFinanceProvider,
         YahooFinanceProvider,
     )
 
@@ -910,6 +920,7 @@ def build_default_registry(
     if yahoo_cooldown is not None:
         yahoo_kwargs["cooldown_seconds"] = yahoo_cooldown
     registry.register(StablePriceStoreProvider())
+    registry.register(YFinanceProvider())
     registry.register(YahooFinanceProvider(**yahoo_kwargs))
     _try_register(AlphaVantageProvider)
     _try_register(FinnhubProvider)
