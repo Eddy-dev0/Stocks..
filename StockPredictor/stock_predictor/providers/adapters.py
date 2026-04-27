@@ -118,6 +118,94 @@ class YahooFinanceProvider(BaseProvider):
         )
 
 
+class YFinanceProvider(BaseProvider):
+    """Adapter using the yfinance package as a resilient Yahoo fallback."""
+
+    name = "yfinance"
+    supported_datasets = (DatasetType.PRICES,)
+
+    async def _fetch(self, request: ProviderRequest) -> ProviderResult:
+        try:
+            import yfinance as yf
+        except Exception as exc:  # pragma: no cover - optional dependency
+            raise ProviderError("yfinance package is not available.") from exc
+
+        start = request.params.get("start")
+        end = request.params.get("end")
+        interval = str(request.params.get("interval", "1d") or "1d")
+        if interval == "1d":
+            interval = "1d"
+        elif interval == "1wk":
+            interval = "1wk"
+        elif interval == "1mo":
+            interval = "1mo"
+        else:
+            interval = "1d"
+
+        def _download() -> pd.DataFrame:
+            return yf.download(
+                tickers=request.symbol,
+                start=start,
+                end=end,
+                interval=interval,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+
+        frame = await asyncio.to_thread(_download)
+        if frame is None or frame.empty:
+            return ProviderResult(
+                dataset_type=request.dataset_type,
+                source=self.name,
+                records=[],
+                metadata={"symbol": request.symbol, "reason": "empty"},
+            )
+
+        if isinstance(frame.columns, pd.MultiIndex):
+            frame.columns = frame.columns.get_level_values(0)
+
+        frame = frame.reset_index()
+        frame = frame.rename(columns={"Datetime": "Date"})
+        if "Date" not in frame.columns:
+            return ProviderResult(
+                dataset_type=request.dataset_type,
+                source=self.name,
+                records=[],
+                metadata={"symbol": request.symbol, "reason": "missing_date"},
+            )
+
+        bars: list[PriceBar] = []
+        for _, row in frame.iterrows():
+            parsed_date = pd.to_datetime(row.get("Date"), errors="coerce")
+            if pd.isna(parsed_date):
+                continue
+            timestamp = parsed_date.to_pydatetime()
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            else:
+                timestamp = timestamp.astimezone(timezone.utc)
+            bars.append(
+                PriceBar(
+                    symbol=request.symbol,
+                    timestamp=timestamp,
+                    open=_parse_float(row.get("Open")),
+                    high=_parse_float(row.get("High")),
+                    low=_parse_float(row.get("Low")),
+                    close=_parse_float(row.get("Close")),
+                    volume=_parse_float(row.get("Volume")),
+                    adj_close=_parse_float(row.get("Adj Close")),
+                )
+            )
+
+        return ProviderResult(
+            dataset_type=request.dataset_type,
+            source=self.name,
+            records=bars,
+            metadata={"symbol": request.symbol, "interval": interval},
+        )
+
+
 class AlphaVantageProvider(BaseProvider):
     """Adapter for Alpha Vantage time-series API."""
 
