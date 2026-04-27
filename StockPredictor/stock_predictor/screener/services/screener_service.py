@@ -63,15 +63,19 @@ class ScreenerService:
         *,
         start_date: object | None = None,
         end_date: object | None = None,
+        timeframe: str = "1h",
+        force_refresh_data: bool = False,
         filters: ScreenerFilters | None = None,
         progress_callback: Callable[[int, int, str], None] | None = None,
         max_symbols: int | None = None,
     ) -> list[dict[str, object]]:
         """Backwards-compatible API that now performs a market-wide scan."""
+        _ = (start_date, end_date, force_refresh_data)
         active_filters = filters or ScreenerFilters()
         options = ScanOptions(
             pattern_type=pattern_type,
             market_filter=market_type,
+            timeframe=timeframe,
             min_confidence=active_filters.min_score,
             min_trade_quality=active_filters.min_occurrences,
             max_symbols=max_symbols,
