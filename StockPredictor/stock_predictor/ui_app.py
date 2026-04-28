@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import tkinter as tk
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+import os
+import json
 from tkinter import ttk
 from types import SimpleNamespace
 from typing import Any
@@ -13,8 +15,11 @@ from stock_predictor.screener.market_data.symbol_universe import SymbolUniverseS
 from stock_predictor.screener.pattern_engine.types import Candle
 from stock_predictor.screener.market_data.provider import (
     MarketDataError,
+    filter_universe_for_provider,
     MockPatternMarketDataProvider,
+    to_alpaca_timeframe,
     YAHOO_FUTURES_MAP,
+    KNOWN_LIQUID_TEST_UNIVERSE,
 )
 from stock_predictor.screener.services import ScreenerService
 
@@ -37,7 +42,8 @@ SCREENER_PATTERN_CHOICES: tuple[str, ...] = (
     "Cup and Handle",
     "Diamond",
 )
-PROVIDER_CHOICES: tuple[str, ...] = ("Auto", "Yahoo", "Alpaca", "Polygon", "Mock")
+PROVIDER_CHOICES: tuple[str, ...] = ("Auto", "Alpaca", "Yahoo", "Mock")
+ALPACA_FEED_CHOICES: tuple[str, ...] = ("auto", "iex", "sip")
 TIMEFRAME_CHOICES: tuple[str, ...] = ("Auto", "1h", "30m", "15m", "45m synthetic")
 
 
@@ -135,6 +141,119 @@ class YahooMarketDataProvider:
         return {"provider": "Yahoo", "mode": "Live", "configured": "yes"}
 
 
+class AlpacaMarketDataProvider:
+    serial_scan = True
+
+    def __init__(self, feed: str = "auto") -> None:
+        self.feed = feed
+        self.api_key = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
+        self.api_secret = os.getenv("ALPACA_API_SECRET") or os.getenv("APCA_API_SECRET_KEY")
+
+    def normalize_symbol(self, symbol: str) -> str:
+        return symbol.strip().upper().replace(".", "-")
+
+    def _window_for_timeframe(self, timeframe: str) -> tuple[str, str]:
+        now = datetime.now(timezone.utc)
+        tf = timeframe.strip().lower()
+        days = 60 if tf in {"1h", "60m"} else 30 if tf == "30m" else 15 if tf == "15m" else 60
+        start = now - timedelta(days=days)
+        return start.isoformat().replace("+00:00", "Z"), now.isoformat().replace("+00:00", "Z")
+
+    def _request(self, symbol: str, timeframe: str, lookback: int, feed: str) -> tuple[list[Candle], dict[str, Any]]:
+        import requests
+
+        start, end = self._window_for_timeframe(timeframe)
+        headers = {"APCA-API-KEY-ID": self.api_key or "", "APCA-API-SECRET-KEY": self.api_secret or ""}
+        params = {
+            "symbols": self.normalize_symbol(symbol),
+            "timeframe": to_alpaca_timeframe(timeframe),
+            "start": start,
+            "end": end,
+            "feed": feed,
+            "limit": min(max(int(lookback), 240), 10000),
+        }
+        response = requests.get("https://data.alpaca.markets/v2/stocks/bars", headers=headers, params=params, timeout=20)
+        snippet = response.text[:500]
+        diag: dict[str, Any] = {"httpStatus": response.status_code, "rawResponseSnippet": snippet, "feed": feed}
+        if response.status_code != 200:
+            return [], diag
+        payload = response.json() if response.text else {}
+        bars = (payload.get("bars") or {}).get(self.normalize_symbol(symbol), [])
+        candles: list[Candle] = []
+        for bar in bars:
+            ts = str(bar.get("t", ""))
+            parsed = datetime.fromisoformat(ts.replace("Z", "+00:00")).replace(tzinfo=None)
+            candles.append(
+                Candle(
+                    timestamp=parsed,
+                    open=float(bar.get("o", 0.0)),
+                    high=float(bar.get("h", 0.0)),
+                    low=float(bar.get("l", 0.0)),
+                    close=float(bar.get("c", 0.0)),
+                    volume=float(bar.get("v", 0.0)),
+                )
+            )
+        return candles, diag
+
+    def get_historical_bars(self, symbol: str, timeframe: str, lookback: int, options: dict[str, Any] | None = None) -> list[Candle]:
+        _ = options
+        if not self.api_key or not self.api_secret:
+            raise MarketDataError(symbol, "Alpaca API key/secret invalid or missing.")
+        chosen = self.feed
+        feeds = ["iex", "sip"] if chosen == "auto" else [chosen]
+        last_diag: dict[str, Any] = {}
+        for feed in feeds:
+            candles, diag = self._request(symbol, timeframe, lookback, feed)
+            last_diag = diag
+            if candles:
+                return candles
+            status = int(diag.get("httpStatus", 0))
+            if status == 401:
+                raise MarketDataError(symbol, "Alpaca API key/secret invalid or missing.")
+            if status == 403:
+                raise MarketDataError(symbol, "Alpaca feed not authorized. Try feed=iex or configure SIP subscription.")
+            if status == 422:
+                raise MarketDataError(symbol, "Invalid request parameters: timeframe/start/end/symbol.")
+            if status == 429:
+                raise MarketDataError(symbol, "Rate limit hit. Reduce concurrency.")
+        raise MarketDataError(symbol, f"No bars returned. Check symbol/feed/time range. feed={last_diag.get('feed', chosen)} http={last_diag.get('httpStatus', '-')}")
+
+    def provider_status(self) -> dict[str, str]:
+        if not self.api_key or not self.api_secret:
+            return {"provider": "Alpaca", "mode": "Live", "configured": "no", "status": "NOT_CONFIGURED", "feed": self.feed}
+        return {"provider": "Alpaca", "mode": "Live", "configured": "yes", "feed": self.feed}
+
+
+class AutoFallbackMarketDataProvider:
+    serial_scan = True
+
+    def __init__(self, alpaca_feed: str = "auto") -> None:
+        self.alpaca = AlpacaMarketDataProvider(feed=alpaca_feed)
+        self.yahoo = YahooMarketDataProvider()
+        self.mock = MockPatternMarketDataProvider()
+        self.last_provider = "Yahoo"
+
+    def normalize_symbol(self, symbol: str) -> str:
+        return self.yahoo.normalize_symbol(symbol)
+
+    def get_historical_bars(self, symbol: str, timeframe: str, lookback: int, options: dict[str, Any] | None = None) -> list[Candle]:
+        try:
+            bars = self.alpaca.get_historical_bars(symbol, timeframe, lookback, options=options)
+            self.last_provider = "Alpaca"
+            return bars
+        except Exception:
+            try:
+                bars = self.yahoo.get_historical_bars(symbol, timeframe, lookback, options=options)
+                self.last_provider = "Yahoo"
+                return bars
+            except Exception:
+                self.last_provider = "Mock"
+                return self.mock.get_historical_bars(symbol, timeframe, lookback, options=options)
+
+    def provider_status(self) -> dict[str, str]:
+        return {"provider": self.last_provider, "mode": "Fallback", "configured": "yes"}
+
+
 class StockPredictorDesktopApp:
     """Desktop application reduced to the screener workflow only."""
 
@@ -154,7 +273,9 @@ class StockPredictorDesktopApp:
         self.screener_last_scan_var = tk.StringVar(value="Last scan: —")
         self.selected_pattern_var = tk.StringVar(value=SCREENER_PATTERN_CHOICES[0])
         self.selected_provider_var = tk.StringVar(value="Auto")
+        self.selected_feed_var = tk.StringVar(value="auto")
         self.selected_timeframe_var = tk.StringVar(value="Auto")
+        self.provider_self_test_passed = False
         self.screener_row_symbol_map: dict[str, str] = {}
         self.screener_pattern_buttons: dict[str, tk.Button] = {}
         self.screener_service = ScreenerService(YahooMarketDataProvider())
@@ -213,11 +334,13 @@ class StockPredictorDesktopApp:
         action_row.grid(row=2, column=0, sticky="e", pady=(8, 0))
         ttk.Label(action_row, text="Provider").grid(row=0, column=0, padx=(0, 4))
         ttk.OptionMenu(action_row, self.selected_provider_var, self.selected_provider_var.get(), *PROVIDER_CHOICES).grid(row=0, column=1, padx=(0, 8))
-        ttk.Label(action_row, text="Timeframe").grid(row=0, column=2, padx=(0, 4))
-        ttk.OptionMenu(action_row, self.selected_timeframe_var, self.selected_timeframe_var.get(), *TIMEFRAME_CHOICES).grid(row=0, column=3, padx=(0, 8))
-        ttk.Button(action_row, text="Test data provider", command=self._on_test_provider).grid(row=0, column=4, padx=(0, 8))
-        ttk.Button(action_row, text="Scan now", command=self._on_refresh).grid(row=0, column=6)
-        ttk.Label(action_row, textvariable=self.screener_progress_var).grid(row=0, column=5, sticky="w", padx=(10, 0))
+        ttk.Label(action_row, text="Feed").grid(row=0, column=2, padx=(0, 4))
+        ttk.OptionMenu(action_row, self.selected_feed_var, self.selected_feed_var.get(), *ALPACA_FEED_CHOICES).grid(row=0, column=3, padx=(0, 8))
+        ttk.Label(action_row, text="Timeframe").grid(row=0, column=4, padx=(0, 4))
+        ttk.OptionMenu(action_row, self.selected_timeframe_var, self.selected_timeframe_var.get(), *TIMEFRAME_CHOICES).grid(row=0, column=5, padx=(0, 8))
+        ttk.Button(action_row, text="Provider self-test", command=self._on_test_provider).grid(row=0, column=6, padx=(0, 8))
+        ttk.Button(action_row, text="Scan now", command=self._on_refresh).grid(row=0, column=8)
+        ttk.Label(action_row, textvariable=self.screener_progress_var).grid(row=0, column=7, sticky="w", padx=(10, 0))
         self._refresh_pattern_button_styles()
 
         status_row = ttk.Frame(frame)
@@ -271,7 +394,7 @@ class StockPredictorDesktopApp:
         debug_frame = ttk.LabelFrame(frame, text="Debug: Symbol Errors (first 50)")
         debug_frame.grid(row=5, column=0, sticky="nsew", pady=(8, 0))
         debug_frame.grid_columnconfigure(0, weight=1)
-        debug_cols = ("symbol", "providerSymbol", "status", "timeframeUsed", "candles", "error")
+        debug_cols = ("symbol", "provider", "feed", "providerSymbol", "status", "timeframeAttempted", "httpStatus", "candles", "errorMessage")
         self.debug_tree = ttk.Treeview(debug_frame, columns=debug_cols, show="headings", height=8)
         for col in debug_cols:
             self.debug_tree.heading(col, text=col)
@@ -280,8 +403,13 @@ class StockPredictorDesktopApp:
 
     def _resolve_provider(self) -> Any:
         selected = self.selected_provider_var.get().strip().lower()
-        if selected in {"auto", "yahoo", "alpaca", "polygon"}:
+        selected_feed = getattr(getattr(self, "selected_feed_var", None), "get", lambda: "auto")().strip().lower()
+        if selected == "auto":
+            return AutoFallbackMarketDataProvider(alpaca_feed=selected_feed)
+        if selected == "yahoo":
             return YahooMarketDataProvider()
+        if selected == "alpaca":
+            return AlpacaMarketDataProvider(feed=selected_feed)
         if selected == "mock":
             return MockPatternMarketDataProvider()
         return YahooMarketDataProvider()
@@ -292,16 +420,26 @@ class StockPredictorDesktopApp:
 
     def _on_test_provider(self) -> None:
         provider = self._resolve_provider()
-        tester = getattr(provider, "test_data_provider", None)
         symbols = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN"]
-        if callable(tester):
-            rows = tester(symbols, timeframe="1h", lookback=500)
-            ok_count = len([r for r in rows if str(r.get("status")) == "OK"])
-            self.screener_status_var.set(
-                f"Provider test complete: {ok_count}/5 symbols OK. Provider: {provider.provider_status().get('provider', 'Unknown')}."
-            )
+        attempts = ["1h", "30m", "15m"]
+        passed = 0
+        for symbol in symbols:
+            success = False
+            for timeframe in attempts:
+                try:
+                    candles = provider.get_historical_bars(symbol, timeframe, 500)
+                    if len(candles) >= 120:
+                        success = True
+                        break
+                except Exception:
+                    continue
+            if success:
+                passed += 1
+        self.provider_self_test_passed = passed >= 3
+        if self.provider_self_test_passed:
+            self.screener_status_var.set(f"Provider self-test passed ({passed}/5 symbols with >=120 candles).")
         else:
-            self.screener_status_var.set("Market data provider not configured.")
+            self.screener_status_var.set("Provider self-test failed. Screener scan disabled until market data works.")
 
     def _update_screener_view(self, force_refresh_data: bool = True) -> None:
         if self.screener_tree is None:
@@ -314,6 +452,9 @@ class StockPredictorDesktopApp:
         pattern = self._get_selected_pattern()
         if not pattern:
             self.screener_status_var.set("Please select a pattern.")
+            return
+        if not getattr(self, "provider_self_test_passed", True):
+            self.screener_status_var.set("Provider self-test failed. Screener scan disabled until market data works.")
             return
         if isinstance(self.screener_service, ScreenerService):
             self.screener_service = ScreenerService(self._resolve_provider())
@@ -345,11 +486,14 @@ class StockPredictorDesktopApp:
         for diag in debug.symbolDiagnostics[:50]:
             self.debug_tree.insert("", "end", values=(
                 diag.get("symbol", "-"),
+                diag.get("provider", debug.providerStatus.get("provider", "-")),
+                diag.get("feed", "-"),
                 diag.get("providerSymbol", "-"),
                 diag.get("status", "-"),
-                diag.get("timeframeUsed", "-"),
+                diag.get("timeframeAttempted", diag.get("timeframeUsed", "-")),
+                diag.get("httpStatus", "-"),
                 diag.get("candles", 0),
-                diag.get("error", ""),
+                diag.get("errorMessage", diag.get("error", "")),
             ))
 
         if not rows:

@@ -48,6 +48,7 @@ class MarketDataProvider(Protocol):
 
 
 TIMEFRAME_TO_MINUTES = {"1h": 60, "60m": 60, "45m": 45, "30m": 30, "15m": 15}
+KNOWN_LIQUID_TEST_UNIVERSE = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL", "AMD", "NFLX", "JPM"]
 
 YAHOO_FUTURES_MAP = {
     "ES": "ES=F",
@@ -87,6 +88,37 @@ def normalize_timeframe_for_provider(provider_name: str, timeframe: str) -> str:
         if tf in {"30m", "15m", "45m"}:
             return tf
     return tf
+
+
+def to_alpaca_timeframe(timeframe: str) -> str:
+    normalized = timeframe.strip().lower()
+    mapping = {
+        "1h": "1Hour",
+        "60m": "1Hour",
+        "30m": "30Min",
+        "15m": "15Min",
+        "5m": "5Min",
+        "1d": "1Day",
+    }
+    if normalized not in mapping:
+        raise ValueError(f"Unsupported Alpaca timeframe: {timeframe}")
+    return mapping[normalized]
+
+
+def filter_universe_for_provider(universe: list[Any], provider_name: str) -> list[Any]:
+    provider = provider_name.strip().lower()
+    if provider != "alpaca":
+        return universe
+    filtered: list[Any] = []
+    for item in universe:
+        market_type = getattr(item, "market_type", "stock")
+        symbol = str(getattr(item, "symbol", "")).upper()
+        if market_type != "stock":
+            continue
+        if symbol in YAHOO_FUTURES_MAP or symbol.endswith("=F"):
+            continue
+        filtered.append(item)
+    return filtered
 
 
 def timeframe_period_hint(timeframe: str) -> str:

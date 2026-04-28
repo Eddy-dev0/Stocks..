@@ -8,8 +8,10 @@ from statistics import median
 from typing import Any, Callable
 
 from ..market_data.provider import (
+    KNOWN_LIQUID_TEST_UNIVERSE,
     MarketDataError,
     MarketDataProvider,
+    filter_universe_for_provider,
     normalize_symbol_for_provider,
     timeframe_period_hint,
 )
@@ -98,6 +100,12 @@ class ScreenerService:
     def get_last_debug_stats(self) -> ScreenerDebugStats:
         return self.last_debug_stats
 
+    def _provider_get_bars(self, symbol: str, timeframe: str, lookback_bars: int, options: dict[str, Any] | None = None) -> list[Candle]:
+        try:
+            return self.provider.get_historical_bars(symbol, timeframe, lookback_bars, options=options)
+        except TypeError:
+            return self.provider.get_historical_bars(symbol, timeframe, lookback_bars)
+
     def _resolve_universe(self, options: ScanOptions) -> list[SymbolInfo]:
         market_filter = options.market_filter
         if market_filter not in {"all", "stock", "future"}:
@@ -105,9 +113,14 @@ class ScreenerService:
         universe = self.universe_service.get_universe(market_filter)
         if not options.include_futures:
             universe = [item for item in universe if item.market_type != "future"]
+        provider_status_fn = getattr(self.provider, "provider_status", None)
+        provider_name = "Yahoo"
+        if callable(provider_status_fn):
+            provider_name = str(provider_status_fn().get("provider", "Yahoo"))
+        filtered = filter_universe_for_provider(universe, provider_name)
         if options.max_symbols is not None and options.max_symbols > 0:
-            return universe[: options.max_symbols]
-        return universe
+            return filtered[: options.max_symbols]
+        return filtered
 
     def _record_reject(self, debug: ScreenerDebugStats, symbol: str, reason: str, detail: str) -> None:
         debug.rejectedByReason[reason] = debug.rejectedByReason.get(reason, 0) + 1
@@ -229,7 +242,7 @@ class ScreenerService:
         for attempt in attempts:
             timeframe = str(attempt["timeframe"])
             try:
-                candles = self.provider.get_historical_bars(symbol, timeframe, lookback_bars, options={"period": attempt["period"]})
+                candles = self._provider_get_bars(symbol, timeframe, lookback_bars, options={"period": attempt["period"]})
                 minimum = self.get_min_candles(timeframe)
                 validation = self.validate_candles(symbol, candles, timeframe, minimum)
                 valid_candles, warnings, reason, _spacing = validation
@@ -293,6 +306,24 @@ class ScreenerService:
             self.last_debug_stats = debug
             return []
 
+        provider_name = str(debug.providerStatus.get("provider", "")).lower()
+        known_liquid = [item for item in universe if item.symbol in KNOWN_LIQUID_TEST_UNIVERSE][:10]
+        if known_liquid and provider_name in {"alpaca", "auto"}:
+            failed_all = True
+            for info in known_liquid:
+                try:
+                    probe = self._provider_get_bars(info.symbol, options.timeframe if options.timeframe != "auto" else "1h", options.lookback_bars, options={"period": timeframe_period_hint("1h")})
+                    if probe:
+                        failed_all = False
+                        break
+                except Exception:
+                    continue
+            if failed_all:
+                debug.warnings.append("Provider failed on 10 known liquid symbols. Scan aborted.")
+                debug.providerStatus["status"] = "BROKEN"
+                self.last_debug_stats = debug
+                return []
+
         def scan_symbol(info: SymbolInfo) -> tuple[dict[str, object] | None, dict[str, object]]:
             provider_status_name = str(debug.providerStatus.get("provider", "Yahoo"))
             provider_symbol, normalize_error = normalize_symbol_for_provider(provider_status_name, info.symbol)
@@ -310,23 +341,46 @@ class ScreenerService:
                     if fetched.get("warning"):
                         metrics["warnings"].append(fetched["warning"])
                 elif options.timeframe == "45m":
-                    base = self.provider.get_historical_bars(provider_symbol, "15m", options.lookback_bars, options={"period": timeframe_period_hint("15m")})
+                    base = self._provider_get_bars(provider_symbol, "15m", options.lookback_bars, options={"period": timeframe_period_hint("15m")})
                     candles = self.aggregate_candles(base, 45)
                     metrics["timeframeUsed"] = "45m"
                 else:
-                    candles = self.provider.get_historical_bars(provider_symbol, options.timeframe, options.lookback_bars, options={"period": timeframe_period_hint(options.timeframe)})
+                    candles = self._provider_get_bars(provider_symbol, options.timeframe, options.lookback_bars, options={"period": timeframe_period_hint(options.timeframe)})
             except Exception as error:
-                metrics["diag"] = {"symbol": info.symbol, "providerSymbol": provider_symbol, "status": "ERROR", "candles": 0, "firstTime": "-", "lastTime": "-", "lastClose": "-", "medianSpacingMinutes": "-", "error": str(error)}
+                metrics["diag"] = {
+                    "symbol": info.symbol,
+                    "providerSymbol": provider_symbol,
+                    "provider": provider_status_name,
+                    "feed": debug.providerStatus.get("feed", "-"),
+                    "status": "ERROR",
+                    "timeframeAttempted": options.timeframe,
+                    "httpStatus": "-",
+                    "candles": 0,
+                    "firstTimestamp": "-",
+                    "lastTimestamp": "-",
+                    "lastClose": "-",
+                    "errorCode": type(error).__name__,
+                    "errorMessage": str(error),
+                    "rawResponseSnippet": "-",
+                    "error": str(error),
+                }
                 reason = "UNSUPPORTED_SYMBOL" if isinstance(error, MarketDataError) and "unsupported" in str(error).lower() else "DATA_ERROR"
                 metrics["rejects"].append((reason, str(error)))
                 return None, metrics
             metrics["candles"] = len(candles)
             if not candles:
-                metrics["diag"] = {"symbol": info.symbol, "providerSymbol": provider_symbol, "status": "ERROR", "candles": 0, "firstTime": "-", "lastTime": "-", "lastClose": "-", "medianSpacingMinutes": "-", "error": "No data returned"}
+                metrics["diag"] = {"symbol": info.symbol, "providerSymbol": provider_symbol, "provider": provider_status_name, "feed": debug.providerStatus.get("feed", "-"), "status": "ERROR", "timeframeAttempted": options.timeframe, "httpStatus": 200, "candles": 0, "firstTimestamp": "-", "lastTimestamp": "-", "lastClose": "-", "errorCode": "EMPTY_BARS", "errorMessage": "No bars returned. Check symbol/feed/time range.", "rawResponseSnippet": "-", "error": "No bars returned. Check symbol/feed/time range."}
                 metrics["rejects"].append(("NO_DATA", "provider returned no candles"))
                 return None, metrics
             used_timeframe = str(metrics.get("timeframeUsed", options.timeframe))
-            min_required = max(1, min(options.min_candles_required, self.get_min_candles(used_timeframe)))
+            min_required = max(
+                1,
+                min(
+                    options.min_candles_required,
+                    self.get_min_candles(used_timeframe),
+                    self._min_candles_for_pattern(options.pattern_type),
+                ),
+            )
             valid_candles, warnings, reject_reason, median_spacing = self.validate_candles(info.symbol, candles, used_timeframe, min_required)
             metrics["warnings"] = warnings
             if reject_reason is not None:
