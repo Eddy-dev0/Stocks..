@@ -11,7 +11,7 @@ import logging
 
 from stock_predictor.screener.market_data.symbol_universe import SymbolUniverseService
 from stock_predictor.screener.pattern_engine.types import Candle
-from stock_predictor.screener.market_data.provider import MarketDataError
+from stock_predictor.screener.market_data.provider import MarketDataError, YAHOO_FUTURES_MAP
 from stock_predictor.screener.services import ScreenerService
 
 
@@ -49,6 +49,12 @@ class YahooMarketDataProvider:
         universe = SymbolUniverseService().get_universe(market_type)
         return [item.symbol for item in universe]
 
+    def normalize_symbol(self, symbol: str) -> str:
+        upper = symbol.strip().upper()
+        if upper in YAHOO_FUTURES_MAP:
+            return YAHOO_FUTURES_MAP[upper]
+        return upper.replace(".", "-")
+
     def get_historical_bars(self, symbol: str, timeframe: str, lookback: int) -> list[Candle]:
         # Loaded lazily so launching the UI does not require yfinance unless scanning.
         import pandas as pd
@@ -57,7 +63,7 @@ class YahooMarketDataProvider:
 
         interval = "1h" if timeframe == "1h" else timeframe
         period = "6mo" if lookback >= 300 else "3mo"
-        normalized_symbol = symbol.strip().upper().replace(".", "-")
+        normalized_symbol = self.normalize_symbol(symbol)
         blocked_until = self._failed_symbols_until.get(normalized_symbol)
         now = datetime.utcnow()
         if blocked_until is not None and blocked_until > now:
