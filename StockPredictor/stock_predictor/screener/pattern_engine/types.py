@@ -67,12 +67,15 @@ class PatternKeyPoint:
 @dataclass(frozen=True)
 class ScoreBreakdown:
     structure: float = 0.0
+    geometry: float = 0.0
+    trendContext: float = 0.0
     symmetry: float = 0.0
     trend: float = 0.0
     neckline: float = 0.0
     compression: float = 0.0
     breakout: float = 0.0
     volume: float = 0.0
+    recency: float = 0.0
     penalties: float = 0.0
     total: float = 0.0
 

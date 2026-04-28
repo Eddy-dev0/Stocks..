@@ -22,7 +22,10 @@ class ScreenerFilters:
     min_score: float = 50.0
     min_occurrences: int = 20
     min_volume: float = 0.0
-    status: str = "all"
+    status: str = "forming_confirmed"
+    sensitivity: str = "normal"
+    show_candidates: bool = False
+    debug: bool = False
 
 
 @dataclass(frozen=True)
@@ -35,6 +38,9 @@ class ScanOptions:
     lookback_bars: int = 500
     min_candles_required: int = 120
     active_lookback_bars: int = 20
+    sensitivity: str = "normal"
+    show_candidates: bool = False
+    debug: bool = False
     max_symbols: int | None = None
     include_futures: bool = True
 
@@ -164,6 +170,7 @@ class ScreenerService:
         filters: ScreenerFilters | None = None,
         progress_callback: Callable[[int, int, str], None] | None = None,
         max_symbols: int | None = None,
+        active_lookback_bars: int = 20,
     ) -> list[dict[str, object]]:
         _ = (start_date, end_date, force_refresh_data)
         active_filters = filters or ScreenerFilters()
@@ -174,6 +181,10 @@ class ScreenerService:
             min_confidence=active_filters.min_score,
             min_trade_quality=active_filters.min_occurrences,
             max_symbols=max_symbols,
+            active_lookback_bars=active_lookback_bars,
+            sensitivity=active_filters.sensitivity,
+            show_candidates=active_filters.show_candidates,
+            debug=active_filters.debug,
         )
         return self.scan_market_wide(options, filters=active_filters, progress_callback=progress_callback)
 
@@ -228,12 +239,15 @@ class ScreenerService:
                 valid_candles,
                 options.pattern_type,
                 PatternOptions(
-                    min_confidence=35,
+                    min_confidence=35 if options.debug else active_filters.min_score,
                     min_confidence_candidate=35,
                     min_confidence_display=50,
                     min_confidence_confirmed=45,
                     active_lookback_bars=options.active_lookback_bars,
-                    sensitivity="normal",
+                    sensitivity=options.sensitivity,
+                    allow_loose_fallback=True,
+                    show_candidates=options.show_candidates,
+                    debug=options.debug,
                 ),
             )
             metrics["pipeline"]["rawDetections"] = len(detections)
@@ -255,8 +269,13 @@ class ScreenerService:
 
             after_market = list(after_conf)
             metrics["pipeline"]["afterMarketFilter"] = len(after_market)
-            if active_filters.status != "all":
-                after_market = [d for d in after_market if d.status == active_filters.status]
+            status_map = {
+                "forming_confirmed": {"forming", "confirmed"},
+                "confirmed_only": {"confirmed"},
+                "all": {"candidate", "forming", "confirmed"},
+            }
+            allowed_statuses = status_map.get(active_filters.status, {"forming", "confirmed"})
+            after_market = [d for d in after_market if d.status in allowed_statuses]
             if not after_market:
                 metrics["rejects"].append(("UI_FILTERED_OUT", f"status filter={active_filters.status}"))
                 return None, metrics
@@ -279,8 +298,7 @@ class ScreenerService:
                 self.cache.set(cache_key, quality)
 
             if quality.occurrences < options.min_trade_quality:
-                metrics["rejects"].append(("UI_FILTERED_OUT", "trade quality occurrence filter"))
-                return None, metrics
+                metrics["warnings"].append("trade quality sample below preferred threshold")
             metrics["pipeline"]["afterTradeQualityFilter"] = 1
             metrics["pipeline"]["displayedResults"] = 1
 
@@ -366,6 +384,15 @@ class ScreenerService:
 
         scanned_for_avg = max(debug.scannedSymbols, 1)
         debug.averageCandlesPerSymbol = round(debug.totalCandlesLoaded / scanned_for_avg, 2)
-        rows.sort(key=lambda x: (x["tradeQuality"]["successRate"], x["confidence"], x["volume"]), reverse=True)
+        status_rank = {"confirmed": 2, "forming": 1, "candidate": 0}
+        rows.sort(
+            key=lambda x: (
+                status_rank.get(str(x.get("status")), -1),
+                float(x.get("confidence", 0.0)),
+                float(x["tradeQuality"]["successRate"]),
+                str(x.get("signalTime", "")),
+            ),
+            reverse=True,
+        )
         self.last_debug_stats = debug
         return rows
