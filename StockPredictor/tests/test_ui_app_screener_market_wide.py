@@ -107,6 +107,9 @@ class _ServiceStub:
             scannedSymbols=10,
             symbolsWithData=9,
             symbolsWithEnoughCandles=8,
+            symbolDiagnostics=[],
+            providerStatus={"provider": "Yahoo"},
+            timeframeUsage={"1h": 8, "60m": 0, "30m": 1, "15m": 0},
             pipeline={"rawDetections": 7, "activeDetections": 4, "displayedResults": len(self.rows), "afterConfidenceFilter": 3},
         )
 
@@ -122,8 +125,11 @@ def _build_app_with_rows(rows) -> StockPredictorDesktopApp:
     app.screener_last_scan_var = _DummyVar()
     app.screener_row_symbol_map = {}
     app.screener_service = _ServiceStub(rows)
+    app.selected_provider_var = _DummyVar("Auto")
+    app.selected_timeframe_var = _DummyVar("Auto")
     app.config = SimpleNamespace(ticker="AAPL")
     app.ticker_var = _DummyTickerVar()
+    app.debug_tree = _DummyTree()
     app._set_status = lambda _msg: None
     app._on_refresh_called = False
     app._on_refresh = lambda: setattr(app, "_on_refresh_called", True)
@@ -139,7 +145,7 @@ def test_screener_status_is_market_wide_not_current_ticker() -> None:
     )
     app._update_screener_view(force_refresh_data=True)
 
-    assert app.screener_status_var.value.startswith("Detected 2 symbols matching Double Bottom on the 1h timeframe.")
+    assert app.screener_status_var.value.startswith("Detected 2 symbols matching Double Bottom.")
     assert app.screener_progress_var.value == "2 Treffer, 10 Aktien gescannt"
     assert "AAPL" not in app.screener_status_var.value
 

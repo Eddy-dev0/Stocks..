@@ -11,7 +11,11 @@ import logging
 
 from stock_predictor.screener.market_data.symbol_universe import SymbolUniverseService
 from stock_predictor.screener.pattern_engine.types import Candle
-from stock_predictor.screener.market_data.provider import MarketDataError, YAHOO_FUTURES_MAP
+from stock_predictor.screener.market_data.provider import (
+    MarketDataError,
+    MockPatternMarketDataProvider,
+    YAHOO_FUTURES_MAP,
+)
 from stock_predictor.screener.services import ScreenerService
 
 
@@ -33,6 +37,8 @@ SCREENER_PATTERN_CHOICES: tuple[str, ...] = (
     "Cup and Handle",
     "Diamond",
 )
+PROVIDER_CHOICES: tuple[str, ...] = ("Auto", "Yahoo", "Alpaca", "Polygon", "Mock")
+TIMEFRAME_CHOICES: tuple[str, ...] = ("Auto", "1h", "30m", "15m", "45m synthetic")
 
 
 class YahooMarketDataProvider:
@@ -55,14 +61,16 @@ class YahooMarketDataProvider:
             return YAHOO_FUTURES_MAP[upper]
         return upper.replace(".", "-")
 
-    def get_historical_bars(self, symbol: str, timeframe: str, lookback: int) -> list[Candle]:
+    def get_historical_bars(self, symbol: str, timeframe: str, lookback: int, options: dict[str, Any] | None = None) -> list[Candle]:
         # Loaded lazily so launching the UI does not require yfinance unless scanning.
+        _ = options
         import pandas as pd
         import yfinance as yf
         from datetime import timedelta
 
-        interval = "1h" if timeframe == "1h" else timeframe
-        period = "6mo" if lookback >= 300 else "3mo"
+        interval = "60m" if timeframe in {"1h", "60m"} else timeframe
+        period_map = {"1h": "60d", "60m": "60d", "30m": "30d", "15m": "15d"}
+        period = period_map.get(timeframe, "60d")
         normalized_symbol = self.normalize_symbol(symbol)
         blocked_until = self._failed_symbols_until.get(normalized_symbol)
         now = datetime.utcnow()
@@ -123,6 +131,9 @@ class YahooMarketDataProvider:
                 continue
         return out
 
+    def provider_status(self) -> dict[str, str]:
+        return {"provider": "Yahoo", "mode": "Live", "configured": "yes"}
+
 
 class StockPredictorDesktopApp:
     """Desktop application reduced to the screener workflow only."""
@@ -142,6 +153,8 @@ class StockPredictorDesktopApp:
         self.screener_progress_var = tk.StringVar(value="")
         self.screener_last_scan_var = tk.StringVar(value="Last scan: —")
         self.selected_pattern_var = tk.StringVar(value=SCREENER_PATTERN_CHOICES[0])
+        self.selected_provider_var = tk.StringVar(value="Auto")
+        self.selected_timeframe_var = tk.StringVar(value="Auto")
         self.screener_row_symbol_map: dict[str, str] = {}
         self.screener_pattern_buttons: dict[str, tk.Button] = {}
         self.screener_service = ScreenerService(YahooMarketDataProvider())
@@ -165,7 +178,7 @@ class StockPredictorDesktopApp:
         )
         ttk.Label(
             frame,
-            text="Market-wide 1h pattern screener for stocks/futures.",
+            text="Market-wide intraday pattern screener with timeframe fallback.",
         ).grid(row=1, column=0, sticky="w", pady=(0, 8))
 
         control_row = ttk.Frame(frame)
@@ -198,8 +211,13 @@ class StockPredictorDesktopApp:
 
         action_row = ttk.Frame(control_row)
         action_row.grid(row=2, column=0, sticky="e", pady=(8, 0))
-        ttk.Button(action_row, text="Scan now", command=self._on_refresh).grid(row=0, column=0)
-        ttk.Label(action_row, textvariable=self.screener_progress_var).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        ttk.Label(action_row, text="Provider").grid(row=0, column=0, padx=(0, 4))
+        ttk.OptionMenu(action_row, self.selected_provider_var, self.selected_provider_var.get(), *PROVIDER_CHOICES).grid(row=0, column=1, padx=(0, 8))
+        ttk.Label(action_row, text="Timeframe").grid(row=0, column=2, padx=(0, 4))
+        ttk.OptionMenu(action_row, self.selected_timeframe_var, self.selected_timeframe_var.get(), *TIMEFRAME_CHOICES).grid(row=0, column=3, padx=(0, 8))
+        ttk.Button(action_row, text="Test data provider", command=self._on_test_provider).grid(row=0, column=4, padx=(0, 8))
+        ttk.Button(action_row, text="Scan now", command=self._on_refresh).grid(row=0, column=6)
+        ttk.Label(action_row, textvariable=self.screener_progress_var).grid(row=0, column=5, sticky="w", padx=(10, 0))
         self._refresh_pattern_button_styles()
 
         status_row = ttk.Frame(frame)
@@ -250,6 +268,41 @@ class StockPredictorDesktopApp:
         )
         self.screener_placeholder.grid(row=0, column=0, sticky="nsew")
 
+        debug_frame = ttk.LabelFrame(frame, text="Debug: Symbol Errors (first 50)")
+        debug_frame.grid(row=5, column=0, sticky="nsew", pady=(8, 0))
+        debug_frame.grid_columnconfigure(0, weight=1)
+        debug_cols = ("symbol", "providerSymbol", "status", "timeframeUsed", "candles", "error")
+        self.debug_tree = ttk.Treeview(debug_frame, columns=debug_cols, show="headings", height=8)
+        for col in debug_cols:
+            self.debug_tree.heading(col, text=col)
+            self.debug_tree.column(col, width=120 if col != "error" else 560)
+        self.debug_tree.grid(row=0, column=0, sticky="nsew")
+
+    def _resolve_provider(self) -> Any:
+        selected = self.selected_provider_var.get().strip().lower()
+        if selected in {"auto", "yahoo", "alpaca", "polygon"}:
+            return YahooMarketDataProvider()
+        if selected == "mock":
+            return MockPatternMarketDataProvider()
+        return YahooMarketDataProvider()
+
+    def _resolve_timeframe(self) -> str:
+        mapping = {"auto": "auto", "1h": "1h", "30m": "30m", "15m": "15m", "45m synthetic": "45m"}
+        return mapping.get(self.selected_timeframe_var.get().strip().lower(), "auto")
+
+    def _on_test_provider(self) -> None:
+        provider = self._resolve_provider()
+        tester = getattr(provider, "test_data_provider", None)
+        symbols = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN"]
+        if callable(tester):
+            rows = tester(symbols, timeframe="1h", lookback=500)
+            ok_count = len([r for r in rows if str(r.get("status")) == "OK"])
+            self.screener_status_var.set(
+                f"Provider test complete: {ok_count}/5 symbols OK. Provider: {provider.provider_status().get('provider', 'Unknown')}."
+            )
+        else:
+            self.screener_status_var.set("Market data provider not configured.")
+
     def _update_screener_view(self, force_refresh_data: bool = True) -> None:
         if self.screener_tree is None:
             return
@@ -262,6 +315,9 @@ class StockPredictorDesktopApp:
         if not pattern:
             self.screener_status_var.set("Please select a pattern.")
             return
+        if isinstance(self.screener_service, ScreenerService):
+            self.screener_service = ScreenerService(self._resolve_provider())
+        timeframe = self._resolve_timeframe()
 
         self.screener_progress_var.set("0 von 0 Aktien gescannt")
 
@@ -273,7 +329,7 @@ class StockPredictorDesktopApp:
         rows = self.screener_service.scan_market(
             pattern,
             "stock",
-            timeframe="1h",
+            timeframe=timeframe,
             force_refresh_data=force_refresh_data,
             progress_callback=_on_progress,
         )
@@ -284,11 +340,22 @@ class StockPredictorDesktopApp:
             self.screener_progress_var.set(f"{total_scanned} von {total_scanned} Aktien gescannt")
 
         debug = self.screener_service.get_last_debug_stats()
+        for item in self.debug_tree.get_children():
+            self.debug_tree.delete(item)
+        for diag in debug.symbolDiagnostics[:50]:
+            self.debug_tree.insert("", "end", values=(
+                diag.get("symbol", "-"),
+                diag.get("providerSymbol", "-"),
+                diag.get("status", "-"),
+                diag.get("timeframeUsed", "-"),
+                diag.get("candles", 0),
+                diag.get("error", ""),
+            ))
 
         if not rows:
             if debug.symbolsWithData == 0:
                 self.screener_status_var.set(
-                    f"Cannot scan patterns because no 1h market data was loaded. {debug.symbolsWithData} of {debug.totalSymbols} symbols returned 1h candles."
+                    "Keine Marktdaten geladen. Der Screener konnte keine 1h/30m/15m Candles abrufen. Bitte Datenprovider prüfen."
                 )
             elif debug.pipeline.get('rawDetections', 0) == 0:
                 self.screener_status_var.set(
@@ -327,7 +394,10 @@ class StockPredictorDesktopApp:
                 self.screener_row_symbol_map[iid] = symbol
 
         self.screener_status_var.set(
-            f"Detected {len(rows)} symbols matching {pattern} on the 1h timeframe. "
+            f"Detected {len(rows)} symbols matching {pattern}. "
+            f"Provider: {debug.providerStatus.get('provider', 'Unknown')} | "
+            f"Timeframes 1h/30m/15m: {debug.timeframeUsage.get('1h',0)+debug.timeframeUsage.get('60m',0)}/"
+            f"{debug.timeframeUsage.get('30m',0)}/{debug.timeframeUsage.get('15m',0)} | "
             f"Pipeline raw/active/displayed: {debug.pipeline.get('rawDetections', 0)}/"
             f"{debug.pipeline.get('activeDetections', 0)}/{debug.pipeline.get('displayedResults', 0)}."
         )

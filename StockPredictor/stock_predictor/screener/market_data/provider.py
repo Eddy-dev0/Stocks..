@@ -30,7 +30,9 @@ class MarketDataError(RuntimeError):
 class MarketDataProvider(Protocol):
     def get_universe(self, market_type: str) -> list[str]: ...
 
-    def get_historical_bars(self, symbol: str, timeframe: str, lookback: int) -> list[Candle]: ...
+    def get_historical_bars(
+        self, symbol: str, timeframe: str, lookback: int, options: dict[str, Any] | None = None
+    ) -> list[Candle]: ...
 
     def get_historical_bars_batch(
         self, symbols: list[str], timeframe: str, lookback: int
@@ -45,6 +47,8 @@ class MarketDataProvider(Protocol):
     def get_symbol_metadata(self, symbol: str) -> dict[str, Any]: ...
 
 
+TIMEFRAME_TO_MINUTES = {"1h": 60, "60m": 60, "45m": 45, "30m": 30, "15m": 15}
+
 YAHOO_FUTURES_MAP = {
     "ES": "ES=F",
     "NQ": "NQ=F",
@@ -58,6 +62,42 @@ YAHOO_FUTURES_MAP = {
     "ZN": "ZN=F",
 }
 
+def normalize_symbol_for_provider(provider_name: str, symbol: str) -> tuple[str | None, str | None]:
+    provider = provider_name.strip().lower()
+    upper = symbol.strip().upper()
+    if provider in {"yahoo", "auto", "mock", "not configured"}:
+        if upper in YAHOO_FUTURES_MAP:
+            return YAHOO_FUTURES_MAP[upper], None
+        return upper.replace(".", "-"), None
+    if provider == "alpaca":
+        if upper in YAHOO_FUTURES_MAP:
+            return None, "UNSUPPORTED_SYMBOL"
+        return upper.replace(".", "-"), None
+    if provider == "polygon":
+        return upper.replace(".", "-"), None
+    return upper.replace(".", "-"), None
+
+
+def normalize_timeframe_for_provider(provider_name: str, timeframe: str) -> str:
+    provider = provider_name.strip().lower()
+    tf = timeframe.strip().lower()
+    if provider in {"yahoo", "mock", "auto", "not configured"}:
+        if tf in {"1h", "60m"}:
+            return "60m"
+        if tf in {"30m", "15m", "45m"}:
+            return tf
+    return tf
+
+
+def timeframe_period_hint(timeframe: str) -> str:
+    tf = timeframe.strip().lower()
+    if tf in {"1h", "60m"}:
+        return "60d"
+    if tf == "30m":
+        return "30d"
+    if tf == "15m":
+        return "15d"
+    return "60d"
 
 @dataclass
 class FrontendAPIMarketDataProvider:
@@ -144,12 +184,12 @@ class FrontendAPIMarketDataProvider:
                 return frame.xs(symbol, axis=1, level=level)
         return frame
 
-    def _fetch_from_yfinance(self, symbol: str, timeframe: str, lookback: int) -> list[Candle]:
+    def _fetch_from_yfinance(self, symbol: str, timeframe: str, lookback: int, period_hint: str | None = None) -> list[Candle]:
         import yfinance as yf
 
         provider_symbol = self.normalize_symbol(symbol)
-        interval = "1h" if timeframe == "1h" else timeframe
-        period = "60d" if timeframe == "1h" else ("1y" if lookback >= 240 else "6mo")
+        interval = normalize_timeframe_for_provider("yahoo", timeframe)
+        period = period_hint or timeframe_period_hint(timeframe)
         try:
             frame = yf.download(
                 tickers=provider_symbol,
@@ -172,19 +212,20 @@ class FrontendAPIMarketDataProvider:
             normalized = normalized.rename(columns={"Date": "timestamp"})
 
         candles = self._to_candles(normalized, provider_symbol)
-        required = min(int(lookback), 120) if timeframe == "1h" else min(int(lookback), 60)
+        required = min(int(lookback), 120 if timeframe in {"1h", "60m"} else 60)
         if len(candles) < required:
             raise MarketDataError(provider_symbol, f"Not enough candles for {timeframe}: {len(candles)}")
         return candles[-int(lookback) :]
 
-    def get_historical_bars(self, symbol: str, timeframe: str, lookback: int) -> list[Candle]:
+    def get_historical_bars(
+        self, symbol: str, timeframe: str, lookback: int, options: dict[str, Any] | None = None
+    ) -> list[Candle]:
         provider_symbol = self.normalize_symbol(symbol)
-        if timeframe != "1h":
-            raise MarketDataError(provider_symbol, f"Unsupported timeframe {timeframe}")
+        period_hint = (options or {}).get("period") if isinstance(options, dict) else None
         try:
-            return self._fetch_from_ui_api(provider_symbol, timeframe)
+            return self._fetch_from_ui_api(provider_symbol, normalize_timeframe_for_provider("yahoo", timeframe))
         except Exception:
-            return self._fetch_from_yfinance(provider_symbol, timeframe, lookback)
+            return self._fetch_from_yfinance(provider_symbol, timeframe, lookback, period_hint=period_hint)
 
     def get_historical_bars_batch(
         self, symbols: list[str], timeframe: str, lookback: int
@@ -199,10 +240,8 @@ class FrontendAPIMarketDataProvider:
         return None
 
     def normalize_symbol(self, symbol: str) -> str:
-        upper = symbol.strip().upper()
-        if upper in YAHOO_FUTURES_MAP:
-            return YAHOO_FUTURES_MAP[upper]
-        return upper.replace(".", "-")
+        normalized, _err = normalize_symbol_for_provider("yahoo", symbol)
+        return normalized or symbol.strip().upper()
 
     def get_symbol_metadata(self, symbol: str) -> dict[str, Any]:
         upper = self.normalize_symbol(symbol)
@@ -236,7 +275,7 @@ class FrontendAPIMarketDataProvider:
         for symbol in symbols:
             provider_symbol = self.normalize_symbol(symbol)
             try:
-                candles = self.get_historical_bars(provider_symbol, timeframe, lookback)
+                candles = self.get_historical_bars(provider_symbol, timeframe, lookback, options={"period": timeframe_period_hint(timeframe)})
                 spacings = [
                     (candles[i].timestamp - candles[i - 1].timestamp).total_seconds() / 60
                     for i in range(1, len(candles))
@@ -299,9 +338,10 @@ class MockPatternMarketDataProvider:
         _ = market_type
         return list(self._fixtures)
 
-    def get_historical_bars(self, symbol: str, timeframe: str, lookback: int) -> list[Candle]:
-        if timeframe != "1h":
-            raise MarketDataError(symbol, "Mock provider only supports 1h")
+    def get_historical_bars(self, symbol: str, timeframe: str, lookback: int, options: dict[str, Any] | None = None) -> list[Candle]:
+        _ = options
+        if timeframe not in {"1h", "60m", "30m", "15m"}:
+            raise MarketDataError(symbol, f"Unsupported timeframe {timeframe}")
         normalized = self.normalize_symbol(symbol)
         candles = self._fixtures.get(normalized)
         if candles is None:
@@ -317,7 +357,11 @@ class MockPatternMarketDataProvider:
         return None
 
     def normalize_symbol(self, symbol: str) -> str:
-        return symbol.strip().upper()
+        normalized, _ = normalize_symbol_for_provider("mock", symbol)
+        return normalized or symbol.strip().upper()
+
+    def provider_status(self) -> dict[str, str]:
+        return {"provider": "Mock", "mode": "Mock", "configured": "yes"}
 
     def get_symbol_metadata(self, symbol: str) -> dict[str, Any]:
         return {"symbol": symbol, "providerSymbol": symbol, "name": symbol, "market_type": "stock"}
