@@ -137,12 +137,18 @@ def test_screener_status_is_market_wide_not_current_ticker() -> None:
             {"name": "Microsoft", "symbol": "MSFT", "marketType": "stock", "patternType": "Double Bottom", "direction": "Bullish", "confidence": 88.4, "tradeQuality": {"rating": "A", "successes": 72, "occurrences": 110}, "signalTime": "2026-04-25 13:00"},
         ]
     )
-
     app._update_screener_view(force_refresh_data=True)
 
     assert app.screener_status_var.value.startswith("Detected 2 symbols matching Double Bottom on the 1h timeframe.")
     assert app.screener_progress_var.value == "2 Treffer, 10 Aktien gescannt"
     assert "AAPL" not in app.screener_status_var.value
+
+
+def test_yahoo_market_data_provider_normalizes_futures_symbols() -> None:
+    provider = YahooMarketDataProvider()
+
+    assert provider.normalize_symbol("ES") == "ES=F"
+    assert provider.normalize_symbol("brk.b") == "BRK-B"
 
 
 def test_screener_row_click_sets_main_ticker() -> None:
