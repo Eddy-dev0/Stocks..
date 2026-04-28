@@ -263,3 +263,17 @@ def test_pattern_without_breakout_can_be_forming(monkeypatch) -> None:
     rows = service.scan_market("Double Bottom", "stock", filters=ScreenerFilters(min_score=50, min_occurrences=0))
     assert rows
     assert rows[0]["status"] == "forming"
+
+def test_scan_aborts_when_known_liquid_symbols_have_no_data() -> None:
+    class _EmptyProvider(_Provider):
+        def provider_status(self):
+            return {"provider": "Alpaca", "feed": "iex"}
+
+    provider = _EmptyProvider({})
+    service = ScreenerService(provider, universe_service=_Universe())
+
+    rows = service.scan_market("Double Bottom", "stock")
+    debug = service.get_last_debug_stats()
+
+    assert rows == []
+    assert any("Provider failed on 10 known liquid symbols" in warning for warning in debug.warnings)
