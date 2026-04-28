@@ -7,7 +7,7 @@ from datetime import datetime
 from statistics import median
 from typing import Callable
 
-from ..market_data.provider import MarketDataProvider
+from ..market_data.provider import MarketDataError, MarketDataProvider
 from ..market_data.symbol_universe import SymbolInfo, SymbolUniverseService
 from ..pattern_engine.detect_pattern import PatternOptions, detect_patterns, is_pattern_active
 from ..pattern_engine.score_pattern import score_pattern
@@ -71,6 +71,7 @@ class ScreenerDebugStats:
         }
     )
     symbolDiagnostics: list[dict[str, float | str | int]] = field(default_factory=list)
+    providerStatus: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -126,11 +127,11 @@ class ScreenerService:
         }
         return mapping.get(pattern_type, 120)
 
-    def validate_candles(self, symbol: str, candles: list[Candle], timeframe: str, min_required: int) -> tuple[list[Candle], list[str], str | None]:
+    def validate_candles(self, symbol: str, candles: list[Candle], timeframe: str, min_required: int) -> tuple[list[Candle], list[str], str | None, float | None]:
         if not isinstance(candles, list):
-            return [], [], "NO_DATA"
+            return [], [], "NO_DATA", None
         if not candles:
-            return [], [], "NO_DATA"
+            return [], [], "NO_DATA", None
         ordered = sorted(candles, key=lambda c: c.timestamp)
         warnings: list[str] = []
         seen: set[datetime] = set()
@@ -145,7 +146,7 @@ class ScreenerService:
                 continue
             clean.append(candle)
         if len(clean) < min_required:
-            return clean, warnings, "NOT_ENOUGH_CANDLES"
+            return clean, warnings, "NOT_ENOUGH_CANDLES", None
         if timeframe == "1h" and len(clean) >= 10:
             spacings = [
                 (clean[i].timestamp - clean[i - 1].timestamp).total_seconds() / 60
@@ -156,7 +157,8 @@ class ScreenerService:
                 med = median(spacings)
                 if med > 90 or med < 30:
                     warnings.append(f"Symbol {symbol} appears to have non-1h candle spacing.")
-        return clean, warnings, None
+                return clean, warnings, None, med
+        return clean, warnings, None, None
 
     def scan_market(
         self,
@@ -198,25 +200,33 @@ class ScreenerService:
         active_filters = filters or ScreenerFilters(min_score=options.min_confidence, min_occurrences=options.min_trade_quality)
         universe = self._resolve_universe(options)
         debug = ScreenerDebugStats(totalSymbols=len(universe))
+        provider_status = getattr(self.provider, "provider_status", None)
+        if callable(provider_status):
+            debug.providerStatus = provider_status()
         if not universe:
             self.last_debug_stats = debug
             return []
 
         def scan_symbol(info: SymbolInfo) -> tuple[dict[str, object] | None, dict[str, object]]:
-            metrics: dict[str, object] = {"symbol": info.symbol, "candles": 0, "rejects": [], "warnings": [], "pipeline": Counter()}
+            provider_symbol = self.provider.normalize_symbol(info.symbol)
+            metrics: dict[str, object] = {"symbol": info.symbol, "providerSymbol": provider_symbol, "candles": 0, "rejects": [], "warnings": [], "pipeline": Counter()}
             try:
-                candles = self.provider.get_historical_bars(info.symbol, options.timeframe, options.lookback_bars)
+                candles = self.provider.get_historical_bars(provider_symbol, options.timeframe, options.lookback_bars)
             except Exception as error:
-                metrics["rejects"].append(("DATA_ERROR", str(error)))
+                metrics["diag"] = {"symbol": info.symbol, "providerSymbol": provider_symbol, "status": "ERROR", "candles": 0, "firstTime": "-", "lastTime": "-", "lastClose": "-", "medianSpacingMinutes": "-", "error": str(error)}
+                reason = "UNSUPPORTED_SYMBOL" if isinstance(error, MarketDataError) and "unsupported" in str(error).lower() else "DATA_ERROR"
+                metrics["rejects"].append((reason, str(error)))
                 return None, metrics
             metrics["candles"] = len(candles)
             if not candles:
+                metrics["diag"] = {"symbol": info.symbol, "providerSymbol": provider_symbol, "status": "ERROR", "candles": 0, "firstTime": "-", "lastTime": "-", "lastClose": "-", "medianSpacingMinutes": "-", "error": "No data returned"}
                 metrics["rejects"].append(("NO_DATA", "provider returned no candles"))
                 return None, metrics
             min_required = max(1, min(options.min_candles_required, self._min_candles_for_pattern(options.pattern_type)))
-            valid_candles, warnings, reject_reason = self.validate_candles(info.symbol, candles, options.timeframe, min_required)
+            valid_candles, warnings, reject_reason, median_spacing = self.validate_candles(info.symbol, candles, options.timeframe, min_required)
             metrics["warnings"] = warnings
             if reject_reason is not None:
+                metrics["diag"] = {"symbol": info.symbol, "providerSymbol": provider_symbol, "status": "INVALID", "candles": len(valid_candles), "firstTime": valid_candles[0].timestamp.strftime("%Y-%m-%d %H:%M") if valid_candles else "-", "lastTime": valid_candles[-1].timestamp.strftime("%Y-%m-%d %H:%M") if valid_candles else "-", "lastClose": round(valid_candles[-1].close, 4) if valid_candles else "-", "medianSpacingMinutes": round(median_spacing, 2) if median_spacing is not None else "-", "error": reject_reason}
                 metrics["rejects"].append((reject_reason, f"candle_count={len(valid_candles)}"))
                 return None, metrics
 
@@ -225,10 +235,16 @@ class ScreenerService:
             swing_low_count = len([s for s in swing_points if s.kind == "low"])
             metrics["diag"] = {
                 "symbol": info.symbol,
-                "candleCount": len(valid_candles),
+                "providerSymbol": provider_symbol,
+                "status": "OK",
+                "candles": len(valid_candles),
+                "firstTime": valid_candles[0].timestamp.strftime("%Y-%m-%d %H:%M"),
+                "lastTime": valid_candles[-1].timestamp.strftime("%Y-%m-%d %H:%M"),
+                "lastClose": round(valid_candles[-1].close, 4),
+                "medianSpacingMinutes": round(median_spacing, 2) if median_spacing is not None else "-",
+                "error": "",
                 "swingHighCount": swing_high_count,
                 "swingLowCount": swing_low_count,
-                "lastClose": valid_candles[-1].close,
             }
             if not swing_points:
                 metrics["rejects"].append(("NO_SWING_POINTS", "swing detector returned 0 points"))
@@ -353,7 +369,7 @@ class ScreenerService:
                 debug.symbolDiagnostics.append(diag)
             for key, value in dict(metrics.get("pipeline", {})).items():
                 debug.pipeline[key] = debug.pipeline.get(key, 0) + int(value)
-            if diag is not None:
+            if isinstance(diag, dict) and str(diag.get("status")) == "OK":
                 debug.symbolsWithEnoughCandles += 1
             for reason, detail in metrics.get("rejects", []):
                 if reason == "NOT_ENOUGH_CANDLES":
