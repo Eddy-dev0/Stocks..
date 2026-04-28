@@ -105,9 +105,20 @@ def render_screener(
     provider = FrontendAPIMarketDataProvider(request_fn=request_fn)
     service = ScreenerService(provider)
 
-    st.info("Live-Provider: UI API /data Endpoint. Wenn kein externer Anbieter konfiguriert ist, sind Ergebnisse ggf. eingeschränkt.")
+    provider_state = provider.provider_status()
+    st.info(f"Provider: {provider_state['provider']} | Data mode: {provider_state['mode']} | API configured: {provider_state['configured']}")
+
+    st.markdown("**Test data provider**")
+    if st.button("Test data provider"):
+        test_rows = provider.test_data_provider(["AAPL", "MSFT", "NVDA", "TSLA", "AMZN"], timeframe="1h", lookback=500)
+        st.dataframe(pd.DataFrame(test_rows), use_container_width=True, hide_index=True)
+        st.session_state["screener_provider_test_ok"] = all(row.get("status") == "OK" for row in test_rows)
 
     if not st.button("Scan starten", type="primary"):
+        return
+
+    if st.session_state.get("screener_provider_test_ok") is False:
+        st.error("Market data provider test failed. Please fix provider before running market scan.")
         return
 
     with st.spinner("Scanning 1h market data..."):
@@ -128,8 +139,17 @@ def render_screener(
             active_lookback_bars=int(active_window),
         )
 
+    debug = service.get_last_debug_stats()
+
     if not rows:
-        st.warning("Keine Treffer für den gewählten Filter gefunden.")
+        if debug.symbolsWithData == 0:
+            st.error(f"Cannot scan patterns because no 1h market data was loaded. {debug.symbolsWithData} of {debug.totalSymbols} symbols returned 1h candles.")
+        elif debug.pipeline.get("rawDetections", 0) == 0:
+            st.warning("Market data loaded, but no pattern candidates found. Try lower sensitivity or debug candidates.")
+        else:
+            st.info("Pattern candidates found, but filtered out by confidence/status filters.")
+        if debug.symbolDiagnostics:
+            st.dataframe(pd.DataFrame(debug.symbolDiagnostics), use_container_width=True, hide_index=True)
         return
 
     if sort_by == "Volumen":
@@ -143,6 +163,10 @@ def render_screener(
     st.caption(f"Last updated: {rows[0]['lastUpdated']} UTC")
     st.dataframe(table, use_container_width=True, hide_index=True)
     st.caption("Hinweis: Confirmed-Setups werden intern priorisiert. Walk-Forward-Backtesting aktiv, sofern ausreichende Historie vorhanden ist.")
+
+    if debug.symbolDiagnostics:
+        st.markdown("**Symbol-Debug**")
+        st.dataframe(pd.DataFrame(debug.symbolDiagnostics), use_container_width=True, hide_index=True)
 
     csv = table.to_csv(index=False).encode("utf-8")
     st.download_button("CSV Export", data=csv, file_name="screener_results.csv", mime="text/csv")

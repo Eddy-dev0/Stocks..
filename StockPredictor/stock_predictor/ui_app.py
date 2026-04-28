@@ -11,6 +11,7 @@ import logging
 
 from stock_predictor.screener.market_data.symbol_universe import SymbolUniverseService
 from stock_predictor.screener.pattern_engine.types import Candle
+from stock_predictor.screener.market_data.provider import MarketDataError
 from stock_predictor.screener.services import ScreenerService
 
 
@@ -60,7 +61,7 @@ class YahooMarketDataProvider:
         blocked_until = self._failed_symbols_until.get(normalized_symbol)
         now = datetime.utcnow()
         if blocked_until is not None and blocked_until > now:
-            return []
+            raise MarketDataError(normalized_symbol, "Skipping symbol during cooldown")
         if blocked_until is not None and blocked_until <= now:
             self._failed_symbols_until.pop(normalized_symbol, None)
         try:
@@ -83,12 +84,12 @@ class YahooMarketDataProvider:
             self._failed_symbols_until[normalized_symbol] = datetime.utcnow() + timedelta(
                 seconds=self._failure_cooldown_seconds
             )
-            return []
+            raise MarketDataError(normalized_symbol, "Skipping symbol during cooldown")
         if frame is None or frame.empty:
             self._failed_symbols_until[normalized_symbol] = datetime.utcnow() + timedelta(
                 seconds=self._failure_cooldown_seconds
             )
-            return []
+            raise MarketDataError(normalized_symbol, "Skipping symbol during cooldown")
 
         normalized = frame.reset_index()
         if "Datetime" in normalized.columns:
@@ -279,12 +280,18 @@ class StockPredictorDesktopApp:
         debug = self.screener_service.get_last_debug_stats()
 
         if not rows:
-            self.screener_status_var.set(
-                f"No active patterns found. Debug: {debug.scannedSymbols} scanned, "
-                f"{debug.symbolsWithData} with data, {debug.symbolsWithEnoughCandles} enough candles, "
-                f"{debug.pipeline.get('rawDetections', 0)} candidates, "
-                f"{debug.pipeline.get('afterConfidenceFilter', 0)} after confidence filter."
-            )
+            if debug.symbolsWithData == 0:
+                self.screener_status_var.set(
+                    f"Cannot scan patterns because no 1h market data was loaded. {debug.symbolsWithData} of {debug.totalSymbols} symbols returned 1h candles."
+                )
+            elif debug.pipeline.get('rawDetections', 0) == 0:
+                self.screener_status_var.set(
+                    "Market data loaded, but no pattern candidates found. Try lower sensitivity or debug candidates."
+                )
+            else:
+                self.screener_status_var.set(
+                    "Pattern candidates found, but filtered out by confidence/status filters."
+                )
             if self.screener_placeholder is not None:
                 self.screener_placeholder.configure(text="No matches for selected filters. Open debug stats in status line.")
                 self.screener_placeholder.grid()
