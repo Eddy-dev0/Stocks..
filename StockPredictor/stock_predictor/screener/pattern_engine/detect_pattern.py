@@ -34,6 +34,9 @@ class PatternOptions:
     min_confidence_confirmed: float = 45.0
     active_lookback_bars: int = 20
     sensitivity: str = "normal"
+    allow_loose_fallback: bool = True
+    show_candidates: bool = False
+    debug: bool = False
     left_bars: int | None = None
     right_bars: int | None = None
     min_move_atr: float | None = None
@@ -50,10 +53,10 @@ def _resolve_swing_config(cfg: PatternOptions) -> tuple[int, int, float, float]:
     )
 
 
-def _run_detector(pattern_type: PatternType, candles: list[Candle], swings) -> PatternDetection | None:
+def _run_detector(pattern_type: PatternType, candles: list[Candle], swings, sensitivity: str) -> PatternDetection | None:
     mapping = {
-        "Double Bottom": lambda: detect_double_bottom(candles, swings),
-        "Double Top": lambda: detect_double_top(candles, swings),
+        "Double Bottom": lambda: detect_double_bottom(candles, swings, sensitivity=sensitivity),
+        "Double Top": lambda: detect_double_top(candles, swings, sensitivity=sensitivity),
         "Triple Bottom": lambda: detect_triple_bottom(candles, swings),
         "Triple Top": lambda: detect_triple_top(candles, swings),
         "Head and Shoulders": lambda: detect_head_and_shoulders(candles, swings),
@@ -87,7 +90,9 @@ def detect_patterns(
     candles: list[Candle], pattern_type: PatternType, options: PatternOptions | None = None
 ) -> list[PatternDetection]:
     cfg = options or PatternOptions()
-    left_bars, right_bars, min_move_atr, min_move_percent = _resolve_swing_config(cfg)
+    passes = [cfg.sensitivity]
+    if cfg.allow_loose_fallback and cfg.sensitivity != "loose":
+        passes.append("loose")
 
     scan_start = max(0, len(candles) - 500)
     scan_candles = candles[scan_start:]
@@ -95,28 +100,36 @@ def detect_patterns(
         return []
 
     detections: list[PatternDetection] = []
-    min_window = max(20, left_bars + right_bars + 10)
-    start_end = max(min_window, len(scan_candles) - cfg.active_lookback_bars)
-    for end in range(start_end, len(scan_candles) + 1):
-        window = scan_candles[:end]
-        swings = find_swing_points(
-            window,
-            left_bars=left_bars,
-            right_bars=right_bars,
-            min_move_atr=min_move_atr,
-            min_move_percent=min_move_percent,
-        )
-        det = _run_detector(pattern_type, window, swings)
-        if det is None:
-            continue
-        shifted = replace(
-            det,
-            start_index=det.start_index + scan_start,
-            end_index=det.end_index + scan_start,
-            signal_index=(det.signal_index + scan_start) if det.signal_index is not None else None,
-            breakout_index=(det.breakout_index + scan_start) if det.breakout_index is not None else None,
-        )
-        detections.append(shifted)
+    for pass_sensitivity in passes:
+        pass_cfg = replace(cfg, sensitivity=pass_sensitivity)
+        left_bars, right_bars, min_move_atr, min_move_percent = _resolve_swing_config(pass_cfg)
+        min_window = max(20, left_bars + right_bars + 10)
+        start_end = max(min_window, len(scan_candles) - cfg.active_lookback_bars)
+        pass_hits = 0
+        for end in range(start_end, len(scan_candles) + 1):
+            window = scan_candles[:end]
+            swings = find_swing_points(
+                window,
+                left_bars=left_bars,
+                right_bars=right_bars,
+                min_move_atr=min_move_atr,
+                min_move_percent=min_move_percent,
+            )
+            det = _run_detector(pattern_type, window, swings, sensitivity=pass_sensitivity)
+            if det is None:
+                continue
+            shifted = replace(
+                det,
+                start_index=det.start_index + scan_start,
+                end_index=det.end_index + scan_start,
+                signal_index=(det.signal_index + scan_start) if det.signal_index is not None else None,
+                breakout_index=(det.breakout_index + scan_start) if det.breakout_index is not None else None,
+                score=(det.score - 10.0 if pass_sensitivity == "loose" and cfg.sensitivity != "loose" else det.score),
+            )
+            detections.append(shifted)
+            pass_hits += 1
+        if pass_hits > 0 and pass_sensitivity != "loose":
+            break
 
     filtered: list[PatternDetection] = []
     for det in dedupe_detections(detections):
@@ -126,6 +139,8 @@ def detect_patterns(
             det = replace(det, status="candidate")
         if det.status == "confirmed" and det.score < cfg.min_confidence_confirmed:
             det = replace(det, status="forming")
+        if det.status == "candidate" and not (cfg.show_candidates or cfg.debug):
+            continue
         if is_pattern_active(det, len(candles), cfg.active_lookback_bars) and det.score >= cfg.min_confidence:
             filtered.append(det)
     return filtered

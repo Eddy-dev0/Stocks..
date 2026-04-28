@@ -15,6 +15,8 @@ from ..types import (
     Trendline,
 )
 
+SENSITIVITY_FACTOR: dict[str, float] = {"loose": 1.35, "normal": 1.0, "strict": 0.7}
+
 
 def slope(values: list[float]) -> float:
     n = len(values)
@@ -58,7 +60,23 @@ def value_at(line: Trendline, index: int) -> float:
 
 
 def breakout_buffer(close: float, atr: float) -> float:
-    return max(close * 0.0015, atr * 0.1)
+    return max(close * 0.0015, atr * 0.15)
+
+
+def price_tolerance(price: float, atr: float, mode: str = "normal") -> float:
+    if mode == "loose":
+        return max(price * 0.035, atr * 2.0)
+    if mode == "strict":
+        return max(price * 0.015, atr * 1.0)
+    return max(price * 0.025, atr * 1.5)
+
+
+def line_tolerance(price: float, atr: float, mode: str = "normal") -> float:
+    if mode == "loose":
+        return max(price * 0.020, atr * 1.5)
+    if mode == "strict":
+        return max(price * 0.007, atr * 0.7)
+    return max(price * 0.012, atr * 1.0)
 
 
 def volume_score(candles: list[Candle], breakout_index: int | None) -> tuple[float, float]:
@@ -124,6 +142,7 @@ def make_detection(
     resistance_level: float | None = None,
     breakout_index: int | None = None,
     score_breakdown: ScoreBreakdown | None = None,
+    sensitivity: str = "normal",
 ) -> PatternDetection:
     start_index = points[0].index if points else max(0, len(candles) - 40)
     end_index = points[-1].index if points else len(candles) - 1
@@ -136,18 +155,21 @@ def make_detection(
         scan_start=end_index,
     )
     vs, _ = volume_score(candles, resolved_breakout)
-    final_score = max(0.0, min(100.0, score + vs))
+    final_score = max(0.0, min(100.0, (score + vs) * SENSITIVITY_FACTOR.get(sensitivity, 1.0)))
     if score_breakdown is None:
         score_breakdown = ScoreBreakdown(structure=score, volume=vs, total=final_score)
     else:
         score_breakdown = ScoreBreakdown(
             structure=score_breakdown.structure,
+            geometry=score_breakdown.geometry,
+            trendContext=score_breakdown.trendContext,
             symmetry=score_breakdown.symmetry,
             trend=score_breakdown.trend,
             neckline=score_breakdown.neckline,
             compression=score_breakdown.compression,
             breakout=score_breakdown.breakout,
             volume=score_breakdown.volume + vs,
+            recency=score_breakdown.recency,
             penalties=score_breakdown.penalties,
             total=final_score,
         )

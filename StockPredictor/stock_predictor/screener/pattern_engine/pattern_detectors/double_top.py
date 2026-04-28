@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from ..swing_points import compute_atr
-from ..types import Candle, PatternDetection, SwingPoint
-from .common import dynamic_tolerance, make_detection, pretrend_ok
+from ..types import Candle, PatternDetection, ScoreBreakdown, SwingPoint
+from .common import make_detection, pretrend_ok, price_tolerance
 
 
-def detect_double_top(candles: list[Candle], swings: list[SwingPoint]) -> PatternDetection | None:
+def detect_double_top(candles: list[Candle], swings: list[SwingPoint], sensitivity: str = "normal") -> PatternDetection | None:
     highs = [s for s in swings if s.kind == "high"]
     lows = [s for s in swings if s.kind == "low"]
     if len(highs) < 2:
@@ -20,18 +20,44 @@ def detect_double_top(candles: list[Candle], swings: list[SwingPoint]) -> Patter
     l = min(between_lows, key=lambda p: p.price)
     atr = compute_atr(candles)
     avg_high = (h1.price + h2.price) / 2
-    tol = dynamic_tolerance(avg_high, atr, percent=0.015, atr_mult=1.0)
-    if abs(h1.price - h2.price) > tol or h2.price > h1.price + tol:
+    tol = price_tolerance(avg_high, atr, sensitivity)
+    high_diff = abs(h1.price - h2.price) / max(avg_high, 1e-9)
+    if h2.price > h1.price + tol:
         return None
     neckline = l.price
-    if neckline >= avg_high - max(atr * 1.5, avg_high * 0.02):
+    neckline_distance = avg_high - neckline
+    if neckline_distance <= max(atr * 0.8, avg_high * 0.01):
         return None
 
-    score = 20 + 15 + 15
+    structure = 20
+    geometry = 0.0
+    symmetry = 0.0
+    trend_ctx = 0.0
+    neckline_score = 0.0
+    penalties = 0.0
+    if high_diff <= 0.01:
+        symmetry += 20
+    elif high_diff <= 0.025:
+        symmetry += 15
+    elif high_diff <= 0.04:
+        symmetry += 8
+    else:
+        return None
+    if neckline_distance >= atr * 2:
+        neckline_score += 15
+    elif neckline_distance >= atr:
+        neckline_score += 8
+    else:
+        geometry += 2
     if pretrend_ok(candles, h1.index, bullish_reversal=False):
-        score += 10
+        trend_ctx += 10
     if h2.price <= h1.price:
-        score += 10
+        geometry += 8
+    else:
+        geometry += 3
+    if bars_between > 45:
+        penalties -= 4
+    score = structure + geometry + symmetry + trend_ctx + neckline_score + penalties
     invalidation = max(h1.price, h2.price) + atr * 0.2
     return make_detection(
         "Double Top",
@@ -44,5 +70,15 @@ def detect_double_top(candles: list[Candle], swings: list[SwingPoint]) -> Patter
         neckline=neckline,
         support_level=neckline,
         resistance_level=max(h1.price, h2.price),
-        explanation="Price rejected the same resistance twice and broke below the neckline.",
+        explanation="Two nearby highs formed resistance with a neckline pivot; breakdown confirms, otherwise forming.",
+        score_breakdown=ScoreBreakdown(
+            structure=structure,
+            geometry=geometry,
+            trendContext=trend_ctx,
+            symmetry=symmetry,
+            neckline=neckline_score,
+            penalties=penalties,
+            total=score,
+        ),
+        sensitivity=sensitivity,
     )

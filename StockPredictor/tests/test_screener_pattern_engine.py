@@ -56,6 +56,42 @@ def test_double_bottom_confirmed_and_close_only_breakout() -> None:
     assert confirmed.score >= 60
 
 
+def test_double_bottom_imperfect_lows_is_still_forming() -> None:
+    closes = [
+        100,
+        98,
+        96,
+        94,
+        97,
+        101,
+        106,
+        112,
+        108,
+        104,
+        102,
+        103,
+        106,
+        109,
+        112,
+        108,
+        104,
+        102,
+        103,
+        106,
+        109,
+        111,
+    ]
+    detections = detect_patterns(
+        _candles_from_close(closes),
+        "Double Bottom",
+        PatternOptions(min_confidence=35, show_candidates=True, allow_loose_fallback=True),
+    )
+    assert detections
+    det = detections[-1]
+    assert det.status in {"forming", "confirmed"}
+    assert det.score >= 50
+
+
 def test_double_top_confirmed() -> None:
     closes = [90, 92, 95, 99, 103, 107, 111, 114, 117, 115, 112, 109, 112, 116.5, 114, 111, 108, 104, 101, 99, 97]
     det = detect_pattern(_candles_from_close(closes), "Double Top")
@@ -104,6 +140,21 @@ def test_confidence_filter_and_dedupe() -> None:
 
     weak = detect_patterns(candles, "Double Bottom", PatternOptions(min_confidence=95))
     assert weak == []
+
+
+def test_loose_fallback_produces_detection_when_normal_is_too_strict() -> None:
+    candles = _candles_from_close([140, 136, 132, 128, 123, 118, 114, 110, 107, 104, 108, 112, 116, 111, 106, 103, 106, 110, 114, 117])
+    strict = detect_patterns(
+        candles,
+        "Double Bottom",
+        PatternOptions(min_confidence=0, sensitivity="strict", allow_loose_fallback=False),
+    )
+    with_fallback = detect_patterns(
+        candles,
+        "Double Bottom",
+        PatternOptions(min_confidence=0, sensitivity="strict", allow_loose_fallback=True),
+    )
+    assert len(with_fallback) >= len(strict)
 
 
 def test_invalidation_failed_status() -> None:

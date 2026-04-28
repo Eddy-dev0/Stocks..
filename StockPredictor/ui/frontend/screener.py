@@ -73,18 +73,33 @@ def render_screener(
     with col2:
         market = st.selectbox("Markt", options=["all", "stock", "future"], format_func=_market_label)
     with col3:
-        min_score = st.slider("Mindest-Trade-Qualität (Score)", min_value=40, max_value=95, value=60)
+        min_score = st.slider("Min Confidence", min_value=35, max_value=90, value=50)
     with col4:
         min_occ = st.slider("Minimum Sample Size", min_value=10, max_value=120, value=20)
 
-    fcol1, fcol2, fcol3, fcol4 = st.columns(4)
+    fcol1, fcol2, fcol3, fcol4, fcol5 = st.columns(5)
     with fcol1:
         min_volume = st.number_input("Mindestvolumen", min_value=0.0, value=0.0, step=1000.0)
     with fcol2:
-        status_filter = st.selectbox("Pattern-Status", options=["all", "forming", "confirmed", "failed", "expired"])
+        status_filter = st.selectbox(
+            "Pattern-Status",
+            options=["forming_confirmed", "confirmed_only", "all"],
+            format_func=lambda v: {
+                "forming_confirmed": "Forming + Confirmed",
+                "confirmed_only": "Confirmed only",
+                "all": "Candidates + Forming + Confirmed",
+            }.get(v, v),
+        )
     with fcol3:
-        lookback_days = st.slider("Lookback Tage", 90, 730, 365, step=30)
+        active_window = st.slider("Active Window (bars)", 5, 50, 20)
     with fcol4:
+        sensitivity = st.selectbox("Sensitivity", options=["normal", "loose", "strict"], index=0, format_func=str.title)
+    with fcol5:
+        debug = st.checkbox("Show Debug", value=False)
+    tcol1, tcol2 = st.columns(2)
+    with tcol1:
+        lookback_days = st.slider("Lookback Tage", 90, 730, 365, step=30)
+    with tcol2:
         sort_by = st.selectbox("Sortierung", options=["Trade-Qualität", "Trefferanzahl", "Volumen", "Aktualität"])
 
     provider = FrontendAPIMarketDataProvider(request_fn=request_fn)
@@ -106,7 +121,11 @@ def render_screener(
                 min_occurrences=int(min_occ),
                 min_volume=float(min_volume),
                 status=status_filter,
+                sensitivity=sensitivity,
+                show_candidates=status_filter == "all",
+                debug=debug,
             ),
+            active_lookback_bars=int(active_window),
         )
 
     if not rows:
