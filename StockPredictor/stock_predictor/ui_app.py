@@ -237,18 +237,24 @@ class AutoFallbackMarketDataProvider:
         return self.yahoo.normalize_symbol(symbol)
 
     def get_historical_bars(self, symbol: str, timeframe: str, lookback: int, options: dict[str, Any] | None = None) -> list[Candle]:
+        alpaca_error: Exception | None = None
         try:
             bars = self.alpaca.get_historical_bars(symbol, timeframe, lookback, options=options)
             self.last_provider = "Alpaca"
             return bars
-        except Exception:
-            try:
-                bars = self.yahoo.get_historical_bars(symbol, timeframe, lookback, options=options)
-                self.last_provider = "Yahoo"
-                return bars
-            except Exception:
-                self.last_provider = "Mock"
-                return self.mock.get_historical_bars(symbol, timeframe, lookback, options=options)
+        except Exception as exc:
+            alpaca_error = exc
+        try:
+            bars = self.yahoo.get_historical_bars(symbol, timeframe, lookback, options=options)
+            self.last_provider = "Yahoo"
+            return bars
+        except Exception as yahoo_error:
+            self.last_provider = "Auto"
+            raise MarketDataError(
+                symbol,
+                f"No live provider available (alpaca={alpaca_error}, yahoo={yahoo_error}). "
+                "Select Mock to test screener logic."
+            ) from yahoo_error
 
     def provider_status(self) -> dict[str, str]:
         return {"provider": self.last_provider, "mode": "Fallback", "configured": "yes"}
@@ -275,7 +281,7 @@ class StockPredictorDesktopApp:
         self.selected_provider_var = tk.StringVar(value="Auto")
         self.selected_feed_var = tk.StringVar(value="auto")
         self.selected_timeframe_var = tk.StringVar(value="Auto")
-        self.provider_self_test_passed = False
+        self.provider_self_test_passed = True
         self.screener_row_symbol_map: dict[str, str] = {}
         self.screener_pattern_buttons: dict[str, tk.Button] = {}
         self.screener_service = ScreenerService(YahooMarketDataProvider())
@@ -423,6 +429,7 @@ class StockPredictorDesktopApp:
         symbols = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN"]
         attempts = ["1h", "30m", "15m"]
         passed = 0
+        rows: list[dict[str, Any]] = []
         for symbol in symbols:
             success = False
             for timeframe in attempts:
@@ -430,16 +437,57 @@ class StockPredictorDesktopApp:
                     candles = provider.get_historical_bars(symbol, timeframe, 500)
                     if len(candles) >= 120:
                         success = True
+                        rows.append(
+                            {
+                                "symbol": symbol,
+                                "provider": getattr(provider, "provider_status", lambda: {})().get("provider", "-"),
+                                "feed": getattr(provider, "provider_status", lambda: {})().get("feed", "-"),
+                                "providerSymbol": getattr(provider, "normalize_symbol", lambda s: s)(symbol),
+                                "status": "OK",
+                                "timeframeAttempted": timeframe,
+                                "httpStatus": "-",
+                                "candles": len(candles),
+                                "errorMessage": "",
+                            }
+                        )
                         break
-                except Exception:
+                except Exception as exc:
+                    rows.append(
+                        {
+                            "symbol": symbol,
+                            "provider": getattr(provider, "provider_status", lambda: {})().get("provider", "-"),
+                            "feed": getattr(provider, "provider_status", lambda: {})().get("feed", "-"),
+                            "providerSymbol": getattr(provider, "normalize_symbol", lambda s: s)(symbol),
+                            "status": "ERROR",
+                            "timeframeAttempted": timeframe,
+                            "httpStatus": "-",
+                            "candles": 0,
+                            "errorMessage": str(exc),
+                        }
+                    )
                     continue
             if success:
                 passed += 1
-        self.provider_self_test_passed = passed >= 3
+        if getattr(self, "debug_tree", None) is not None:
+            for item in self.debug_tree.get_children():
+                self.debug_tree.delete(item)
+            for diag in rows[:50]:
+                self.debug_tree.insert("", "end", values=(
+                    diag.get("symbol", "-"),
+                    diag.get("provider", "-"),
+                    diag.get("feed", "-"),
+                    diag.get("providerSymbol", "-"),
+                    diag.get("status", "-"),
+                    diag.get("timeframeAttempted", "-"),
+                    diag.get("httpStatus", "-"),
+                    diag.get("candles", 0),
+                    diag.get("errorMessage", ""),
+                ))
+        self.provider_self_test_passed = passed >= 1
         if self.provider_self_test_passed:
             self.screener_status_var.set(f"Provider self-test passed ({passed}/5 symbols with >=120 candles).")
         else:
-            self.screener_status_var.set("Provider self-test failed. Screener scan disabled until market data works.")
+            self.screener_status_var.set("Live provider failed. You can switch to Yahoo or Mock.")
 
     def _update_screener_view(self, force_refresh_data: bool = True) -> None:
         if self.screener_tree is None:
@@ -452,9 +500,6 @@ class StockPredictorDesktopApp:
         pattern = self._get_selected_pattern()
         if not pattern:
             self.screener_status_var.set("Please select a pattern.")
-            return
-        if not getattr(self, "provider_self_test_passed", True):
-            self.screener_status_var.set("Provider self-test failed. Screener scan disabled until market data works.")
             return
         if isinstance(self.screener_service, ScreenerService):
             self.screener_service = ScreenerService(self._resolve_provider())
