@@ -29,7 +29,7 @@ def test_provider_self_test_fails_when_all_symbols_empty() -> None:
     StockPredictorDesktopApp._on_test_provider(app)
 
     assert app.provider_self_test_passed is False
-    assert "Provider self-test failed" in app.screener_status_var.value
+    assert "Live provider failed" in app.screener_status_var.value
 
 
 def test_alpaca_403_error_message(monkeypatch) -> None:
